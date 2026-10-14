@@ -118,6 +118,41 @@ fn cast_and_choose_damage(b: &mut Board, instant: ObjectId) -> Vec<usize> {
     panic!("the stack did not empty");
 }
 
+/// Cast the given instant and stop at Gandalf's mode prompt. Returns the
+/// `unavailable_modes` the prompt offered.
+fn cast_until_mode_prompt(b: &mut Board, instant: ObjectId) -> Vec<usize> {
+    let card_id = b.runner.state().objects[&instant].card_id;
+    b.runner
+        .act(GameAction::CastSpell {
+            object_id: instant,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("casting the instant must be accepted");
+    for _ in 0..8 {
+        match b.runner.state().waiting_for.clone() {
+            WaitingFor::OrderTriggers { triggers, .. } => {
+                b.runner
+                    .act(GameAction::OrderTriggers {
+                        order: (0..triggers.len()).collect(),
+                    })
+                    .expect("ordering triggers must be accepted");
+            }
+            WaitingFor::AbilityModeChoice {
+                source_id,
+                unavailable_modes,
+                ..
+            } => {
+                assert_eq!(source_id, b.gandalf, "reach: the prompt is Gandalf's");
+                return unavailable_modes;
+            }
+            other => panic!("unexpected wait: {}", other.variant_name()),
+        }
+    }
+    panic!("reach: Gandalf's mode prompt must surface");
+}
+
 fn life(b: &Board, player: engine::types::player::PlayerId) -> i32 {
     b.runner.state().players[player.0 as usize].life
 }
@@ -139,46 +174,20 @@ fn gandalf_mode_stays_unavailable_without_zone_change() {
         "reach: the damage mode resolved"
     );
 
-    let card_id = b.runner.state().objects[&second].card_id;
-    b.runner
-        .act(GameAction::CastSpell {
-            object_id: second,
-            card_id,
-            targets: vec![],
-            payment_mode: CastPaymentMode::Auto,
-        })
-        .expect("casting the second instant must be accepted");
-    for _ in 0..8 {
-        match b.runner.state().waiting_for.clone() {
-            WaitingFor::OrderTriggers { triggers, .. } => {
-                b.runner
-                    .act(GameAction::OrderTriggers {
-                        order: (0..triggers.len()).collect(),
-                    })
-                    .expect("ordering triggers must be accepted");
-            }
-            WaitingFor::AbilityModeChoice {
-                unavailable_modes, ..
-            } => {
-                assert_eq!(
-                    unavailable_modes,
-                    vec![DAMAGE_MODE],
-                    "CR 700.2: the same object cannot choose the damage mode twice"
-                );
-                assert!(
-                    b.runner
-                        .act(GameAction::SelectModes {
-                            indices: vec![DAMAGE_MODE],
-                        })
-                        .is_err(),
-                    "CR 700.2: re-choosing a used mode is rejected"
-                );
-                return;
-            }
-            other => panic!("unexpected wait: {}", other.variant_name()),
-        }
-    }
-    panic!("reach: Gandalf's second mode prompt must surface");
+    let unavailable = cast_until_mode_prompt(&mut b, second);
+    assert_eq!(
+        unavailable,
+        vec![DAMAGE_MODE],
+        "CR 700.2: the same object cannot choose the damage mode twice"
+    );
+    assert!(
+        b.runner
+            .act(GameAction::SelectModes {
+                indices: vec![DAMAGE_MODE],
+            })
+            .is_err(),
+        "CR 700.2: re-choosing a used mode is rejected"
+    );
 }
 
 /// CR 400.7: bouncing Gandalf and returning it makes a new object, so the
@@ -259,12 +268,14 @@ fn zone_exit_clears_turn_scoped_modal_history_for_departing_object_only() {
 }
 
 /// A control change is not a zone change: the permanent remains the same
-/// object and keeps its no-repeat history. The control change is applied by
-/// writing `controller` directly (P0 -> P1 -> P0); no zone-exit path runs.
+/// object and keeps its no-repeat history. Control moves P0 -> P1 -> P0 by
+/// writing `controller` directly (no zone-exit path runs), then the next
+/// trigger is read through the engine's real mode prompt.
 #[test]
 fn gandalf_mode_history_survives_control_change() {
     let mut b = board();
     let first = b.instants[0];
+    let second = b.instants[1];
     assert!(cast_and_choose_damage(&mut b, first).is_empty());
 
     let gandalf = b.gandalf;
@@ -276,11 +287,10 @@ fn gandalf_mode_history_survives_control_change() {
             .expect("Gandalf exists")
             .controller = controller;
     }
-    assert!(
-        b.runner
-            .state()
-            .modal_modes_chosen_this_game
-            .contains(&(gandalf, DAMAGE_MODE)),
+
+    assert_eq!(
+        cast_until_mode_prompt(&mut b, second),
+        vec![DAMAGE_MODE],
         "the same object keeps its game-scoped no-repeat history"
     );
 }
