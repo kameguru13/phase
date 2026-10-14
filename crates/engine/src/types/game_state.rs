@@ -22695,13 +22695,15 @@ declare_game_state! {
 
     /// Modal modes chosen this turn per source: (ObjectId, mode_index).
     /// CR 700.2: "choose one that hasn't been chosen this turn"
-    /// Note: ObjectId-keyed — zone changes create new ObjectId per CR 400.7, naturally resetting tracking.
+    /// CR 400.7: ObjectId is storage identity reused across zone moves; entries are cleared in
+    /// `zones::apply_zone_exit_cleanup` so a returned object has no memory of earlier choices.
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub modal_modes_chosen_this_turn: HashSet<(ObjectId, usize)>,
     /// Modal modes chosen this game per source: (ObjectId, mode_index).
     /// CR 700.2: "choose one that hasn't been chosen" (game-scoped)
-    /// Note: ObjectId-keyed — zone changes create new ObjectId per CR 400.7, naturally resetting tracking.
+    /// CR 400.7: ObjectId is storage identity reused across zone moves; entries are cleared in
+    /// `zones::apply_zone_exit_cleanup` so a returned object has no memory of earlier choices.
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub modal_modes_chosen_this_game: HashSet<(ObjectId, usize)>,
