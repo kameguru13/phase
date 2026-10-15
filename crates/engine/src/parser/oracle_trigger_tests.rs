@@ -24,7 +24,8 @@ use crate::types::ability::{
     ZoneChoiceCandidateSource, ZoneChoiceChooser, ZoneOwner, ZoneRef,
 };
 use crate::types::ability::{
-    EffectOutcomeSignal, IllegalTargetsDisposition, MultiTargetSpec, SpentColor,
+    EffectOutcomeSignal, IllegalTargetsDisposition, MultiTargetSpec, NumberQuality, Parity,
+    SpentColor, StaticCondition, StaticDefinition,
 };
 use crate::types::card_type::Supertype;
 use crate::types::counter::{CounterMatch, CounterType};
@@ -262,11 +263,11 @@ fn extract_had_counters_positive_quantifier_composes_with_type_axis() {
     }
 }
 
-/// Binding-rule unit test for `positive_had_counter_gate_qty`: only a positive
+/// Binding-rule unit test for `positive_count_gate_qty`: only a positive
 /// `HadCounters` (directly, or as an agreeing `And` conjunct) establishes the
 /// event-source counter read; `Not`, `Or`, and ambiguous `And`s never bind.
 #[test]
-fn positive_had_counter_gate_qty_binds_only_positive_gates() {
+fn positive_count_gate_qty_binds_only_positive_gates() {
     let any = TriggerCondition::HadCounters { counter_type: None };
     let plus = TriggerCondition::HadCounters {
         counter_type: Some(CounterType::Plus1Plus1),
@@ -276,38 +277,346 @@ fn positive_had_counter_gate_qty_binds_only_positive_gates() {
         counter_type: None,
     };
 
-    assert_eq!(positive_had_counter_gate_qty(&any), Some(any_read.clone()));
+    assert_eq!(positive_count_gate_qty(&any), Some(any_read.clone()));
     assert_eq!(
-        positive_had_counter_gate_qty(&TriggerCondition::And {
+        positive_count_gate_qty(&TriggerCondition::And {
             conditions: vec![TriggerCondition::LostLifeLastTurn, any.clone()],
         }),
         Some(any_read),
         "an intervening-if ANDed onto a pre-existing condition still binds"
     );
     assert_eq!(
-        positive_had_counter_gate_qty(&TriggerCondition::Not {
+        positive_count_gate_qty(&TriggerCondition::Not {
             condition: Box::new(any.clone()),
         }),
         None,
         "\"if it had no counters\" measured nothing — never an antecedent"
     );
     assert_eq!(
-        positive_had_counter_gate_qty(&TriggerCondition::Or {
+        positive_count_gate_qty(&TriggerCondition::Or {
             conditions: vec![any.clone(), TriggerCondition::LostLifeLastTurn],
         }),
         None,
         "a disjunction does not establish which operand held"
     );
     assert_eq!(
-        positive_had_counter_gate_qty(&TriggerCondition::And {
+        positive_count_gate_qty(&TriggerCondition::And {
             conditions: vec![any, plus],
         }),
         None,
         "two disagreeing counter gates are ambiguous and fail closed"
     );
     assert_eq!(
-        positive_had_counter_gate_qty(&TriggerCondition::LostLifeLastTurn),
+        positive_count_gate_qty(&TriggerCondition::LostLifeLastTurn),
         None
+    );
+
+    // CR 107.1: an arithmetic-quality gate over a quantity reference names
+    // that reference (positive reach-guard for the negatives below).
+    let lands = lands_you_count();
+    let creatures = QuantityRef::ObjectCount {
+        filter: TargetFilter::Typed(
+            TypedFilter::creature()
+                .controller(ControllerRef::You)
+                .properties(vec![FilterProp::InZone {
+                    zone: Zone::Battlefield,
+                }]),
+        ),
+    };
+    let prime_lands = quality_gate(lands.clone(), NumberQuality::Prime);
+    let odd_creatures = quality_gate(creatures, NumberQuality::Parity(Parity::Odd));
+    assert_eq!(positive_count_gate_qty(&prime_lands), Some(lands.clone()));
+    assert_eq!(
+        positive_count_gate_qty(&TriggerCondition::And {
+            conditions: vec![land_entered_this_turn(), prime_lands.clone()],
+        }),
+        Some(lands.clone()),
+        "a non-gate conjunct (the entered-this-turn tally) does not take part"
+    );
+    assert_eq!(
+        positive_count_gate_qty(&TriggerCondition::Not {
+            condition: Box::new(prime_lands.clone()),
+        }),
+        None,
+        "a negated quality gate measured nothing"
+    );
+    assert_eq!(
+        positive_count_gate_qty(&TriggerCondition::Or {
+            conditions: vec![prime_lands.clone(), TriggerCondition::LostLifeLastTurn],
+        }),
+        None
+    );
+    assert_eq!(
+        positive_count_gate_qty(&TriggerCondition::And {
+            conditions: vec![prime_lands.clone(), odd_creatures],
+        }),
+        None,
+        "two disagreeing quality gates are ambiguous and fail closed"
+    );
+    assert_eq!(
+        positive_count_gate_qty(&TriggerCondition::And {
+            conditions: vec![
+                TriggerCondition::HadCounters { counter_type: None },
+                prime_lands,
+            ],
+        }),
+        None,
+        "a counter gate and a quality gate disagree"
+    );
+    assert_eq!(
+        positive_count_gate_qty(&TriggerCondition::QuantityQuality {
+            quantity: QuantityExpr::Fixed { value: 3 },
+            quality: NumberQuality::Prime,
+        }),
+        None,
+        "a constant names no reference"
+    );
+}
+
+/// Zimone, All-Questioning — verbatim Oracle text.
+const ZIMONE: &str = "At the beginning of your end step, if a land entered the battlefield under your control this turn and you control a prime number of lands, create Primo, the Indivisible, a legendary 0/0 green and blue Fractal creature token, then put that many +1/+1 counters on it. (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, and 31 are prime numbers.)";
+
+/// Lands on the battlefield under the ability controller's control.
+fn lands_you_count() -> QuantityRef {
+    QuantityRef::ObjectCount {
+        filter: TargetFilter::Typed(
+            TypedFilter::land()
+                .controller(ControllerRef::You)
+                .properties(vec![FilterProp::InZone {
+                    zone: Zone::Battlefield,
+                }]),
+        ),
+    }
+}
+
+fn quality_gate(qty: QuantityRef, quality: NumberQuality) -> TriggerCondition {
+    TriggerCondition::QuantityQuality {
+        quantity: QuantityExpr::Ref { qty },
+        quality,
+    }
+}
+
+/// CR 608.2i: "a land entered the battlefield under your control this turn".
+fn land_entered_this_turn() -> TriggerCondition {
+    TriggerCondition::QuantityComparison {
+        lhs: QuantityExpr::Ref {
+            qty: QuantityRef::BattlefieldEntriesThisTurn {
+                player: PlayerScope::Controller,
+                filter: TargetFilter::Typed(TypedFilter::land()),
+            },
+        },
+        comparator: Comparator::GE,
+        rhs: QuantityExpr::Fixed { value: 1 },
+    }
+}
+
+fn the_only_trigger(
+    text: &str,
+    name: &str,
+    types: &[&str],
+    subtypes: &[&str],
+) -> TriggerDefinition {
+    let owned = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let parsed = parse_oracle_text(text, name, &[], &owned(types), &owned(subtypes));
+    assert!(
+        parsed.parse_warnings.is_empty(),
+        "{:?}",
+        parsed.parse_warnings
+    );
+    assert_eq!(parsed.triggers.len(), 1, "{:?}", parsed.triggers);
+    parsed.triggers.into_iter().next().unwrap()
+}
+
+/// Every effect the walker reaches, failing on any `Unimplemented`; returns
+/// the number of `Token` effects visited (positive walker guard).
+fn tokens_visited_without_gaps(def: &AbilityDefinition) -> usize {
+    let mut tokens = 0;
+    let _ = crate::types::ability_visit::visit_ability_def(def, &mut |effect| {
+        assert!(
+            !matches!(effect, Effect::Unimplemented { .. }),
+            "{effect:?}"
+        );
+        if matches!(effect, Effect::Token { .. }) {
+            tokens += 1;
+        }
+        std::ops::ControlFlow::Continue(())
+    });
+    tokens
+}
+
+fn token_entry_counters(def: &AbilityDefinition) -> &[(CounterType, QuantityExpr)] {
+    match def.effect.as_ref() {
+        Effect::Token {
+            enter_with_counters,
+            ..
+        } => enter_with_counters,
+        other => panic!("expected Token, got {other:?}"),
+    }
+}
+
+const GAIN_LIFE_FRACTAL: &str = "Whenever you gain life, create a 0/0 green and blue Fractal creature token, then put that many +1/+1 counters on it.";
+
+/// CR 122.6 + CR 608.2h: the gate rebind reaches the token's entry-counter
+/// magnitudes but not the statics the token is granted.
+#[test]
+fn count_gate_rebind_reaches_token_entry_counters_but_not_granted_statics() {
+    let trigger = the_only_trigger(GAIN_LIFE_FRACTAL, "Test Fractalist", &["Creature"], &[]);
+    let mut execute = *trigger.execute.expect("trigger body");
+    let placeholder = QuantityExpr::Ref {
+        qty: QuantityRef::EventContextAmount,
+    };
+    let granted_condition = StaticCondition::QuantityComparison {
+        lhs: placeholder.clone(),
+        comparator: Comparator::GE,
+        rhs: QuantityExpr::Fixed { value: 1 },
+    };
+    match execute.effect.as_mut() {
+        Effect::Token {
+            static_abilities,
+            enter_with_counters,
+            ..
+        } => {
+            // Reach-guard: the placeholder is there before the rebind.
+            assert_eq!(enter_with_counters[0].1, placeholder);
+            static_abilities
+                .push(StaticDefinition::continuous().condition(granted_condition.clone()));
+        }
+        other => panic!("expected Token, got {other:?}"),
+    }
+    let lands = lands_you_count();
+    rebind_event_context_amount_counts_in_ability(&mut execute, &lands);
+    match execute.effect.as_ref() {
+        Effect::Token {
+            static_abilities,
+            enter_with_counters,
+            count,
+            ..
+        } => {
+            assert_eq!(
+                enter_with_counters[0].1,
+                QuantityExpr::Ref { qty: lands.clone() }
+            );
+            assert_eq!(*count, QuantityExpr::Fixed { value: 1 });
+            assert_eq!(static_abilities[0].condition, Some(granted_condition));
+        }
+        other => panic!("expected Token, got {other:?}"),
+    }
+}
+
+/// Zimone, All-Questioning parses to a fully supported end-step trigger whose
+/// "that many" reads the very count its intervening-if checks.
+#[test]
+fn zimone_all_questioning_parses_gate_bound_primo() {
+    let trigger = the_only_trigger(
+        ZIMONE,
+        "Zimone, All-Questioning",
+        &["Creature"],
+        &["Human", "Wizard"],
+    );
+    assert_eq!(trigger.mode, TriggerMode::Phase);
+    assert_eq!(trigger.phase, Some(Phase::End));
+    assert_eq!(
+        trigger.constraint,
+        Some(TriggerConstraint::OnlyDuringYourTurn)
+    );
+    let lands = lands_you_count();
+    // CR 603.4: the intervening-if conjunction.
+    assert_eq!(
+        trigger.condition,
+        Some(TriggerCondition::And {
+            conditions: vec![
+                land_entered_this_turn(),
+                quality_gate(lands.clone(), NumberQuality::Prime),
+            ],
+        })
+    );
+    let execute = trigger.execute.as_deref().expect("trigger body");
+    assert_eq!(tokens_visited_without_gaps(execute), 1);
+    assert!(execute.sub_ability.is_none(), "{:?}", execute.sub_ability);
+    match execute.effect.as_ref() {
+        Effect::Token {
+            name,
+            power,
+            toughness,
+            types,
+            colors,
+            count,
+            supertypes,
+            enter_with_counters,
+            ..
+        } => {
+            // CR 111.4: the creating effect names the token.
+            assert_eq!(name, "Primo, the Indivisible");
+            assert_eq!(supertypes, &vec![Supertype::Legendary]);
+            assert_eq!(*power, PtValue::Fixed(0));
+            assert_eq!(*toughness, PtValue::Fixed(0));
+            assert_eq!(colors, &vec![ManaColor::Green, ManaColor::Blue]);
+            assert_eq!(types, &vec!["Creature".to_string(), "Fractal".to_string()]);
+            assert_eq!(*count, QuantityExpr::Fixed { value: 1 });
+            // CR 122.6: the entry counters count the gate's lands.
+            assert_eq!(
+                enter_with_counters,
+                &vec![(CounterType::Plus1Plus1, QuantityExpr::Ref { qty: lands })]
+            );
+        }
+        other => panic!("expected Token, got {other:?}"),
+    }
+}
+
+/// With no gate, "that many" stays the `EventContextAmount` placeholder.
+/// Parse shape only: runtime resolution of the placeholder on event triggers
+/// is not claimed here.
+#[test]
+fn ungated_that_many_token_counters_keep_the_placeholder() {
+    let trigger = the_only_trigger(GAIN_LIFE_FRACTAL, "Test Fractalist", &["Creature"], &[]);
+    assert_eq!(trigger.condition, None);
+    let execute = trigger.execute.as_deref().expect("trigger body");
+    assert_eq!(tokens_visited_without_gaps(execute), 1);
+    assert_eq!(
+        token_entry_counters(execute),
+        &[(
+            CounterType::Plus1Plus1,
+            QuantityExpr::Ref {
+                qty: QuantityRef::EventContextAmount,
+            },
+        )]
+    );
+}
+
+/// Assumption (no printed card): on an event trigger, a positive quality gate
+/// still binds "that many" — the `HadCounters`-consistent reading.
+#[test]
+fn quality_gate_on_event_trigger_binds_that_many_to_the_gate() {
+    let trigger = the_only_trigger(
+        "Whenever you gain life, if you control an odd number of creatures, create a 0/0 green and blue Fractal creature token, then put that many +1/+1 counters on it.",
+        "Test Fractalist",
+        &["Creature"],
+        &[],
+    );
+    let creatures = QuantityRef::ObjectCount {
+        filter: TargetFilter::Typed(
+            TypedFilter::creature()
+                .controller(ControllerRef::You)
+                .properties(vec![FilterProp::InZone {
+                    zone: Zone::Battlefield,
+                }]),
+        ),
+    };
+    assert_eq!(
+        trigger.condition,
+        Some(quality_gate(
+            creatures.clone(),
+            NumberQuality::Parity(Parity::Odd)
+        ))
+    );
+    let execute = trigger.execute.as_deref().expect("trigger body");
+    assert_eq!(tokens_visited_without_gaps(execute), 1);
+    assert_eq!(
+        token_entry_counters(execute),
+        &[(
+            CounterType::Plus1Plus1,
+            QuantityExpr::Ref { qty: creatures }
+        )]
     );
 }
 
@@ -481,9 +790,7 @@ fn reyhan_typed_counter_lookback_binds_typed_event_source_count() {
         };
         put_counter_defs += 1;
         assert_eq!(
-            def.condition
-                .as_ref()
-                .and_then(positive_had_counter_gate_qty),
+            def.condition.as_ref().and_then(positive_count_gate_qty),
             Some(plus_read.clone()),
             "the +1/+1 intervening-if must hoist as a positive typed gate: {:?}",
             def.condition

@@ -1226,6 +1226,7 @@ mod no_witnesses_most_creatures_investigate;
 mod notion_thief_opponent_draw_redirect;
 mod nth_spell_ordinal_cost_reduction;
 mod null_summoner_exiled_card_cast;
+mod number_quality_gate_reach;
 mod oath_cycle_target_restriction;
 mod ob_nixilis_captive_kingpin_life_loss;
 mod obeka_splitter_additional_phases;
@@ -1942,6 +1943,7 @@ mod yurlok_of_scorch_thrash;
 mod zenos_yae_galvus_chosen_object;
 mod zero_life_mid_cast_payment;
 mod zhulodok_double_cascade;
+mod zimone_all_questioning;
 mod zone_change_reflexive_this_way;
 
 mod activated_self_reference_new_object;

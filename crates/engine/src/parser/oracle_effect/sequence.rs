@@ -1,7 +1,7 @@
 use crate::parser::oracle_nom::error::{oracle_err, OracleError, OracleResult};
 use nom::branch::alt;
 use nom::bytes::complete::{is_not, tag, tag_no_case, take_till, take_until};
-use nom::character::complete::multispace1;
+use nom::character::complete::{multispace0, multispace1};
 use nom::combinator::{all_consuming, eof, map, map_opt, not, opt, recognize, rest, value, verify};
 use nom::multi::separated_list1;
 use nom::sequence::{preceded, terminated};
@@ -9641,6 +9641,10 @@ fn try_parse_token_enters_with_counters(lower: &str) -> Option<ContinuationAst> 
 ///   2. `"N <type> counter(s) on it, where x is <quantity>"` → fixed N with
 ///      a deferred X-binding (Fractal Anomaly class).
 ///   3. `"N <type> counter(s) on it"` → fixed N.
+///   4. `"that many <type> counter(s) on it"` → the `EventContextAmount`
+///      placeholder, bound to the trigger gate's measured count at trigger
+///      lowering (Zimone, All-Questioning); with no gate it stays the
+///      placeholder.
 ///
 /// Returns `TokenEntersWithCounters` so it shares the continuation absorption
 /// path with `try_parse_token_enters_with_counters` (declarative form).
@@ -9650,6 +9654,14 @@ fn try_parse_token_enters_with_counters(lower: &str) -> Option<ContinuationAst> 
 /// attach clause.
 fn token_counter_followup_tail_is_clean(rest: &str) -> bool {
     rest.trim().trim_start_matches(['.', ' ']).is_empty()
+}
+
+/// The count prefix of the imperative token-counter followup ("put <prefix> <type> counter(s) on it").
+#[derive(Clone, Copy)]
+enum CountPrefix {
+    VariableX,
+    Fixed(u32),
+    ThatMany,
 }
 
 fn try_parse_put_counters_on_token_followup(lower: &str) -> Option<ContinuationAst> {
@@ -9685,21 +9697,21 @@ fn try_parse_put_counters_on_token_followup(lower: &str) -> Option<ContinuationA
 
     // Forms 2 + 3 (fixed N with optional "where x is" rebind): the original
     // grammar, retained for the Fractal Anomaly / G'raha Tia class. Counter
-    // count is `x` (deferred), an article (1), or a literal number.
+    // count is `x` (deferred), "that many" (gate-bound), an article (1), or a
+    // literal number.
     let (rest, count_prefix) = alt((
         // "x " — variable resolved later via "where X is" or by caller payment
-        value(None, tag::<_, _, OracleError<'_>>("x ")),
-        value(Some(1u32), tag("a ")),
-        value(Some(1u32), tag("an ")),
+        value(CountPrefix::VariableX, tag::<_, _, OracleError<'_>>("x ")),
+        value(CountPrefix::ThatMany, tag("that many ")),
+        value(CountPrefix::Fixed(1), tag("a ")),
+        value(CountPrefix::Fixed(1), tag("an ")),
+        map(
+            terminated(nom_primitives::parse_number, multispace0),
+            CountPrefix::Fixed,
+        ),
     ))
     .parse(rest)
-    .unwrap_or_else(|_: nom::Err<OracleError<'_>>| {
-        if let Ok((r, n)) = nom_primitives::parse_number(rest) {
-            (r.trim_start(), Some(n))
-        } else {
-            (rest, None)
-        }
-    });
+    .unwrap_or((rest, CountPrefix::VariableX));
 
     // Parse counter type: only +1/+1 and -1/-1 are common in token contexts
     // (matches the AST scope of the existing enters-with-counters helper).
@@ -9749,19 +9761,21 @@ fn try_parse_put_counters_on_token_followup(lower: &str) -> Option<ContinuationA
         return None;
     }
 
-    let count = if let Some(qty) = quantity {
-        qty
-    } else if let Some(n) = count_prefix {
-        QuantityExpr::Fixed { value: n as i32 }
-    } else {
+    let count = match (quantity, count_prefix) {
+        (Some(qty), _) => qty,
+        (None, CountPrefix::Fixed(n)) => QuantityExpr::Fixed { value: n as i32 },
+        // CR 608.2h: "that many" placeholder; the count is determined as the effect is applied, bound to its antecedent at trigger lowering.
+        (None, CountPrefix::ThatMany) => QuantityExpr::Ref {
+            qty: QuantityRef::EventContextAmount,
+        },
         // Bare X with no "where X is" — variable resolved from the enclosing
         // ability's payment (e.g., G'raha Tia: X is the spell's mana value
         // paid as life via the parent PayCost).
-        QuantityExpr::Ref {
+        (None, CountPrefix::VariableX) => QuantityExpr::Ref {
             qty: QuantityRef::Variable {
                 name: "X".to_string(),
             },
-        }
+        },
     };
 
     Some(ContinuationAst::TokenEntersWithCounters {
@@ -14839,6 +14853,41 @@ mod tests {
         // SelfRef = source card, not the just-created token).
         let result = try_parse_put_counters_on_token_followup("put a +1/+1 counter on rat king");
         assert!(result.is_none());
+    }
+
+    /// CR 608.2h: "that many" marks the `EventContextAmount` placeholder on
+    /// both counter kinds; trigger lowering binds it to the gate's count.
+    #[test]
+    fn put_counters_on_it_followup_that_many_marks_the_count_anaphor() {
+        let that_many = QuantityExpr::Ref {
+            qty: QuantityRef::EventContextAmount,
+        };
+        for (text, expected_type) in [
+            (
+                "put that many +1/+1 counters on it",
+                CounterType::Plus1Plus1,
+            ),
+            (
+                "put that many -1/-1 counters on it",
+                CounterType::Minus1Minus1,
+            ),
+        ] {
+            match try_parse_put_counters_on_token_followup(text) {
+                Some(ContinuationAst::TokenEntersWithCounters {
+                    counter_type,
+                    count,
+                }) => {
+                    assert_eq!(counter_type, expected_type, "{text:?}");
+                    assert_eq!(count, that_many, "{text:?}");
+                }
+                other => panic!("expected TokenEntersWithCounters for {text:?}, got {other:?}"),
+            }
+        }
+        // The recipient must still be the just-created token.
+        assert!(try_parse_put_counters_on_token_followup(
+            "put that many +1/+1 counters on target creature"
+        )
+        .is_none());
     }
 
     #[test]

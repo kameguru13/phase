@@ -1822,7 +1822,7 @@ pub enum Parity {
 }
 
 impl Parity {
-    /// True when `n` has this parity. The single parity authority.
+    /// True when `n` has this parity. Shared by the mana-value parity filter and `NumberQuality`; zero is even.
     pub fn matches(self, n: i64) -> bool {
         // CR 107.1 + CR 107.1b: integer game values (negatives included); zero is even.
         match self {

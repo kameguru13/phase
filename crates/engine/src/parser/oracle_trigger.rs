@@ -2319,20 +2319,20 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
     // not the spell that caused a SpellCast trigger.
     rebind_source_counter_condition_recipient(&mut def);
 
-    // CR 603.4 + CR 603.10a + CR 608.2h: a positive past-tense counter
-    // intervening-if ("if it had one or more counters on it") measures the
-    // triggering object as it last existed, and the body's immediate count
-    // anaphor ("put that number of +1/+1 counters", "draws that many cards")
-    // is that measured quantity. Bind the `EventContextAmount` placeholder to
-    // the same event-source counter read the condition checks (LKI on a
-    // battlefield departure, per CR 122.2 the live counters are gone). Only a
+    // CR 603.4 + CR 603.10a + CR 107.1 + CR 608.2h: a positive intervening-if
+    // gate measures a nameable count, and the body's immediate count anaphor
+    // ("put that number of +1/+1 counters", "draws that many cards") is that
+    // measured quantity. Two gate shapes bind it:
+    // - a past-tense counter gate ("if it had one or more counters on it")
+    //   measures the triggering object as it last existed — the same
+    //   event-source counter read the condition checks (LKI on a battlefield
+    //   departure, per CR 122.2 the live counters are gone);
+    // - an arithmetic-quality gate ("if you control a prime number of lands")
+    //   measures the quantity reference the condition evaluates.
+    // Bind the `EventContextAmount` placeholder to that quantity. Only a
     // positive gate establishes an antecedent: "if it had no counters on it"
     // measured nothing, so a `Not` gate never binds.
-    if let Some(gate_qty) = def
-        .condition
-        .as_ref()
-        .and_then(positive_had_counter_gate_qty)
-    {
+    if let Some(gate_qty) = def.condition.as_ref().and_then(positive_count_gate_qty) {
         if let Some(execute) = def.execute.as_deref_mut() {
             rebind_event_context_amount_counts_in_ability(execute, &gate_qty);
         }
@@ -3042,19 +3042,29 @@ fn condition_contains_source_counter(condition: &TriggerCondition) -> bool {
     }
 }
 
-/// CR 603.4 + CR 603.10a + CR 608.2h: the counter read a positive past-tense
-/// `HadCounters` intervening-if establishes as the antecedent of the body's
-/// count anaphor — `CountersOn { scope: EventSource, counter_type }`, the same
-/// event-source (LKI on a battlefield departure) counter set the condition
-/// itself checks. `counter_type: None` sums every kind.
-fn positive_had_counter_gate_qty(condition: &TriggerCondition) -> Option<QuantityRef> {
+/// CR 603.4 + CR 608.2h: the quantity a positive intervening-if gate measured — the
+/// antecedent of the body's count anaphor ("that many", "that number of").
+/// - CR 603.10a: a past-tense `HadCounters` gate reads the event source's counters
+///   (`CountersOn { EventSource, .. }`, LKI on a departure).
+/// - CR 107.1: a `QuantityQuality` gate over a quantity reference ("you control a prime
+///   number of lands") names that reference — the same expression the condition evaluates.
+/// `And` binds only when every gate agrees; non-gate conjuncts don't take part. `Not` and
+/// `Or` never bind: neither establishes which number held. Assumption (no printed card):
+/// on an event trigger that also carries an event amount, a positive gate still binds the
+/// anaphor, as `HadCounters` does.
+fn positive_count_gate_qty(condition: &TriggerCondition) -> Option<QuantityRef> {
     match condition {
         TriggerCondition::HadCounters { counter_type } => Some(QuantityRef::CountersOn {
             scope: ObjectScope::EventSource,
             counter_type: counter_type.clone(),
         }),
+        TriggerCondition::QuantityQuality {
+            quantity: QuantityExpr::Ref { qty },
+            quality: _,
+        } => Some(qty.clone()),
+        TriggerCondition::QuantityQuality { .. } => None,
         TriggerCondition::And { conditions } => {
-            let mut gates = conditions.iter().filter_map(positive_had_counter_gate_qty);
+            let mut gates = conditions.iter().filter_map(positive_count_gate_qty);
             let first = gates.next()?;
             gates.all(|gate| gate == first).then_some(first)
         }
