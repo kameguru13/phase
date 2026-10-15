@@ -3048,6 +3048,7 @@ fn condition_contains_source_counter(condition: &TriggerCondition) -> bool {
 ///   (`CountersOn { EventSource, .. }`, LKI on a departure).
 /// - CR 107.1: a `QuantityQuality` gate over a quantity reference ("you control a prime
 ///   number of lands") names that reference — the same expression the condition evaluates.
+///
 /// `And` binds only when every gate agrees; non-gate conjuncts don't take part. `Not` and
 /// `Or` never bind: neither establishes which number held. Assumption (no printed card):
 /// on an event trigger that also carries an event amount, a positive gate still binds the
