@@ -3051,7 +3051,8 @@ fn condition_contains_source_counter(condition: &TriggerCondition) -> bool {
 /// `And` binds only when every gate agrees; non-gate conjuncts don't take part. `Not` and
 /// `Or` never bind: neither establishes which number held. Assumption (no printed card):
 /// on an event trigger that also carries an event amount, a positive gate still binds the
-/// anaphor, as `HadCounters` does.
+/// anaphor, as `HadCounters` does. That includes a "that much" placeholder, which lowers
+/// to the same `EventContextAmount`.
 fn positive_count_gate_qty(condition: &TriggerCondition) -> Option<QuantityRef> {
     match condition {
         TriggerCondition::HadCounters { counter_type } => Some(QuantityRef::CountersOn {

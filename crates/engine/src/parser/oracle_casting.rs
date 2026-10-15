@@ -592,8 +592,6 @@ pub(crate) fn extract_spend_only_on_x_prefix(line: &str) -> Option<(&str, Castin
     Some((rest.trim(), restriction))
 }
 
-/// CR 601.3: Parse "Cast this spell only [condition]" into typed restrictions.
-/// Handles ability word prefixes (e.g., "Tragic Backstory — Cast this spell only if...").
 /// CR 601.3: the "Cast this spell only …" casting-restriction frame, printed bare or
 /// behind an ability word ("Hellbent — Cast this spell only …"). Returns the lowercased
 /// text after the frame, or `None` when the line is not in this frame.
@@ -619,6 +617,8 @@ pub(crate) fn is_cast_this_spell_only_line(text: &str) -> bool {
     cast_this_spell_only_tail(text.trim().trim_end_matches('.')).is_some()
 }
 
+/// CR 601.3: Parse "Cast this spell only [condition]" into typed restrictions.
+/// Handles ability word prefixes (e.g., "Tragic Backstory — Cast this spell only if...").
 pub(crate) fn parse_casting_restriction_line(text: &str) -> Option<Vec<CastingRestriction>> {
     let trimmed = text.trim().trim_end_matches('.');
     // Try direct match first, then fall back to stripping ability word prefix
