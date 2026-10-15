@@ -373,6 +373,57 @@ fn positive_count_gate_qty_binds_only_positive_gates() {
     );
 }
 
+/// CR 603.4 + CR 508.5 + CR 608.2h: `lower_trigger_ir` binds "that many" to the
+/// trigger condition's quantity only after every rewrite of that quantity. On an
+/// attack trigger naming the attacked player, the "that player" rebind turns a
+/// `ScopedPlayer` gate quantity into `DefendingPlayer`; the bound effect count
+/// must be that post-rebind quantity, the same one the condition evaluates.
+/// The gate is hand-built (no parsed "that player has an odd number of …" gate
+/// exists yet) and swapped into the parsed IR before lowering.
+#[test]
+fn lower_trigger_ir_binds_that_many_after_attack_anaphor_rebind() {
+    let mut ir = parse_trigger_line_with_index_ir(
+        "Whenever a creature attacks one of your opponents, if that player has seven or more \
+         cards in hand, you draw that many cards.",
+        "Test Card",
+        None,
+        &mut ParseContext::default(),
+    );
+    ir.modifiers.intervening_if = Some(quality_gate(
+        QuantityRef::HandSize {
+            player: PlayerScope::ScopedPlayer,
+        },
+        NumberQuality::Parity(Parity::Odd),
+    ));
+    let def = lower_trigger_ir(&ir);
+
+    let defending_hand = QuantityExpr::Ref {
+        qty: QuantityRef::HandSize {
+            player: PlayerScope::DefendingPlayer,
+        },
+    };
+    // Reach-guard: the attack anaphor rebind ran and rewrote the gate.
+    assert!(attack_intervening_if_anaphor_is_defending_player(&def));
+    let Some(TriggerCondition::QuantityQuality { quantity, .. }) = def.condition.as_ref() else {
+        panic!(
+            "gate must lower to QuantityQuality, got {:?}",
+            def.condition
+        );
+    };
+    assert_eq!(
+        *quantity, defending_hand,
+        "the rebind must read the attacked player's hand"
+    );
+    let execute = def.execute.as_deref().expect("draw body");
+    let Effect::Draw { count, .. } = execute.effect.as_ref() else {
+        panic!("body must parse to Draw, got {:?}", execute.effect);
+    };
+    assert_eq!(
+        *count, *quantity,
+        "\"that many\" must bind the post-rebind condition quantity, not a pre-rebind copy"
+    );
+}
+
 /// Zimone, All-Questioning — verbatim Oracle text.
 const ZIMONE: &str = "At the beginning of your end step, if a land entered the battlefield under your control this turn and you control a prime number of lands, create Primo, the Indivisible, a legendary 0/0 green and blue Fractal creature token, then put that many +1/+1 counters on it. (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, and 31 are prime numbers.)";
 

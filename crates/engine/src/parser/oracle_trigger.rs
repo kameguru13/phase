@@ -2319,25 +2319,6 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
     // not the spell that caused a SpellCast trigger.
     rebind_source_counter_condition_recipient(&mut def);
 
-    // CR 603.4 + CR 603.10a + CR 107.1 + CR 608.2h: a positive intervening-if
-    // gate measures a nameable count, and the body's immediate count anaphor
-    // ("put that number of +1/+1 counters", "draws that many cards") is that
-    // measured quantity. Two gate shapes bind it:
-    // - a past-tense counter gate ("if it had one or more counters on it")
-    //   measures the triggering object as it last existed — the same
-    //   event-source counter read the condition checks (LKI on a battlefield
-    //   departure, per CR 122.2 the live counters are gone);
-    // - an arithmetic-quality gate ("if you control a prime number of lands")
-    //   measures the quantity reference the condition evaluates.
-    // Bind the `EventContextAmount` placeholder to that quantity. Only a
-    // positive gate establishes an antecedent: "if it had no counters on it"
-    // measured nothing, so a `Not` gate never binds.
-    if let Some(gate_qty) = def.condition.as_ref().and_then(positive_count_gate_qty) {
-        if let Some(execute) = def.execute.as_deref_mut() {
-            rebind_event_context_amount_counts_in_ability(execute, &gate_qty);
-        }
-    }
-
     // CR 601.2h + CR 400.7d: On a spell-cast-family trigger, an intervening-if
     // anaphor "mana spent to cast it"/"...this spell" denotes the *triggering
     // spell*, not the ability's source permanent. The bare anaphor parses to
@@ -2369,6 +2350,29 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
     if attack_intervening_if_anaphor_is_defending_player(&def) {
         if let Some(cond) = def.condition.as_mut() {
             rebind_attack_anaphor_to_defending_player(cond);
+        }
+    }
+
+    // CR 603.4 + CR 603.10a + CR 107.1 + CR 608.2h: a positive intervening-if
+    // gate measures a nameable count, and the body's immediate count anaphor
+    // ("put that number of +1/+1 counters", "draws that many cards") is that
+    // measured quantity. Two gate shapes bind it:
+    // - a past-tense counter gate ("if it had one or more counters on it")
+    //   measures the triggering object as it last existed — the same
+    //   event-source counter read the condition checks (LKI on a battlefield
+    //   departure, per CR 122.2 the live counters are gone);
+    // - an arithmetic-quality gate ("if you control a prime number of lands")
+    //   measures the quantity reference the condition evaluates.
+    // Bind the `EventContextAmount` placeholder to that quantity. Only a
+    // positive gate establishes an antecedent: "if it had no counters on it"
+    // measured nothing, so a `Not` gate never binds.
+    // Placed after every rewrite that can reach the condition's quantity (the
+    // spell-cast scope remap and the attack "that player" rebind above), so the
+    // bound quantity is the finished condition's own quantity, never a
+    // pre-remap copy of it.
+    if let Some(gate_qty) = def.condition.as_ref().and_then(positive_count_gate_qty) {
+        if let Some(execute) = def.execute.as_deref_mut() {
+            rebind_event_context_amount_counts_in_ability(execute, &gate_qty);
         }
     }
 
