@@ -1072,6 +1072,10 @@ fn ability_condition_is_cast_stable_for_pre_cast(condition: &AbilityCondition) -
         AbilityCondition::QuantityCheck { lhs, rhs, .. } => {
             quantity_is_cast_stable_for_pre_cast(lhs) && quantity_is_cast_stable_for_pre_cast(rhs)
         }
+        AbilityCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => quantity_is_cast_stable_for_pre_cast(quantity),
         AbilityCondition::ConditionInstead { inner }
         | AbilityCondition::Not { condition: inner } => {
             ability_condition_is_cast_stable_for_pre_cast(inner)
@@ -1320,6 +1324,10 @@ fn static_condition_is_cast_stable_for_pre_cast(condition: &StaticCondition) -> 
         StaticCondition::QuantityComparison { lhs, rhs, .. } => {
             quantity_is_cast_stable_for_pre_cast(lhs) && quantity_is_cast_stable_for_pre_cast(rhs)
         }
+        StaticCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => quantity_is_cast_stable_for_pre_cast(quantity),
         StaticCondition::And { conditions } | StaticCondition::Or { conditions } => conditions
             .iter()
             .all(static_condition_is_cast_stable_for_pre_cast),
@@ -1417,6 +1425,10 @@ fn trigger_condition_is_cast_stable_for_pre_cast(condition: &TriggerCondition) -
         TriggerCondition::QuantityComparison { lhs, rhs, .. } => {
             quantity_is_cast_stable_for_pre_cast(lhs) && quantity_is_cast_stable_for_pre_cast(rhs)
         }
+        TriggerCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => quantity_is_cast_stable_for_pre_cast(quantity),
         TriggerCondition::And { conditions } | TriggerCondition::Or { conditions } => conditions
             .iter()
             .all(trigger_condition_is_cast_stable_for_pre_cast),
@@ -2426,6 +2438,10 @@ pub(crate) fn static_condition_uses_unspent_mana(condition: &StaticCondition) ->
         StaticCondition::QuantityComparison { lhs, rhs, .. } => {
             quantity_expr_uses_unspent_mana(lhs) || quantity_expr_uses_unspent_mana(rhs)
         }
+        StaticCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => quantity_expr_uses_unspent_mana(quantity),
         StaticCondition::And { conditions } | StaticCondition::Or { conditions } => {
             conditions.iter().any(static_condition_uses_unspent_mana)
         }

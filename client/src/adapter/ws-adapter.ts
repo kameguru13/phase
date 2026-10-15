@@ -210,6 +210,14 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 144 — StaticCondition, TriggerCondition and AbilityCondition gain
+ *      QuantityQuality { quantity, quality } with the new NumberQuality
+ *      ({"type":"Prime"} / {"type":"Parity","value":"Odd"|"Even"}), carried
+ *      in GameState ability definitions (CR 107.1, CR 603.4) — see
+ *      PROTOCOL_VERSION's own `/// 144` entry in
+ *      crates/lobby-broker/src/protocol.rs. A v143 peer cannot parse the
+ *      tag; the exact-match version check at connect refuses the pairing.
+ *      Wire 126 moves with it.
  * 143 — GameState.modal_modes_chosen_this_turn / _this_game retype from
  *      (ObjectId, usize) to (ObjectIncarnationRef, usize) (CR 400.7), so a
  *      non-empty entry [50, 1] is now [{object_id: 50, incarnation: 0}, 1] —
@@ -873,7 +881,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 143;
+export const PROTOCOL_VERSION = 144;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

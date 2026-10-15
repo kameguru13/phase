@@ -1821,6 +1821,52 @@ pub enum Parity {
     Even,
 }
 
+impl Parity {
+    /// True when `n` has this parity. The single parity authority.
+    pub fn matches(self, n: i64) -> bool {
+        // CR 107.1 + CR 107.1b: integer game values (negatives included); zero is even.
+        match self {
+            Parity::Even => n.rem_euclid(2) == 0,
+            Parity::Odd => n.rem_euclid(2) == 1,
+        }
+    }
+}
+
+/// CR 107.1 + CR 107.1b: an arithmetic quality of an integer game value
+/// (negative values included).
+/// Prime/odd/even are mathematical; no CR rule defines them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value")]
+pub enum NumberQuality {
+    Parity(Parity),
+    Prime,
+}
+
+impl NumberQuality {
+    /// True when `n` has this arithmetic quality.
+    pub fn matches(self, n: i64) -> bool {
+        match self {
+            NumberQuality::Parity(parity) => parity.matches(n),
+            NumberQuality::Prime => is_prime(n),
+        }
+    }
+}
+
+/// True mathematical primality; not bounded by any card's reminder list.
+fn is_prime(n: i64) -> bool {
+    if n < 2 {
+        return false;
+    }
+    if n.rem_euclid(2) == 0 {
+        return n == 2;
+    }
+    // `d <= n / d` bounds the trial divisor at sqrt(n) without overflow.
+    (3_i64..)
+        .step_by(2)
+        .take_while(|&d| d <= n / d)
+        .all(|d| n % d != 0)
+}
+
 /// Source for odd/even parity predicates over mana value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value")]
@@ -12385,6 +12431,12 @@ pub enum StaticCondition {
         comparator: Comparator,
         rhs: QuantityExpr,
     },
+    /// CR 107.1 + CR 611.3a: true while the resolved quantity has the given
+    /// arithmetic quality ("you control a prime number of lands").
+    QuantityQuality {
+        quantity: QuantityExpr,
+        quality: NumberQuality,
+    },
     /// CR 702.178a: The relevant player has max speed.
     HasMaxSpeed,
     /// CR 702.178a + CR 702.179f: The relevant player's speed is at least the threshold.
@@ -12802,8 +12854,8 @@ impl StaticCondition {
     ///
     /// Boolean combinators return `None`; the tree predicate descends into
     /// them through `any_leaf`.
-    /// `QuantityComparison` returns `None` BY DEFINITION — it tests a quantity,
-    /// not a designation.
+    /// `QuantityComparison` and `QuantityQuality` return `None` BY DEFINITION —
+    /// they test a quantity, not a designation.
     pub(crate) fn designation_anchor(&self) -> Option<(Designation, &PlayerScope)> {
         match self {
             StaticCondition::IsMonarch { player } => Some((Designation::Monarch, player)),
@@ -12812,6 +12864,7 @@ impl StaticCondition {
             | StaticCondition::ChosenColorIs { .. }
             | StaticCondition::ChosenLabelIs { .. }
             | StaticCondition::QuantityComparison { .. }
+            | StaticCondition::QuantityQuality { .. }
             | StaticCondition::HasMaxSpeed
             | StaticCondition::SpeedGE { .. }
             | StaticCondition::And { .. }
@@ -12922,6 +12975,7 @@ impl StaticCondition {
             | StaticCondition::ChosenColorIs { .. }
             | StaticCondition::ChosenLabelIs { .. }
             | StaticCondition::QuantityComparison { .. }
+            | StaticCondition::QuantityQuality { .. }
             | StaticCondition::HasMaxSpeed
             | StaticCondition::SpeedGE { .. }
             | StaticCondition::And { .. }
@@ -13155,6 +13209,7 @@ impl StaticCondition {
             | StaticCondition::ChosenColorIs { .. }
             | StaticCondition::ChosenLabelIs { .. }
             | StaticCondition::QuantityComparison { .. }
+            | StaticCondition::QuantityQuality { .. }
             | StaticCondition::HasMaxSpeed
             | StaticCondition::SpeedGE { .. }
             | StaticCondition::And { .. }
@@ -13275,6 +13330,7 @@ impl StaticCondition {
             | StaticCondition::ChosenColorIs { .. }
             | StaticCondition::ChosenLabelIs { .. }
             | StaticCondition::QuantityComparison { .. }
+            | StaticCondition::QuantityQuality { .. }
             | StaticCondition::HasMaxSpeed
             | StaticCondition::SpeedGE { .. }
             | StaticCondition::DayNightIs { .. }
@@ -28512,6 +28568,11 @@ pub enum AbilityCondition {
         comparator: Comparator,
         rhs: QuantityExpr,
     },
+    /// CR 608.2h: effect-level arithmetic-quality gate, determined when the effect is applied.
+    QuantityQuality {
+        quantity: QuantityExpr,
+        quality: NumberQuality,
+    },
     /// CR 608.2c + CR 120.10: Compares the numeric result tracked from
     /// the previous instruction in the same resolution against `rhs`. The
     /// `channel` selects which resolution-local tally is read:
@@ -28946,6 +29007,7 @@ impl AbilityCondition {
             | AbilityCondition::CastVariantPaid { .. }
             | AbilityCondition::CastVariantPaidInstead { .. }
             | AbilityCondition::QuantityCheck { .. }
+            | AbilityCondition::QuantityQuality { .. }
             | AbilityCondition::PreviousEffectAmount { .. }
             | AbilityCondition::CompletedDungeon { .. }
             | AbilityCondition::TargetHasKeywordInstead { .. }
@@ -29028,6 +29090,7 @@ impl AbilityCondition {
             | AbilityCondition::CastVariantPaid { .. }
             | AbilityCondition::CastVariantPaidInstead { .. }
             | AbilityCondition::QuantityCheck { .. }
+            | AbilityCondition::QuantityQuality { .. }
             | AbilityCondition::PreviousEffectAmount { .. }
             | AbilityCondition::CompletedDungeon { .. }
             | AbilityCondition::TargetHasKeywordInstead { .. }
@@ -29181,6 +29244,7 @@ impl AbilityCondition {
             | AbilityCondition::CastVariantPaid { .. }
             | AbilityCondition::CastVariantPaidInstead { .. }
             | AbilityCondition::QuantityCheck { .. }
+            | AbilityCondition::QuantityQuality { .. }
             | AbilityCondition::PreviousEffectAmount { .. }
             | AbilityCondition::CompletedDungeon { .. }
             | AbilityCondition::TargetHasKeywordInstead { .. }
@@ -30041,6 +30105,12 @@ pub enum TriggerCondition {
         comparator: Comparator,
         rhs: QuantityExpr,
     },
+    /// CR 603.4: intervening-if form of the arithmetic-quality predicate;
+    /// checked on trigger and again on resolution.
+    QuantityQuality {
+        quantity: QuantityExpr,
+        quality: NumberQuality,
+    },
     /// CR 702.178a: The trigger functions only while its controller has max speed.
     HasMaxSpeed,
 
@@ -30415,6 +30485,7 @@ impl TriggerCondition {
             | TriggerCondition::FirstCombatPhaseOfTurn
             | TriggerCondition::CastSpellThisTurn { .. }
             | TriggerCondition::QuantityComparison { .. }
+            | TriggerCondition::QuantityQuality { .. }
             | TriggerCondition::HasMaxSpeed
             | TriggerCondition::IsInitiative
             | TriggerCondition::NoMonarch
@@ -40521,6 +40592,144 @@ mod tests {
         let json = serde_json::to_string(&conditions).unwrap();
         let deserialized: Vec<StaticCondition> = serde_json::from_str(&json).unwrap();
         assert_eq!(conditions, deserialized);
+    }
+
+    /// Independent Eratosthenes sieve over `0..=limit`, the reference reading
+    /// `NumberQuality::Prime` is measured against.
+    fn sieve_primes(limit: usize) -> Vec<bool> {
+        let mut is_prime = vec![true; limit + 1];
+        is_prime[0] = false;
+        if limit >= 1 {
+            is_prime[1] = false;
+        }
+        let mut p = 2;
+        while p * p <= limit {
+            if is_prime[p] {
+                let mut multiple = p * p;
+                while multiple <= limit {
+                    is_prime[multiple] = false;
+                    multiple += p;
+                }
+            }
+            p += 1;
+        }
+        is_prime
+    }
+
+    #[test]
+    fn number_quality_matches_mathematical_primes_and_parity() {
+        let sieve = sieve_primes(100);
+        for n in -3_i64..=100 {
+            let expected = usize::try_from(n).is_ok_and(|i| sieve[i]);
+            assert_eq!(
+                NumberQuality::Prime.matches(n),
+                expected,
+                "primality of {n} must match the sieve"
+            );
+        }
+        // Primes past any reminder-text list (Zimone's ruling: 37 … 97 and beyond).
+        for n in [2, 3, 37, 41, 97, 7919] {
+            assert!(NumberQuality::Prime.matches(n), "{n} is prime");
+        }
+        for n in [0, 1, 4, 9, 25, 91, 7917, -2, -3] {
+            assert!(!NumberQuality::Prime.matches(n), "{n} is not prime");
+        }
+        // The trial-division bound must not overflow at the top of the range.
+        assert!(!NumberQuality::Prime.matches(i64::MAX));
+
+        let even = NumberQuality::Parity(Parity::Even);
+        let odd = NumberQuality::Parity(Parity::Odd);
+        assert!(even.matches(0), "zero is even");
+        assert!(!odd.matches(0));
+        assert!(odd.matches(-3), "negative odd values are odd");
+        assert!(!even.matches(-3));
+        assert!(even.matches(-4));
+        assert!(!odd.matches(-4));
+        assert!(odd.matches(7));
+        assert!(!even.matches(7));
+    }
+
+    #[test]
+    fn parity_matches_preserves_mana_value_parity_reading() {
+        for mv in 0_u32..=20 {
+            assert_eq!(
+                Parity::Even.matches(i64::from(mv)),
+                mv.is_multiple_of(2),
+                "even parity of mana value {mv}"
+            );
+            assert_eq!(
+                Parity::Odd.matches(i64::from(mv)),
+                !mv.is_multiple_of(2),
+                "odd parity of mana value {mv}"
+            );
+        }
+    }
+
+    #[test]
+    fn number_quality_conditions_roundtrip_and_pin_shape() {
+        let quantity = QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TypedFilter::land().controller(ControllerRef::You).into(),
+            },
+        };
+        for quality in [NumberQuality::Prime, NumberQuality::Parity(Parity::Even)] {
+            let stat = StaticCondition::QuantityQuality {
+                quantity: quantity.clone(),
+                quality,
+            };
+            let trig = TriggerCondition::QuantityQuality {
+                quantity: quantity.clone(),
+                quality,
+            };
+            let abil = AbilityCondition::QuantityQuality {
+                quantity: quantity.clone(),
+                quality,
+            };
+            let stat_back: StaticCondition =
+                serde_json::from_str(&serde_json::to_string(&stat).unwrap()).unwrap();
+            let trig_back: TriggerCondition =
+                serde_json::from_str(&serde_json::to_string(&trig).unwrap()).unwrap();
+            let abil_back: AbilityCondition =
+                serde_json::from_str(&serde_json::to_string(&abil).unwrap()).unwrap();
+            assert_eq!(stat, stat_back);
+            assert_eq!(trig, trig_back);
+            assert_eq!(abil, abil_back);
+        }
+
+        // Wire contract pin: the condition tag and the adjacently tagged quality.
+        let quantity_json = serde_json::to_value(&quantity).unwrap();
+        let expected = serde_json::json!({
+            "type": "QuantityQuality",
+            "quantity": quantity_json,
+            "quality": { "type": "Prime" },
+        });
+        for value in [
+            serde_json::to_value(StaticCondition::QuantityQuality {
+                quantity: quantity.clone(),
+                quality: NumberQuality::Prime,
+            })
+            .unwrap(),
+            serde_json::to_value(TriggerCondition::QuantityQuality {
+                quantity: quantity.clone(),
+                quality: NumberQuality::Prime,
+            })
+            .unwrap(),
+            serde_json::to_value(AbilityCondition::QuantityQuality {
+                quantity: quantity.clone(),
+                quality: NumberQuality::Prime,
+            })
+            .unwrap(),
+        ] {
+            assert_eq!(value, expected);
+        }
+        assert_eq!(
+            serde_json::to_value(NumberQuality::Parity(Parity::Odd)).unwrap(),
+            serde_json::json!({ "type": "Parity", "value": "Odd" })
+        );
+        assert_eq!(
+            serde_json::to_value(NumberQuality::Parity(Parity::Even)).unwrap(),
+            serde_json::json!({ "type": "Parity", "value": "Even" })
+        );
     }
 
     #[test]

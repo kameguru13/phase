@@ -11982,6 +11982,10 @@ fn gate_binding_diverges_at_fire_time(condition: &AbilityCondition) -> bool {
         AbilityCondition::QuantityCheck { lhs, rhs, .. } => {
             quantity_expr_binding_diverges(lhs) || quantity_expr_binding_diverges(rhs)
         }
+        AbilityCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => quantity_expr_binding_diverges(quantity),
         AbilityCondition::Not { condition } => gate_binding_diverges_at_fire_time(condition),
         AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => {
             conditions.iter().any(gate_binding_diverges_at_fire_time)
@@ -15724,6 +15728,19 @@ fn evaluate_trigger_condition_with_source(
             );
             comparator.evaluate(lhs, rhs)
         }
+        TriggerCondition::QuantityQuality { quantity, quality } => {
+            // CR 603.4: checked when the trigger event occurs and again on resolution.
+            // Resolved exactly as `QuantityComparison`'s operands, against the
+            // explicit `trigger_event` at detection time.
+            let value = crate::game::quantity::resolve_quantity_for_trigger_check(
+                state,
+                quantity,
+                controller,
+                source_context,
+                trigger_event,
+            );
+            quality.matches(i64::from(value))
+        }
         TriggerCondition::HasMaxSpeed => has_max_speed(state, controller),
         // CR 122.1: "if you put a counter on a permanent this turn"
         TriggerCondition::CounterAddedThisTurn => state
@@ -17432,12 +17449,13 @@ pub mod tests {
         ChosenAttribute, ChosenSubtypeKind, CommanderOwnership, Comparator, ContinuousModification,
         ControllerRef, DamageChannel, DamageKindFilter, DelayedTriggerCondition,
         DelayedTriggerLifetime, DiscardSelfScope, Duration, EachDamageRecipient, Effect,
-        FilterProp, GuessSubject, KickerVariant, ModalChoice, MultiTargetSpec, PlayerFilter,
-        PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
-        ReplacementDefinition, ReplacementMode, ResolvedAbility, SearchSelectionConstraint,
-        SharedQuality, SharedQualityRelation, SpentColor, StaticCondition, StaticDefinition,
-        TargetFilter, TargetRef, TargetSelectionMode, TriggerCondition, TriggerConstraint,
-        TriggerDefinition, TriggerGrantInstanceRef, TypeFilter, TypedFilter,
+        FilterProp, GuessSubject, KickerVariant, ModalChoice, MultiTargetSpec, NumberQuality,
+        Parity, PlayerFilter, PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr,
+        QuantityRef, ReplacementDefinition, ReplacementMode, ResolvedAbility,
+        SearchSelectionConstraint, SharedQuality, SharedQualityRelation, SpentColor,
+        StaticCondition, StaticDefinition, TargetFilter, TargetRef, TargetSelectionMode,
+        TriggerCondition, TriggerConstraint, TriggerDefinition, TriggerGrantInstanceRef,
+        TypeFilter, TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card::LayoutKind;
@@ -34709,6 +34727,158 @@ pub mod tests {
             1,
             "Command-zone beginning-of-upkeep trigger must fire while its source is in the command zone"
         );
+    }
+
+    /// "You control a prime number of lands" as a trigger-side arithmetic quality.
+    fn lands_you_control_quality(quality: NumberQuality) -> TriggerCondition {
+        TriggerCondition::QuantityQuality {
+            quantity: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: TypedFilter::land().controller(ControllerRef::You).into(),
+                },
+            },
+            quality,
+        }
+    }
+
+    fn add_battlefield_lands(state: &mut GameState, owner: PlayerId, count: usize) {
+        for i in 0..count {
+            let id = create_object(
+                state,
+                CardId(0x0A000 + u64::try_from(i).unwrap()),
+                owner,
+                format!("Test Land {i}"),
+                Zone::Battlefield,
+            );
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Land);
+        }
+    }
+
+    /// Fires a P0 "at the beginning of your end step, if <condition>" trigger
+    /// with the given land counts and returns the resulting stack length.
+    fn end_step_quality_trigger_stack_len(
+        condition: TriggerCondition,
+        p0_lands: usize,
+        p1_lands: usize,
+    ) -> usize {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+        let source = create_object(
+            &mut state,
+            CardId(0x09F00),
+            PlayerId(0),
+            "Quality Gate Source".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&source).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.trigger_definitions.push(
+                TriggerDefinition::new(TriggerMode::Phase)
+                    .phase(Phase::End)
+                    .valid_target(TargetFilter::Controller)
+                    .execute(AbilityDefinition::new(
+                        AbilityKind::Database,
+                        Effect::GainLife {
+                            amount: QuantityExpr::Fixed { value: 1 },
+                            player: TargetFilter::Controller,
+                        },
+                    ))
+                    .condition(condition),
+            );
+        }
+        add_battlefield_lands(&mut state, PlayerId(0), p0_lands);
+        add_battlefield_lands(&mut state, PlayerId(1), p1_lands);
+        process_triggers(&mut state, &[GameEvent::PhaseChanged { phase: Phase::End }]);
+        state.stack.len()
+    }
+
+    #[test]
+    fn quantity_quality_intervening_if_gates_end_step_trigger() {
+        // CR 603.4: the intervening-if is checked when the end step begins.
+        let prime = || lands_you_control_quality(NumberQuality::Prime);
+        for lands in [2, 3, 5, 37] {
+            assert_eq!(
+                end_step_quality_trigger_stack_len(prime(), lands, 0),
+                1,
+                "{lands} lands is prime: the trigger must fire"
+            );
+        }
+        for lands in [0, 1, 4, 9] {
+            assert_eq!(
+                end_step_quality_trigger_stack_len(prime(), lands, 0),
+                0,
+                "{lands} lands is not prime: the trigger must not fire"
+            );
+        }
+
+        let odd = || lands_you_control_quality(NumberQuality::Parity(Parity::Odd));
+        assert_eq!(end_step_quality_trigger_stack_len(odd(), 3, 0), 1);
+        assert_eq!(end_step_quality_trigger_stack_len(odd(), 4, 0), 0);
+
+        // Multi-authority: "you control" is the trigger controller's count. P0
+        // with 4 lands plus P1 with 1 is a combined (prime) 5, yet P0's 4 is not
+        // prime, so the trigger must not fire. Paired positive: P0 alone with 5.
+        assert_eq!(end_step_quality_trigger_stack_len(prime(), 4, 1), 0);
+        assert_eq!(end_step_quality_trigger_stack_len(prime(), 5, 0), 1);
+    }
+
+    #[test]
+    fn quantity_quality_rechecked_at_resolution() {
+        // CR 603.4 + Zimone ruling: "It won't resolve if you don't control a
+        // prime number of lands as it resolves." The generic resolution recheck
+        // re-evaluates the predicate against the live board.
+        fn recheck(state: &mut GameState, condition: &TriggerCondition) -> bool {
+            crate::game::stack::bind_triggered_resolution_scope(
+                state,
+                Some(crate::game::stack::TriggeredResolutionScope {
+                    condition: Some(condition),
+                    controller: PlayerId(0),
+                    trigger_source: None,
+                    trigger_definition: None,
+                    trigger_event: None,
+                    subject_match_count: None,
+                    die_result: None,
+                }),
+                None,
+            )
+        }
+        let prime = lands_you_control_quality(NumberQuality::Prime);
+        let not_prime = TriggerCondition::Not {
+            condition: Box::new(prime.clone()),
+        };
+
+        let mut state = setup();
+        add_battlefield_lands(&mut state, PlayerId(0), 3);
+        assert!(recheck(&mut state, &prime), "3 lands: still prime");
+        assert!(!recheck(&mut state, &not_prime));
+
+        // The same board gains a fourth land between trigger and resolution.
+        let fourth = create_object(
+            &mut state,
+            CardId(0x0AF00),
+            PlayerId(0),
+            "Fourth Land".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&fourth)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Land);
+        assert!(
+            !recheck(&mut state, &prime),
+            "a fourth land makes the count non-prime: the ability does not resolve"
+        );
+        assert!(recheck(&mut state, &not_prime));
     }
 
     #[test]

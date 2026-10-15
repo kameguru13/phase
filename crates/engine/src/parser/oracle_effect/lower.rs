@@ -12815,6 +12815,10 @@ fn apply_where_x_ability_condition(
             bind_where_x_quantity(lhs, where_x_expression, unbound);
             bind_where_x_quantity(rhs, where_x_expression, unbound);
         }
+        AbilityCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => bind_where_x_quantity(quantity, where_x_expression, unbound),
         AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => {
             for c in conditions.iter_mut() {
                 apply_where_x_ability_condition(c, where_x_expression, unbound);
@@ -12840,6 +12844,10 @@ fn apply_where_x_static_condition(
             bind_where_x_quantity(lhs, where_x_expression, unbound);
             bind_where_x_quantity(rhs, where_x_expression, unbound);
         }
+        StaticCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => bind_where_x_quantity(quantity, where_x_expression, unbound),
         StaticCondition::And { conditions } | StaticCondition::Or { conditions } => {
             for condition in conditions {
                 apply_where_x_static_condition(condition, where_x_expression, unbound);

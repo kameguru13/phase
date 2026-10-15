@@ -617,6 +617,10 @@ fn condition_refs_source_object(condition: &AbilityCondition) -> bool {
         AbilityCondition::QuantityCheck { lhs, rhs, .. } => {
             quantity_expr_reads_source_counters(lhs) || quantity_expr_reads_source_counters(rhs)
         }
+        AbilityCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => quantity_expr_reads_source_counters(quantity),
         AbilityCondition::Not { condition }
         | AbilityCondition::ConditionInstead { inner: condition } => {
             condition_refs_source_object(condition)
@@ -686,6 +690,10 @@ fn rebind_source_counter_condition(condition: &mut AbilityCondition, to: ObjectS
             rebind_source_counter_quantity_expr(lhs, to);
             rebind_source_counter_quantity_expr(rhs, to);
         }
+        AbilityCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => rebind_source_counter_quantity_expr(quantity, to),
         AbilityCondition::Not { condition }
         | AbilityCondition::ConditionInstead { inner: condition } => {
             rebind_source_counter_condition(condition, to);
@@ -1541,6 +1549,10 @@ fn condition_reads_player_chosen_number(condition: &AbilityCondition) -> bool {
             quantity_expr_reads_player_chosen_number(lhs)
                 || quantity_expr_reads_player_chosen_number(rhs)
         }
+        AbilityCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => quantity_expr_reads_player_chosen_number(quantity),
         AbilityCondition::ConditionInstead { inner } => condition_reads_player_chosen_number(inner),
         AbilityCondition::Not { condition } => condition_reads_player_chosen_number(condition),
         AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => {
@@ -2159,6 +2171,7 @@ fn condition_reads_the_event_subject(condition: &AbilityCondition) -> bool {
         | AbilityCondition::CastVariantPaid { .. }
         | AbilityCondition::CastVariantPaidInstead { .. }
         | AbilityCondition::QuantityCheck { .. }
+        | AbilityCondition::QuantityQuality { .. }
         | AbilityCondition::PreviousEffectAmount { .. }
         | AbilityCondition::HasMaxSpeed
         | AbilityCondition::IsMonarch
@@ -33202,6 +33215,10 @@ fn rewrite_ability_condition_keyword(condition: &mut AbilityCondition, new_keywo
             rewrite_quantity_expr_keyword(lhs, new_keyword);
             rewrite_quantity_expr_keyword(rhs, new_keyword);
         }
+        AbilityCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => rewrite_quantity_expr_keyword(quantity, new_keyword),
         AbilityCondition::TargetHasKeywordInstead { keyword }
         | AbilityCondition::SourceLacksKeyword { keyword } => {
             *keyword = new_keyword.clone();
@@ -36583,6 +36600,10 @@ fn rewrite_player_scope_refs(def: &mut AbilityDefinition) {
                 rewrite_condition_quantity_expr(lhs);
                 rewrite_condition_quantity_expr(rhs);
             }
+            AbilityCondition::QuantityQuality {
+                quantity,
+                quality: _,
+            } => rewrite_condition_quantity_expr(quantity),
             AbilityCondition::TargetMatchesFilter { filter, .. }
             | AbilityCondition::SourceMatchesFilter { filter }
             | AbilityCondition::ZoneChangeObjectMatchesFilter { filter, .. }
@@ -37515,6 +37536,10 @@ pub(crate) fn trigger_condition_references_controller_life_gained(
         TriggerCondition::QuantityComparison { lhs, .. } => {
             quantity_expr_references_controller_life_gained(lhs)
         }
+        TriggerCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => quantity_expr_references_controller_life_gained(quantity),
         TriggerCondition::And { conditions } | TriggerCondition::Or { conditions } => conditions
             .iter()
             .any(trigger_condition_references_controller_life_gained),

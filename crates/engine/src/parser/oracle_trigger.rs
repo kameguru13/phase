@@ -544,6 +544,10 @@ fn rewrite_cost_x_in_condition(cond: &mut crate::types::ability::AbilityConditio
             rewrite_variable_x_to_cost_x_paid(lhs);
             rewrite_variable_x_to_cost_x_paid(rhs);
         }
+        AbilityCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => rewrite_variable_x_to_cost_x_paid(quantity),
         AbilityCondition::PreviousEffectAmount { rhs, .. } => {
             rewrite_variable_x_to_cost_x_paid(rhs);
         }
@@ -644,6 +648,10 @@ fn cost_x_sibling_slot_still_unbound(def: &crate::types::ability::AbilityDefinit
             AbilityCondition::QuantityCheck { lhs, rhs, .. } => {
                 lhs.contains_x() || rhs.contains_x()
             }
+            AbilityCondition::QuantityQuality {
+                quantity,
+                quality: _,
+            } => quantity.contains_x(),
             AbilityCondition::PreviousEffectAmount { rhs, .. } => rhs.contains_x(),
             AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => {
                 conditions.iter().any(condition_has_bare_x)
@@ -6041,6 +6049,10 @@ fn remap_self_cast_scope_to_triggering_spell(cond: &mut TriggerCondition) {
             remap_self_cast_scope_in_quantity(lhs);
             remap_self_cast_scope_in_quantity(rhs);
         }
+        TriggerCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => remap_self_cast_scope_in_quantity(quantity),
         TriggerCondition::And { conditions } | TriggerCondition::Or { conditions } => {
             conditions
                 .iter_mut()
@@ -6190,6 +6202,10 @@ fn rebind_attack_anaphor_to_defending_player(cond: &mut TriggerCondition) {
             rebind_attack_anaphor_in_quantity(lhs);
             rebind_attack_anaphor_in_quantity(rhs);
         }
+        TriggerCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => rebind_attack_anaphor_in_quantity(quantity),
         TriggerCondition::And { conditions } | TriggerCondition::Or { conditions } => {
             conditions
                 .iter_mut()
@@ -6268,6 +6284,16 @@ pub(crate) fn static_condition_to_trigger_condition(
             comparator: *comparator,
             rhs: substitute_another_in_expr(rhs),
         }),
+        // CR 603.4: same "other" → other-than-triggering-object substitution as
+        // QuantityComparison.
+        // `Not` over this variant goes through the generic `inner =>` negation
+        // arm below: a quality cannot be negated in place.
+        StaticCondition::QuantityQuality { quantity, quality } => {
+            Some(TriggerCondition::QuantityQuality {
+                quantity: substitute_another_in_expr(quantity),
+                quality: *quality,
+            })
+        }
 
         // CR 702.178a: Speed condition.
         StaticCondition::HasMaxSpeed => Some(TriggerCondition::HasMaxSpeed),
@@ -24128,5 +24154,55 @@ mod structural_marker_tests {
         ] {
             assert!(parse(declined).is_none(), "{declined:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod number_quality_bridge_tests {
+    use super::{static_condition_to_trigger_condition, substitute_another_in_expr};
+    use crate::types::ability::{
+        ControllerRef, FilterProp, NumberQuality, QuantityExpr, QuantityRef, StaticCondition,
+        TriggerCondition, TypedFilter,
+    };
+
+    /// CR 603.4: the static→trigger bridge maps `QuantityQuality` 1:1, with the
+    /// same "other" → other-than-triggering-object substitution as
+    /// `QuantityComparison`, and negation rides the generic `Not` arm.
+    #[test]
+    fn static_quantity_quality_bridges_to_trigger_condition() {
+        let quantity = QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TypedFilter::land()
+                    .properties(vec![FilterProp::Another])
+                    .controller(ControllerRef::You)
+                    .into(),
+            },
+        };
+        let substituted = substitute_another_in_expr(&quantity);
+        assert_ne!(
+            substituted, quantity,
+            "the substitution must be observable for this fixture"
+        );
+        let affirmative = StaticCondition::QuantityQuality {
+            quantity: quantity.clone(),
+            quality: NumberQuality::Prime,
+        };
+        let expected = TriggerCondition::QuantityQuality {
+            quantity: substituted,
+            quality: NumberQuality::Prime,
+        };
+        assert_eq!(
+            static_condition_to_trigger_condition(&affirmative),
+            Some(expected.clone())
+        );
+        let negated = StaticCondition::Not {
+            condition: Box::new(affirmative),
+        };
+        assert_eq!(
+            static_condition_to_trigger_condition(&negated),
+            Some(TriggerCondition::Not {
+                condition: Box::new(expected),
+            })
+        );
     }
 }

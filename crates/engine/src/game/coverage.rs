@@ -25,13 +25,14 @@ use crate::types::ability::{
     CountScope, CounterKindChooser, CounterKindDomain, CounterSourceRider, DelayedTriggerCondition,
     DieRollModifier, DoublePTMode, Duration, EachDamageRecipient, Effect, EffectOutcomeSignal,
     EffectScope, FilterProp, ForEachCategoryAction, GameRestriction, LetterQuery, LibraryPosition,
-    ManaProduction, MassLibraryShuffleMode, NameStickerSet, ObjectProperty, ObjectScope,
-    ObjectSelectionCardinality, ObjectSelectionEligibility, ParsedCondition, PerpetualModification,
-    PlayerFilter, PlayerRelation, PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr,
-    QuantityRef, ReplacementCondition, ReplacementDefinition, ReplacementMode, SeatDirection,
-    SharedQuality, SharedQualityRelation, SpeedDelta, SpellCastingOption, SpellCastingOptionKind,
-    SpellStackToGraveyardReplacement, StackAbilityKind, StaticCondition, StaticDefinition,
-    TapStateChange, TargetFilter, TriggerDefinition, TypeFilter, TypedFilter, ZoneRef,
+    ManaProduction, MassLibraryShuffleMode, NameStickerSet, NumberQuality, ObjectProperty,
+    ObjectScope, ObjectSelectionCardinality, ObjectSelectionEligibility, Parity, ParsedCondition,
+    PerpetualModification, PlayerFilter, PlayerRelation, PlayerScope, PtStat, PtValue,
+    PtValueScope, QuantityExpr, QuantityRef, ReplacementCondition, ReplacementDefinition,
+    ReplacementMode, SeatDirection, SharedQuality, SharedQualityRelation, SpeedDelta,
+    SpellCastingOption, SpellCastingOptionKind, SpellStackToGraveyardReplacement, StackAbilityKind,
+    StaticCondition, StaticDefinition, TapStateChange, TargetFilter, TriggerDefinition, TypeFilter,
+    TypedFilter, ZoneRef,
 };
 use crate::types::card::CardFace;
 use crate::types::card_type::CoreType;
@@ -4602,6 +4603,14 @@ fn fmt_comparator(c: &Comparator) -> &'static str {
     }
 }
 
+fn fmt_number_quality(q: &NumberQuality) -> &'static str {
+    match q {
+        NumberQuality::Prime => "prime",
+        NumberQuality::Parity(Parity::Even) => "even",
+        NumberQuality::Parity(Parity::Odd) => "odd",
+    }
+}
+
 /// CR 903.3 vs CR 903.3d: the single label authority for a commander-control
 /// gate, shared by ALL FOUR condition-vocabulary formatters
 /// (`AbilityCondition`, `TriggerCondition`, `StaticCondition`, and any future
@@ -4670,6 +4679,11 @@ fn fmt_ability_condition(cond: &AbilityCondition) -> String {
             fmt_quantity(lhs),
             fmt_comparator(comparator),
             fmt_quantity(rhs)
+        ),
+        AbilityCondition::QuantityQuality { quantity, quality } => format!(
+            "{} is {}",
+            fmt_quantity(quantity),
+            fmt_number_quality(quality)
         ),
         AbilityCondition::PreviousEffectAmount {
             comparator,
@@ -4859,6 +4873,11 @@ fn fmt_trigger_condition(
             fmt_quantity(lhs),
             fmt_comparator(comparator),
             fmt_quantity(rhs)
+        ),
+        TC::QuantityQuality { quantity, quality } => format!(
+            "{} is {}",
+            fmt_quantity(quantity),
+            fmt_number_quality(quality)
         ),
         TC::HasMaxSpeed => "has max speed".into(),
         // CR 725.1 + CR 109.5: keep the controller-scoped description byte-stable
@@ -5067,6 +5086,11 @@ fn fmt_static_condition(cond: &StaticCondition) -> String {
             fmt_quantity(lhs),
             fmt_comparator(comparator),
             fmt_quantity(rhs)
+        ),
+        SC::QuantityQuality { quantity, quality } => format!(
+            "{} is {}",
+            fmt_quantity(quantity),
+            fmt_number_quality(quality)
         ),
         SC::HasMaxSpeed => "has max speed".into(),
         SC::SpeedGE { threshold } => format!("speed ≥ {threshold}"),
@@ -9616,6 +9640,14 @@ fn extract_static_condition_features(
             extract_quantity_features(lhs, features);
             extract_quantity_features(rhs, features);
         }
+        StaticCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => {
+            let (name, support) = static_condition_feature(cond);
+            features.insert(ResolverFeatureFamily::StaticCondition.key(name), support);
+            extract_quantity_features(quantity, features);
+        }
         StaticCondition::And { conditions } | StaticCondition::Or { conditions } => {
             for sub in conditions {
                 extract_static_condition_features(sub, features);
@@ -9859,9 +9891,16 @@ fn extract_condition_quantity_features(
     cond: &AbilityCondition,
     features: &mut HashMap<String, FeatureSupport>,
 ) {
-    if let AbilityCondition::QuantityCheck { lhs, rhs, .. } = cond {
-        extract_quantity_features(lhs, features);
-        extract_quantity_features(rhs, features);
+    match cond {
+        AbilityCondition::QuantityCheck { lhs, rhs, .. } => {
+            extract_quantity_features(lhs, features);
+            extract_quantity_features(rhs, features);
+        }
+        AbilityCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => extract_quantity_features(quantity, features),
+        _ => {}
     }
 }
 
@@ -9968,6 +10007,7 @@ fn condition_feature(cond: &AbilityCondition) -> (&'static str, FeatureSupport) 
         AbilityCondition::CastVariantPaid { .. } => ("CastVariantPaid", Handled),
         AbilityCondition::CastVariantPaidInstead { .. } => ("CastVariantPaidInstead", Handled),
         AbilityCondition::QuantityCheck { .. } => ("QuantityCheck", Handled),
+        AbilityCondition::QuantityQuality { .. } => ("QuantityQuality", Handled),
         AbilityCondition::PreviousEffectAmount { .. } => ("PreviousEffectAmount", Handled),
         AbilityCondition::CastDuringPhase { .. } => ("CastDuringPhase", Handled),
         AbilityCondition::CastTimingPermission { .. } => ("CastTimingPermission", Handled),
@@ -10488,6 +10528,7 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
     use FeatureSupport::*;
     match cond {
         StaticCondition::QuantityComparison { .. } => ("QuantityComparison", Handled),
+        StaticCondition::QuantityQuality { .. } => ("QuantityQuality", Handled),
         StaticCondition::DevotionGE { .. } => ("DevotionGE", Handled),
         StaticCondition::IsPresent { .. } => ("IsPresent", Handled),
         StaticCondition::ChosenColorIs { .. } => ("ChosenColorIs", Handled),
@@ -14819,6 +14860,72 @@ mod tests {
     use crate::types::replacements::ReplacementEvent;
     use crate::types::statics::{BlockExceptionKind, ProhibitionScope};
     use crate::types::zones::{EtbTapState, Zone};
+
+    /// `QuantityQuality` is a handled feature that walks its quantity exactly
+    /// once — the same quantity keys a `QuantityComparison` of that quantity
+    /// against a constant emits — and formats with its quality word.
+    #[test]
+    fn quantity_quality_coverage_feature_and_format() {
+        use crate::types::ability::{NumberQuality, Parity, QuantityRef, TypedFilter};
+        use FeatureSupport::Handled;
+        let q = QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TypedFilter::land().controller(ControllerRef::You).into(),
+            },
+        };
+        let sq = StaticCondition::QuantityQuality {
+            quantity: q.clone(),
+            quality: NumberQuality::Prime,
+        };
+        let sc = StaticCondition::QuantityComparison {
+            lhs: q.clone(),
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        };
+        assert_eq!(static_condition_feature(&sq), ("QuantityQuality", Handled));
+
+        let mut quality_features = HashMap::new();
+        extract_static_condition_features(&sq, &mut quality_features);
+        let quality_key = ResolverFeatureFamily::StaticCondition.key("QuantityQuality");
+        assert_eq!(quality_features.remove(&quality_key), Some(Handled));
+        let mut comparison_features = HashMap::new();
+        extract_static_condition_features(&sc, &mut comparison_features);
+        comparison_features
+            .remove(&ResolverFeatureFamily::StaticCondition.key("QuantityComparison"));
+        assert!(
+            !quality_features.is_empty(),
+            "the quantity's own feature keys must be emitted"
+        );
+        assert_eq!(quality_features, comparison_features);
+
+        let aq = AbilityCondition::QuantityQuality {
+            quantity: q.clone(),
+            quality: NumberQuality::Parity(Parity::Even),
+        };
+        let ac = AbilityCondition::QuantityCheck {
+            lhs: q.clone(),
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        };
+        assert_eq!(condition_feature(&aq), ("QuantityQuality", Handled));
+        let mut aq_features = HashMap::new();
+        extract_condition_quantity_features(&aq, &mut aq_features);
+        let mut ac_features = HashMap::new();
+        extract_condition_quantity_features(&ac, &mut ac_features);
+        assert!(!aq_features.is_empty());
+        assert_eq!(aq_features, ac_features);
+
+        assert!(fmt_static_condition(&sq).contains("is prime"));
+        assert!(fmt_ability_condition(&aq).contains("is even"));
+        let tq = crate::types::ability::TriggerCondition::QuantityQuality {
+            quantity: q,
+            quality: NumberQuality::Parity(Parity::Odd),
+        };
+        assert!(
+            fmt_trigger_condition(&tq, &crate::types::triggers::TriggerMode::Phase)
+                .contains("is odd")
+        );
+    }
 
     #[test]
     fn nonfirst_spell_constraint_has_grammatical_coverage_detail() {

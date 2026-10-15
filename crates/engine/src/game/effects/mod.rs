@@ -3606,12 +3606,18 @@ fn build_reflexive_pending_trigger(
     // `WhenYouDo` creation gate (both dispatch here at the call sites); the
     // consume below strips only `WhenYouDo`, so a `QuantityCheck` survives onto
     // the stack object and is re-checked at resolution per CR 603.4.
+    // CR 603.12: a quantity gate on a targeted sub defers target choice until
+    // the gate is evaluated, the same class as QuantityCheck.
     debug_assert!(
         ability.condition.as_ref().is_some_and(|condition| {
             condition.has_when_you_do_marker()
-                || matches!(condition, AbilityCondition::QuantityCheck { .. })
+                || matches!(
+                    condition,
+                    AbilityCondition::QuantityCheck { .. }
+                        | AbilityCondition::QuantityQuality { .. }
+                )
         }),
-        "build_reflexive_pending_trigger requires a WhenYouDo or QuantityCheck gate"
+        "build_reflexive_pending_trigger requires a WhenYouDo, QuantityCheck, or QuantityQuality gate"
     );
     consume_reflexive_creation_gate(&mut ability);
 
@@ -6223,6 +6229,10 @@ fn condition_depends_on_zone_change_this_way(condition: &AbilityCondition) -> bo
             quantity_expr_counts_population_matching(lhs, &filter_contains_last_zone_changed)
                 || quantity_expr_counts_population_matching(rhs, &filter_contains_last_zone_changed)
         }
+        AbilityCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => quantity_expr_counts_population_matching(quantity, &filter_contains_last_zone_changed),
         AbilityCondition::Not { condition } => condition_depends_on_zone_change_this_way(condition),
         AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => conditions
             .iter()
@@ -6240,6 +6250,10 @@ fn condition_depends_on_graveyard_size(condition: &AbilityCondition) -> bool {
             quantity_expr_any_ref(lhs, &mut quantity_ref_reads_graveyard_card_count)
                 || quantity_expr_any_ref(rhs, &mut quantity_ref_reads_graveyard_card_count)
         }
+        AbilityCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => quantity_expr_any_ref(quantity, &mut quantity_ref_reads_graveyard_card_count),
         AbilityCondition::Not { condition } => condition_depends_on_graveyard_size(condition),
         AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => {
             conditions.iter().any(condition_depends_on_graveyard_size)
@@ -6355,6 +6369,10 @@ fn condition_reads_filter_population(
         }
         // Conditions that COUNT a population.
         AbilityCondition::QuantityCheck { lhs, rhs, .. } => has_quantity(lhs) || has_quantity(rhs),
+        AbilityCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => has_quantity(quantity),
         AbilityCondition::PreviousEffectAmount { rhs, .. } => has_quantity(rhs),
         // Leaves: nothing filter- or quantity-shaped to read.
         AbilityCondition::TriggerEventTargetDamagedBySourceThisTurn
@@ -6854,6 +6872,7 @@ fn should_resolve_subability_on_optional_decline(ability: &ResolvedAbility) -> b
             | AbilityCondition::CastVariantPaid { .. }
             | AbilityCondition::CastVariantPaidInstead { .. }
             | AbilityCondition::QuantityCheck { .. }
+            | AbilityCondition::QuantityQuality { .. }
             | AbilityCondition::PreviousEffectAmount { .. }
             | AbilityCondition::HasMaxSpeed
             | AbilityCondition::IsMonarch
@@ -14859,6 +14878,12 @@ fn condition_awaits_resolution_only_referent(
                 state, rhs, ability,
             )
         }
+        AbilityCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => crate::game::quantity::quantity_expr_missing_resolution_only_referent(
+            state, quantity, ability,
+        ),
         AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => conditions
             .iter()
             .any(|c| condition_awaits_resolution_only_referent(c, state, ability)),
@@ -16480,8 +16505,13 @@ fn resolve_chain_body(
         // interactive `DiscardChoice`) carries its gate on `ability.condition`
         // itself, not as a parent's `sub_ability`. Mirror the reflexive target
         // selection path used for inline sub-chains.
+        // CR 603.12: a quantity gate on a targeted sub defers target choice until
+        // the gate is evaluated, the same class as QuantityCheck.
         if (condition.has_when_you_do_marker()
-            || matches!(condition, AbilityCondition::QuantityCheck { .. }))
+            || matches!(
+                condition,
+                AbilityCondition::QuantityCheck { .. } | AbilityCondition::QuantityQuality { .. }
+            ))
             && try_materialize_reflexive_trigger(state, ability, None, None, events, depth)?
         {
             return Ok(());
@@ -18817,8 +18847,14 @@ fn resolve_chain_body(
             }
 
             // CR 603.12: Deferred reflexive target selection for inline sub-chains.
+            // A quantity gate on a targeted sub defers target choice until the
+            // gate is evaluated, the same class as QuantityCheck.
             if (condition.has_when_you_do_marker()
-                || matches!(condition, AbilityCondition::QuantityCheck { .. }))
+                || matches!(
+                    condition,
+                    AbilityCondition::QuantityCheck { .. }
+                        | AbilityCondition::QuantityQuality { .. }
+                ))
                 && try_materialize_reflexive_trigger(
                     state,
                     sub,
@@ -20522,6 +20558,21 @@ pub(crate) fn evaluate_condition(
             let r =
                 crate::game::quantity::resolve_quantity_for_ability_condition(state, rhs, ability);
             comparator.evaluate(l, r)
+        }
+        AbilityCondition::QuantityQuality { quantity, quality } => {
+            // CR 701.57c: same absent-referent guard as `QuantityCheck` above —
+            // an absent resolution-only referent makes the predicate false
+            // rather than testing the `0` fallback (zero is even).
+            if crate::game::quantity::quantity_expr_missing_resolution_only_referent(
+                state, quantity, ability,
+            ) {
+                return false;
+            }
+            // CR 608.2h: determined once, when the effect is applied.
+            let value = crate::game::quantity::resolve_quantity_for_ability_condition(
+                state, quantity, ability,
+            );
+            quality.matches(i64::from(value))
         }
         AbilityCondition::PreviousEffectAmount {
             comparator,
@@ -37323,6 +37374,87 @@ mod tests {
             evaluate_condition(ability.condition.as_ref().unwrap(), &state, &ability),
             "the condition must count P0's creatures, not the scoped opponent's"
         );
+    }
+
+    #[test]
+    fn quantity_quality_ability_condition_evaluates_at_resolution() {
+        use crate::types::ability::{NumberQuality, Parity};
+        // CR 608.2h: the quality is read once, when the effect is applied.
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(0x0C000),
+            PlayerId(0),
+            "Quality Ability Source".to_string(),
+            Zone::Battlefield,
+        );
+        let add_land = |state: &mut GameState, i: u64| {
+            let id = create_object(
+                state,
+                CardId(0x0C100 + i),
+                PlayerId(0),
+                format!("Land {i}"),
+                Zone::Battlefield,
+            );
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Land);
+        };
+        let ability = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        let prime_lands = AbilityCondition::QuantityQuality {
+            quantity: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: TargetFilter::Typed(TypedFilter::land().controller(ControllerRef::You)),
+                },
+            },
+            quality: NumberQuality::Prime,
+        };
+        add_land(&mut state, 1);
+        add_land(&mut state, 2);
+        assert!(
+            evaluate_condition(&prime_lands, &state, &ability),
+            "2 lands is prime"
+        );
+        add_land(&mut state, 3);
+        add_land(&mut state, 4);
+        assert!(
+            !evaluate_condition(&prime_lands, &state, &ability),
+            "4 lands is not prime"
+        );
+
+        // CR 701.57c absent-referent guard: the unguarded read of a missing
+        // cost-paid object's mana value is 0, which is even — the guard must make
+        // the predicate false instead.
+        let absent_even = AbilityCondition::QuantityQuality {
+            quantity: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectManaValue {
+                    scope: ObjectScope::CostPaidObject,
+                },
+            },
+            quality: NumberQuality::Parity(Parity::Even),
+        };
+        assert!(
+            !evaluate_condition(&absent_even, &state, &ability),
+            "an absent resolution-only referent is a false predicate, not an even 0"
+        );
+        // Paired positive: the same quality over a present (fixed) value holds.
+        let fixed_even = AbilityCondition::QuantityQuality {
+            quantity: QuantityExpr::Fixed { value: 2 },
+            quality: NumberQuality::Parity(Parity::Even),
+        };
+        assert!(evaluate_condition(&fixed_even, &state, &ability));
     }
 
     #[test]
