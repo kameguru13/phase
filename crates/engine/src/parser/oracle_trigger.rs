@@ -1556,21 +1556,26 @@ pub(crate) fn parse_trigger_line_with_index_ir(
     // for the meld effect combinator, and the residual ("exile them, then meld
     // them into [result]") is parsed as the effect body. Falls through to the
     // generic `extract_if_condition` for every non-meld trigger.
-    let (effect_without_if, if_condition, meld_partner) =
+    let (effect_without_if, if_condition, meld_partner, leading_guard_refused) =
         match crate::parser::oracle_effect::meld::parse_meld_gate(&effect_text) {
-            Some((gate, partner, residual)) => (residual, Some(gate), Some(partner)),
+            Some((gate, partner, residual)) => (residual, Some(gate), Some(partner), false),
             None => {
                 // Extract intervening-if condition from effect text first — a
                 // leading "if X, " can hide the "you may " optional marker behind
                 // the if-clause.
-                let (without_if, cond) = extract_if_condition_with_card_name(
+                let extraction = extract_if_condition_with_card_name(
                     &effect_text,
                     card_name,
                     Some(&trigger_subject),
                     trigger_head_dies_zone_change(&cond_lower),
                     trigger_head_enters_battlefield(&cond_lower),
                 );
-                (without_if, cond, None)
+                (
+                    extraction.text,
+                    extraction.condition,
+                    None,
+                    extraction.leading_guard_refused,
+                )
             }
         };
     let optional_player = optional_player_from_effect_body(&effect_without_if)
@@ -1900,6 +1905,7 @@ pub(crate) fn parse_trigger_line_with_index_ir(
                         &chain_text,
                         if_condition.as_ref(),
                         &effect_ctx,
+                        leading_guard_refused,
                     ),
                 ))
             })
@@ -6510,6 +6516,11 @@ pub(crate) fn static_condition_to_trigger_condition(
         StaticCondition::HasCityBlessing => Some(TriggerCondition::HasCityBlessing),
         // CR 702.195b: Enduring story bridges as a player designation.
         StaticCondition::HasEnduringStory => Some(TriggerCondition::HasEnduringStory),
+        // Digital-only Alchemy (no CR entry): "if you have a boon" bridges
+        // 1:1 (same `player` axis).
+        StaticCondition::HasBoon { player } => Some(TriggerCondition::HasBoon {
+            player: player.clone(),
+        }),
         // CR 110.5b: Source tapped state bridges for trigger conditions like
         // "At the beginning of your upkeep, if this land is tapped, ..."
         StaticCondition::SourceIsTapped => Some(TriggerCondition::SourceIsTapped),
@@ -7033,8 +7044,11 @@ fn parse_cast_and_condition_intervening_if(input: &str) -> OracleResult<'_, Trig
 fn extract_if_condition(text: &str) -> (String, Option<TriggerCondition>) {
     // No proven head shape: neither the dies zone-change pair nor an ETB head, so
     // both shape-gated arms are unreachable here by construction. Exercise those
-    // through `parse_trigger_line` with a full trigger line instead.
-    extract_if_condition_with_card_name(text, "", None, None, false)
+    // through `parse_trigger_line` with a full trigger line instead. Refusal is
+    // dropped here: the strict-gate body-gap contract is covered through
+    // `parse_trigger_line`, which threads the full `IfExtraction`.
+    let extraction = extract_if_condition_with_card_name(text, "", None, None, false);
+    (extraction.text, extraction.condition)
 }
 
 /// CR 603.4: the bare `if ` keyword token that opens a condition clause.
@@ -7053,11 +7067,17 @@ fn parse_if_keyword(input: &str) -> OracleResult<'_, ()> {
 ///
 /// Only the LEADING position is intervening. A later-sentence `If` is a
 /// resolution-time instruction of its own and stays with the effect chain.
+///
+/// `leading_guard_refused` forces the gap: the strict gate recognized the
+/// leading guard and refused it as unsupported. The generic body fallback may
+/// still have parsed the guard text into a (misbound) first-clause condition —
+/// that rescue must not count as capture.
 fn fail_closed_on_dropped_intervening_if(
     ir: EffectChainIr,
     effect_text: &str,
     hoisted: Option<&TriggerCondition>,
     ctx: &ParseContext,
+    leading_guard_refused: bool,
 ) -> EffectChainIr {
     let effect_text = effect_text.trim_start();
     let effect_lower = effect_text.to_lowercase();
@@ -7066,21 +7086,22 @@ fn fail_closed_on_dropped_intervening_if(
     // LEADING guard itself is exempt; a different unhoisted guard stays a gap.
     let guard_is_ordinal_constraint =
         parse_nth_spell_this_turn_intervening_if(&effect_lower).is_ok();
-    let leading_guard_dropped = hoisted.is_none()
-        && !guard_is_ordinal_constraint
-        && parse_if_keyword(&effect_lower).is_ok()
-        && split_leading_conditional(effect_text).is_some()
-        && ir.clauses.first().is_some_and(|clause| {
-            // A leading guard has no antecedent in intervening-if position, so a
-            // condition that reads a prior instruction's outcome is not the guard.
-            !clause
-                .condition
-                .iter()
-                .chain(clause.parsed.condition.iter())
-                .any(|condition| !condition_reads_prior_instruction(condition))
-                && clause.parsed.unlowered_guard.is_none()
-                && !matches!(clause.parsed.effect, Effect::Unimplemented { .. })
-        });
+    let leading_guard_dropped = leading_guard_refused
+        || (hoisted.is_none()
+            && !guard_is_ordinal_constraint
+            && parse_if_keyword(&effect_lower).is_ok()
+            && split_leading_conditional(effect_text).is_some()
+            && ir.clauses.first().is_some_and(|clause| {
+                // A leading guard has no antecedent in intervening-if position, so a
+                // condition that reads a prior instruction's outcome is not the guard.
+                !clause
+                    .condition
+                    .iter()
+                    .chain(clause.parsed.condition.iter())
+                    .any(|condition| !condition_reads_prior_instruction(condition))
+                    && clause.parsed.unlowered_guard.is_none()
+                    && !matches!(clause.parsed.effect, Effect::Unimplemented { .. })
+            }));
     if !leading_guard_dropped {
         return ir;
     }
@@ -7152,13 +7173,52 @@ fn parse_otherwise_branch_connector(input: &str) -> OracleResult<'_, ()> {
 /// conditions. Only source-referential patterns that require the trigger source
 /// as context ("if you cast it", "if it's attacking", ninjutsu costs, "if it was a
 /// [type]", defending player) are handled directly here.
+///
+/// Outcome of leading-guard (`if`/`unless`) extraction from trigger effect text.
+struct IfExtraction {
+    /// Effect text with any hoisted guard stripped (original text otherwise).
+    text: String,
+    /// Hoisted trigger condition, if a guard was captured.
+    condition: Option<TriggerCondition>,
+    /// A LEADING guard was recognized but refused as unsupported (strict
+    /// non-self P/T). The whole trigger must gap — the generic body fallback
+    /// must not rescue the guard text as a misbound Source condition.
+    leading_guard_refused: bool,
+}
+
+impl IfExtraction {
+    fn absent(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            condition: None,
+            leading_guard_refused: false,
+        }
+    }
+
+    fn hoisted(text: String, condition: TriggerCondition) -> Self {
+        Self {
+            text,
+            condition: Some(condition),
+            leading_guard_refused: false,
+        }
+    }
+
+    fn refused(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            condition: None,
+            leading_guard_refused: true,
+        }
+    }
+}
+
 fn extract_if_condition_with_card_name(
     text: &str,
     card_name: &str,
     dying_subject: Option<&TargetFilter>,
     trigger_zone_change: Option<(Zone, Zone)>,
     head_enters_battlefield: bool,
-) -> (String, Option<TriggerCondition>) {
+) -> IfExtraction {
     let lower = text.to_lowercase();
     let tp = TextPair::new(text, &lower);
     // Only a proven self-trigger may use the source-bound "it's on the
@@ -7178,7 +7238,7 @@ fn extract_if_condition_with_card_name(
     // "then if" in effect order, so checking the first occurrence is sufficient.
     if let Some(first_if) = tp.find("if ") {
         if if_belongs_to_then_clause(&lower, first_if) {
-            return (text.to_string(), None);
+            return IfExtraction::absent(text);
         }
         // CR 603.4: A true intervening-if immediately follows the trigger
         // condition clause. If the first `if ` appears AFTER a sentence
@@ -7189,7 +7249,7 @@ fn extract_if_condition_with_card_name(
         // more mana was spent to cast that spell, this creature also gains
         // double strike ..." — the second sentence's "if" must NOT hoist.
         if lower[..first_if].contains(". ") {
-            return (text.to_string(), None);
+            return IfExtraction::absent(text);
         }
     }
 
@@ -7209,7 +7269,7 @@ fn extract_if_condition_with_card_name(
         if !before_if.trim().is_empty()
             && scan_preceded(after_if, parse_otherwise_branch_connector).is_some()
         {
-            return (text.to_string(), None);
+            return IfExtraction::absent(text);
         }
     }
 
@@ -7224,9 +7284,9 @@ fn extract_if_condition_with_card_name(
         parse_disjunctive_first_spell_intervening_if(i, card_name)
     }) {
         let clause_len = lower.len() - prefix.len() - rest.len();
-        return (
+        return IfExtraction::hoisted(
             strip_condition_clause(text, prefix.len(), clause_len),
-            Some(condition),
+            condition,
         );
     }
 
@@ -7241,9 +7301,9 @@ fn extract_if_condition_with_card_name(
         scan_preceded(&lower, parse_chose_other_ring_bearer_intervening_if)
     {
         let clause_len = lower.len() - before.len() - rest.len();
-        return (
+        return IfExtraction::hoisted(
             strip_condition_clause(text, before.len(), clause_len),
-            Some(condition),
+            condition,
         );
     }
 
@@ -7256,9 +7316,9 @@ fn extract_if_condition_with_card_name(
         scan_preceded(&lower, parse_additional_cost_intervening_if)
     {
         let clause_len = lower.len() - before.len() - rest.len();
-        return (
+        return IfExtraction::hoisted(
             strip_condition_clause(text, before.len(), clause_len),
-            Some(condition),
+            condition,
         );
     }
 
@@ -7274,10 +7334,7 @@ fn extract_if_condition_with_card_name(
     {
         let pos = before.len();
         let clause_len = lower.len() - before.len() - rest.len();
-        return (
-            strip_condition_clause(text, pos, clause_len),
-            Some(condition),
-        );
+        return IfExtraction::hoisted(strip_condition_clause(text, pos, clause_len), condition);
     }
 
     // CR 603.4 + CR 601.2: "if you cast it/them [from <zone>] and <game-state
@@ -7288,10 +7345,7 @@ fn extract_if_condition_with_card_name(
     {
         let pos = before.len();
         let clause_len = lower.len() - before.len() - rest.len();
-        return (
-            strip_condition_clause(text, pos, clause_len),
-            Some(condition),
-        );
+        return IfExtraction::hoisted(strip_condition_clause(text, pos, clause_len), condition);
     }
 
     // CR 603.4 + CR 601.2: simple positive zone-specific cast check. Keep this
@@ -7301,10 +7355,7 @@ fn extract_if_condition_with_card_name(
     {
         let pos = before.len();
         let clause_len = lower.len() - before.len() - rest.len();
-        return (
-            strip_condition_clause(text, pos, clause_len),
-            Some(condition),
-        );
+        return IfExtraction::hoisted(strip_condition_clause(text, pos, clause_len), condition);
     }
 
     // CR 701.57a: "if you cast it" — zoneless cast check (Discover ETBs).
@@ -7312,13 +7363,13 @@ fn extract_if_condition_with_card_name(
     if let Some(pos) = tp.find("if you cast it") {
         let after = &lower[pos + "if you cast it".len()..];
         if !after.starts_with(" from") {
-            return (
+            return IfExtraction::hoisted(
                 strip_condition_clause(text, pos, "if you cast it".len()),
-                Some(TriggerCondition::WasCast {
+                TriggerCondition::WasCast {
                     zone: None,
                     controller: None,
                     owner: None,
-                }),
+                },
             );
         }
     }
@@ -7333,9 +7384,9 @@ fn extract_if_condition_with_card_name(
         scan_preceded(&lower, parse_graveyard_origin_intervening_if)
     {
         let clause_len = lower.len() - prefix.len() - rest.len();
-        return (
+        return IfExtraction::hoisted(
             strip_condition_clause(text, prefix.len(), clause_len),
-            Some(condition),
+            condition,
         );
     }
 
@@ -7344,9 +7395,9 @@ fn extract_if_condition_with_card_name(
     // not have been cast at all, or have been cast for free (no mana spent).
     if let Some(pos) = tp.find("if none of them were cast or no mana was spent to cast them") {
         let pattern = "if none of them were cast or no mana was spent to cast them";
-        return (
+        return IfExtraction::hoisted(
             strip_condition_clause(text, pos, pattern.len()),
-            Some(TriggerCondition::Or {
+            TriggerCondition::Or {
                 conditions: vec![
                     TriggerCondition::Not {
                         condition: Box::new(TriggerCondition::WasCast {
@@ -7359,7 +7410,7 @@ fn extract_if_condition_with_card_name(
                         text: "no mana was spent to cast them".to_string(),
                     },
                 ],
-            }),
+            },
         );
     }
 
@@ -7370,14 +7421,22 @@ fn extract_if_condition_with_card_name(
     // (Liberator, Urza's Battlethopter: "greater than ~'s power") is NOT this
     // clause; it belongs to `parse_mana_spent_vs_source_pt` in
     // `oracle_nom/condition.rs`.
-    if let Some(result) = try_extract_mana_spent_comparison_condition(&lower, text) {
-        return result;
+    if let Some((stripped, cond)) = try_extract_mana_spent_comparison_condition(&lower, text) {
+        return IfExtraction {
+            text: stripped,
+            condition: cond,
+            leading_guard_refused: false,
+        };
     }
 
     // CR 603.4 + CR 601.2h: "if no mana was spent to cast it/that spell" —
     // intervening-if for free-spell counter triggers (Lavinia / Vexing Bauble).
-    if let Some(result) = try_extract_no_mana_spent_condition(&lower, text) {
-        return result;
+    if let Some((stripped, cond)) = try_extract_no_mana_spent_condition(&lower, text) {
+        return IfExtraction {
+            text: stripped,
+            condition: cond,
+            leading_guard_refused: false,
+        };
     }
 
     // CR 702.188a + CR 603.4: "if <pronoun> was cast using web-slinging" —
@@ -7392,10 +7451,7 @@ fn extract_if_condition_with_card_name(
     {
         let pos = before.len();
         let clause_len = lower.len() - before.len() - rest.len();
-        return (
-            strip_condition_clause(text, pos, clause_len),
-            Some(condition),
-        );
+        return IfExtraction::hoisted(strip_condition_clause(text, pos, clause_len), condition);
     }
 
     // CR 701.26 + CR 603.4: "if it's the first time that creature has become tapped
@@ -7406,10 +7462,7 @@ fn extract_if_condition_with_card_name(
     {
         let pos = before.len();
         let clause_len = lower.len() - before.len() - rest.len();
-        return (
-            strip_condition_clause(text, pos, clause_len),
-            Some(condition),
-        );
+        return IfExtraction::hoisted(strip_condition_clause(text, pos, clause_len), condition);
     }
 
     // CR 122.1 + CR 603.4: "if it's the first time counters have been put on that
@@ -7421,10 +7474,7 @@ fn extract_if_condition_with_card_name(
     {
         let pos = before.len();
         let clause_len = lower.len() - before.len() - rest.len();
-        return (
-            strip_condition_clause(text, pos, clause_len),
-            Some(condition),
-        );
+        return IfExtraction::hoisted(strip_condition_clause(text, pos, clause_len), condition);
     }
 
     // CR 603.4 + CR 607.1c: "if you haven't added mana with this ability this
@@ -7436,10 +7486,7 @@ fn extract_if_condition_with_card_name(
     {
         let pos = before.len();
         let clause_len = lower.len() - before.len() - rest.len();
-        return (
-            strip_condition_clause(text, pos, clause_len),
-            Some(condition),
-        );
+        return IfExtraction::hoisted(strip_condition_clause(text, pos, clause_len), condition);
     }
 
     // CR 603.4 + CR 601.2: "if it was cast" — the entering permanent must have
@@ -7453,27 +7500,27 @@ fn extract_if_condition_with_card_name(
     // your hand" and would shadow it here.
     let was_cast_pos = tp.find("if it was cast"); // allow-noncombinator: anchor for strip_condition_clause — structural if-clause excision, not parse dispatch
     if let Some(pos) = was_cast_pos {
-        return (
+        return IfExtraction::hoisted(
             strip_condition_clause(text, pos, "if it was cast".len()),
-            Some(TriggerCondition::WasCast {
+            TriggerCondition::WasCast {
                 zone: None,
                 controller: None,
                 owner: None,
-            }),
+            },
         );
     }
 
     // CR 603.4 + CR 601.2: "if it wasn't cast" — negation of WasCast.
     if let Some(pos) = tp.find("if it wasn't cast") {
-        return (
+        return IfExtraction::hoisted(
             strip_condition_clause(text, pos, "if it wasn't cast".len()),
-            Some(TriggerCondition::Not {
+            TriggerCondition::Not {
                 condition: Box::new(TriggerCondition::WasCast {
                     zone: None,
                     controller: None,
                     owner: None,
                 }),
-            }),
+            },
         );
     }
 
@@ -7487,10 +7534,7 @@ fn extract_if_condition_with_card_name(
     ) {
         let pos = before.len();
         let clause_len = lower.len() - before.len() - rest.len();
-        return (
-            strip_condition_clause(text, pos, clause_len),
-            Some(condition),
-        );
+        return IfExtraction::hoisted(strip_condition_clause(text, pos, clause_len), condition);
     }
 
     // CR 603.4 + CR 603.6a: "if it wasn't put onto the battlefield with this
@@ -7504,11 +7548,11 @@ fn extract_if_condition_with_card_name(
             .parse(i)
     }) {
         let pat = "if it wasn't put onto the battlefield with this ability";
-        return (
+        return IfExtraction::hoisted(
             strip_condition_clause(text, prefix.len(), pat.len()),
-            Some(TriggerCondition::Not {
+            TriggerCondition::Not {
                 condition: Box::new(TriggerCondition::PlacedByAbilitySource),
-            }),
+            },
         );
     }
 
@@ -7519,9 +7563,9 @@ fn extract_if_condition_with_card_name(
             .parse(i)
     }) {
         let pat = "if it was put onto the battlefield with this ability";
-        return (
+        return IfExtraction::hoisted(
             strip_condition_clause(text, prefix.len(), pat.len()),
-            Some(TriggerCondition::PlacedByAbilitySource),
+            TriggerCondition::PlacedByAbilitySource,
         );
     }
 
@@ -7548,9 +7592,9 @@ fn extract_if_condition_with_card_name(
     }) {
         let pat_start = before.len();
         let clause_len = lower.len() - before.len() - rest.len();
-        return (
+        return IfExtraction::hoisted(
             strip_condition_clause(text, pat_start, clause_len),
-            Some(TriggerCondition::QuantityComparison {
+            TriggerCondition::QuantityComparison {
                 lhs: QuantityExpr::Ref {
                     qty: QuantityRef::LifeTotal {
                         player: PlayerScope::DefendingPlayer,
@@ -7565,7 +7609,7 @@ fn extract_if_condition_with_card_name(
                         },
                     },
                 },
-            }),
+            },
         );
     }
 
@@ -7579,13 +7623,13 @@ fn extract_if_condition_with_card_name(
     if let Some((prefix, _)) = scan_split_at_phrase(&lower, |i| {
         tag::<_, _, OracleError<'_>>("unless it escaped").parse(i)
     }) {
-        return (
+        return IfExtraction::hoisted(
             strip_condition_clause(text, prefix.len(), "unless it escaped".len()),
-            Some(TriggerCondition::Not {
+            TriggerCondition::Not {
                 condition: Box::new(TriggerCondition::CastVariantPaid {
                     variant: CastVariantPaid::Escape,
                 }),
-            }),
+            },
         );
     }
 
@@ -7597,14 +7641,14 @@ fn extract_if_condition_with_card_name(
         tag::<_, _, OracleError<'_>>("if ~ attacked this combat").parse(i)
     }) {
         let clause_len = lower.len() - prefix.len() - rest.len();
-        return (
+        return IfExtraction::hoisted(
             strip_condition_clause(text, prefix.len(), clause_len),
-            Some(TriggerCondition::SourceAttackedThisCombat),
+            TriggerCondition::SourceAttackedThisCombat,
         );
     }
 
     // Simple pattern→condition extractions (no dynamic parsing or guards needed).
-    if let Some(result) = try_extract_simple_condition(
+    if let Some((stripped, cond)) = try_extract_simple_condition(
         &tp,
         text,
         source_is_self,
@@ -7730,61 +7774,101 @@ fn extract_if_condition_with_card_name(
             ),
         ],
     ) {
-        return result;
+        return IfExtraction {
+            text: stripped,
+            condition: cond,
+            leading_guard_refused: false,
+        };
     }
 
     // CR 603.4 + CR 102.1: "if it's / it is / it isn't / it's not / it is not
     // that player's turn" — composed from two orthogonal axes (linking-verb
     // contraction and optional negation postfix) rather than enumerated as
     // five verbatim phrases.
-    if let Some(result) = try_extract_that_players_turn(&tp, &lower, text) {
-        return result;
+    if let Some((stripped, cond)) = try_extract_that_players_turn(&tp, &lower, text) {
+        return IfExtraction {
+            text: stripped,
+            condition: cond,
+            leading_guard_refused: false,
+        };
     }
 
     // CR 506.2 + CR 508.1b + CR 603.4: Mangara-class attack-batch
     // intervening-if, "if N or more of those creatures are attacking you
     // and/or planeswalkers you control."
-    if let Some(result) = try_extract_attackers_to_controller_min(&lower, text) {
-        return result;
+    if let Some((stripped, cond)) = try_extract_attackers_to_controller_min(&lower, text) {
+        return IfExtraction {
+            text: stripped,
+            condition: cond,
+            leading_guard_refused: false,
+        };
     }
 
     // CR 309.7: "if you haven't completed [dungeon name]" — dynamic dungeon name parsing.
-    if let Some(result) = try_extract_not_completed_dungeon(&tp, &lower, text) {
-        return result;
+    if let Some((stripped, cond)) = try_extract_not_completed_dungeon(&tp, &lower, text) {
+        return IfExtraction {
+            text: stripped,
+            condition: cond,
+            leading_guard_refused: false,
+        };
     }
 
     // CR 400.7 + CR 603.10: "if it had [no] [a <type>] counter(s) on it" —
     // past-state counter check (positive, negated, typed, and untyped forms).
-    if let Some(result) = try_extract_had_counter_condition(&tp, &lower, text) {
-        return result;
+    if let Some((stripped, cond)) = try_extract_had_counter_condition(&tp, &lower, text) {
+        return IfExtraction {
+            text: stripped,
+            condition: cond,
+            leading_guard_refused: false,
+        };
     }
 
     // CR 603.4 + CR 122.1: "if <source> has [quantity] [type] counter(s) on it"
     // — present-tense source-scoped counter check. Delegates the grammar to the
     // shared `parse_source_has_counters` authority (any/typed/quantified forms).
-    if let Some(result) = try_extract_has_counter_condition(&tp, &lower, text) {
-        return result;
+    if let Some((stripped, cond)) = try_extract_has_counter_condition(&tp, &lower, text) {
+        return IfExtraction {
+            text: stripped,
+            condition: cond,
+            leading_guard_refused: false,
+        };
     }
 
     // CR 207.2c: Adamant — "if at least N [color] mana was spent to cast this/it"
-    if let Some(result) = try_extract_adamant_condition(&tp, &lower, text) {
-        return result;
+    if let Some((stripped, cond)) = try_extract_adamant_condition(&tp, &lower, text) {
+        return IfExtraction {
+            text: stripped,
+            condition: cond,
+            leading_guard_refused: false,
+        };
     }
 
     // CR 400.7d: Symbolic-form spent-mana — "if {C}{C}... was spent to cast it"
     // (Incarnation / hybrid-ETB cycle: Wistfulness, Vibrance, Deceit, Catharsis, Emptiness, ...).
-    if let Some(result) = try_extract_symbolic_mana_spent_condition(&tp, &lower, text) {
-        return result;
+    if let Some((stripped, cond)) = try_extract_symbolic_mana_spent_condition(&tp, &lower, text) {
+        return IfExtraction {
+            text: stripped,
+            condition: cond,
+            leading_guard_refused: false,
+        };
     }
-    if let Some(result) = try_extract_symbolic_unless_mana_spent_condition(text) {
-        return result;
+    if let Some((stripped, cond)) = try_extract_symbolic_unless_mana_spent_condition(text) {
+        return IfExtraction {
+            text: stripped,
+            condition: cond,
+            leading_guard_refused: false,
+        };
     }
 
     // CR 702.49 / CR 702.117a / CR 702.137a + CR 603.4: "if [possessive]
     // sneak/ninjutsu/surge/spectacle cost was paid [this turn]"
     // Guard: "instead" means conditional override, not intervening-if.
-    if let Some(result) = try_extract_cast_variant_paid_condition(&tp, &lower, text) {
-        return result;
+    if let Some((stripped, cond)) = try_extract_cast_variant_paid_condition(&tp, &lower, text) {
+        return IfExtraction {
+            text: stripped,
+            condition: cond,
+            leading_guard_refused: false,
+        };
     }
 
     // CR 603.4 + CR 603.10a + CR 700.4: A leading past-tense pronoun predicate
@@ -7799,9 +7883,9 @@ fn extract_if_condition_with_card_name(
     .filter(|(before, _, _)| before.trim().is_empty())
     {
         let clause_len = lower.len() - before.len() - rest.len();
-        return (
+        return IfExtraction::hoisted(
             strip_condition_clause(text, before.len(), clause_len),
-            Some(condition),
+            condition,
         );
     }
 
@@ -7825,9 +7909,9 @@ fn extract_if_condition_with_card_name(
         if let Some((before, card_type, rest)) = scan_preceded(&lower, was_type_combinator) {
             let pos = before.len();
             let clause_len = lower.len() - before.len() - rest.len();
-            return (
+            return IfExtraction::hoisted(
                 strip_condition_clause(text, pos, clause_len),
-                Some(TriggerCondition::WasType { card_type }),
+                TriggerCondition::WasType { card_type },
             );
         }
     }
@@ -7854,9 +7938,9 @@ fn extract_if_condition_with_card_name(
             if before.trim().is_empty() {
                 let pos = before.len();
                 let clause_len = lower.len() - before.len() - rest.len();
-                return (
+                return IfExtraction::hoisted(
                     strip_condition_clause(text, pos, clause_len),
-                    Some(condition),
+                    condition,
                 );
             }
         }
@@ -7889,10 +7973,7 @@ fn extract_if_condition_with_card_name(
         // CR 603.4 + CR 603.10: route zone-change triggers (dies/leaves) through
         // the event-snapshot evaluator; non-zone events (CounterAdded) stay live.
         let condition = build_event_object_subtype_condition(filter, negated, trigger_zone_change);
-        return (
-            strip_condition_clause(text, pos, clause_len),
-            Some(condition),
-        );
+        return IfExtraction::hoisted(strip_condition_clause(text, pos, clause_len), condition);
     }
 
     // CR 603.4 + CR 603.6a + CR 201.2a: entering-object same-name intervening-if
@@ -7902,25 +7983,37 @@ fn extract_if_condition_with_card_name(
     // left honestly swallowed rather than hoisted onto a condition that could
     // never fire.
     if head_enters_battlefield {
-        if let Some(result) = try_extract_entering_object_name_comparison(&lower, text) {
-            return result;
+        if let Some((stripped, cond)) = try_extract_entering_object_name_comparison(&lower, text) {
+            return IfExtraction {
+                text: stripped,
+                condition: cond,
+                leading_guard_refused: false,
+            };
         }
     }
 
-    if let Some(result) = try_extract_zone_change_object_filter_condition(
+    if let Some((stripped, cond)) = try_extract_zone_change_object_filter_condition(
         &lower,
         text,
         dying_subject,
         trigger_zone_change,
         head_enters_battlefield,
     ) {
-        return result;
+        return IfExtraction {
+            text: stripped,
+            condition: cond,
+            leading_guard_refused: false,
+        };
     }
 
     // CR 603.4 + CR 120.1: "if any of that [combat] damage was dealt by
     // <source-chain>" — damage-source-type intervening-if (Mindblade Render).
-    if let Some(result) = try_extract_event_damage_source_condition(&lower, text) {
-        return result;
+    if let Some((stripped, cond)) = try_extract_event_damage_source_condition(&lower, text) {
+        return IfExtraction {
+            text: stripped,
+            condition: cond,
+            leading_guard_refused: false,
+        };
     }
 
     // CR 509.1a + CR 603.4: "if defending player controls no [type]"
@@ -7937,9 +8030,9 @@ fn extract_if_condition_with_card_name(
             let (filter, rest) = parse_type_phrase_folding(after);
             if !matches!(filter, TargetFilter::Any) {
                 let consumed = after.len() - rest.len();
-                return (
+                return IfExtraction::hoisted(
                     strip_condition_clause(text, pos, prefix_len + consumed),
-                    Some(TriggerCondition::DefendingPlayerControlsNone { filter }),
+                    TriggerCondition::DefendingPlayerControlsNone { filter },
                 );
             }
         }
@@ -7959,9 +8052,9 @@ fn extract_if_condition_with_card_name(
     if let Some((before, _, _)) = scan_preceded(&lower, first_land_played_condition) {
         let pos = before.len();
         let pattern_len = "if it wasn't the first land you played this turn".len();
-        return (
+        return IfExtraction::hoisted(
             strip_condition_clause(text, pos, pattern_len),
-            Some(TriggerCondition::QuantityComparison {
+            TriggerCondition::QuantityComparison {
                 lhs: QuantityExpr::Ref {
                     qty: QuantityRef::LandsPlayedThisTurn {
                         player: PlayerScope::Controller,
@@ -7970,7 +8063,7 @@ fn extract_if_condition_with_card_name(
                 },
                 comparator: Comparator::GE,
                 rhs: QuantityExpr::Fixed { value: 2 },
-            }),
+            },
         );
     }
 
@@ -7989,8 +8082,12 @@ fn extract_if_condition_with_card_name(
     // parsed predicate in `Not`. Cost-form `unless` ("unless you pay {2}",
     // "unless you sacrifice a creature") is already stripped upstream by
     // `extract_unless_pay_modifier`.
-    if let Some(result) = try_extract_spell_targets_intervening_if(&tp, &lower, text) {
-        return result;
+    if let Some((stripped, cond)) = try_extract_spell_targets_intervening_if(&tp, &lower, text) {
+        return IfExtraction {
+            text: stripped,
+            condition: cond,
+            leading_guard_refused: false,
+        };
     }
 
     // CR 508.1 + CR 603.4: "if a Pirate and a Vehicle attacked this combat" —
@@ -8002,10 +8099,7 @@ fn extract_if_condition_with_card_name(
     {
         let pos = before.len();
         let clause_len = lower.len() - before.len() - rest.len();
-        return (
-            strip_condition_clause(text, pos, clause_len),
-            Some(condition),
-        );
+        return IfExtraction::hoisted(strip_condition_clause(text, pos, clause_len), condition);
     }
 
     // CR 603.4 + CR 701.60a/d: "if it's not suspected" — source-designation
@@ -8017,13 +8111,10 @@ fn extract_if_condition_with_card_name(
     {
         let pos = before.len();
         let clause_len = lower.len() - before.len() - rest.len();
-        return (
-            strip_condition_clause(text, pos, clause_len),
-            Some(condition),
-        );
+        return IfExtraction::hoisted(strip_condition_clause(text, pos, clause_len), condition);
     }
 
-    if let Some(result) = try_extract_intervening(
+    match try_extract_intervening(
         &tp,
         &lower,
         text,
@@ -8032,9 +8123,15 @@ fn extract_if_condition_with_card_name(
         source_is_self,
         |c| c,
     ) {
-        return result;
+        InterveningExtraction::Hoisted(stripped, condition) => {
+            return IfExtraction::hoisted(stripped, *condition);
+        }
+        InterveningExtraction::RefusedLeadingGuard => {
+            return IfExtraction::refused(text);
+        }
+        InterveningExtraction::Absent => {}
     }
-    if let Some(result) = try_extract_intervening(
+    match try_extract_intervening(
         &tp,
         &lower,
         text,
@@ -8045,10 +8142,16 @@ fn extract_if_condition_with_card_name(
             condition: Box::new(c),
         },
     ) {
-        return result;
+        InterveningExtraction::Hoisted(stripped, condition) => {
+            return IfExtraction::hoisted(stripped, *condition);
+        }
+        InterveningExtraction::RefusedLeadingGuard => {
+            return IfExtraction::refused(text);
+        }
+        InterveningExtraction::Absent => {}
     }
 
-    (text.to_string(), None)
+    IfExtraction::absent(text)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9399,6 +9502,62 @@ fn parse_leading_spell_targets_if_clause(input: &str) -> Option<(&str, TargetFil
     Some((rest, filter))
 }
 
+/// True when `fragment` is a possessive/object-pronoun P/T clause the shared
+/// composer lowered to a STRICT Source-scoped comparison — the shape whose
+/// source binding is valid only on self-subject triggers ("its power is
+/// greater than 0" with "its" == the source). Explicit source subjects
+/// ("~", "this creature") and non-strict forms never match.
+/// Nom-first pronoun-head prefix for [`strict_pronoun_pt_comparison`]: the
+/// possessive/object heads (`its`/`her`/`his`/`it`) as a composed `alt`
+/// production in the shared trailing-space shape (`oracle_nom::filter` uses
+/// the same boundary). The trailing space IS the word boundary — `it ` never
+/// matches `item` — so this accepts exactly what the retired `starts_with`
+/// predicate accepted.
+fn parse_strict_pronoun_head(input: &str) -> OracleResult<'_, ()> {
+    value((), alt((tag("its "), tag("her "), tag("his "), tag("it ")))).parse(input)
+}
+
+fn strict_pronoun_pt_comparison(fragment: &str, sc: &StaticCondition) -> bool {
+    let trimmed = fragment.trim_start();
+    if parse_strict_pronoun_head(trimmed).is_err() {
+        return false;
+    }
+    let StaticCondition::QuantityComparison {
+        lhs, comparator, ..
+    } = sc
+    else {
+        return false;
+    };
+    if !matches!(comparator, Comparator::GT | Comparator::LT) {
+        return false;
+    }
+    let QuantityExpr::Ref { qty } = lhs else {
+        return false;
+    };
+    matches!(
+        qty,
+        QuantityRef::Power {
+            scope: ObjectScope::Source
+        } | QuantityRef::Toughness {
+            scope: ObjectScope::Source
+        }
+    )
+}
+
+/// Outcome of one keyword's intervening-if extraction attempt.
+enum InterveningExtraction {
+    /// Guard hoisted: stripped text plus the trigger condition (boxed:
+    /// `TriggerCondition` is large and the sibling variants are small).
+    Hoisted(String, Box<TriggerCondition>),
+    /// No guard at this keyword; the caller may try the next extractor.
+    Absent,
+    /// A LEADING guard was recognized but refused as unsupported (strict
+    /// non-self P/T). The whole trigger must gap — callers must NOT fall
+    /// through to generic body parsing, which would rescue the guard text as
+    /// a misbound Source condition.
+    RefusedLeadingGuard,
+}
+
 fn try_extract_intervening(
     tp: &TextPair<'_>,
     lower: &str,
@@ -9407,8 +9566,10 @@ fn try_extract_intervening(
     policy: PostEffectPolicy,
     source_is_self: bool,
     wrap: impl FnOnce(TriggerCondition) -> TriggerCondition,
-) -> Option<(String, Option<TriggerCondition>)> {
-    let pos = tp.find(keyword)?;
+) -> InterveningExtraction {
+    let Some(pos) = tp.find(keyword) else {
+        return InterveningExtraction::Absent;
+    };
     let is_leading = lower[..pos].trim().is_empty();
     // CR 603.4: a leading keyword immediately follows the trigger condition — a
     // true intervening predicate; always hoist. A post-effect occurrence is
@@ -9417,7 +9578,8 @@ fn try_extract_intervening(
         if let PostEffectPolicy::DeferIfRehomeable = policy {
             let condition_text = lower[pos + keyword.len()..].trim_end_matches('.').trim();
             if condition_text_is_rehomeable(condition_text) {
-                return None; // leave it for strip_suffix_conditional to re-home
+                // leave it for strip_suffix_conditional to re-home
+                return InterveningExtraction::Absent;
             }
         }
         // AlwaysHoist, or non-re-homeable: fall through and hoist as before.
@@ -9437,7 +9599,26 @@ fn try_extract_intervening(
         } else {
             cond_fragment
         };
-    let (rest, sc) = parse_inner_condition(condition_input).ok()?;
+    let Ok((rest, sc)) = parse_inner_condition(condition_input) else {
+        return InterveningExtraction::Absent;
+    };
+    // CR 201.5 + CR 603.4: the shared possessive composer binds "its"/"her"/
+    // "his"/"it" to the ability source. On a non-self trigger that reading is
+    // wrong for a STRICT P/T gate — the pronoun names the event object, whose
+    // past-tense form the dying-object arm owns and whose present tense no arm
+    // binds. No printed card needs the strict misreading, so fail closed
+    // rather than check the grantor's stat.
+    //
+    // A refused LEADING guard is terminal refusal, not absence: returning
+    // `Absent` would let the generic body fallback rescue the guard text as a
+    // Source-bound resolution condition with no fire-time check. Non-leading
+    // occurrences keep the old fall-through (re-home or generic handling).
+    if !source_is_self && strict_pronoun_pt_comparison(cond_fragment, &sc) {
+        if is_leading {
+            return InterveningExtraction::RefusedLeadingGuard;
+        }
+        return InterveningExtraction::Absent;
+    }
     let rest_trimmed = rest.trim();
     let after_dots = rest_trimmed.trim_start_matches('.').trim_start();
     let has_otherwise = tag::<_, _, OracleError<'_>>("otherwise")
@@ -9446,17 +9627,19 @@ fn try_extract_intervening(
     let at_boundary =
         rest_trimmed.is_empty() || rest_trimmed.starts_with(',') || rest_trimmed.starts_with('.');
     if has_otherwise || !at_boundary {
-        return None;
+        return InterveningExtraction::Absent;
     }
-    let inner = static_condition_to_trigger_condition(&sc)?;
+    let Some(inner) = static_condition_to_trigger_condition(&sc).map(wrap) else {
+        return InterveningExtraction::Absent;
+    };
     // `source_zone_contraction_tail` changes only the consumed subject/copula;
     // the unconsumed suffix is byte-for-byte the original suffix, so its length
     // gives the correct span in `cond_fragment` for `strip_condition_clause`.
     let consumed = cond_fragment.len() - rest.len();
-    Some((
+    InterveningExtraction::Hoisted(
         strip_condition_clause(text, pos, keyword.len() + consumed),
-        Some(wrap(inner)),
-    ))
+        Box::new(inner),
+    )
 }
 
 /// Returns the unmodified suffix after a source-bound `it's` / `it’s` only
@@ -15308,6 +15491,10 @@ fn try_parse_event(
         Exploits {
             victim: Option<TargetFilter>,
         },
+        /// CR 702.154c: A creature enlisted another creature. No victim field:
+        /// only the vacuous "a creature" object parses (anything enlisted is a
+        /// creature by CR 702.154a), so the object carries no information.
+        Enlists,
         /// CR 701.44b: A permanent "explores" after the explore process completes.
         Explores,
         /// CR 701.50f: A permanent "connives" after the connive process completes.
@@ -15373,6 +15560,25 @@ fn try_parse_event(
                 victim: Some(victim),
             },
         ))
+    }
+    /// CR 702.154c: actor-side enlist event — "enlists" / "enlists a creature".
+    /// Only the vacuous object is admitted (only creatures can be enlisted, CR
+    /// 702.154a) and it is dropped. Victim-qualified forms ("enlists a nontoken
+    /// creature", Goblin Morale Sergeant) fail here: `match_enlisted` keys on
+    /// the attacker alone, so admitting them would over-fire.
+    fn parse_enlists_event(input: &str) -> OracleResult<'_, SimpleEvent> {
+        let (remaining, _) = tag("enlists").parse(input)?;
+        if remaining.is_empty() {
+            return Ok((remaining, SimpleEvent::Enlists));
+        }
+        let (rest, _) = tag(" a creature").parse(remaining)?;
+        if rest.is_empty() {
+            return Ok(("", SimpleEvent::Enlists));
+        }
+        Err(nom::Err::Error(OracleError::new(
+            rest,
+            nom::error::ErrorKind::Eof,
+        )))
     }
     /// CR 120.4 + CR 120.4b: the source-scoping tail on the received-damage
     /// grammar — `"…by a single source"` (Pain Magnification). It narrows the
@@ -15631,6 +15837,9 @@ fn try_parse_event(
             // Short form: "becomes attached" without a trailing target phrase
             // (future-proofing; no current Oracle cards use this form).
             value(SimpleEvent::BecomesAttached, tag("becomes attached")),
+            // CR 702.154c: actor-side enlist trigger (Benalish Knight-Counselor,
+            // Guardian of New Benalia).
+            parse_enlists_event,
         )))
         .parse(input)
     }
@@ -15859,6 +16068,20 @@ fn try_parse_event(
                 def.mode = TriggerMode::Exploited;
                 def.valid_source = Some(subject.clone());
                 def.valid_card = victim;
+            }
+            SimpleEvent::Enlists => {
+                // CR 702.154c: actor-side enlist trigger. Self subjects only —
+                // no printed card scopes another enlister, and `match_enlisted`
+                // fires on the source attacker. Same shape as the synthesized
+                // keyword trigger (`valid_card` = subject, `valid_source` unset).
+                if !matches!(
+                    subject,
+                    TargetFilter::SelfRef | TargetFilter::Any | TargetFilter::CostPaidObject
+                ) {
+                    return None;
+                }
+                def.mode = TriggerMode::Enlisted;
+                def.valid_card = Some(subject.clone());
             }
             SimpleEvent::Explores => {
                 if !remaining.trim().is_empty() {
