@@ -30292,8 +30292,8 @@ pub struct SpellContext {
     /// root at the chain's depth-0 entry and seeded into `last_effect_amount`, so
     /// "… removed this way" / "that much" read it. `None` = no counter cost;
     /// `Some(0)` = a counter cost that removed none. CR 707.10: a copy of the
-    /// ability copies all decisions made for it, including its costs, so a copy
-    /// keeps the original's count (the official copier rulings: "If the activated
+    /// ability copies all decisions made for it and can't pay the cost again, so a
+    /// copy keeps the original's count (the official copier rulings: "If the activated
     /// ability's cost contains a choice, such as … a number of counters to remove,
     /// the copy uses that same information").
     #[serde(default, skip_serializing_if = "Option::is_none")]

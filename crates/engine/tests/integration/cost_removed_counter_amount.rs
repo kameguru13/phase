@@ -5,7 +5,7 @@
 //! paid it, on both the stack route and the mana route (CR 605.3b).
 //!
 //! CR 707.10: a copy of such an ability copies all decisions made for it,
-//! including the value of X and its costs, so the copy reads the original's
+//! including the value of X, and isn't activated, so the copy reads the original's
 //! removed-counter count (the official copier rulings, e.g. Abstruse Archaic:
 //! "If the activated ability's cost contains a choice, such as a creature to
 //! sacrifice or a number of counters to remove, the copy uses that same
@@ -984,9 +984,9 @@ fn sage_of_hours_takes_an_extra_turn_per_five_counters_removed() {
 /// it is not a "choice normally made on resolution" that the copy re-makes. The
 /// copy cannot pay the cost again (it isn't activated, CR 707.10), so its "that
 /// much" is the amount bound to the activation it copies — the same reading
-/// Lithoform Engine's ruling gives paid costs ("effects based on any alternative
-/// or additional costs that were paid for the original … are copied as though
-/// those same costs were paid for the copy").
+/// Lithoform Engine's ruling gives a copied spell's paid costs ("effects based on
+/// any alternative or additional costs that were paid for the original spell are
+/// copied as though those same costs were paid for the copy").
 #[test]
 fn rings_copy_of_relic_amulet_deals_the_originals_amount() {
     let mut scenario = main_phase();
