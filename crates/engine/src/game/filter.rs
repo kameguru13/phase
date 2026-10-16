@@ -3974,6 +3974,69 @@ pub(crate) fn matches_target_filter_on_departure(
     )
 }
 
+/// CR 603.10 + CR 603.6a + CR 611.3c: evaluate an enters observer's subject filter against the
+/// entrant as it existed immediately after its entry event. A settled observation
+/// (`GameState::battlefield_entry_observation`) is authoritative: it is laid over the exact live
+/// entrant (or, when that incarnation is gone — CR 400.7 — over a skeleton) and evaluated by the
+/// full object filter. With no observation the entry was never settled — no instruction boundary
+/// followed it, settlement was deferred (`entry_observation_deferred`, a same-instruction
+/// co-entry, or a pending choice), or it was mid-entry — so the reading is exactly today's: the
+/// live entrant, or a gone entrant's record.
+/// Distinct from the CR 614.12 would-be-entrant authorities (`BattlefieldEntrantProjection`,
+/// `matches_target_filter_on_battlefield_entry`): observers read the realized entrant.
+pub(crate) fn matches_target_filter_on_entry_observation(
+    state: &GameState,
+    record: &ZoneChangeRecord,
+    licensed: Option<Zone>,
+    filter: &TargetFilter,
+    ctx: &FilterContext<'_>,
+) -> bool {
+    let Some(observation) = state.battlefield_entry_observation(record) else {
+        return if state.objects.contains_key(&record.object_id) {
+            matches_target_filter(state, record.object_id, filter, ctx)
+        } else {
+            matches_target_filter_on_zone_change_record_licensed(
+                state, record, licensed, filter, ctx,
+            )
+        };
+    };
+    // CR 400.7: only the exact observed incarnation lends its live object (and so its
+    // abilities) to the view; otherwise the projection stands alone on a skeleton.
+    let mut view = match state.objects.get(&record.object_id) {
+        Some(live) if ObjectIncarnationRef::from_object(live) == observation.identity.reference => {
+            live.clone()
+        }
+        _ => GameObject::new(
+            record.object_id,
+            observation.card_id,
+            observation.lki.owner,
+            observation.lki.name.clone(),
+            observation.identity.expected_zone,
+        ),
+    };
+    view.overlay_source_projection(observation);
+    // CR 702.26b: a phased-out permanent is treated as though it does not exist.
+    if view.is_phased_out() {
+        return false;
+    }
+    filter_inner_for_object(
+        state,
+        &view,
+        record.object_id,
+        filter,
+        ctx.source_id,
+        ctx.source_controller,
+        ctx.ability,
+        ctx.trigger_source,
+        ctx.recipient_id,
+        ctx.scoped_iteration_player,
+        ctx.triggering_object,
+        ctx.declared_slot_view,
+        ctx.granting_object,
+        ControllerLookup::LiveOrLki,
+    )
+}
+
 /// CR 701.20e + CR 608.2c: Look-then-cast chains publish cards via
 /// `last_revealed_ids` while the parser still binds later steps to
 /// `ExiledBySource`. When resolving those steps against library cards,
@@ -23349,5 +23412,279 @@ mod entry_projection_tests {
         ));
         unrelated.inherit_delivery_boundary(&original);
         assert!(!unrelated.parks_delivery(&original));
+    }
+}
+
+#[cfg(test)]
+mod entry_observation_tests {
+    //! U3 — CR 603.10 + CR 603.6a + CR 611.3c: the enters-observer evaluator reads the settled
+    //! entry observation, not the live entrant; with no observation it is exactly today's
+    //! live / record reading.
+    use super::*;
+    use crate::game::layers::{flush_layers, mark_layers_full};
+    use crate::game::zones::{
+        create_object, record_and_emit_entry_from_no_zone, settle_battlefield_entry_observations,
+    };
+    use crate::types::ability::{
+        Comparator, ControllerRef, PtStat, PtValueScope, QuantityExpr, TypeFilter, TypedFilter,
+    };
+    use crate::types::counter::CounterType;
+
+    struct Fixture {
+        state: GameState,
+        source: ObjectId,
+        entrant: ObjectId,
+        record: ZoneChangeRecord,
+    }
+
+    /// A 1/1 Bear creature under P0 enters from no zone; `settle` decides whether the entry
+    /// is observed at once.
+    fn fixture(settle: bool) -> Fixture {
+        let mut state = GameState::new_two_player(11);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Observer".to_string(),
+            Zone::Battlefield,
+        );
+        let entrant = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Entrant".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&entrant).expect("created");
+            obj.card_types.core_types = vec![CoreType::Creature];
+            obj.card_types.subtypes = vec!["Bear".to_string()];
+            obj.base_power = Some(1);
+            obj.base_toughness = Some(1);
+            obj.power = Some(1);
+            obj.toughness = Some(1);
+        }
+        mark_layers_full(&mut state);
+        flush_layers(&mut state);
+        let mut events = Vec::new();
+        let record =
+            record_and_emit_entry_from_no_zone(&mut state, entrant, &mut events).expect("entered");
+        if settle {
+            settle_battlefield_entry_observations(&mut state, &events);
+            assert!(
+                state.battlefield_entry_observation(&record).is_some(),
+                "precondition: the entry is observed"
+            );
+        }
+        Fixture {
+            state,
+            source,
+            entrant,
+            record,
+        }
+    }
+
+    fn creature_with(props: Vec<FilterProp>) -> TargetFilter {
+        TargetFilter::Typed(TypedFilter::creature().properties(props))
+    }
+
+    fn power_at_least(n: i32) -> TargetFilter {
+        creature_with(vec![FilterProp::PtComparison {
+            stat: PtStat::Power,
+            scope: PtValueScope::Current,
+            comparator: Comparator::GE,
+            value: QuantityExpr::Fixed { value: n },
+        }])
+    }
+
+    /// (through the evaluator, through the live object)
+    fn both(f: &Fixture, record: &ZoneChangeRecord, filter: &TargetFilter) -> (bool, bool) {
+        let ctx = FilterContext::from_source(&f.state, f.source);
+        (
+            matches_target_filter_on_entry_observation(&f.state, record, None, filter, &ctx),
+            matches_target_filter(&f.state, f.entrant, filter, &ctx),
+        )
+    }
+
+    fn add_counters(state: &mut GameState, id: ObjectId, n: u32) {
+        state
+            .objects
+            .get_mut(&id)
+            .unwrap()
+            .counters
+            .insert(CounterType::Plus1Plus1, n);
+        mark_layers_full(state);
+        flush_layers(state);
+    }
+
+    #[test]
+    fn entry_observation_overrides_later_counters() {
+        let mut f = fixture(true);
+        add_counters(&mut f.state, f.entrant, 2);
+        assert_eq!(f.state.objects[&f.entrant].power, Some(3), "precondition");
+        let record = f.record.clone();
+        assert_eq!(both(&f, &record, &power_at_least(3)), (false, true));
+    }
+
+    #[test]
+    fn entry_observation_answers_for_departed_entrant() {
+        let mut f = fixture(true);
+        add_counters(&mut f.state, f.entrant, 2);
+        // CR 400.7: the entrant left; its storage id now names a new graveyard object.
+        {
+            let obj = f.state.objects.get_mut(&f.entrant).unwrap();
+            obj.incarnation += 1;
+            obj.zone = Zone::Graveyard;
+        }
+        let ctx = FilterContext::from_source(&f.state, f.source);
+        let at_most_one = creature_with(vec![FilterProp::PtComparison {
+            stat: PtStat::Power,
+            scope: PtValueScope::Current,
+            comparator: Comparator::LE,
+            value: QuantityExpr::Fixed { value: 1 },
+        }]);
+        assert!(matches_target_filter_on_entry_observation(
+            &f.state,
+            &f.record,
+            None,
+            &at_most_one,
+            &ctx
+        ));
+        assert!(!matches_target_filter_on_entry_observation(
+            &f.state,
+            &f.record,
+            None,
+            &power_at_least(3),
+            &ctx
+        ));
+        // Gone entirely (a token that ceased to exist): the skeleton view still answers.
+        f.state.objects.remove(&f.entrant);
+        let ctx = FilterContext::from_source(&f.state, f.source);
+        assert!(matches_target_filter_on_entry_observation(
+            &f.state,
+            &f.record,
+            None,
+            &at_most_one,
+            &ctx
+        ));
+    }
+
+    #[test]
+    fn entry_observation_ignores_reentered_incarnation() {
+        let mut f = fixture(true);
+        // CR 400.7: the same storage id re-enters as a new object with counters.
+        f.state.objects.get_mut(&f.entrant).unwrap().incarnation += 1;
+        add_counters(&mut f.state, f.entrant, 2);
+        let mut events = Vec::new();
+        let reentry = record_and_emit_entry_from_no_zone(&mut f.state, f.entrant, &mut events)
+            .expect("re-entered");
+        assert!(f.state.battlefield_entry_observation(&reentry).is_none());
+        // The re-entry has no observation, so it reads live; the original entry keeps its own.
+        assert_eq!(both(&f, &reentry, &power_at_least(3)), (true, true));
+        let original = f.record.clone();
+        assert!(!both(&f, &original, &power_at_least(3)).0);
+        // A record claiming the original index for the new incarnation never matches the row.
+        let mut forged = original.clone();
+        forged.entered_incarnation = reentry.entered_incarnation;
+        assert!(f.state.battlefield_entry_observation(&forged).is_none());
+    }
+
+    #[test]
+    fn entry_observation_absent_matches_todays_arms() {
+        let mut f = fixture(false);
+        add_counters(&mut f.state, f.entrant, 2);
+        let record = f.record.clone();
+        for filter in [power_at_least(3), power_at_least(4)] {
+            let (evaluated, live) = both(&f, &record, &filter);
+            assert_eq!(evaluated, live, "live arm");
+        }
+        assert!(
+            both(&f, &record, &power_at_least(3)).0,
+            "reach: the live arm admits"
+        );
+        f.state.objects.remove(&f.entrant);
+        let ctx = FilterContext::from_source(&f.state, f.source);
+        for filter in [power_at_least(1), power_at_least(2)] {
+            assert_eq!(
+                matches_target_filter_on_entry_observation(&f.state, &record, None, &filter, &ctx),
+                matches_target_filter_on_zone_change_record_licensed(
+                    &f.state, &record, None, &filter, &ctx
+                ),
+                "record arm"
+            );
+        }
+        assert!(
+            matches_target_filter_on_entry_observation(
+                &f.state,
+                &record,
+                None,
+                &power_at_least(1),
+                &ctx
+            ),
+            "reach: the record arm admits"
+        );
+    }
+
+    /// Shape coverage: each filter shape enter observers use reads the projection, not
+    /// `state.objects`, when the live entrant differs from it in exactly that field.
+    #[test]
+    fn entry_observation_shapes_read_the_projection() {
+        let shape = |mutate: fn(&mut GameObject), filter: TargetFilter| {
+            let mut f = fixture(true);
+            mutate(f.state.objects.get_mut(&f.entrant).unwrap());
+            let record = f.record.clone();
+            both(&f, &record, &filter)
+        };
+        assert_eq!(
+            shape(
+                |o| o.keywords.push(Keyword::Flying),
+                creature_with(vec![FilterProp::WithKeyword {
+                    value: Keyword::Flying
+                }])
+            ),
+            (false, true),
+            "WithKeyword"
+        );
+        assert_eq!(
+            shape(
+                |o| o.card_types.subtypes.push("Zombie".to_string()),
+                TargetFilter::Typed(TypedFilter::creature().subtype("Zombie".to_string()))
+            ),
+            (false, true),
+            "Subtype"
+        );
+        assert_eq!(
+            shape(
+                |o| o.card_types.core_types.push(CoreType::Artifact),
+                TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact))
+            ),
+            (false, true),
+            "core type"
+        );
+        assert_eq!(
+            shape(
+                |o| o.controller = PlayerId(1),
+                TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You))
+            ),
+            (true, false),
+            "controller"
+        );
+        assert_eq!(
+            shape(|o| o.tapped = true, creature_with(vec![FilterProp::Tapped])),
+            (false, true),
+            "Tapped"
+        );
+        // `Another` reads the view's identity against the observer: the entrant is
+        // "another" creature for a different observer, and not for itself.
+        let f = fixture(true);
+        let another = creature_with(vec![FilterProp::Another]);
+        let other_ctx = FilterContext::from_source(&f.state, f.source);
+        assert!(matches_target_filter_on_entry_observation(
+            &f.state, &f.record, None, &another, &other_ctx
+        ));
+        let self_ctx = FilterContext::from_source(&f.state, f.entrant);
+        assert!(!matches_target_filter_on_entry_observation(
+            &f.state, &f.record, None, &another, &self_ctx
+        ));
     }
 }
