@@ -4924,10 +4924,11 @@ mod tests {
         );
 
         // "the number of five counters removed this way" is not a grouping
-        // construct: it declines rather than reading the bare count.
-        assert_ne!(
+        // construct: it declines (no reference at all) rather than reading the
+        // bare count or another "the number of …" count.
+        assert_eq!(
             parse_quantity_ref("the number of five counters removed this way"),
-            Some(previous_effect_amount.clone())
+            None
         );
         assert_eq!(
             parse_quantity_ref("the number of counters removed this way"),

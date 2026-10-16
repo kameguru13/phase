@@ -1035,22 +1035,10 @@ pub(crate) fn set_resolved_source_recursive(ability: &mut ResolvedAbility, sourc
 /// `Effect::NoteManaSpent` resolving on the copy (Jeweled Amulet's first
 /// ability copied via Rings of Brighthearth or similar) would falsely note
 /// mana colors the copy never paid.
-///
-/// For the same reason it zeroes the cost-removed counter count: the copy
-/// removed no counters, so its "… counters removed this way" / "that much"
-/// reads 0 (CR 707.10 + CR 122.1).
 fn preserve_ability_copy_source_recursive(ability: &mut ResolvedAbility) {
     let source_id = ability.source_id;
     set_resolved_source_recursive(ability, source_id);
     ability.clear_noted_mana_payment_recursive();
-    // CR 707.10 + CR 122.1: a copy of an activated ability isn't activated, so it
-    // removed no counters; the original's removed counters are not objects, so
-    // CR 707.10's "objects used to pay its costs" does not forward them (cf. the
-    // Dawnglow Infusion example). `Some(0)`, not `None`, so the copy's "that much"
-    // reads 0 rather than falling back to the copied choice.
-    if let Some(removed) = ability.context.cost_removed_counter_amount.as_mut() {
-        *removed = 0;
-    }
 }
 
 /// CR 707.10d: Replace every object target on a copied spell with `new_target`

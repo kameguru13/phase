@@ -747,7 +747,16 @@ fn produce_mana_from_ability(
     // The count is the preceding "this way" amount for the head production and
     // the sub-chain. A mana ability can resolve inside another resolution's
     // payment, so the outer `last_effect_amount` is restored afterwards.
-    let cost_removed = super::costs::take_cost_removed_counters(state, source_id);
+    // Only a mana ability whose own cost removes counters drains the latch: a
+    // non-mana activation of this source paused for its mana payment may hold
+    // its own count there, and a mana ability activated in that window (CR 601.2g
+    // + CR 605.3a) must neither read it nor strip it from that activation.
+    let pays_counter_cost = mana_sources::cost_has_component(&ability_def.cost, |cost| {
+        matches!(cost, AbilityCost::RemoveCounter { .. })
+    });
+    let cost_removed = pays_counter_cost
+        .then(|| super::costs::take_cost_removed_counters(state, source_id))
+        .flatten();
     resolved_for_quantity.context.cost_removed_counter_amount = cost_removed;
     let outer_last_effect_amount = cost_removed.map(|n| {
         state

@@ -1689,8 +1689,10 @@ pub struct GameObject {
     /// `costs::take_cost_removed_counters` drains it synchronously at both
     /// stack placements (`push_ability_entry` and the direct push in
     /// `casting::activate_with_cost_carrier`) into that activation's own
-    /// `SpellContext::cost_removed_counter_amount`, and at mana production
-    /// (`produce_mana_from_ability`, CR 605.3b). `None` = no counter cost was
+    /// `SpellContext::cost_removed_counter_amount`, and at the production of a
+    /// mana ability whose own cost removes counters (`produce_mana_from_ability`,
+    /// CR 605.3b; any other mana ability of this object leaves it to the
+    /// activation whose payment it is helping). `None` = no counter cost was
     /// paid since the last drain; `Some(0)` = a counter cost removed none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_removed_counters_to_activate: Option<u32>,

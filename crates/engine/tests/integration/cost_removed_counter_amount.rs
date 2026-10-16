@@ -4,9 +4,12 @@
 //! remove-all cost, "that much"). The count is bound to the one activation that
 //! paid it, on both the stack route and the mana route (CR 605.3b).
 //!
-//! CR 707.10 + CR 122.1: a copy of such an ability isn't activated and the
-//! counters the original removed are not objects, so the copy reads 0 removed
-//! counters; it still copies the announced value of X (CR 107.3a).
+//! CR 707.10: a copy of such an ability copies all decisions made for it,
+//! including the value of X and its costs, so the copy reads the original's
+//! removed-counter count (the official copier rulings, e.g. Abstruse Archaic:
+//! "If the activated ability's cost contains a choice, such as a creature to
+//! sacrifice or a number of counters to remove, the copy uses that same
+//! information. You can't pay the cost again, even if you want to.").
 //!
 //! CR 107.1: "for each N <things>" counts complete groups of N (Sage of Hours;
 //! CR 500.7 extra turns). A reference that cannot express the grouping fails
@@ -30,7 +33,7 @@ use engine::types::game_state::{
     CounterCostChoice, GameState, PayCostKind, StackEntryKind, WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
-use engine::types::mana::{ManaType, ManaUnit};
+use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 
 const ESSENCE_BOTTLE: &str = "{3}, {T}: Put an elixir counter on this artifact.\n{T}, Remove all elixir counters from this artifact: You gain 2 life for each elixir counter removed this way.";
@@ -51,6 +54,8 @@ const GEISTFLAME_RESERVOIR: &str = "Whenever you cast an instant or sorcery spel
 const ANT_MAN: &str = "Whenever you draw a card, put a +1/+1 counter on The Astonishing Ant-Man.\n{2}{G}, {T}, Remove any number of +1/+1 counters from The Astonishing Ant-Man: Create that many 1/1 green Insect creature tokens.";
 const RINGS_OF_BRIGHTHEARTH: &str = "Whenever you activate an ability, if it isn't a mana ability, you may pay {2}. If you do, copy that ability. You may choose new targets for the copy.";
 const ILLUSIONISTS_BRACERS: &str = "Whenever an ability of equipped creature is activated, if it isn't a mana ability, copy that ability. You may choose new targets for the copy.\nEquip {3}";
+const OPALESCENCE: &str = "Each other non-Aura enchantment is a creature in addition to its other types and has base power and base toughness each equal to its mana value.";
+const CRYPTOLITH_RITE: &str = "Creatures you control have \"{T}: Add one mana of any color.\"";
 /// C5a: the effect-path control — counters removed by an EFFECT, not a cost.
 const EFFECT_PATH_CONTROL: &str = "{T}: Remove all charge counters from this artifact. You gain 1 life for each charge counter removed this way.";
 /// C7d: a reader of X itself (not of the counters removed).
@@ -663,6 +668,88 @@ fn black_mana_battery_adds_an_additional_black_per_counter_removed() {
     assert_eq!(pool(&runner, ManaType::Black), 3);
 }
 
+/// C3c: Ooze Flux, a 4/4 creature under Opalescence with the mana ability
+/// Cryptolith Rite grants, pays its interactive counter cost (3 from among),
+/// then taps itself for mana to pay the rest of {1}{G} (CR 601.2g + CR 605.3a).
+/// That mana ability removed no counters, so it must neither read nor drain
+/// Ooze Flux's pending count: the Ooze is 3/3.
+#[test]
+fn a_mana_ability_activated_while_paying_does_not_take_the_pending_count() {
+    let mut scenario = main_phase();
+    scenario.add_enchantment_from_oracle(P0, "Opalescence", OPALESCENCE);
+    let rite = scenario
+        .add_enchantment_from_oracle(P0, "Cryptolith Rite", CRYPTOLITH_RITE)
+        .id();
+    // Ooze Flux's printed mana cost {3}{G}: Opalescence makes it a 4/4.
+    let flux = scenario
+        .add_enchantment_from_oracle(P0, "Ooze Flux", OOZE_FLUX)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Green],
+            generic: 3,
+        })
+        .id();
+    let first = scenario.add_creature(P0, "First", 1, 1).id();
+    let second = scenario.add_creature(P0, "Second", 1, 1).id();
+    scenario.with_counter(first, CounterType::Plus1Plus1, 2);
+    scenario.with_counter(second, CounterType::Plus1Plus1, 1);
+    add_mana(&mut scenario, &[ManaType::Green]);
+    let mut runner = scenario.build();
+    engine::game::layers::evaluate_layers(runner.state_mut());
+    // The animated Rite, First and Second could also tap for mana; tapping them
+    // leaves Ooze Flux the only untapped source for the {1}.
+    for id in [rite, first, second] {
+        runner.state_mut().objects.get_mut(&id).unwrap().tapped = true;
+    }
+    assert!(
+        runner.state().objects[&flux]
+            .card_types
+            .core_types
+            .contains(&engine::types::card_type::CoreType::Creature),
+        "reach: Opalescence makes Ooze Flux a creature"
+    );
+    let mut answers = Answers {
+        x: Some(3),
+        pay_amount: Some(3),
+        distribution: Some(vec![
+            CounterCostChoice {
+                object_id: first,
+                counter_type: CounterType::Plus1Plus1,
+                count: 2,
+            },
+            CounterCostChoice {
+                object_id: second,
+                counter_type: CounterType::Plus1Plus1,
+                count: 1,
+            },
+        ]),
+        ..Answers::default()
+    };
+
+    let index = counter_cost_ability(&runner, flux, 0);
+    activate(&mut runner, flux, index);
+    drive(&mut runner, priority_with_stack(1), &mut answers);
+    assert!(
+        runner.state().objects[&flux].tapped,
+        "reach: Ooze Flux tapped for mana with the granted ability"
+    );
+    assert!(
+        runner.state().players[0].mana_pool.is_empty(),
+        "reach: the pool and the granted mana paid {{1}}{{G}}"
+    );
+
+    drive(&mut runner, priority_with_empty_stack, &mut answers);
+    assert_eq!(counters_on(&runner, first, &CounterType::Plus1Plus1), 0);
+    assert_eq!(counters_on(&runner, second, &CounterType::Plus1Plus1), 0);
+    let oozes = battlefield_named(&runner, "Ooze");
+    assert_eq!(oozes.len(), 1, "the Ooze survives: it is not 0/0");
+    assert_eq!(
+        (power(&runner, oozes[0]), toughness(&runner, oozes[0])),
+        (3, 3),
+        "Ooze Flux reads its own 3 counters removed"
+    );
+    assert!(latch_is_empty(&runner, flux));
+}
+
 // ---------------------------------------------------------------------------
 // C4 — hostiles: the amount belongs to its own activation
 // ---------------------------------------------------------------------------
@@ -883,13 +970,25 @@ fn sage_of_hours_takes_an_extra_turn_per_five_counters_removed() {
 }
 
 // ---------------------------------------------------------------------------
-// C7 — copies (CR 707.10 + CR 122.1)
+// C7 — copies (CR 707.10)
 // ---------------------------------------------------------------------------
 
-/// C7a: Relic Amulet copied by Rings of Brighthearth — the copy removed no
-/// counters and deals 0; the original deals 3.
+/// C7a: Relic Amulet copied by Rings of Brighthearth — the copy deals the
+/// original's 3, then the original deals 3 (6 total).
+///
+/// A remove-ALL cost involves no player choice, so the copier rulings' "the
+/// copy uses that same information" does not literally name it. The copy still
+/// reads 3: CR 707.10 copies "all decisions made for it, including … additional
+/// or alternative costs", and the number of counters removed is fixed when the
+/// cost is paid during activation (CR 602.2b + CR 601.2h), not on resolution, so
+/// it is not a "choice normally made on resolution" that the copy re-makes. The
+/// copy cannot pay the cost again (it isn't activated, CR 707.10), so its "that
+/// much" is the amount bound to the activation it copies — the same reading
+/// Lithoform Engine's ruling gives paid costs ("effects based on any alternative
+/// or additional costs that were paid for the original … are copied as though
+/// those same costs were paid for the copy").
 #[test]
-fn rings_copy_of_relic_amulet_deals_no_damage() {
+fn rings_copy_of_relic_amulet_deals_the_originals_amount() {
     let mut scenario = main_phase();
     let rings = scenario
         .add_artifact_from_oracle(P0, "Rings of Brighthearth", RINGS_OF_BRIGHTHEARTH)
@@ -916,15 +1015,20 @@ fn rings_copy_of_relic_amulet_deals_no_damage() {
         "reach: the original and its copy wait on the stack"
     );
     drive(&mut runner, priority_with_stack(1), &mut answers);
-    assert_eq!(damage(&runner, victim), 0, "the copy deals 0");
+    assert_eq!(
+        damage(&runner, victim),
+        3,
+        "the copy deals the original's 3"
+    );
     drive(&mut runner, priority_with_empty_stack, &mut answers);
-    assert_eq!(damage(&runner, victim), 3, "the original deals 3");
+    assert_eq!(damage(&runner, victim), 6, "the original deals 3 more");
 }
 
 /// C7b: Geistflame Reservoir (2 of 3) copied by Rings — the copy's "that much"
-/// reads 0, not the copied choice.
+/// uses the original's chosen count (CR 707.10; the copier rulings' "a number of
+/// counters to remove, the copy uses that same information"): 2, then 2 more.
 #[test]
-fn rings_copy_of_geistflame_reservoir_deals_no_damage() {
+fn rings_copy_of_geistflame_reservoir_deals_the_chosen_amount() {
     let mut scenario = main_phase();
     let rings = scenario
         .add_artifact_from_oracle(P0, "Rings of Brighthearth", RINGS_OF_BRIGHTHEARTH)
@@ -954,9 +1058,14 @@ fn rings_copy_of_geistflame_reservoir_deals_no_damage() {
         "reach: the original and its copy wait on the stack"
     );
     drive(&mut runner, priority_with_stack(1), &mut answers);
-    assert_eq!(damage(&runner, victim), 0, "the copy deals 0");
+    assert_eq!(
+        damage(&runner, victim),
+        2,
+        "the copy deals the original's 2"
+    );
     drive(&mut runner, priority_with_empty_stack, &mut answers);
-    assert_eq!(damage(&runner, victim), 2, "the original deals 2");
+    assert_eq!(damage(&runner, victim), 4, "the original deals 2 more");
+    assert_eq!(counters_on(&runner, reservoir, &counter("charge")), 1);
 }
 
 fn baku_with_bracers(oracle: &str) -> (GameRunner, ObjectId) {
@@ -977,10 +1086,12 @@ fn baku_with_bracers(oracle: &str) -> (GameRunner, ObjectId) {
     (runner, baku)
 }
 
-/// C7c: Blademane Baku (X = 2) copied by Illusionist's Bracers — the copy keeps
-/// X but removed no counters (+0/+0); the original gets +4/+0.
+/// C7c: Blademane Baku (X = 2) copied by Illusionist's Bracers — the copy uses
+/// the original's 2 counters removed (CR 707.10; the copier rulings) and gives
+/// +4/+0, then the original gives +4/+0: power 1 → 5 → 9, and only 2 ki counters
+/// leave (the copy pays no cost).
 #[test]
-fn bracers_copy_of_blademane_baku_gets_nothing() {
+fn bracers_copy_of_blademane_baku_uses_the_originals_count() {
     let (mut runner, baku) = baku_with_bracers(BLADEMANE_BAKU);
     let mut answers = Answers::x(2);
 
@@ -989,9 +1100,9 @@ fn bracers_copy_of_blademane_baku_gets_nothing() {
     drive(&mut runner, priority_with_no_trigger_waiting, &mut answers);
     assert_eq!(runner.state().stack.len(), 2, "reach: original and copy");
     drive(&mut runner, priority_with_stack(1), &mut answers);
-    assert_eq!(power(&runner, baku), 1, "the copy gives +0/+0");
+    assert_eq!(power(&runner, baku), 5, "the copy gives +4/+0");
     drive(&mut runner, priority_with_empty_stack, &mut answers);
-    assert_eq!(power(&runner, baku), 5);
+    assert_eq!(power(&runner, baku), 9, "the original gives +4/+0 more");
     assert_eq!(counters_on(&runner, baku, &counter("ki")), 1);
 }
 
@@ -1090,20 +1201,41 @@ fn for_each_group_of_n_never_reads_the_bare_count() {
     }
 
     // "the number of five counters removed this way" is not a grouping
-    // construct: it must decline rather than read the bare count or divide.
+    // construct: the quantity declines honestly as an unparsed quantity (not a
+    // bare count, a division, or another "the number of …" count).
     let (abilities, _) = parsed_json(
         "{T}, Remove all +1/+1 counters from this creature: It deals damage to any target equal to the number of five counters removed this way.",
     );
+    let abilities_json: serde_json::Value = serde_json::from_str(&abilities).unwrap();
+    assert_eq!(
+        abilities_json.as_array().map(Vec::len),
+        Some(1),
+        "reach: THENUM5 parses to one ability: {abilities}"
+    );
+    assert_eq!(
+        (
+            &abilities_json[0]["effect"]["type"],
+            &abilities_json[0]["effect"]["name"],
+        ),
+        (
+            &serde_json::json!("Unimplemented"),
+            &serde_json::json!("unparsed_quantity"),
+        ),
+        "THENUM5 declines honestly: {abilities}"
+    );
     assert!(
         !abilities.contains("PreviousEffectAmount") && !abilities.contains("DivideRounded"),
-        "THENUM5 declines: {abilities}"
+        "THENUM5 reads no count: {abilities}"
     );
 
-    // A static consumer: divided or unsupported, never the bare count.
+    // A static consumer divides: +1/+1 per complete pair of creatures.
     let (_, statics) = parsed_json("This creature gets +1/+1 for each two creatures you control.");
+    let pairs = "value: DivideRounded { inner: Ref { qty: ObjectCount { filter: Typed(TypedFilter { type_filters: [Creature], controller: Some(You), properties: [] }) } }, divisor: 2, rounding: Down }";
     assert!(
-        statics.contains("DivideRounded") || !statics.contains("ObjectCount"),
-        "STATIC2: {statics}"
+        statics.contains(&format!(
+            "modifications: [AddDynamicPower {{ {pairs} }}, AddDynamicToughness {{ {pairs} }}]"
+        )),
+        "STATIC2 divides on both power and toughness: {statics}"
     );
 
     // N = 1 is unchanged.
