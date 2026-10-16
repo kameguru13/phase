@@ -1637,6 +1637,7 @@ mod coerced_attack_punisher;
 mod committed_dump_walk;
 mod condition_gates_fail_closed;
 mod conditional_cost_reduction_3223;
+mod conditional_entry_gate_projection;
 mod conformer_shuriken;
 mod connecting_the_dots_return_exiled_with;
 mod connive_draw_pause_tail_completion;
