@@ -1,0 +1,9 @@
+crates/engine/src/types/ability.rs
+crates/engine/src/parser/oracle_effect/lower.rs
+crates/engine/src/parser/oracle_effect/sequence.rs
+crates/phase-ai/src/ability_chain.rs
+crates/engine/src/game/effects/mod.rs
+crates/engine/src/game/triggers.rs
+crates/engine/src/parser/oracle_trigger.rs
+crates/engine/tests/integration/created_token_counter_sequence.rs
+crates/engine/src/types/zones.rs

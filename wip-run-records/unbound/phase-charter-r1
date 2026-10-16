@@ -1,0 +1,287 @@
+# Phase charter: Unbound Flourishing (run `unbound`), revision r1
+
+**Source.** Charter loop round 1. Derived from the draft `.git/engine-implementer-runs/unbound/plan-r1.md` and the plan-review r1 findings F1–F6.
+
+**Input gap the orchestrator must close.** `.git/engine-implementer-runs/unbound/plan-review-r1.md` was **1 byte (empty)** when I read it, and no copy exists under `/mnt/project-files/unbound-zimone/wip/runs/unbound/`. I took F1–F6 from their one-line summaries in the spawn brief and the `phase-fit` record:
+- F1: visibility leak
+- F2: protocol bump
+- F3: once-per-turn split
+- F4: unparsed "if" in the split
+- F5: sizing
+- F6: test rows
+
+The decisions below follow those summaries. Before phase-plan dispatch, the orchestrator must hand the full review text to the charter reviewer and to each phase planner. If the full text contradicts a decision here, that is a charter-review finding, not an addendum.
+
+**Base.** The Zimone tip (protocol 144 / wire 126 from `6295aa7`, plus Zimone phase 2 when it lands). Unbound ships as its own PR, stacked on Zimone. I made no repo edits and ran no cargo.
+
+## Surviving steps
+
+- **Step 0, premise.** The draft's Oracle text matches `/mnt/project-files/unbound-zimone/oracle-verified.md` word for word, and all 14 rulings carry into the phases. The class cards named below were re-read from local MTGJSON `data/mtgjson/AtomicCards.json`:
+  - Bill Potts ("This ability triggers only once each turn.")
+  - Glava, Five-Advents Mage ("Do this only once each turn.")
+  - Neerdiv, Devious Diver (no constraint, no "if")
+  - Vazi, Keen Negotiator ("if mana from a Treasure was spent to cast it or activate it")
+- **CR citations.** Every rule this charter cites was grep-verified in `docs/MagicCompRules.txt`: 107.3a, 107.3c, 107.3e, 107.3m, 113.7a, 202.3e, 400.7, 601.2f, 602.2b, 603.2, 603.2h, 603.3b, 603.4, 605.3b, 605.5a, 608.2h, 701.6a, 701.10, 707.10, 707.10c.
+- **Step 1, skills, by phase:**
+  - Phase 1: `/oracle-parser`, `/add-trigger`, `/card-test`
+  - Phase 2: `/casting-stack-conditions`, plus the `/add-engine-variant` field audit (item 7, wire contract, is discharged here)
+  - Phase 3: `/add-engine-effect`, `/add-engine-variant` (the `Effect` variant and `XModification`), `/casting-stack-conditions` (the X-channel contract), `/card-test`
+  - Phase 4: `/add-trigger` (ordering)
+- **Step 2, traces.** The draft's traces survive and are reused as each phase's analogous trace:
+  - T-A, Magus Lucea Kane: phases 1 and 2
+  - T-B, printed compound split: phase 1
+  - T-C, `Effect::Double`: phase 3
+  - T-D, X channels: phases 3 and 4
+
+## Seam validation (the planner's A/B/C/D, kept)
+
+The draft's four-way split is the right decomposition. Each edge was checked:
+
+- **1 → 3 (the line-1 filter, then the line-1 effect).** Phase 1 fixes the over-firing filter on line 1. Line 1's effect stays a strict-failure `Unimplemented`, so the card stays honestly unsupported and the tree stays green.
+- **1 → 2 (the activation-leg copy, then the copy of a countered ability).** The Unbound row "stifled {X} ability still copied" cannot exist until phase 1's activation leg exists. Phase 2 is also independently discriminating on a card already in the corpus (Rings of Brighthearth), so its interim verification is not purely structural.
+- **3 → 4 (the X writer, then ordering honesty).** Ordering honesty has no discriminating test until a writer of the event object's X exists. This is a textbook T3 dependency seam.
+- **Merges were considered and rejected:**
+  - Merging 3+4 makes two units over phase 3's already-large forced-site fan-out, which trips T1∧T2.
+  - Merging 1+2 adds a GameState wire change to a parser phase for no seam gain.
+- **Reordering 2 and 3 was considered and rejected.** Neither depends on the other. Keeping 2 first puts the cheaper wire-shape phase (and so the run's single bump, decision 2.5) earliest, and lets phase 3's card test run on a tree where copy and doubling are both live.
+
+Order: **Phase 1 → Phase 2 → Phase 3 → Phase 4.**
+
+---
+
+## Phase 1: X-cost qualifier grammar and the cast-or-activate split (parser, draft U1+U2)
+
+**Goal.**
+- Line 1's spell filter carries the "mana cost that contains {X}" qualifier (it no longer over-fires).
+- Line 2 lowers to one trigger per event: a spell-cast trigger and an ability-activation trigger. Each carries its folded cost-X filter and the shared copy effect.
+- An {X} instant or sorcery, and an {X} activated ability, are copied with the same X (CR 707.10), and the copy may be retargeted (CR 707.10c).
+
+**Scope rule (anchors).** Standing classes implied.
+- `crates/engine/src/parser/oracle_trigger.rs`
+- `crates/engine/src/parser/oracle_trigger_tests.rs`
+- `crates/engine/tests/integration/` (new `unbound_flourishing.rs` plus its `mod` line)
+- Conditional, admitted by addendum only if the phase plan's measurement requires it (draft residual 3, the departed-LKI activation source): `crates/engine/src/game/filter.rs` and/or `crates/engine/src/game/trigger_matchers.rs`
+
+**Architecture decisions.**
+1. **One shared cost-X qualifier combinator** covers both cost slots ("with {X} in its mana/activation cost" ∪ "with a(n) mana/activation cost that contains {X}").
+   - The slot is a parser-local typed enum mapping to the existing `HasXInManaCost` / `HasXInActivationCost` props.
+   - Both existing post-modifier parsers delegate to it. The existing cards on those parsers must not change output.
+   - It is pure nom: no `contains` / `find` / `starts_with` dispatch.
+2. **A dedicated cast-or-activate splitter** sits in the printed-trigger compound-split pipeline (the T-B pattern):
+   - one trigger per event, sharing the effect, with offset base indexes;
+   - subject-verb agreement for "you" vs third-person actors.
+   - The global event-verb lexicon is **not** widened.
+   - Rejected and staying rejected: a `TriggerMode::SpellCastOrAbilityActivated` sibling (sibling-cluster smell, and it conflates two subject kinds), and a `TriggerDefinition.or_trigger` field (out of run; see the deferral list).
+3. **Intervening-if fold.** The CR 603.4 intervening-if "if that spell's mana cost or that ability's activation cost contains {X}" is distributed by anaphor:
+   - each subject goes to exactly one half's `valid_card`, at event-match time;
+   - no rechecked `TriggerCondition` is produced.
+   - Why: the predicate reads costs fixed at CR 601.2f / CR 602.2b, so the resolution recheck has the same answer. The "copy even if countered" ruling also requires that the recheck not fail on a departed object.
+   - The phase plan must **establish** that a rechecked activation-cost leaf would fail at resolution. That is the decisive hostile case behind this decision, and the charter does not assert it.
+4. **F3: the splitter declines on any per-ability frequency constraint.** Declining applies when the line carries "This ability triggers only once each turn" (Bill Potts), "Do this only once each turn" (CR 603.2h, Glava) or any sibling once-per-turn/round rider.
+   - Why: splitting one printed ability into two definitions gives each half its own frequency counter, but CR 603.2h / the printed rider bounds the *one* ability.
+   - "Declines" means no split, and the line must end **honestly unsupported**: a strict-failure marker, never a silently dropped leg.
+   - The phase plan measures what today's fallback produces for those lines. If the fallback is already unsupported, falling through is acceptable. If it is "supported with a dropped leg", the decline must route the line to a strict-failure marker instead.
+5. **F4: the splitter declines on any "if" it cannot fold.** An intervening-if that is not exactly the anaphor-distributed cost-X form makes the splitter decline. Vazi's "if mana from a Treasure was spent to cast it or activate it" is the example. Partial folds are also declined: a subject reaching zero halves, or a half receiving two subjects.
+   - The splitter never emits halves with a condition dropped, or attached to only one half.
+   - The honest-red rule is the same as decision 4.
+6. **Copy anaphor.** "copy that spell or ability" in each half resolves to the event's own stack object through the existing copy authority (`copy_source_entry` and kin).
+   - The phase plan measures whether the reconstructed activation half already yields a context-ref target the copy authority accepts (draft probe P1). If it does not, the phase lifts the anaphor through the existing parent-target → triggering-source lift pattern rather than adding a field.
+7. **Triggered abilities that pay {X} are not copied** (ruling 2; CR 603.2: they are not activations). The phase plan establishes this from the emitters of the activation event (draft V16/P5). It is not assumed.
+8. **Class effect.**
+   - Neerdiv is expected to surface its activation leg: a real activation trigger, or an honest `Unimplemented` for its "of a card in your graveyard" qualifier.
+   - Bill Potts, Glava and Vazi decline (decisions 4 and 5).
+   - Every coverage flip is reported, never hidden.
+
+**Constraints carried to the phase planner (by ID, not acceptance rows).**
+- **F3, F4:** decisions 4 and 5. Each decline path gets a hostile row reached through `parse_trigger_lines`, paired with the Unbound positive.
+- **F5:** the Sizing section counts reproducibly per the phase-fit rule and separates authored from compiler-forced paths. The reviewer's whole-run count (~31–33) supersedes the draft's 22–24; phase plans must not regress to the draft's figure.
+- **F6:** the test-row corrections from plan-review r1 apply to this phase's rows. The orchestrator supplies the full text (see the input gap above).
+- Draft residual 3 (departed-LKI activation source answering `HasXInActivationCost`) is this phase's to **establish**. A required fix enters by addendum (conditional anchors).
+- The countered-**spell** copy (ruling 1, draft V11) is measured here. If the existing departed-spell path is defective, the fix takes the defective-reference route in **phase 2**, which owns the departed-record family. Phase 1 then writes that row as `DEFERRED(phase 2)` by addendum.
+
+**Addenda file:** `.git/engine-implementer-runs/unbound/addenda/phase-1`
+
+**Deferral list.**
+- Copy of a countered/stifled **ability** (Unbound and Rings of Brighthearth rows) → **DEFERRED(phase 2)**
+- Line 1's effect "double the value of X" (stays strict-failure here) → **DEFERRED(phase 3)**
+- Unbound coverage-supported status → **DEFERRED(phase 3)**
+- Ordering prompt with same-event X readers → **DEFERRED(phase 4)**
+- Out of run: see the run-level deferrals.
+
+**Recursive phase-fit check.**
+- T1 is met (two units).
+- T2 is not met: about 4 anchors, plus at most 2 addendum-admitted runtime files.
+- The conjunction does not fire.
+
+---
+
+## Phase 2: Departed activated-ability record (draft U5)
+
+**Goal.** A "copy that ability" trigger still copies its ability after that ability has left the stack without resolving (CR 701.6a). The copy is made from the ability's last-known stack entry (CR 113.7a + CR 608.2h + CR 707.10). This mirrors the existing departed-spell record. It also fixes a pre-existing defect class (Rings of Brighthearth, Magus Lucea Kane, every "copy that ability" trigger).
+
+**Scope rule (anchors).** Standing classes implied.
+- `crates/engine/src/types/game_state.rs`
+- `crates/engine/src/game/stack.rs`
+- `crates/engine/src/game/turns.rs`
+- `crates/engine/src/game/effects/copy_spell.rs`
+- `crates/engine/src/game/visibility.rs` (authored: decision 4, not merely compiler-forced)
+- `crates/engine/tests/integration/` (the Unbound file plus a Rings of Brighthearth row)
+- Version surfaces (decision 5). T2 excludes these as protocol-version surfaces.
+  - `crates/lobby-broker/src/protocol.rs`
+  - `crates/server-core/src/protocol.rs`
+  - `client/src/adapter/ws-adapter.ts`
+  - `client/src/network/protocol.ts`
+  - `client/src/network/__tests__/protocol.test.ts`
+  - `scripts/check-protocol-version.mjs`
+  - plus whatever adapter tests the Zimone bump moved in lockstep (the phase plan reads `git show 6295aa7 --stat` for the set)
+
+**Architecture decisions.**
+1. **New `GameState` side map: activated-ability stack entries as they last existed on the stack.**
+   - Keyed by stack-entry id.
+   - The sibling of the departed-spell record, with the same serde, determinism and equality treatment.
+   - It records **only** activated-ability entries, through an exhaustive match over the stack-entry kind.
+2. **Lifecycle mirrors the departed-spell record exactly:**
+   - recorded at the same non-resolving-removal authority;
+   - cleared at the same step-transition point;
+   - pruned by a sibling of the trigger-referenced retention pass, which keeps entries a stacked or resolving activation-event trigger still names.
+3. **The consumer is the existing activation lookup in the copy authority.**
+   - The departed record is consulted only when the entry is not on the stack.
+   - Identity is the **stack-entry id**, never the source object. Two activations of one source must stay distinguishable (draft identity-contract hostile fixture).
+4. **F1: visibility redaction is required.**
+   - The viewer projection must apply to the new map every redaction it applies to the departed-spell record and to live stack entries. Nothing in a departed ability entry may reach a viewer that the same entry would not show while on the stack.
+   - The draft's "projection copies the map unchanged" is rejected.
+   - The phase plan enumerates, by measurement, which redactions apply to a stack entry's payload: for example, private cleanup authority, hidden choices, and face-down source identity. It also adds a projection test in the existing departed-spell redaction test pattern.
+5. **F2: phase 2 owns the run's single protocol bump.**
+   - **Why phase 2.** It is the earliest phase that changes wire shape (a new serialized `GameState` field). By precedent, a new `GameState` carrier bumps: v139 `crew_history_this_turn`, v142 `LinkedExileSnapshot.incarnation`. "Additive" does not exempt it.
+   - **What moves.** The bump moves the full-game `PROTOCOL_VERSION` history entry, server-core's pin, the P2P `WIRE_PROTOCOL_VERSION` with its test, the client adapter, and the check script's expected offsets, in lockstep exactly as the Zimone bump did. Each value is the next one after the phase base's (the phase plan reads them; the charter does not fix numbers).
+   - **Bundling.** One bump covers the whole run, per precedent: multi-change entries such as v82 and v129 exist, and Zimone's one bump covered four new types. The history entry names phase 2's field. Phase 3 **extends the same entry's text** to name `Effect::ModifyAnnouncedX` / `XModification`, without moving any number. That edit is in phase 3's standing comment-only class.
+   - **No other phase bumps.**
+   - If the Zimone PR's numbers move upstream before ship, re-deriving this run's numbers is ship-time work for `/ship-commits`, not a re-charter.
+6. **Journal decision.** The departed-ability record's write follows **exactly** the journaling status of the departed-spell record's write at the same authority. If that write is journaled as part of a resolved-rules command, the ability record joins it; if it is not, neither is the new one. The phase plan establishes which. The run adds no new resolved-command kinds.
+
+**Constraints carried.** F5, F6 (as in phase 1). Draft probe P4 (Stifle targeting an activated stack entry through the harness) is this phase's to establish.
+
+**Addenda file:** `.git/engine-implementer-runs/unbound/addenda/phase-2`
+
+**Deferral list.**
+- Line 1's doubling and its version-entry text → **DEFERRED(phase 3)**
+- Ordering → **DEFERRED(phase 4)**
+
+**Recursive phase-fit check.**
+- T1 is not met (one unit).
+- T2 is not met: about 6 authored anchors plus tests; version surfaces are excluded.
+- The conjunction does not fire.
+
+---
+
+## Phase 3: `Effect::ModifyAnnouncedX` and the single X-rewrite authority (draft U3)
+
+**Goal.** "double the value of X" in a spell-cast trigger body rewrites the X of the triggering spell on the stack (CR 107.3c: "the value of X may change while that spell or ability is on the stack"). Every downstream reader sees the new X:
+- entry counters (CR 107.3m)
+- mana value on the stack (CR 202.3e)
+- X-referencing text (CR 107.3e)
+- copies (CR 707.10)
+
+No additional mana is paid (ruling 12). Two Unbounds give ×4 (ruling 7). X = 0 still triggers and stays 0 (ruling 6). Unbound reaches coverage-supported.
+
+**Scope rule (anchors).** Standing classes implied; the forced-arm fan-out of a new `Effect` variant is compiler-forced.
+- `crates/engine/src/types/ability.rs`
+- `crates/engine/src/game/effects/` (new resolver module plus `mod.rs`)
+- `crates/engine/src/game/stack.rs`
+- `crates/engine/src/parser/oracle_effect/counter.rs`
+- `crates/engine/src/parser/oracle_effect/tests.rs`
+- `crates/engine/src/parser/oracle_effect/gap_diagnosis.rs` (its test pins "double the value of X" as a Quantity gap)
+- `crates/engine/tests/integration/`
+- Comment-only: the protocol history entry in `crates/lobby-broker/src/protocol.rs` (decision 2.5)
+
+**Architecture decisions.**
+1. **A new `Effect::ModifyAnnouncedX { target, modification: XModification }`, with `XModification { Double }`.**
+   - It is a typed enum, extensible to Glava's "become N" without a later `SetX` sibling.
+   - `DoubleTarget::AnnouncedX` is refused. `DoubleTarget` spans CR 701.10's subjects, and the value of X is CR 107.3, so adding it would cross categorical sections.
+   - CR 701.10 is cited only as the printed verb; the annotation must say it has no X sub-rule.
+2. **A single authority for rewriting a stack object's announced X**, in the stack module. It writes every X channel that a reader consumes during the object's stack life and at its resolution, in lockstep:
+   - it is an exhaustive match over the stack-entry kind;
+   - spells and activated abilities are written (CR 107.3a);
+   - other kinds are no-ops;
+   - the activated-ability arm never touches spell-only channels.
+   - The phase plan enumerates the channels by measurement (draft T-D is the starting map, not a fact).
+   - Cast-time history records stay as-cast, unless the plan finds a reader of their X *value* and justifies otherwise.
+3. **Binding.** The resolver resolves "X" through the incarnation-pinned triggering-spell authority (CR 400.7).
+   - Only a live on-stack incarnation is written.
+   - A departed or gone spell (countered before the doubling resolves) is a no-op that still emits the effect-resolved event.
+4. **Parser arm.** It lives in the "double …" dispatch, before the generic arm, as a nom tag over the full phrase.
+   - It produces the effect only when the parse context's object anaphor is the triggering source (a spell-cast trigger body).
+   - Anywhere else it produces a strict-failure `Effect::unimplemented`.
+   - The plan establishes that the trigger body's context reaches this dispatch. If it does not, the plan threads the existing seed and does not add a field.
+5. **Journal decision.** The X rewrite is an in-place stack-entry mutation. It joins the documented, currently unjournaled in-place class named in `types/resolved_commands.rs`, and its doc comment says so. This run does not open the in-place journaling class.
+   - If the phase plan finds a census that pins in-place stack write sites, the new site is registered there with its CR. That is an addendum, not a re-charter.
+6. **Ordering profile, minimal.** The new effect's read/write profile declares a write of the event object (so phase 4 has a writer to classify). The read side is phase 4's.
+7. **Wire.** No new bump (decision 2.5). This phase extends the bump's history entry text, and adds no TypeScript mirror unless the plan finds a generated binding for `Effect`. A binding found that way is grouped with its source under the standing class.
+
+**Constraints carried.** F5 (this phase's Sizing separates the authored set from the forced-arm set by a reproducible sibling-name measurement), F6.
+
+**Addenda file:** `.git/engine-implementer-runs/unbound/addenda/phase-3`
+
+**Deferral list.**
+- Order-trigger prompt between the doubling and same-event X readers (Hydroid Krasis, ruling 4) → **DEFERRED(phase 4)**. Until phase 4, that pair may auto-order. This is a known interim divergence, recorded in the phase-3 summary.
+- Glava "become 5" (`XModification::Become`) → out of run.
+
+**Recursive phase-fit check.**
+- T1 is not met (one unit).
+- T2 is likely met by the forced-arm fan-out alone.
+- The conjunction does not fire.
+
+---
+
+## Phase 4: Same-event ordering honesty (draft U4)
+
+**Goal.** When the doubling and a same-event trigger that reads the spell's X at resolution trigger together, the controller is offered the order (CR 603.3b; ruling 4: "you choose whether to double the value of X before or after that ability resolves"). The two orders give different results, and the spell's own entry counters are the doubled value either way.
+
+**Scope rule (anchors).**
+- `crates/engine/src/game/ability_rw.rs`
+- `crates/engine/tests/integration/`
+- The ordering parity-sweep pin lists, if the sweep requires an entry (comment and evidence lists; never a floor bump)
+
+**Architecture decisions.**
+1. **A bare X with no own chosen value is classified as an event-live read.** It is the X reference that falls back to the triggering object's X (CR 107.3e). This makes it conflict with phase 3's event-object writer. Other variable and mana-value references keep their current profile.
+2. **The group-ordering gate is used as it is.** The phase plan establishes, by measurement, whether the gate unions profiles or needs a pairwise feed (draft probe P3), and edits only the profiler accordingly.
+3. **The full-DB ordering parity sweep is run and its delta read.** New genuine same-event pairs are admitted with CR 603.3b evidence. No floor is ever bumped.
+
+**Constraints carried.** F5, F6.
+
+**Addenda file:** `.git/engine-implementer-runs/unbound/addenda/phase-4`
+
+**Deferral list.** None inside the run.
+
+**Recursive phase-fit check.**
+- T1 is not met (one unit).
+- T2 is not met (2–3 paths).
+- The conjunction does not fire.
+
+---
+
+## Run-level deferrals (outside this run, each named with its discriminating test)
+
+1. **Mana abilities with {X}: explicitly out of scope** (the draft's residual 1; the review note asked for a landing phase or an explicit out-of-scope).
+   - "activate an ability" includes mana abilities, and Unbound's trigger is not itself a mana ability (CR 605.5a: it triggers from activation but cannot add mana). So the trigger should trigger.
+   - But the ability it would copy never used the stack (CR 605.3b). Neither the card, its rulings nor CR 707.10 determines what "copy that ability" produces for a mana ability that has already resolved. Implementing "trigger fires, copy does nothing" or "copy adds X mana" would each ship a guess.
+   - The run keeps today's behaviour (no trigger for mana abilities). The phase-1 summary records it as a known divergence. The only corpus card the draft found is Wizard's Rockets.
+   - Follow-up test: `unbound_triggers_on_x_mana_ability` (`DEFERRED(follow-up)`), pending a rules determination.
+   - If the orchestrator or the user prefers landing the trigger half in-run, it belongs in phase 1 by addendum; the copy half stays out.
+2. **A single-definition disjunctive printed trigger** (an `or_trigger`-style field on `TriggerDefinition`). This would let F3's declined cards (Bill Potts, Glava) split while keeping one frequency counter. It is also the parameterization target for the `EntersOrAttacks`-family siblings. Follow-up test: Bill Potts copies once per turn across both legs.
+3. **Glava's "have the value of X become 5"** (`XModification::Become`). It needs item 2 first, plus the "isn't a mana ability" activation qualifier.
+4. **Vazi's Treasure-spent intervening-if over a cast-or-activate split.** It needs a per-half condition distribution for non-cost conditions.
+
+## Seam notes
+
+- **`parser/oracle_trigger.rs`** is phase 1's only. Zimone phase 2 also edits it, so phase 1 runs strictly after Zimone's tip is committed.
+- **`game/stack.rs`** is touched by phase 2 (departed record) and phase 3 (X-rewrite authority), sequentially.
+- **The integration test file** (`unbound_flourishing.rs`) is created in phase 1 and extended in phases 2–4. The `mod` line is added once, in phase 1.
+- **`game/ability_rw.rs`**: phase 3 adds the new variant's forced arm (the writer, decision 3.6). Phase 4 changes the read-side arm. Sequential execution makes this safe.
+- **Version surfaces**: phase 2 bumps. Phase 3's edit to the history entry is comment-only. No other phase touches them.
+- **No strict-failure tags are needed to hold the tree green.** Line 1's effect stays `Unimplemented` through phases 1–2, so Unbound is honestly unsupported until phase 3. F3/F4 declines keep the declined cards honestly red.
+- **Not charter content (orchestrator triage):** draft residual 2, the pre-existing per-half frequency counter in the split convention, is superseded in-run by F3's decline. Any already-split printed compound with a frequency rider that the phase-1 plan finds is pre-existing and goes to triage.
+
+## Feasibility exit
+
+Not taken. Each of the 1→2, 1→3 and 3→4 seams leaves a green tree.

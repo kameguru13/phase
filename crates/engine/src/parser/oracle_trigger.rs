@@ -3059,10 +3059,10 @@ fn condition_contains_source_counter(condition: &TriggerCondition) -> bool {
 /// - CR 107.1: a `QuantityQuality` gate over a quantity reference ("you control a prime
 ///   number of lands") names that reference — the same expression the condition evaluates.
 ///
-/// `And` binds only when every gate agrees; non-gate conjuncts don't take part. `Not` and
-/// `Or` never bind: neither establishes which number held. Assumption (no printed card):
-/// on an event trigger that also carries an event amount, a positive gate still binds the
-/// anaphor, as `HadCounters` does. That includes a "that much" placeholder, which lowers
+/// `And` binds only when every gate agrees; non-gate conjuncts don't take part. `Not`, `Or`
+/// and `EventTime` never bind: none establishes which number held. Assumption (no printed
+/// card): on an event trigger that also carries an event amount, a positive gate still binds
+/// the anaphor, as `HadCounters` does. That includes a "that much" placeholder, which lowers
 /// to the same `EventContextAmount`.
 fn positive_count_gate_qty(condition: &TriggerCondition) -> Option<QuantityRef> {
     match condition {
@@ -3081,6 +3081,13 @@ fn positive_count_gate_qty(condition: &TriggerCondition) -> Option<QuantityRef> 
             gates.all(|gate| gate == first).then_some(first)
         }
         TriggerCondition::Not { .. } | TriggerCondition::Or { .. } => None,
+        // CR 603.4 + CR 603.8: an `EventTime` condition is the trigger event itself (an
+        // attack-while gate, an event count qualifier, a state trigger's condition), read
+        // when the event occurs and never rechecked; CR 603.4's recheck applies only to an
+        // intervening "if". It is not a positive resolution-recheck count gate, so it names
+        // no antecedent for the body's count anaphor — binding one would read the count at
+        // resolution, not the count the event measured. Deliberately no descent.
+        TriggerCondition::EventTime { .. } => None,
         _ => None,
     }
 }

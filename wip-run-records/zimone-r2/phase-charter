@@ -1,0 +1,298 @@
+# Phase charter: run zimone-r2 (PR phase-rs/phase#10004, round-2 blockers F1–F4)
+
+Revision r2. Derived from draft plan r1 (unreviewed) and revised under charter review r1: its decision finding D-1 and corrections C-1..C-8 are applied as constraints. The phase indexes below are the only identifiers. Per chartered.md the charter holds no commit SHA: phase 1's base is the run-level `BASE_SHA`, and each later phase's base is the previous phase's accepted candidate.
+
+## Original task (carried into every phase)
+
+This run fixes the four round-2 blockers from maintainer matthewevans, all in this PR (user decision, phase-fit entry 4):
+- **F1/M1:** CR 608.2e two-action order for player-scoped token creation followed by counter placement. Maintainer's fix shape: create tokens for all seats first, keep each seat's created-object refs through pauses, then place counters. Requested control: a real-cast, unequal-power, two-player Oversimplify test (Hardened Scales + Branching Evolution) requiring both Fractals at the first replacement prompt.
+- **F2/M2:** coverage honesty for quantities nested in conditions. Fix shape: recurse through ability and trigger conditions with `extract_quantity_features`; keep `Unhandled` on repeated keys. Controls: direct, compound and trigger cases, and both aggregation orders.
+- **F3/M3:** a negated subject-dependent condition must not be vacuously true when its referent is absent. Fix shape: extend the pre-negation guard via `quantity_expr_missing_resolution_only_referent`. Controls: positive, negated, absent and present.
+- **F4/M4:** the AI must pair a created-token placement with its true publisher. Fix shape: engine-owned publisher classification; pair only when the nearest publisher is `Token`. Controls: ordinary and intervening-Conjure chains.
+
+It also takes minimal follow-ups: C4 (an explicit no-descent `EventTime` arm), C2 (a test rename and doc; review-input records no maintainer stance on C2), and a Wild Hypothesis regression guard (from the maintainer's 'structural reparenting' parse-evidence note). The maintainer's stances, from review-input.md's 'NEW since the 19:20Z snapshot' section and phase-fit entry 3, are:
+- C5: 'Nonblocking limitation';
+- C4: 'The state-trigger head is not admitted by the current grammar. Blind recursion is not justified.';
+- C3: 'The malformed-count fallback predates this change. Nonblocking.'
+
+## Premise verification (Step 0, survives)
+
+I checked the Oracle text of every card this charter names against `data/mtgjson/AtomicCards.json`.
+
+| Card | Clause that matters |
+|---|---|
+| Oversimplify | "Each player creates a 0/0 … Fractal creature token **and puts** a number of +1/+1 counters **on it** equal to the total power of creatures they controlled that were exiled this way." |
+| The War Games, ch. I | "Each player creates three tapped 1/1 white Warrior creature tokens. **The tokens** are goaded for as long as this Saga remains on the battlefield." |
+| Rendmaw, Creaking Nest | "… each player creates a tapped 2/2 black Bird creature token with flying. **The tokens** are goaded for the rest of the game." |
+| Wild Hypothesis | "Create a 0/0 … Fractal creature token. Put X +1/+1 counters on it. Surveil 2." |
+| Tunnel Tipster | "… if a face-down creature entered the battlefield under your control this turn, put a +1/+1 counter on this creature." |
+| Zimone, All-Questioning | "… create Primo, the Indivisible, … then put that many +1/+1 counters on it." |
+
+CR texts grepped in `docs/MagicCompRules.txt`: 608.2c, 608.2e, 608.2f, 111.2, 115.10a, 400.7, 603.4, 609.3, 700.11, 701.15b. CR 101.4 and CR 616.1 are cited from draft r1's verified list; each phase plan re-greps every number it writes.
+
+Skills that inform the unit boundaries (Step 1, survives):
+- **Phase 1:** `/casting-stack-conditions` (condition evaluation), `/oracle-parser` (delegation only), `/card-test`.
+- **Phases 2 and 3:** `/casting-stack-conditions` + `/add-interactive-effect` (the continuation and pause pattern), `/card-test`.
+- **Phase 3:** `/oracle-parser` as well (structural lowering).
+- **Phase 4:** `/add-card-data-pipeline` (coverage report).
+- **No phase adds an enum variant,** so `/add-engine-variant` is not triggered. If a phase plan finds it needs a variant, that is drift: the variant's phase records it as an addendum and runs the gate.
+
+Analogous traces that set the seams (Step 2, survives; from draft r1):
+- The player-scope linked-exile sidecar: a paused fan-out defers its unscoped tail until every seat leg drains, and accumulates its batch from events. This is the template for the created-token union (phase 2).
+- The Windfall co-scoped tail: a detached tail that keeps `player_scope` re-enters the driver as its own all-seats loop. This is the template for CR 608.2e "action, then next action" (phase 3).
+- The delayed-trigger snapshot that turns `LastCreated` into `ParentTarget`: it snapshots ids with incarnation pins. This is the template for per-seat binding (phase 3).
+
+## Evaluation of the draft's suggested partition
+
+The draft suggests:
+- **Phase 1 = U-A + U-B:** 2 units, 10 counted paths in the draft.
+- **Phase 2 = U-C + U-D + U-E.**
+
+**It fails the recursive check.** The draft's phase-1 count leaves out the protocol ledger entries. U-B's serialized sidecar change must amend the PR's 145 ledger (decision D2.4). That adds every file in which the PR's protocol bump wrote a 145 or wire-127 ledger entry, which takes a 2-unit phase past 13 counted paths, and T1∧T2 fires inside the phase.
+
+**U-B is also likely two units under review.** Its body names two independently tested behaviours:
+- the union of every seat's created tokens for an unscoped tail (War Games, Rendmaw);
+- CR 608.2e two-action ordering with per-seat binding (Oversimplify).
+
+The second consumes the first. That is a genuine infrastructure→consumer seam (T3), so this charter splits there.
+
+**The draft's phase 2 bundles F2 with unrelated fixes.** F2 should be cleanly separable, so this charter gives it a phase of its own, last.
+
+**Result:** four sequential phases. Every seam leaves the tree green; see the per-phase seam notes.
+
+| Phase | Units | Blocker |
+|---|---|---|
+| 1 | U-A (F4), U-C (F3), U-E (C2, C4, Wild Hypothesis guard) | F4, F3 |
+| 2 | U-B1: player-scope created-token union | F1, part 1 (War Games and Rendmaw) |
+| 3 | U-B2: CR 608.2e two-action player scope with per-seat binding | F1, part 2 (Oversimplify) |
+| 4 | U-D: coverage condition-quantity honesty | F2 |
+
+**Why this order:**
+- Phase 1 lands the engine-owned token-creator authority that phase 2 consumes (infrastructure → consumer).
+- Phase 1 also lands the Wild Hypothesis guard before phase 3 changes the player-scope splitter.
+- Phase 2 lands the union ledger that phase 3's per-seat binding reads (infrastructure → consumer).
+- Phase 4 depends on nothing earlier except a green tree, and nothing depends on it. Its coverage change is therefore attributable to phase 4 alone, and the phase can be peeled off without reworking an accepted phase.
+
+---
+
+## Phase 1: engine-owned created-referent authority and local contracts (F4, F3, minor)
+
+**Goal.**
+- The AI pairs a `PutCounter { target: LastCreated }` placement with a created token only when the nearest publisher of the chain-created referent is a token creator.
+- The publisher classification has one engine-owned authority.
+- A negated subject-dependent condition whose resolution-only subject is absent is not vacuously true.
+- The C2 rename, the C4 explicit arm and the Wild Hypothesis regression guard land.
+
+**Scope rule.** The phase owns these subsystems and anchor paths:
+- The `impl Effect` classification predicates in `crates/engine/src/types/ability.rs`.
+- The parser's publisher predicates in `crates/engine/src/parser/oracle_effect/lower.rs`, delegation only: their names are kept and their callers are unchanged (D1.1).
+- In `crates/engine/src/parser/oracle_effect/sequence.rs`, only the tokens-goaded continuation arm's token-creator guard, delegation only: the arm calls the engine token-creator predicate instead of listing its members.
+- `crates/phase-ai/src/ability_chain.rs`, including its inline tests. Also `crates/phase-ai/src/policies/x_reference.rs`, but only if a walk-level test is placed there.
+- In `crates/engine/src/game/effects/mod.rs`, only the condition evaluator's no-subject guard and its inline tests, and the declined-gate walk's publisher call (line-level: it may switch from the parser delegator to the engine predicate).
+- In `crates/engine/src/game/triggers.rs`, only the C2 test.
+- In `crates/engine/src/parser/oracle_trigger.rs`, only `positive_count_gate_qty`.
+- `crates/engine/tests/integration/created_token_counter_sequence.rs`.
+- Standing classes are implied.
+
+**Architecture decisions.**
+- **D1.1. One engine-owned authority.** `impl Effect` gains two classification predicates:
+  - a token-creator predicate, the set the parser calls token-creating today;
+  - a created-referent-publisher predicate, a superset of the first.
+
+  Membership is defined by one runtime criterion: the effect's resolver assigns the referent that `TargetFilter::LastCreated` reads. The parser and phase-ai both delegate to these predicates, and no publisher list is re-derived anywhere. The parser keeps `is_token_creating_effect` and `publishes_chain_created_referent` as thin delegators to the new `impl Effect` predicates. No rename; existing parser callers are unchanged. Each candidate member the draft names (`CopyTokenBlockingAttacker`, `EachPlayerCopyChosen`) joins the publisher predicate only if its resolver is shown to meet the criterion, and joins the token-creator predicate only if, in addition, the object it publishes is a token it creates (CR 111.1). Any change to the token-creator set is a parse-diff change the phase plan derives card by card.
+- **D1.2. The AI pairing rule.**
+  - The placement's referent is the nearest preceding publisher, because a later publisher overwrites the referent.
+  - It pairs as a created-token placement only when that publisher is `Effect::Token`.
+  - `CopyTokenOf` and `Populate` stay unpaired; the doc records why.
+  - No AI-side logic is added beyond consuming the predicate.
+  - CLAUDE.md's `cargo ai-gate` rule applies.
+- **D1.3. The no-subject guard covers the class.** It covers every subject-dependent condition whose subject is a single resolution-only referent: `QuantityQuality` and `QuantityCheck` over a quantity whose resolution-only referent is absent, plus the existing revealed-card-type arm, all seen through `Not`.
+  - `And`/`Or` are not recursed. The guard covers a negated subject-dependent leaf. A negated compound with a subject-dependent operand (for example `Not(And(QuantityQuality{absent}, …))`) remains vacuously true, and the guard's doc records this as a known limitation that no printed card reaches.
+  - The PR-added `QuantityQuality` arm cites CR 608.2c, not CR 701.57c.
+  - The `QuantityCheck` arm is part of the class, not scope creep.
+- **D1.4. C4.** `positive_count_gate_qty` gets an explicit `TriggerCondition::EventTime` arm that does **not** descend, with a CR-annotated reason: an event-time gate is not a resolution-recheck count gate. This follows the maintainer's "blind recursion not justified".
+- **D1.5. C2 is a rename and doc only.** The constructed-scope unit test is renamed to say it tests the bind function, and its doc points at the existing production recheck coverage. No logic changes.
+- **D1.6. The Wild Hypothesis guard.** A cast-pipeline test guards Wild Hypothesis's reading derived from its Oracle text: counters on the Fractal before the surveil prompt, and Surveil still resolves. It must stay green through phase 3. If it is red at the phase base, the defect takes the pre-existing-report route.
+
+**Deferral list.**
+- The production consumer of the token-creator predicate inside the player-scope driver → phase 2. No phase-1 test exercises the predicate through the driver: `DEFERRED(phase 2)`. In phase 1 the predicates reach production through parser delegation (and, for the publisher predicate, through the AI pairing and the declined-gate walk), which keeps the tree free of dead code.
+- The Oversimplify, War Games and Rendmaw behaviour → phases 2 and 3.
+- Coverage → phase 4.
+
+**Addenda:** `<run-root>/addenda/phase-1`
+
+**Recursive check.** Units: U-A, U-C, U-E. That is 3 units, or 5 if a reviewer counts U-E's three items separately, so T1 holds.
+
+Counted paths:
+- **Definite:** `types/ability.rs`, `parser/oracle_effect/lower.rs`, `phase-ai/src/ability_chain.rs`, `game/effects/mod.rs`, `game/triggers.rs`, `parser/oracle_trigger.rs`, `parser/oracle_effect/sequence.rs`, `tests/integration/created_token_counter_sequence.rs`.
+- **Conditional:** `phase-ai/src/policies/x_reference.rs`, only if a walk-level test is placed there.
+- **Not admitted, by D1.1:** because the parser predicate names are kept as delegators and their callers are unchanged, no rename conditional and no caller-switch conditional exist.
+- **Conditional, comment-only:** `types/zones.rs`, whose doc names the parser function as the membership authority to change together with the engine marks; after D1.1 that authority is the `impl Effect` predicate. The other comment sites that name the parser predicates (`rg -n 'publishes_chain_created_referent|is_token_creating_effect'` outside the definite files) still describe a delegator truthfully and are not admitted.
+- **Worst case:** the definite paths plus `x_reference.rs` (if a walk-level test is placed there) plus `types/zones.rs` (comment-only). That is below 13, so T2 is false and NOT(T1∧T2) holds.
+- **Pre-named fallback seam:** if scope-freeze materializes ≥13, the re-charter splits U-E out as its own phase. Its items are independent of U-A and U-C.
+
+---
+
+## Phase 2: player-scope created-token union (F1, part 1)
+
+**Goal.**
+- "Each player creates … tokens" is one action with one result (CR 608.2f).
+- An unscoped following instruction that reads the created referent ("The tokens are goaded") reads every token that action created for every seat, not only the last seat's, whether the fan-out completes synchronously or pauses mid-fan-out for a player choice.
+
+**Scope rule.** The phase owns these subsystems and anchor paths:
+- The player-scope driver, clause-result publication, and every reader or writer of the paused-fan-out sidecar, including the continuation drain and the resolution-time extension, in `crates/engine/src/game/effects/mod.rs`.
+- The sidecar type and its `PendingContinuation`/`GameState` fields in `crates/engine/src/types/game_state.rs`.
+- Comment-only: `crates/engine/src/game/visibility.rs`.
+- Tests: `crates/engine/tests/integration/goaded_creature_under_pacifism_visible.rs`, plus a new integration test file under `crates/engine/tests/integration/` if the plan picks one; its `main.rs` mod line is a standing class.
+- The protocol-145 ledger entries (D2.4) in:
+  - `crates/lobby-broker/src/protocol.rs`
+  - `crates/server-core/src/protocol.rs`
+  - `scripts/check-protocol-version.mjs`
+  - `client/src/adapter/ws-adapter.ts`, the full-game 145 entry
+  - `client/src/network/protocol.ts`, the wire-127 note
+- Standing classes are implied.
+
+**Architecture decisions.**
+- **D2.1. When the union is published.** At clause completion, for a player-scoped clause whose effect is a token creator (the phase-1 predicate), the created referent is published as the union of every token the clause's creation action created.
+  - It applies at both completion points:
+    - synchronous: through the existing single clause-publication authority (CR 608.2f, "one action ⇒ one terminal result");
+    - paused: when the last seat leg drains and nothing waits.
+  - The token resolver and the counter resolver are unchanged, and no new driver mode is created.
+- **D2.2. Attribution and identity.**
+  - Union members are attributed to the clause's own creation action. Tokens added by replacement effects (Parallel Lives, Anointed Procession) are included, because they are created by that same action.
+  - Tokens created by anything outside the clause are excluded, including another clause of the same source.
+  - Each member is pinned by incarnation when observed (CR 400.7).
+  - At publication, only members that are still live at the same incarnation are written (CR 609.3).
+- **D2.3. One generalized sidecar.**
+  - The existing paused-fan-out sidecar is generalized to carry a second, optional channel: the created-token union, which accumulates across pauses and nested re-pauses exactly as the linked-exile batch does. No second sidecar type and no new `Effect`, `WaitingFor` or `GameAction` variant.
+  - The change is **additive and legacy-decodable**:
+    - existing serialized keys keep their names and meanings; a Rust-side rename, if any, keeps the wire key;
+    - the new channel key is optional with a serde default;
+    - a sidecar decoded without it behaves exactly as today's linked-exile sidecar.
+  - Every consumer that today treats "sidecar present" as "linked exile" is keyed on the channel it actually needs. The queue-end park stays keyed on presence, because both channels defer the tail.
+- **D2.4. Protocol: ride the PR's unshipped 145; no second bump.**
+  - The PR already moves full-game protocol to 145 and P2P wire to 127. The full-game floor is current-only, so any v144 peer is already refused, and a further `GameState` shape change inside the same unshipped bump needs no new number.
+  - Every ledger entry that enumerates what 145 (or wire 127) carries must also name the sidecar change: the lobby-broker version ledger, the server-core v145 test doc, the check-protocol-version.mjs v145 comment lines, the client full-game 145 entry in `client/src/adapter/ws-adapter.ts` and the client wire-127 note in `client/src/network/protocol.ts`. The set is every file in which the PR's protocol bump wrote a 145 or wire-127 ledger entry; the phase plan regenerates it from the PR diff (`-G'145|127'`), minus files whose only change is a version number. That makes those entries comment-level edits, which this charter counts.
+  - D2.3's additivity is what makes a resolution-state wire-version bump unnecessary.
+  - If 145 has shipped upstream by handoff, re-numbering is a PR-handoff merge concern, not charter drift. If the sidecar shape cannot decode every legacy form additively, D2.3 and D2.4 break: re-charter the remaining phases.
+- **D2.5. Oversimplify is not changed in this phase.**
+  - Its placement stays a per-seat local continuation of its token clause until phase 3.
+  - Union publication at clause completion is observable only by a following instruction, so Oversimplify's readings must be unchanged; existing Oversimplify and Zimone tests stay green.
+
+**Deferral list.**
+- Every discriminating row about Oversimplify's two-action order, its per-seat binding, its parse shape (the placement carrying the player scope), and the rewritten splitter unit test: `DEFERRED(phase 3)`. These structurally cannot exist until phase 3 detaches the placement.
+- Phase 2's interim verification for the shared machinery is the War Games and Rendmaw rows, synchronous and paused, plus the green existing suites.
+- Coverage → phase 4.
+
+**Addenda:** `<run-root>/addenda/phase-2`
+
+**Recursive check.** One unit, so T1 is false and the conjunction cannot fire.
+
+Counted paths:
+- **Definite:** `game/effects/mod.rs`, `types/game_state.rs`, `game/visibility.rs`, `tests/integration/goaded_creature_under_pacifism_visible.rs`, and the ledger files named in the scope rule.
+- **Conditional:** a new integration test file, and the `main.rs` mod line.
+- Below 13 either way.
+
+T1 alone keeps the phase single even if a reviewer splits "synchronous union" from "paused union", because the count stays below 13.
+
+---
+
+## Phase 3: CR 608.2e two-action player scope with per-seat binding (F1, part 2)
+
+**Goal.**
+- For Oversimplify's class, a player-scoped instruction whose second action, under the same subject, refers back to "it" (the token that player created): every seat completes the creation action first, in APNAP order (CR 101.4).
+- Then every seat performs the placement, in APNAP order, each bound to that seat's own token.
+- Counter-replacement ordering choices are made by the affected object's controller (CR 616.1), in APNAP order.
+- Both Fractals exist before the first placement prompt.
+
+**Scope rule.** The phase owns these subsystems and anchor paths:
+- The continuation lowering of "… and puts counters on it" in `crates/engine/src/parser/oracle_effect/sequence.rs`. Also `crates/engine/src/parser/oracle_effect/assembly.rs`, but only if the plan establishes that the subject's player scope is stamped there.
+- In `crates/engine/src/game/effects/mod.rs`, the local-continuation predicate, the player-scope splitter and its inline tests, and the driver's per-seat binding on co-scoped tail re-entry.
+- Tests: `crates/engine/tests/integration/oversimplify_per_player_fractal.rs`, plus a new integration test file if the plan picks one.
+- Standing classes are implied.
+
+**Architecture decisions.**
+- **D3.1. Parser: scope propagation.** The placement inherits the subject's player scope, because "each player" governs both verbs (CR 608.2e). This is structural propagation: no new combinator and no string dispatch. Chains with no player scope (Wild Hypothesis) are unchanged.
+- **D3.2. Splitter.** The placement is no longer a local continuation of its token clause. The PR-added (Token, PutCounter{LastCreated}) local-continuation pairing is removed. The placement detaches as a co-scoped tail and re-enters the driver as its own all-seats loop, the existing Windfall path, so all seats finish action 1 before any seat starts action 2.
+- **D3.3. Per-seat binding.**
+  - At the co-scoped tail's loop start, the driver snapshots the union published by phase 2.
+  - For each seat, the `LastCreated` referent is bound to the subset of that snapshot the seat **owns**: CR 111.2, the creator is the owner. Binding is never by controller, because control can change between the two actions.
+  - The binding uses explicit object refs with incarnation pins, rewriting `LastCreated` → `ParentTarget`, after the delayed-trigger precedent.
+  - These are affected objects, not targets (CR 115.10a), so the binding adds no targeting legality.
+  - A seat with an empty subset does nothing (CR 609.3).
+  - The binding applies only to `LastCreated`-reading templates under a player scope.
+  - A pause during action 2 rides the existing leg continuation, with each leg's binding already baked in.
+- **D3.4. No new serialized shape.** The binding lives in existing `ResolvedAbility` targets. If the plan establishes that a new serialized field is needed, it rides 145 under D2.4, recorded as an addendum.
+
+**Deferral list.** Coverage → phase 4. Nothing else; every `DEFERRED(phase 3)` row from phase 2 lands here.
+
+**Addenda:** `<run-root>/addenda/phase-3`
+
+**Recursive check.** One unit, so T1 is false. Counted paths:
+- **Definite (3):** `parser/oracle_effect/sequence.rs`, `game/effects/mod.rs`, `tests/integration/oversimplify_per_player_fractal.rs`.
+- **Conditional (3):** `parser/oracle_effect/assembly.rs`, a new test file, and the `main.rs` mod line.
+- **Up to 6.**
+
+---
+
+## Phase 4: coverage honesty for condition quantities (F2)
+
+**Goal.**
+- Every `QuantityRef` reachable from an ability condition or a trigger condition is classified.
+- An `Unhandled` verdict can never be overwritten by a later `Handled` verdict for the same feature key.
+- Coverage verdicts change only where a card's Oracle text derives the change.
+
+**Scope rule.** The phase owns these anchor paths:
+- `crates/engine/src/game/coverage.rs`, including its inline tests.
+- `crates/engine/src/game/triggers.rs`, but only for runtime-evidence tests behind a reclassification, and only if the plan cannot cite existing ones.
+- `crates/engine/src/game/quantity.rs`, CR annotation only, if the plan finds one missing at a reclassified ref's resolver.
+- Standing classes are implied.
+
+**Architecture decisions.**
+- **D4.1. One feature-recording authority.** Every insertion goes through a single sticky merge, under which `Unhandled` is never downgraded.
+- **D4.2. Ability-condition walk.** The ability-condition quantity walk recurses through every compound condition that carries operands (`And`, `Or`, `Not`, and the others the plan enumerates), as the static-condition walker already does.
+- **D4.3. Trigger-condition walk.**
+  - A trigger-condition quantity walker is added and called from trigger feature extraction.
+  - It **descends** into `EventTime`. Coverage asks whether a quantity resolves at all, which is a different question from D1.4's resolution-recheck gate.
+  - Both sites carry a comment saying so, so a reviewer does not conflate them.
+- **D4.4. Defective-reference route.** A ref that coverage classifies `Unhandled` while the resolver implements it is reclassified `Handled` in this phase. This applies only where the plan establishes that the resolver implements the ref and a runtime test proves it. The draft names `SpellsCastLastTurn` and `DescendedThisTurn` as candidates. The phase-fit record and the addendum record it per SKILL.md.
+- **D4.5. Unpredicted flips return to the plan step.** The plan derives the expected flip set from each affected card's Oracle text; Tunnel Tipster's face-down filter is the draft's candidate. A flip outside that derived set returns to the phase plan step and is not absorbed.
+
+**Deferral list.** None.
+
+**Addenda:** `<run-root>/addenda/phase-4`
+
+**Recursive check.** One unit, so T1 is false. Counted paths:
+- **Definite (1):** `game/coverage.rs`.
+- **Conditional (2):** `game/triggers.rs`, `game/quantity.rs`.
+- **Up to 3.** T2 is false even if a reviewer counts D4.1–D4.4 as separate units.
+
+---
+
+## Outside the run (no phase lands these; record in the PR reply)
+
+- **C3, the VariableX fallback: dropped.** It predates the PR, and the maintainer marked it non-blocking ('The malformed-count fallback predates this change. Nonblocking.'). Follow-up only.
+- **C5, the hand-stamped opponent land entry: kept as is.** Maintainer stance: 'Nonblocking limitation'. Reply material is in triage.md §C5.
+- **Non-token created-referent publishers under a player scope** ("each player manifests … those creatures"): not part of D2.1. If a phase plan establishes that a printed card reaches them, it takes the pre-existing-report route (fix, file or drop) and does not become a phase.
+- **PR body and maintainer replies:** the Wild Hypothesis reparenting, the Primo naming, the F1 rules account, and phase 4's coverage flips. This is handoff work.
+
+## Seam notes (for each phase's reviewers and for the integration review)
+
+- **`crates/engine/src/game/effects/mod.rs` is shared by phases 1–3, each in different subsystems:**
+  - phase 1: the condition evaluator, and the declined-gate walk's publisher call;
+  - phase 2: the driver's publication and the sidecar;
+  - phase 3: the splitter and the per-seat bind.
+
+  The phases run in sequence, and each re-reads the file at its own phase base. `crates/engine/src/game/triggers.rs` is shared by phase 1 (C2) and phase 4 (runtime evidence). `crates/engine/tests/integration/main.rs` mod lines are a standing class in any phase. `crates/engine/src/parser/oracle_effect/sequence.rs` is shared by phase 1 (the tokens-goaded guard's delegation) and phase 3 (the placement continuation lowering), in different arms.
+- **Green-tree seams:**
+  - **1→2:** the phase-1 predicates have production callers through parser delegation and the AI pairing, so the tree is clippy-clean without phase 2.
+  - **2→3:** Oversimplify keeps its local-continuation reading until phase 3 (D2.5), and the phase-3 rows are `DEFERRED(phase 3)` in phase 2.
+  - **3→4:** independent.
+- **Protocol:** the serialized change that every phase rides on is phase 2's additive sidecar channel (D2.3), under the unshipped 145 bump (D2.4). Any later serialized change amends the same 145 ledger entries, as an addendum. The integration review checks that the 145 and wire-127 ledger entries name every serialized change in the run span and that no second bump was made.
+- **Integration review consistency checks:**
+  - D1.4, where C4 does not descend into `EventTime`, and D4.3, where coverage does descend, are documented as different questions.
+  - D1.2's AI pairing still reads Oversimplify correctly after D3.1/D3.2.
+  - The phase-1 Wild Hypothesis guard is green at the final candidate.
+  - Parse diff: each phase plan derives its expected parse diff from the Oracle text of every changed card. The integration review checks that the run-span parse diff is the union of those derived sets, and that phases 2 and 4, which change no parser file, contribute none.
+  - The union (D2.1) and the per-seat owner subset (D3.3) use the same attribution and incarnation discipline.
+- **F2 separability:** phase 4 depends on nothing in phases 1–3 except a green tree, and nothing depends on it. It shares no subsystem with them, and the only shared file is triggers.rs, in a different test. Its coverage diff is attributable to phase 4 alone.

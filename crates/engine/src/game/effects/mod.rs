@@ -8,7 +8,6 @@ use crate::game::conditions::{
 };
 use crate::game::filter;
 use crate::game::speed::has_max_speed;
-use crate::parser::oracle_effect::publishes_chain_created_referent;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityUseTally, CardPlayMode,
     CardTypeSetSource, CastFromZoneDriver, ChosenAttribute, CommanderOwnership,
@@ -5056,8 +5055,8 @@ fn declined_gate_surviving_instructions(gate: &ResolvedAbility) -> Vec<&Resolved
     // moves the object or declares a target of its own.
     let mut parent_target_is_declared = gate_declares_target_it_leaves_in_place(gate);
     // Each kept node with its instruction number and printed position; the
-    // kept nodes whose object a later `LastCreated` names (the parser's
-    // publisher authority, `publishes_chain_created_referent`); and those
+    // kept nodes whose object a later `LastCreated` names (the publisher
+    // classification, `Effect::publishes_created_referent`); and those
     // skipped with a later node.
     let mut kept = Vec::new();
     let mut producers = Vec::new();
@@ -5091,7 +5090,7 @@ fn declined_gate_surviving_instructions(gate: &ResolvedAbility) -> Vec<&Resolved
             dropped || !instruction_outlives_declined_gate(node, &audit, parent_target_is_declared);
         if !dropped {
             kept.push((instruction, position, node));
-            if publishes_chain_created_referent(&node.effect) {
+            if node.effect.publishes_created_referent() {
                 producers.push((instruction, position));
             }
         } else {
@@ -20108,10 +20107,22 @@ fn revealed_card_type_condition_subject<'a>(
         })
 }
 
-/// CR 608.2c + CR 700.1: `RevealedHasCardType` riders (including `Not` for
-/// nonland branches) must not evaluate when no card was revealed or moved this
-/// way — negating a failed land match must not become true (issue #2871).
-fn subject_dependent_type_condition_has_no_subject(
+/// CR 608.2c: a subject-dependent condition whose single resolution-only subject
+/// is absent tests nothing, so negating it must not make it true.
+///
+/// - CR 608.2c + CR 700.1: `RevealedHasCardType` riders (including `Not` for
+///   nonland branches) must not evaluate when no card was revealed or moved this
+///   way — negating a failed land match must not become true (issue #2871).
+/// - CR 608.2c: `QuantityCheck` (either operand) and `QuantityQuality` over a
+///   quantity whose resolution-only referent is absent
+///   (`quantity_expr_missing_resolution_only_referent`) — `Not` of a predicate
+///   over "the cost-paid object's mana value" with no such object is not true.
+///
+/// Known limitation: `And` / `Or` are not recursed. The guard covers a negated
+/// subject-dependent leaf; a negated compound with a subject-dependent operand
+/// (for example `Not(And(QuantityQuality { absent }, …))`) remains vacuously
+/// true. No printed card reaches it.
+fn subject_dependent_condition_has_no_subject(
     condition: &AbilityCondition,
     state: &GameState,
     ability: &ResolvedAbility,
@@ -20120,8 +20131,20 @@ fn subject_dependent_type_condition_has_no_subject(
         AbilityCondition::RevealedHasCardType { .. } => {
             revealed_card_type_condition_subject(state, ability).is_none()
         }
+        AbilityCondition::QuantityCheck { lhs, rhs, .. } => {
+            crate::game::quantity::quantity_expr_missing_resolution_only_referent(
+                state, lhs, ability,
+            ) || crate::game::quantity::quantity_expr_missing_resolution_only_referent(
+                state, rhs, ability,
+            )
+        }
+        AbilityCondition::QuantityQuality { quantity, .. } => {
+            crate::game::quantity::quantity_expr_missing_resolution_only_referent(
+                state, quantity, ability,
+            )
+        }
         AbilityCondition::Not { condition } => {
-            subject_dependent_type_condition_has_no_subject(condition, state, ability)
+            subject_dependent_condition_has_no_subject(condition, state, ability)
         }
         _ => false,
     }
@@ -20607,7 +20630,7 @@ pub(crate) fn evaluate_condition(
             comparator.evaluate(l, r)
         }
         AbilityCondition::QuantityQuality { quantity, quality } => {
-            // CR 701.57c: same absent-referent guard as `QuantityCheck` above —
+            // CR 608.2c: same absent-referent guard as `QuantityCheck` above —
             // an absent resolution-only referent makes the predicate false
             // rather than testing the `0` fallback (zero is even).
             if crate::game::quantity::quantity_expr_missing_resolution_only_referent(
@@ -21070,7 +21093,7 @@ pub(crate) fn evaluate_condition(
             .any(|c| evaluate_condition(c, state, ability)),
         // CR 608.2c: Logical negation — true when the inner condition is false.
         AbilityCondition::Not { condition } => {
-            if subject_dependent_type_condition_has_no_subject(condition, state, ability) {
+            if subject_dependent_condition_has_no_subject(condition, state, ability) {
                 return false;
             }
             !evaluate_condition(condition, state, ability)
@@ -37643,7 +37666,7 @@ mod tests {
             "4 lands is not prime"
         );
 
-        // CR 701.57c absent-referent guard: the unguarded read of a missing
+        // CR 608.2c absent-referent guard: the unguarded read of a missing
         // cost-paid object's mana value is 0, which is even — the guard must make
         // the predicate false instead.
         let absent_even = AbilityCondition::QuantityQuality {
@@ -37664,6 +37687,234 @@ mod tests {
             quality: NumberQuality::Parity(Parity::Even),
         };
         assert!(evaluate_condition(&fixed_even, &state, &ability));
+    }
+
+    /// The subject a negated subject-dependent condition reads, supplied per row.
+    enum ConditionSubject {
+        /// No resolution-only referent at all.
+        Absent,
+        /// A cost-paid object with this mana value.
+        CostPaid(u32),
+        /// No cost-paid object, but an effect-context object with this mana value.
+        EffectContext(u32),
+        /// An object target with this power.
+        TargetPower(i32),
+    }
+
+    /// Resolves "You gain 3 life." gated on `condition` through
+    /// `resolve_ability_chain` (the production entry that evaluates
+    /// `ability.condition`) and returns P0's life gained.
+    fn life_gained_under_condition(condition: AbilityCondition, subject: ConditionSubject) -> i32 {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(0x0C200),
+            PlayerId(0),
+            "Condition Source".to_string(),
+            Zone::Battlefield,
+        );
+        let referent = create_object(
+            &mut state,
+            CardId(0x0C201),
+            PlayerId(0),
+            "Condition Subject".to_string(),
+            Zone::Battlefield,
+        );
+        let snapshot = |state: &GameState, mana_value: u32| {
+            let obj = &state.objects[&referent];
+            let mut lki = obj.snapshot_for_mana_spent();
+            lki.mana_value = mana_value;
+            CostPaidObjectSnapshot::capture(obj, lki)
+        };
+        let mut ability = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 3 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        )
+        .condition(condition);
+        match subject {
+            ConditionSubject::Absent => {}
+            ConditionSubject::CostPaid(mana_value) => {
+                ability.cost_paid_object = Some(snapshot(&state, mana_value));
+            }
+            ConditionSubject::EffectContext(mana_value) => {
+                ability.effect_context_object = Some(snapshot(&state, mana_value));
+            }
+            ConditionSubject::TargetPower(power) => {
+                let obj = state.objects.get_mut(&referent).unwrap();
+                obj.card_types.core_types.push(CoreType::Creature);
+                obj.power = Some(power);
+                obj.toughness = Some(power);
+                ability.targets = vec![TargetRef::Object(referent)];
+            }
+        }
+        let before = state.players[0].life;
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        state.players[0].life - before
+    }
+
+    fn cost_paid_mana_value() -> QuantityExpr {
+        QuantityExpr::Ref {
+            qty: QuantityRef::ObjectManaValue {
+                scope: ObjectScope::CostPaidObject,
+            },
+        }
+    }
+
+    fn cost_paid_mana_value_is_even() -> AbilityCondition {
+        use crate::types::ability::{NumberQuality, Parity};
+        AbilityCondition::QuantityQuality {
+            quantity: cost_paid_mana_value(),
+            quality: NumberQuality::Parity(Parity::Even),
+        }
+    }
+
+    fn negated(condition: AbilityCondition) -> AbilityCondition {
+        AbilityCondition::Not {
+            condition: Box::new(condition),
+        }
+    }
+
+    /// CR 608.2c + CR 608.2h: `Not(QuantityQuality)` over a resolution-only
+    /// referent. With no cost-paid object the negation tests nothing and is false;
+    /// with one present it is the plain negation of the quality.
+    #[test]
+    fn subject_dependent_negated_quantity_quality_needs_its_subject() {
+        // Negated, absent: not vacuously true.
+        assert_eq!(
+            life_gained_under_condition(
+                negated(cost_paid_mana_value_is_even()),
+                ConditionSubject::Absent
+            ),
+            0,
+            "no cost-paid object: the negated quality must not hold"
+        );
+        // Negated, present, quality fails (MV 3 is odd): the negation holds.
+        // Reach-guard: the subject is read at all.
+        let mut state = GameState::new_two_player(42);
+        let referent = create_object(
+            &mut state,
+            CardId(0x0C202),
+            PlayerId(0),
+            "Read Guard".to_string(),
+            Zone::Battlefield,
+        );
+        let mut probe = ResolvedAbility::new(Effect::NoOp, vec![], referent, PlayerId(0));
+        let mut lki = state.objects[&referent].snapshot_for_mana_spent();
+        lki.mana_value = 3;
+        probe.cost_paid_object = Some(CostPaidObjectSnapshot::capture(
+            &state.objects[&referent],
+            lki,
+        ));
+        assert_eq!(
+            crate::game::quantity::resolve_quantity_for_ability_condition(
+                &state,
+                &cost_paid_mana_value(),
+                &probe,
+            ),
+            3
+        );
+        assert_eq!(
+            life_gained_under_condition(
+                negated(cost_paid_mana_value_is_even()),
+                ConditionSubject::CostPaid(3)
+            ),
+            3
+        );
+        // Negated, present, quality holds (MV 2 is even): the negation fails.
+        assert_eq!(
+            life_gained_under_condition(
+                negated(cost_paid_mana_value_is_even()),
+                ConditionSubject::CostPaid(2)
+            ),
+            0
+        );
+        // Positive, present and absent.
+        assert_eq!(
+            life_gained_under_condition(
+                cost_paid_mana_value_is_even(),
+                ConditionSubject::CostPaid(2)
+            ),
+            3
+        );
+        assert_eq!(
+            life_gained_under_condition(cost_paid_mana_value_is_even(), ConditionSubject::Absent),
+            0
+        );
+    }
+
+    /// CR 608.2c: `Not(QuantityCheck)` with an operand over a resolution-only
+    /// referent. Presence, not the value 0, decides: an absent subject makes the
+    /// negation false, a present MV-0 subject is an ordinary comparison.
+    #[test]
+    fn subject_dependent_negated_quantity_check_needs_its_subject() {
+        let mana_value_at_least_one = AbilityCondition::QuantityCheck {
+            lhs: cost_paid_mana_value(),
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        };
+        assert_eq!(
+            life_gained_under_condition(
+                negated(mana_value_at_least_one.clone()),
+                ConditionSubject::Absent
+            ),
+            0,
+            "no cost-paid object: the negated comparison must not hold"
+        );
+        assert_eq!(
+            life_gained_under_condition(
+                negated(mana_value_at_least_one),
+                ConditionSubject::CostPaid(0)
+            ),
+            3,
+            "a present MV-0 subject: 0 >= 1 is false, so the negation holds"
+        );
+
+        // Another resolution-only scope: the target's power.
+        let target_power_at_least_three = AbilityCondition::QuantityCheck {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::Power {
+                    scope: ObjectScope::Target,
+                },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 3 },
+        };
+        assert_eq!(
+            life_gained_under_condition(
+                negated(target_power_at_least_three.clone()),
+                ConditionSubject::Absent
+            ),
+            0,
+            "no object target: the negated comparison must not hold"
+        );
+        assert_eq!(
+            life_gained_under_condition(
+                negated(target_power_at_least_three),
+                ConditionSubject::TargetPower(2)
+            ),
+            3,
+            "a target with power 2: 2 >= 3 is false, so the negation holds"
+        );
+    }
+
+    /// CR 608.2c: the presence ladder's fallback. With no cost-paid object but an
+    /// effect-context object, the cost-paid scope's subject is present, so the
+    /// guard stays quiet and the negation is read from the fallback's value.
+    #[test]
+    fn subject_dependent_negated_condition_reads_the_fallback_subject() {
+        assert_eq!(
+            life_gained_under_condition(
+                negated(cost_paid_mana_value_is_even()),
+                ConditionSubject::EffectContext(3)
+            ),
+            3
+        );
     }
 
     #[test]

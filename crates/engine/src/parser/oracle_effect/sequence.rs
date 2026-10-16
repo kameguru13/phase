@@ -9297,8 +9297,13 @@ pub(super) fn parse_followup_continuation_ast_with_search_destination(
             parse_change_zone_enters_tapped_attacking(&lower, ctx)
         }
         // CR 701.15a + CR 701.15b: "The token(s) (is|are) goaded [duration]" after token creation.
-        Effect::CopyTokenOf { .. } | Effect::Token { .. } | Effect::Populate
-            if let Some(continuation) = try_parse_tokens_goaded_continuation(&lower) =>
+        // The token-creator set is `Effect::is_token_creator`'s; the detector runs only
+        // for its members, and a miss falls through to the later arms.
+        effect
+            if let Some(continuation) = effect
+                .is_token_creator()
+                .then(|| try_parse_tokens_goaded_continuation(&lower))
+                .flatten() =>
         {
             Some(continuation)
         }
