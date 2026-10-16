@@ -20,6 +20,7 @@ use std::sync::Arc;
 
 use engine::ai_support::{ActionMetadata, AiDecisionContext, CandidateAction, TacticalClass};
 use engine::game::zones::create_object;
+use engine::parser::oracle::{parse_oracle_text, ParsedAbilities};
 use engine::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, Comparator, ControllerRef, Effect, FilterProp,
     PlayerScope, PtValue, QuantityExpr, QuantityRef, SharedQuality, SubAbilityLink, TargetFilter,
@@ -716,5 +717,316 @@ fn route_rows_score_identically_in_both_representations() {
     ];
     for row in &rows {
         assert_row_parity(row, SubAbilityLink::SequentialSibling);
+    }
+}
+
+// ─── Production-parse seam (S1) ─────────────────────────────────────────────
+
+/// The engine's imperative lowering: a `ContinuationStep`, `Spell`-kind
+/// `PutCounter { target: LastCreated }` (CR 608.2c + CR 122.1).
+fn is_created_token_placement(def: &AbilityDefinition) -> bool {
+    matches!(
+        &*def.effect,
+        Effect::PutCounter {
+            target: TargetFilter::LastCreated,
+            ..
+        }
+    ) && def.sub_link == SubAbilityLink::ContinuationStep
+        && def.kind == AbilityKind::Spell
+}
+
+/// Every `PutCounter { target: LastCreated }` in `def`, across its sub, else and
+/// mode branches.
+fn last_created_placements(def: &AbilityDefinition) -> usize {
+    let own = usize::from(matches!(
+        &*def.effect,
+        Effect::PutCounter {
+            target: TargetFilter::LastCreated,
+            ..
+        }
+    ));
+    own + [def.sub_ability.as_deref(), def.else_ability.as_deref()]
+        .into_iter()
+        .flatten()
+        .chain(def.mode_abilities.iter())
+        .map(last_created_placements)
+        .sum::<usize>()
+}
+
+/// The S1 seam assertion: the production parse is exactly the shape the
+/// phase-1 predicate pairs — one `Token` with no entry counters whose DIRECT
+/// sub is the placement, and no other `LastCreated` placement anywhere.
+fn assert_production_seam(name: &str, def: &AbilityDefinition) {
+    let mut paired_tokens = 0;
+    let mut node = Some(def);
+    while let Some(current) = node {
+        if let Effect::Token {
+            enter_with_counters,
+            ..
+        } = &*current.effect
+        {
+            assert!(
+                enter_with_counters.is_empty(),
+                "{name}: the production token carries no entry counters: {def:?}"
+            );
+            if current
+                .sub_ability
+                .as_deref()
+                .is_some_and(is_created_token_placement)
+            {
+                paired_tokens += 1;
+            }
+        }
+        node = current.sub_ability.as_deref();
+    }
+    assert_eq!(
+        (paired_tokens, last_created_placements(def)),
+        (1, 1),
+        "{name}: one token directly followed by its placement, and no other \
+         LastCreated placement: {def:?}"
+    );
+}
+
+/// Inverse of the engine's imperative lowering, applied in place: the
+/// placement's `(counter_type, count)` becomes the `Token`'s entry counters and
+/// the placement's own sub moves up under the `Token`. Returns whether a
+/// placement was folded.
+fn fold_in_place(node: &mut AbilityDefinition) -> bool {
+    let is_pair = matches!(&*node.effect, Effect::Token { .. })
+        && node
+            .sub_ability
+            .as_deref()
+            .is_some_and(is_created_token_placement);
+    if !is_pair {
+        return node.sub_ability.as_deref_mut().is_some_and(fold_in_place);
+    }
+    let placement = *node.sub_ability.take().expect("checked above");
+    let Effect::PutCounter {
+        counter_type,
+        count,
+        ..
+    } = *placement.effect
+    else {
+        panic!("a created-token placement is a PutCounter");
+    };
+    if let Effect::Token {
+        enter_with_counters,
+        ..
+    } = &mut *node.effect
+    {
+        enter_with_counters.push((counter_type, count));
+    }
+    node.sub_ability = placement.sub_ability;
+    true
+}
+
+/// The declarative twin of a production parse.
+fn fold_placement_into_entry_counters(def: &AbilityDefinition) -> AbilityDefinition {
+    let mut folded = def.clone();
+    assert!(
+        fold_in_place(&mut folded),
+        "the production parse holds a placement: {def:?}"
+    );
+    folded
+}
+
+/// The production `ability` in `repr`: the parse itself after the seam
+/// assertion (it lowers only to `ContinuationStep`), or its declarative fold.
+fn production_in(
+    repr: Representation,
+    name: &str,
+    ability: AbilityDefinition,
+) -> AbilityDefinition {
+    match repr {
+        Representation::Imperative(link) => {
+            assert_eq!(
+                link,
+                SubAbilityLink::ContinuationStep,
+                "{name}: the production parse is the ContinuationStep shape"
+            );
+            assert_production_seam(name, &ability);
+            ability
+        }
+        Representation::Declarative => fold_placement_into_entry_counters(&ability),
+    }
+}
+
+fn parse_card(
+    oracle: &str,
+    name: &str,
+    keywords: &[&str],
+    types: &[&str],
+    subtypes: &[&str],
+) -> ParsedAbilities {
+    let owned = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    parse_oracle_text(
+        oracle,
+        name,
+        &owned(keywords),
+        &owned(types),
+        &owned(subtypes),
+    )
+}
+
+/// The one activated ability of a production parse.
+fn activated_ability(parsed: ParsedAbilities) -> AbilityDefinition {
+    let mut activated = parsed
+        .abilities
+        .into_iter()
+        .filter(|ability| ability.kind == AbilityKind::Activated);
+    let ability = activated.next().expect("an activated ability");
+    assert!(activated.next().is_none(), "exactly one activated ability");
+    ability
+}
+
+/// Fractal Summoning, verbatim Oracle (MTGJSON).
+fn fractal_summoning_parsed(state: &mut GameState, repr: Representation) -> (ObjectId, GameAction) {
+    let parsed = parse_card(
+        "Create a 0/0 green and blue Fractal creature token. Put X +1/+1 counters on it.",
+        "Fractal Summoning",
+        &[],
+        &["Sorcery"],
+        &["Lesson"],
+    );
+    let ability = parsed
+        .abilities
+        .into_iter()
+        .next()
+        .expect("the spell ability");
+    let id = add_object(
+        state,
+        "Fractal Summoning",
+        Zone::Hand,
+        vec![CoreType::Sorcery],
+        mana(
+            vec![
+                ManaCostShard::X,
+                ManaCostShard::GreenBlue,
+                ManaCostShard::GreenBlue,
+            ],
+            0,
+        ),
+    );
+    let ability = production_in(repr, "Fractal Summoning", ability);
+    set_abilities(state, id, vec![ability]);
+    (id, cast(state, id))
+}
+
+/// Manifestation Sage, verbatim Oracle (MTGJSON): the production self-ETB
+/// trigger, with its execute in `repr`.
+fn manifestation_sage_parsed(
+    state: &mut GameState,
+    repr: Representation,
+) -> (ObjectId, GameAction) {
+    let parsed = parse_card(
+        "When this creature enters, create a 0/0 green and blue Fractal creature token. Put X +1/+1 counters on it, where X is the number of cards in your hand.",
+        "Manifestation Sage",
+        &[],
+        &["Creature"],
+        &["Human", "Wizard"],
+    );
+    let mut trigger = parsed.triggers.into_iter().next().expect("the ETB trigger");
+    let execute = *trigger.execute.take().expect("the trigger body");
+    trigger.execute = Some(Box::new(production_in(repr, "Manifestation Sage", execute)));
+    let id = add_object(
+        state,
+        "Manifestation Sage",
+        Zone::Hand,
+        vec![CoreType::Creature],
+        mana(vec![ManaCostShard::GreenBlue; 4], 0),
+    );
+    state
+        .objects
+        .get_mut(&id)
+        .expect("source")
+        .trigger_definitions
+        .push(trigger);
+    (id, cast(state, id))
+}
+
+/// Berta, Wise Extrapolator, verbatim Oracle (MTGJSON): the production "{X},
+/// {T}: Create … and put X +1/+1 counters on it." ("and put" grammar).
+fn berta_activate_parsed(state: &mut GameState, repr: Representation) -> (ObjectId, GameAction) {
+    let parsed = parse_card(
+        "Increment (Whenever you cast a spell, if the amount of mana you spent is greater than this creature's power or toughness, put a +1/+1 counter on this creature.)\nWhenever one or more +1/+1 counters are put on Berta, add one mana of any color.\n{X}, {T}: Create a 0/0 green and blue Fractal creature token and put X +1/+1 counters on it.",
+        "Berta, Wise Extrapolator",
+        &["Increment"],
+        &["Creature"],
+        &["Frog", "Druid"],
+    );
+    let ability = production_in(repr, "Berta", activated_ability(parsed));
+    let id = add_object(
+        state,
+        "Berta, Wise Extrapolator",
+        Zone::Battlefield,
+        vec![CoreType::Creature],
+        mana(vec![ManaCostShard::Green, ManaCostShard::Blue], 2),
+    );
+    set_abilities(state, id, vec![ability]);
+    (
+        id,
+        GameAction::ActivateAbility {
+            source_id: id,
+            ability_index: 0,
+        },
+    )
+}
+
+/// Sequence Engine, verbatim Oracle (MTGJSON): a non-creature activated source
+/// with a declared target, whose token is nested under the exile.
+fn sequence_engine_activate_parsed(
+    state: &mut GameState,
+    repr: Representation,
+) -> (ObjectId, GameAction) {
+    let parsed = parse_card(
+        "{X}, {T}: Exile target creature card with mana value X from a graveyard. Create a 0/0 green and blue Fractal creature token. Put X +1/+1 counters on it. Activate only as a sorcery.",
+        "Sequence Engine",
+        &[],
+        &["Artifact"],
+        &[],
+    );
+    let ability = production_in(repr, "Sequence Engine", activated_ability(parsed));
+    let id = add_object(
+        state,
+        "Sequence Engine",
+        Zone::Battlefield,
+        vec![CoreType::Artifact],
+        mana(vec![ManaCostShard::Green], 2),
+    );
+    set_abilities(state, id, vec![ability]);
+    (
+        id,
+        GameAction::ActivateAbility {
+            source_id: id,
+            ability_index: 0,
+        },
+    )
+}
+
+/// S1: the production parse of moved class members is the shape the phase-1
+/// predicate pairs, and the full registry scores it identically to its
+/// declarative fold.
+#[test]
+fn production_parse_rows_score_identically_in_both_representations() {
+    let rows = [
+        ParityRow {
+            name: "Fractal Summoning cast (production parse)",
+            build: fractal_summoning_parsed,
+        },
+        ParityRow {
+            name: "Manifestation Sage cast (production parse)",
+            build: manifestation_sage_parsed,
+        },
+        ParityRow {
+            name: "Berta activate (production parse)",
+            build: berta_activate_parsed,
+        },
+        ParityRow {
+            name: "Sequence Engine activate (production parse)",
+            build: sequence_engine_activate_parsed,
+        },
+    ];
+    for row in &rows {
+        assert_row_parity(row, SubAbilityLink::ContinuationStep);
     }
 }

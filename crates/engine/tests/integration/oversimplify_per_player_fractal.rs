@@ -26,13 +26,20 @@
 //!      semantics work even for stolen creatures (whose post-exile controller
 //!      resets to owner).
 //!
-//! This test drives the real resolver (`resolve_ability_chain`) end-to-end:
-//! exile all creatures, then verify each player's Fractal token enters with
-//! the correct counter count equal to that player's total exiled power.
+//! The token is created first and the counters are put on it afterwards
+//! (CR 608.2c + CR 122.1): the Token is followed by a `ContinuationStep`
+//! `PutCounter { target: LastCreated }`, which the player-scope fan-out keeps
+//! inside each player's iteration so it reads that player's new token.
+//!
+//! This test parses the verbatim Oracle text and drives the real resolver
+//! (`resolve_ability_chain`) end-to-end: exile all creatures, then verify each
+//! player's Fractal token receives the correct counter count equal to that
+//! player's total exiled power.
 
 use engine::game::ability_utils::build_resolved_from_def;
 use engine::game::effects::resolve_ability_chain;
 use engine::game::zones::create_object;
+use engine::parser::parse_oracle_text;
 use engine::types::card_type::CoreType;
 use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
@@ -41,7 +48,8 @@ use engine::types::identifiers::CardId;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 
-use crate::support::shared_card_db as load_db;
+/// Oversimplify's verbatim Oracle text (MTGJSON).
+const OVERSIMPLIFY: &str = "Exile all creatures. Each player creates a 0/0 green and blue Fractal creature token and puts a number of +1/+1 counters on it equal to the total power of creatures they controlled that were exiled this way.";
 
 fn add_creature(
     state: &mut GameState,
@@ -73,15 +81,14 @@ fn add_creature(
 
 #[test]
 fn oversimplify_per_player_fractal_counters_match_exiled_power() {
-    let Some(db) = load_db() else {
-        // No card-data export available in this build — skip.
-        return;
-    };
-
-    let face = db
-        .get_face_by_name("Oversimplify")
-        .expect("Oversimplify should be in the card database");
-    let definition = face
+    let parsed = parse_oracle_text(
+        OVERSIMPLIFY,
+        "Oversimplify",
+        &[],
+        &["Sorcery".to_string()],
+        &[],
+    );
+    let definition = parsed
         .abilities
         .first()
         .expect("Oversimplify should parse a spell ability");
@@ -89,7 +96,7 @@ fn oversimplify_per_player_fractal_counters_match_exiled_power() {
     // ----- Parser-level assertions (the four-task class repair). -----
     use engine::types::ability::{
         AggregateFunction, ControllerRef, Effect, ObjectProperty, QuantityExpr, QuantityRef,
-        TargetFilter, TypedFilter,
+        SubAbilityLink, TargetFilter, TypedFilter,
     };
     let Effect::ChangeZoneAll { .. } = definition.effect.as_ref() else {
         panic!(
@@ -111,13 +118,28 @@ fn oversimplify_per_player_fractal_counters_match_exiled_power() {
             token_def.effect
         );
     };
-    assert_eq!(
-        enter_with_counters.len(),
-        1,
-        "the Fractal token must carry exactly one enter_with_counters entry — \
-         pre-fix this list was empty (DynamicQty SwallowedClause)"
+    assert!(
+        enter_with_counters.is_empty(),
+        "the Fractal token receives its counters by a later instruction, not as \
+         entry counters: {enter_with_counters:?}"
     );
-    let (counter_type, count_expr) = &enter_with_counters[0];
+    let placement = token_def
+        .sub_ability
+        .as_deref()
+        .expect("the counter placement is the Token's direct sub");
+    assert_eq!(placement.sub_link, SubAbilityLink::ContinuationStep);
+    let Effect::PutCounter {
+        counter_type,
+        count: count_expr,
+        target: TargetFilter::LastCreated,
+    } = placement.effect.as_ref()
+    else {
+        panic!(
+            "the Token must be followed by PutCounter {{ LastCreated }} — pre-fix \
+             the dynamic quantity was swallowed (DynamicQty SwallowedClause), got {:?}",
+            placement.effect
+        );
+    };
     assert_eq!(*counter_type, CounterType::Plus1Plus1);
     let expected_count = QuantityExpr::Ref {
         qty: QuantityRef::PropertyAggregate(
@@ -221,13 +243,13 @@ fn oversimplify_per_player_fractal_counters_match_exiled_power() {
         .unwrap_or(0);
     assert_eq!(
         p0_counters, 5,
-        "P0's Fractal must enter with 5 +1/+1 counters (4+1 power exiled — \
+        "P0's Fractal must receive 5 +1/+1 counters (4+1 power exiled — \
          the stolen 2/2 must NOT count for P0 since P1 controlled it at exile), \
          got {p0_counters}"
     );
     assert_eq!(
         p1_counters, 5,
-        "P1's Fractal must enter with 5 +1/+1 counters (3 own + 2 stolen \
+        "P1's Fractal must receive 5 +1/+1 counters (3 own + 2 stolen \
          — the stolen P0-owned creature counts toward P1 because P1 was its \
          controller at exile per CR 109.4 LKI), got {p1_counters}"
     );

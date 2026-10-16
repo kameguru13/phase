@@ -11,20 +11,24 @@
 //! - CR 608.2i: "a land entered … this turn" looks back; the land need not still
 //!   be on the battlefield.
 //! - CR 608.2h: "that many" is the land count as the effect is applied.
+//! - CR 608.2c: the instructions are followed in the order written — Primo is
+//!   created as a 0/0 first, then the counters are put on it (CR 122.1).
 
 use engine::game::coverage::card_face_gaps;
 use engine::game::game_object::GameObject;
 use engine::game::restrictions::record_battlefield_entry;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::game::zones::{create_object, move_to_zone};
+use engine::game::zones::create_object;
 use engine::parser::parse_oracle_text;
+use engine::types::ability::{Effect, SubAbilityLink, TargetFilter};
 use engine::types::actions::GameAction;
 use engine::types::card::CardFace;
 use engine::types::card_type::{CardType, CoreType, Supertype};
 use engine::types::counter::CounterType;
+use engine::types::events::GameEvent;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::{CardId, ObjectId};
-use engine::types::mana::ManaColor;
+use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
@@ -32,6 +36,10 @@ use engine::types::zones::Zone;
 const ZIMONE: &str = "At the beginning of your end step, if a land entered the battlefield under your control this turn and you control a prime number of lands, create Primo, the Indivisible, a legendary 0/0 green and blue Fractal creature token, then put that many +1/+1 counters on it. (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, and 31 are prime numbers.)";
 
 const PRIMO: &str = "Primo, the Indivisible";
+
+const HARDENED_SCALES: &str = "If one or more +1/+1 counters would be put on a creature you control, that many plus one +1/+1 counters are put on it instead.";
+
+const BRANCHING_EVOLUTION: &str = "If one or more +1/+1 counters would be put on a creature you control, twice that many +1/+1 counters are put on that creature instead.";
 
 /// A board for P0: Zimone, `forests` Forests already in play, and (when
 /// `land_in_hand`) one land in hand. Returns the runner and the hand land.
@@ -134,8 +142,23 @@ fn zimone_face_is_coverage_supported() {
         &["Creature".to_string()],
         &["Human".to_string(), "Wizard".to_string()],
     );
-    // Reach-guard: the face carries the one end-step trigger.
+    // Reach-guard: the face carries the one end-step trigger, whose token is
+    // followed directly by its counter placement (CR 608.2c + CR 122.1).
     assert_eq!(parsed.triggers.len(), 1);
+    let execute = parsed.triggers[0].execute.as_deref().expect("trigger body");
+    let placement = execute
+        .sub_ability
+        .as_deref()
+        .expect("the counter placement under the token");
+    assert!(matches!(&*execute.effect, Effect::Token { .. }));
+    assert!(matches!(
+        &*placement.effect,
+        Effect::PutCounter {
+            target: TargetFilter::LastCreated,
+            ..
+        }
+    ));
+    assert_eq!(placement.sub_link, SubAbilityLink::ContinuationStep);
     let face = CardFace {
         name: "Zimone, All-Questioning".to_string(),
         card_type: CardType {
@@ -153,7 +176,8 @@ fn zimone_face_is_coverage_supported() {
     assert_eq!(card_face_gaps(&face), Vec::<String>::new());
 }
 
-/// 1 Forest + 1 played = 2 lands (prime): Primo enters with two counters.
+/// 1 Forest + 1 played = 2 lands (prime): Primo is created and then receives
+/// two counters.
 #[test]
 fn two_lands_create_primo_with_two_counters() {
     let (mut runner, land) = board(1, true);
@@ -226,26 +250,180 @@ fn thirty_seven_lands_is_prime() {
     assert_eq!(the_primo_counters(&runner), 37);
 }
 
+/// One blue mana in P0's pool.
+fn one_blue() -> Vec<ManaUnit> {
+    vec![ManaUnit::new(ManaType::Blue, ObjectId(0), false, vec![])]
+}
+
+/// P0's board for `entered_land_need_not_remain`: Zimone, `forests` Forests,
+/// a Wastes in hand, and a {U} sorcery with `oracle` in hand. Returns the
+/// runner, the Wastes and the sorcery.
+fn board_with_removal(forests: usize, oracle: &str) -> (GameRunner, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_creature_from_oracle(P0, "Zimone, All-Questioning", 1, 1, ZIMONE);
+    for _ in 0..forests {
+        scenario.add_basic_land(P0, ManaColor::Green);
+    }
+    let land = scenario.add_land_to_hand(P0, "Wastes").id();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Removal", false, oracle)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Blue],
+            generic: 0,
+        })
+        .id();
+    scenario.with_mana_pool(P0, one_blue());
+    (scenario.build(), land, spell)
+}
+
 /// CR 608.2i: the entry still counts after the land has left the battlefield.
+/// Both departures go through a real cast, so the zone change runs the
+/// production replacement and event pipeline.
 #[test]
 fn entered_land_need_not_remain() {
-    // (a) 2 Forests + 1 played, then the played land returns to hand: the entry
-    // counts and 2 lands remain (prime).
-    let (mut runner, land) = board(2, true);
-    let land = land.unwrap();
+    // (a) 2 Forests + 1 played, then the played land is returned to hand: the
+    // entry counts and 2 lands remain (prime).
+    let (mut runner, land, bounce) =
+        board_with_removal(2, "Return target land to its owner's hand.");
     play_land(&mut runner, land);
-    move_to_zone(runner.state_mut(), land, Zone::Hand, &mut Vec::new());
+    let outcome = runner.cast(bounce).target_object(land).resolve();
+    // Reach-guard: the land really left the battlefield.
+    outcome.assert_zone(&[land], Zone::Hand);
     play_and_finish_turn(&mut runner, None);
     assert_eq!(the_primo_counters(&runner), 2);
 
-    // (b) 0 Forests + 1 played, then the land goes to the graveyard: the entry
-    // counts but 0 lands remain (not prime).
-    let (mut runner, land) = board(0, true);
-    let land = land.unwrap();
+    // (b) 0 Forests + 1 played, then the land is destroyed: the entry counts
+    // but 0 lands remain (not prime).
+    let (mut runner, land, destroy) = board_with_removal(0, "Destroy target land.");
     play_land(&mut runner, land);
-    move_to_zone(runner.state_mut(), land, Zone::Graveyard, &mut Vec::new());
+    let outcome = runner.cast(destroy).target_object(land).resolve();
+    outcome.assert_zone(&[land], Zone::Graveyard);
     play_and_finish_turn(&mut runner, None);
     assert!(primos(&runner).is_empty());
+}
+
+/// Every event while the stack drains by passing priority.
+fn drain_collecting_events(runner: &mut GameRunner) -> Vec<GameEvent> {
+    let mut events = Vec::new();
+    for _ in 0..60 {
+        if runner.state().stack.is_empty() {
+            return events;
+        }
+        let result = runner
+            .act(GameAction::PassPriority)
+            .expect("passing priority is legal");
+        events.extend(result.events);
+    }
+    panic!("the stack did not empty");
+}
+
+/// CR 608.2c + CR 122.1 (D2.4): in one end-step resolution Primo enters the
+/// battlefield as a 0/0 and only then receives "that many" counters — its
+/// battlefield `ZoneChanged` precedes every `CounterAdded` for it. It survives:
+/// state-based actions are not checked mid-resolution (CR 704.4), and by the
+/// next check it is a 3/3 (CR 704.5f).
+#[test]
+fn primo_enters_as_a_0_0_then_receives_that_many_counters() {
+    // 2 Forests + 1 played = 3 lands (prime).
+    let (mut runner, land) = board(2, true);
+    play_land(&mut runner, land.unwrap());
+    advance_to_end_step(&mut runner);
+    assert_eq!(runner.state().stack.len(), 1, "the trigger is on the stack");
+    let events = drain_collecting_events(&mut runner);
+
+    let found = primos(&runner);
+    assert_eq!(found.len(), 1, "exactly one Primo");
+    let primo = found[0].id;
+    let (entry, record) = events
+        .iter()
+        .enumerate()
+        .find_map(|(index, e)| match e {
+            GameEvent::ZoneChanged {
+                object_id,
+                to: Zone::Battlefield,
+                record,
+                ..
+            } if *object_id == primo => Some((index, record)),
+            _ => None,
+        })
+        .expect("reach-guard: Primo's battlefield entry event");
+    let first_counter = events
+        .iter()
+        .position(|e| matches!(e, GameEvent::CounterAdded { object_id, .. } if *object_id == primo))
+        .expect("reach-guard: Primo's counter event");
+    assert!(
+        entry < first_counter,
+        "Primo enters before it receives counters (entry {entry}, first counter {first_counter})"
+    );
+    assert_eq!((record.power, record.base_power), (Some(0), Some(0)));
+
+    assert_eq!(plus_counters(found[0]), 3);
+    assert_eq!((found[0].power, found[0].toughness), (Some(3), Some(3)));
+}
+
+/// CR 616.1 + CR 704.4: two replacements that both modify the counter
+/// placement make P0 choose an order while the placement resolves. At that
+/// pause Primo is already on the battlefield as a 0/0 with no counters, and it
+/// survives (no state-based actions mid-resolution). Hardened Scales first:
+/// (3 + 1) × 2 = 8.
+#[test]
+fn replacement_order_pause_leaves_a_surviving_0_0_primo() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_creature_from_oracle(P0, "Zimone, All-Questioning", 1, 1, ZIMONE);
+    scenario.add_enchantment_from_oracle(P0, "Hardened Scales", HARDENED_SCALES);
+    scenario.add_enchantment_from_oracle(P0, "Branching Evolution", BRANCHING_EVOLUTION);
+    for _ in 0..2 {
+        scenario.add_basic_land(P0, ManaColor::Green);
+    }
+    let land = scenario.add_land_to_hand(P0, "Wastes").id();
+    let mut runner = scenario.build();
+    play_land(&mut runner, land);
+    advance_to_end_step(&mut runner);
+
+    let mut paused = false;
+    for _ in 0..60 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::ReplacementChoice { candidates, .. } => {
+                let names: Vec<&str> = candidates
+                    .iter()
+                    .map(|candidate| candidate.source_name.as_str())
+                    .collect();
+                // Reach-guard: both replacements are offered.
+                assert!(
+                    names.contains(&"Hardened Scales") && names.contains(&"Branching Evolution"),
+                    "{names:?}"
+                );
+                let found = primos(&runner);
+                assert_eq!(found.len(), 1, "Primo is on the battlefield at the pause");
+                assert_eq!(plus_counters(found[0]), 0, "and has no counters yet");
+                let index = names
+                    .iter()
+                    .position(|name| *name == "Hardened Scales")
+                    .expect("Hardened Scales is offered");
+                runner
+                    .act(GameAction::ChooseReplacement { index })
+                    .expect("choosing a replacement is legal");
+                paused = true;
+            }
+            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => break,
+            WaitingFor::Priority { .. } => {
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("passing priority is legal");
+            }
+            other => panic!("unexpected prompt: {other:?}"),
+        }
+    }
+    assert!(
+        paused,
+        "reach-guard: the replacement-order prompt was observed"
+    );
+    let found = primos(&runner);
+    assert_eq!(found.len(), 1, "Primo survives");
+    assert_eq!(plus_counters(found[0]), 8);
+    assert_eq!((found[0].power, found[0].toughness), (Some(8), Some(8)));
 }
 
 /// "you"/"your": only P0's lands count, and only an entry under P0's control.

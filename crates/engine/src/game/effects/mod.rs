@@ -6972,6 +6972,18 @@ fn is_player_scope_local_continuation(
                     ..
                 }
             )
+            // CR 608.2c + CR 111.1: "Each player creates a … token and puts …
+            // counters on it" (Oversimplify) — "it" is the token THIS
+            // iteration's player just created, so the placement is part of that
+            // player's instruction and runs inside the same iteration, never as
+            // the unscoped tail that would read only the last player's token.
+            | (
+                Effect::Token { .. },
+                Effect::PutCounter {
+                    target: TargetFilter::LastCreated,
+                    ..
+                }
+            )
     );
     if generic_local_continuation {
         return true;
@@ -36757,6 +36769,101 @@ mod tests {
         assert!(scoped.sub_ability.is_none());
         let tail = tail.expect("without a choice the consumer detaches as the tail");
         assert!(matches!(tail.effect, Effect::ChangeZone { .. }));
+    }
+
+    /// CR 608.2c + CR 111.1 — "Each player creates a … token and puts … counters
+    /// on it" (Oversimplify): the `ContinuationStep` `PutCounter { LastCreated }`
+    /// directly under a player-scoped `Token` is part of that player's
+    /// instruction, so it stays inside the scoped iteration and reads that
+    /// player's token. Any other shape still detaches as the unscoped tail.
+    #[test]
+    fn split_player_scope_keeps_created_token_counter_placement_in_iteration() {
+        let make_chain = |child_effect: Effect, link: SubAbilityLink| {
+            let mut token = ResolvedAbility::new(
+                Effect::Token {
+                    name: "Fractal".to_string(),
+                    power: PtValue::Fixed(0),
+                    toughness: PtValue::Fixed(0),
+                    types: vec!["Creature".to_string(), "Fractal".to_string()],
+                    colors: vec![ManaColor::Green, ManaColor::Blue],
+                    keywords: vec![],
+                    tapped: false,
+                    count: QuantityExpr::Fixed { value: 1 },
+                    owner: TargetFilter::Controller,
+                    attach_to: None,
+                    enters_attacking: false,
+                    supertypes: vec![],
+                    static_abilities: vec![],
+                    enter_with_counters: vec![],
+                },
+                vec![],
+                ObjectId(1),
+                PlayerId(0),
+            );
+            token.player_scope = Some(PlayerFilter::All);
+            let mut child = ResolvedAbility::new(child_effect, vec![], ObjectId(1), PlayerId(0));
+            child.player_scope = Some(PlayerFilter::All);
+            child.sub_link = link;
+            token.sub_ability = Some(Box::new(child));
+            token
+        };
+        let placement = |target: TargetFilter| Effect::PutCounter {
+            counter_type: CounterType::Plus1Plus1,
+            count: QuantityExpr::Fixed { value: 2 },
+            target,
+        };
+
+        let chain = make_chain(
+            placement(TargetFilter::LastCreated),
+            SubAbilityLink::ContinuationStep,
+        );
+        let (scoped, tail) = split_player_scope_chain(&chain, &PlayerFilter::All);
+        assert!(tail.is_none(), "the placement stays in the iteration");
+        let kept = scoped
+            .sub_ability
+            .as_ref()
+            .expect("the PutCounter stays attached to the Token");
+        assert!(matches!(
+            kept.effect,
+            Effect::PutCounter {
+                target: TargetFilter::LastCreated,
+                ..
+            }
+        ));
+        assert!(
+            kept.player_scope.is_none(),
+            "the kept placement's redundant player_scope is cleared so it does not re-loop"
+        );
+
+        // Hostile siblings: a non-`LastCreated` recipient, an independent
+        // instruction, and a non-counter `LastCreated` consumer (F-U2) detach.
+        for (label, effect, link) in [
+            (
+                "PutCounter { Any }",
+                placement(TargetFilter::Any),
+                SubAbilityLink::ContinuationStep,
+            ),
+            (
+                "SequentialSibling placement",
+                placement(TargetFilter::LastCreated),
+                SubAbilityLink::SequentialSibling,
+            ),
+            (
+                "GenericEffect { LastCreated }",
+                Effect::GenericEffect {
+                    static_abilities: vec![],
+                    duration: None,
+                    target: Some(TargetFilter::LastCreated),
+                    end_cost: None,
+                },
+                SubAbilityLink::ContinuationStep,
+            ),
+        ] {
+            let (scoped, tail) =
+                split_player_scope_chain(&make_chain(effect, link), &PlayerFilter::All);
+            assert!(scoped.sub_ability.is_none(), "{label}: detaches");
+            assert!(tail.is_some(), "{label}: runs as the unscoped tail");
+        }
     }
 
     /// CR 608.2c — a non-choosing per-player reveal introduces no per-iteration

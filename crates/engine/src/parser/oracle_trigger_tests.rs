@@ -495,24 +495,45 @@ fn tokens_visited_without_gaps(def: &AbilityDefinition) -> usize {
     tokens
 }
 
-fn token_entry_counters(def: &AbilityDefinition) -> &[(CounterType, QuantityExpr)] {
+/// CR 608.2c + CR 122.1: the counters a created token receives from the
+/// imperative "then put … counters on it" — the token carries no entry
+/// counters, and its direct `ContinuationStep` sub is a
+/// `PutCounter { target: LastCreated }`. Returns that placement's counter type
+/// and count; panics on any other shape.
+fn created_token_counter_placement(def: &AbilityDefinition) -> (&CounterType, &QuantityExpr) {
     match def.effect.as_ref() {
         Effect::Token {
             enter_with_counters,
             ..
-        } => enter_with_counters,
+        } => assert!(
+            enter_with_counters.is_empty(),
+            "the token carries no entry counters: {enter_with_counters:?}"
+        ),
         other => panic!("expected Token, got {other:?}"),
+    }
+    let sub = def
+        .sub_ability
+        .as_deref()
+        .expect("the counter placement is the token's direct sub");
+    assert_eq!(sub.sub_link, SubAbilityLink::ContinuationStep);
+    match sub.effect.as_ref() {
+        Effect::PutCounter {
+            counter_type,
+            count,
+            target: TargetFilter::LastCreated,
+        } => (counter_type, count),
+        other => panic!("expected PutCounter {{ LastCreated }}, got {other:?}"),
     }
 }
 
 const GAIN_LIFE_FRACTAL: &str = "Whenever you gain life, create a 0/0 green and blue Fractal creature token, then put that many +1/+1 counters on it.";
 
-/// CR 122.6 + CR 608.2h: the gate rebind reaches the token's entry-counter
-/// magnitudes but not the statics the token is granted.
+/// CR 614.1c + CR 608.2h: the gate rebind reaches a declarative token's
+/// entry-counter magnitudes ("The token enters with that many …") but not the
+/// statics the token is granted. Constructed: the imperative class lowers to a
+/// `PutCounter` sub instead, so the entry-counter arm is driven directly.
 #[test]
 fn count_gate_rebind_reaches_token_entry_counters_but_not_granted_statics() {
-    let trigger = the_only_trigger(GAIN_LIFE_FRACTAL, "Test Fractalist", &["Creature"], &[]);
-    let mut execute = *trigger.execute.expect("trigger body");
     let placeholder = QuantityExpr::Ref {
         qty: QuantityRef::EventContextAmount,
     };
@@ -521,16 +542,34 @@ fn count_gate_rebind_reaches_token_entry_counters_but_not_granted_statics() {
         comparator: Comparator::GE,
         rhs: QuantityExpr::Fixed { value: 1 },
     };
-    match execute.effect.as_mut() {
+    let mut execute = AbilityDefinition::new(
+        AbilityKind::Spell,
         Effect::Token {
-            static_abilities,
+            name: "Fractal".to_string(),
+            power: PtValue::Fixed(0),
+            toughness: PtValue::Fixed(0),
+            types: vec!["Creature".to_string(), "Fractal".to_string()],
+            colors: vec![ManaColor::Green, ManaColor::Blue],
+            keywords: vec![],
+            tapped: false,
+            count: QuantityExpr::Fixed { value: 1 },
+            owner: TargetFilter::Controller,
+            attach_to: None,
+            enters_attacking: false,
+            supertypes: vec![],
+            static_abilities: vec![
+                StaticDefinition::continuous().condition(granted_condition.clone())
+            ],
+            enter_with_counters: vec![(CounterType::Plus1Plus1, placeholder.clone())],
+        },
+    );
+    match execute.effect.as_ref() {
+        Effect::Token {
             enter_with_counters,
             ..
         } => {
             // Reach-guard: the placeholder is there before the rebind.
             assert_eq!(enter_with_counters[0].1, placeholder);
-            static_abilities
-                .push(StaticDefinition::continuous().condition(granted_condition.clone()));
         }
         other => panic!("expected Token, got {other:?}"),
     }
@@ -583,7 +622,15 @@ fn zimone_all_questioning_parses_gate_bound_primo() {
     );
     let execute = trigger.execute.as_deref().expect("trigger body");
     assert_eq!(tokens_visited_without_gaps(execute), 1);
-    assert!(execute.sub_ability.is_none(), "{:?}", execute.sub_ability);
+    // CR 608.2c + CR 122.1 + CR 608.2h: Primo is created, then receives
+    // counters counting the gate's lands.
+    assert_eq!(
+        created_token_counter_placement(execute),
+        (
+            &CounterType::Plus1Plus1,
+            &QuantityExpr::Ref { qty: lands.clone() }
+        )
+    );
     match execute.effect.as_ref() {
         Effect::Token {
             name,
@@ -593,7 +640,6 @@ fn zimone_all_questioning_parses_gate_bound_primo() {
             colors,
             count,
             supertypes,
-            enter_with_counters,
             ..
         } => {
             // CR 111.4: the creating effect names the token.
@@ -604,11 +650,6 @@ fn zimone_all_questioning_parses_gate_bound_primo() {
             assert_eq!(colors, &vec![ManaColor::Green, ManaColor::Blue]);
             assert_eq!(types, &vec!["Creature".to_string(), "Fractal".to_string()]);
             assert_eq!(*count, QuantityExpr::Fixed { value: 1 });
-            // CR 122.6: the entry counters count the gate's lands.
-            assert_eq!(
-                enter_with_counters,
-                &vec![(CounterType::Plus1Plus1, QuantityExpr::Ref { qty: lands })]
-            );
         }
         other => panic!("expected Token, got {other:?}"),
     }
@@ -624,13 +665,13 @@ fn ungated_that_many_token_counters_keep_the_placeholder() {
     let execute = trigger.execute.as_deref().expect("trigger body");
     assert_eq!(tokens_visited_without_gaps(execute), 1);
     assert_eq!(
-        token_entry_counters(execute),
-        &[(
-            CounterType::Plus1Plus1,
-            QuantityExpr::Ref {
+        created_token_counter_placement(execute),
+        (
+            &CounterType::Plus1Plus1,
+            &QuantityExpr::Ref {
                 qty: QuantityRef::EventContextAmount,
             },
-        )]
+        )
     );
 }
 
@@ -663,11 +704,11 @@ fn quality_gate_on_event_trigger_binds_that_many_to_the_gate() {
     let execute = trigger.execute.as_deref().expect("trigger body");
     assert_eq!(tokens_visited_without_gaps(execute), 1);
     assert_eq!(
-        token_entry_counters(execute),
-        &[(
-            CounterType::Plus1Plus1,
-            QuantityExpr::Ref { qty: creatures }
-        )]
+        created_token_counter_placement(execute),
+        (
+            &CounterType::Plus1Plus1,
+            &QuantityExpr::Ref { qty: creatures }
+        )
     );
 }
 
@@ -5641,8 +5682,8 @@ fn malcolm_keen_eyed_navigator_damage_trigger_counts_damaged_opponents() {
 #[test]
 fn primo_the_unbounded_combat_damage_trigger() {
     // Primo, the Unbounded (#1361): the triggering creatures' base power is 0,
-    // and the Fractal token enters with +1/+1 counters equal to the combat
-    // damage dealt (EventContextAmount). Verifies the full trigger:
+    // and the Fractal token is created, then receives +1/+1 counters equal to
+    // the combat damage dealt (EventContextAmount). Verifies the full trigger:
     //   - DamageDoneOnceByController mode
     //   - valid_source carries a base-power-0 check (CR 208.4b)
     //   - the token-creation body has no Unimplemented effects
@@ -5691,34 +5732,29 @@ fn primo_the_unbounded_combat_damage_trigger() {
         current = ability.sub_ability.as_deref();
     }
 
-    // The Fractal token must enter with +1/+1 counters equal to the combat
-    // damage dealt (EventContextAmount), not a fixed count. Walk the
-    // sub-ability chain to find the Token effect and verify its
-    // enter_with_counters payload.
+    // CR 608.2c + CR 122.1: the Fractal token is created, then receives +1/+1
+    // counters equal to the combat damage dealt (EventContextAmount), not a
+    // fixed count. Walk the sub-ability chain to the Token effect and read its
+    // counter placement.
     let mut current: Option<&AbilityDefinition> = Some(execute);
-    let mut enter_with_counters: Option<&Vec<(CounterType, QuantityExpr)>> = None;
+    let mut token: Option<&AbilityDefinition> = None;
     while let Some(ability) = current {
-        if let Effect::Token {
-            enter_with_counters: counters,
-            ..
-        } = &*ability.effect
-        {
-            enter_with_counters = Some(counters);
+        if matches!(&*ability.effect, Effect::Token { .. }) {
+            token = Some(ability);
             break;
         }
         current = ability.sub_ability.as_deref();
     }
-    let counters = enter_with_counters.expect("trigger body should contain a Token effect");
-    let expected: Vec<(CounterType, QuantityExpr)> = vec![(
-        CounterType::Plus1Plus1,
-        QuantityExpr::Ref {
-            qty: QuantityRef::EventContextAmount,
-        },
-    )];
+    let token = token.expect("trigger body should contain a Token effect");
     assert_eq!(
-        counters, &expected,
-        "Fractal token must enter with +1/+1 counters equal to damage dealt, got: {:?}",
-        counters
+        created_token_counter_placement(token),
+        (
+            &CounterType::Plus1Plus1,
+            &QuantityExpr::Ref {
+                qty: QuantityRef::EventContextAmount,
+            },
+        ),
+        "the Fractal token must receive +1/+1 counters equal to the damage dealt"
     );
 }
 
