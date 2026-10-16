@@ -3195,6 +3195,7 @@ impl GameObject {
         let lki = &context.lki;
         // Identity.
         self.incarnation = context.identity.reference.incarnation;
+        // allow-raw-zone: writes a detached read-only view for filter evaluation, never an object in `GameState`; no zone change occurs (CR 603.10).
         self.zone = context.identity.expected_zone;
         self.card_id = context.card_id;
         self.printed_ref = context.printed_ref.clone();
