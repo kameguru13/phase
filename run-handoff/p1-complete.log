@@ -1,0 +1,412 @@
+HEAD d687e9bc5cb3e2237c13e76f573c29018a4a9ab6
+=== fmt 03:43:29
+=== rc=0
+=== gateA 03:44:05
+Gate G PASS (router/grant architecture: strict router vs permissive grant boundary intact)
+Gate A: scanned 28 file(s) under crates/engine/src/parser (working tree vs f4080d2364b5a454dffa0498b432a0d338065de3).
+Gate A PASS head=d687e9bc5cb3e2237c13e76f573c29018a4a9ab6 base=f4080d2364b5a454dffa0498b432a0d338065de3
+=== rc=0
+=== authorities 03:44:08
+test_annotated_synthetic_hit_passes (__main__.HardGateTests.test_annotated_synthetic_hit_passes) ... ok
+test_nonannotated_synthetic_hit_fails (__main__.HardGateTests.test_nonannotated_synthetic_hit_fails) ... ok
+test_anonymous_lifetime_vs_underscore_char (__main__.LifetimeTests.test_anonymous_lifetime_vs_underscore_char) ... ok
+test_byte_char_literal_is_stripped_despite_its_prefix (__main__.LifetimeTests.test_byte_char_literal_is_stripped_despite_its_prefix) ... ok
+test_char_a_is_a_literal_but_lifetime_a_is_not (__main__.LifetimeTests.test_char_a_is_a_literal_but_lifetime_a_is_not) ... ok
+test_char_literal_escapes_are_still_stripped (__main__.LifetimeTests.test_char_literal_escapes_are_still_stripped) ... ok
+test_lifetime_before_a_brace_char_literal_does_not_leak_the_brace (__main__.LifetimeTests.test_lifetime_before_a_brace_char_literal_does_not_leak_the_brace) ... ok
+test_lifetime_does_not_desync_a_cfg_test_skip_region (__main__.LifetimeTests.test_lifetime_does_not_desync_a_cfg_test_skip_region) ... ok
+test_lifetime_does_not_eat_a_brace (__main__.LifetimeTests.test_lifetime_does_not_eat_a_brace) ... ok
+test_lifetime_does_not_swallow_the_hit_after_it (__main__.LifetimeTests.test_lifetime_does_not_swallow_the_hit_after_it) ... ok
+test_loop_label_is_not_a_char_literal (__main__.LifetimeTests.test_loop_label_is_not_a_char_literal) ... ok
+test_multiple_lifetimes_on_one_line (__main__.LifetimeTests.test_multiple_lifetimes_on_one_line) ... ok
+test_static_lifetime (__main__.LifetimeTests.test_static_lifetime) ... ok
+test_byte_and_c_string_continuations (__main__.LineContinuationTests.test_byte_and_c_string_continuations) ... ok
+test_continuation_block_comment_open_does_not_eat_the_file (__main__.LineContinuationTests.test_continuation_block_comment_open_does_not_eat_the_file) ... ok
+test_continuation_body_is_not_code (__main__.LineContinuationTests.test_continuation_body_is_not_code) ... ok
+test_continuation_brace_does_not_leak (__main__.LineContinuationTests.test_continuation_brace_does_not_leak) ... ok
+test_continuation_cannot_toggle_the_cfg_test_region (__main__.LineContinuationTests.test_continuation_cannot_toggle_the_cfg_test_region) ... ok
+test_continuation_comment_markers_do_not_start_a_comment (__main__.LineContinuationTests.test_continuation_comment_markers_do_not_start_a_comment) ... ok
+test_continuation_inside_a_cfg_test_body_does_not_desync (__main__.LineContinuationTests.test_continuation_inside_a_cfg_test_body_does_not_desync) ... ok
+test_escaped_backslash_before_the_closing_quote_closes_the_string (__main__.LineContinuationTests.test_escaped_backslash_before_the_closing_quote_closes_the_string) ... ok
+test_multiline_continuation_across_three_lines (__main__.LineContinuationTests.test_multiline_continuation_across_three_lines) ... ok
+test_raw_string_is_not_continued_by_a_backslash (__main__.LineContinuationTests.test_raw_string_is_not_continued_by_a_backslash) ... ok
+test_trailing_backslash_outside_a_string_continues_nothing (__main__.LineContinuationTests.test_trailing_backslash_outside_a_string_continues_nothing) ... ok
+test_block_comment_is_stripped_across_lines (__main__.PreservedBehaviourTests.test_block_comment_is_stripped_across_lines) ... ok
+test_cfg_not_test_is_production (__main__.PreservedBehaviourTests.test_cfg_not_test_is_production) ... ok
+test_compound_cfg_test_predicate_is_skipped (__main__.PreservedBehaviourTests.test_compound_cfg_test_predicate_is_skipped) ... ok
+test_desync_still_raises (__main__.PreservedBehaviourTests.test_desync_still_raises) ... ok
+test_double_quote_char_literal (__main__.PreservedBehaviourTests.test_double_quote_char_literal) ... ok
+test_enclosing_fn_is_tracked (__main__.PreservedBehaviourTests.test_enclosing_fn_is_tracked) ... ok
+test_escaped_quote_in_string (__main__.PreservedBehaviourTests.test_escaped_quote_in_string) ... ok
+test_feature_test_support_is_production (__main__.PreservedBehaviourTests.test_feature_test_support_is_production) ... ok
+test_inline_cfg_test_mod_is_skipped (__main__.PreservedBehaviourTests.test_inline_cfg_test_mod_is_skipped) ... ok
+test_line_comment_is_stripped (__main__.PreservedBehaviourTests.test_line_comment_is_stripped) ... ok
+test_nested_block_comment_is_stripped_to_its_true_end (__main__.PreservedBehaviourTests.test_nested_block_comment_is_stripped_to_its_true_end) ... ok
+test_normal_string_content_is_not_code (__main__.PreservedBehaviourTests.test_normal_string_content_is_not_code) ... ok
+test_arbitrary_hash_depth (__main__.RawStringTests.test_arbitrary_hash_depth) ... ok
+test_byte_and_c_string_raw_forms (__main__.RawStringTests.test_byte_and_c_string_raw_forms) ... ok
+test_hashed_raw_string_content_is_not_code (__main__.RawStringTests.test_hashed_raw_string_content_is_not_code) ... ok
+test_multiline_raw_string_braces_do_not_desync (__main__.RawStringTests.test_multiline_raw_string_braces_do_not_desync) ... ok
+test_multiline_raw_string_remainder_survives (__main__.RawStringTests.test_multiline_raw_string_remainder_survives) ... ok
+test_non_raw_byte_and_c_strings_still_stripped (__main__.RawStringTests.test_non_raw_byte_and_c_strings_still_stripped) ... ok
+test_plain_raw_string_content_is_not_code (__main__.RawStringTests.test_plain_raw_string_content_is_not_code) ... ok
+test_quoted_cfg_test_does_not_arm_the_next_real_mod (__main__.RawStringTests.test_quoted_cfg_test_does_not_arm_the_next_real_mod) ... ok
+test_raw_string_block_comment_open_does_not_eat_the_file (__main__.RawStringTests.test_raw_string_block_comment_open_does_not_eat_the_file) ... ok
+test_raw_string_cannot_toggle_the_cfg_test_region (__main__.RawStringTests.test_raw_string_cannot_toggle_the_cfg_test_region) ... ok
+test_raw_string_comment_markers_do_not_start_a_comment (__main__.RawStringTests.test_raw_string_comment_markers_do_not_start_a_comment) ... ok
+test_raw_string_prefix_must_start_at_a_token_boundary (__main__.RawStringTests.test_raw_string_prefix_must_start_at_a_token_boundary) ... ok
+test_dual_declared_production_module_is_not_test_support (__main__.TestSupportBoundaryTests.test_dual_declared_production_module_is_not_test_support) ... ok
+test_ignores_modules_without_the_test_support_boundary (__main__.TestSupportBoundaryTests.test_ignores_modules_without_the_test_support_boundary) ... ok
+test_recognizes_explicit_test_support_exports (__main__.TestSupportBoundaryTests.test_recognizes_explicit_test_support_exports) ... ok
+test_scenarios_are_not_a_basename_whitelist (__main__.TestSupportBoundaryTests.test_scenarios_are_not_a_basename_whitelist) ... ok
+
+----------------------------------------------------------------------
+Ran 52 tests in 0.002s
+
+OK
+Gate B PASS: 53 classified production hits carry allow-raw-zone annotations (35 rows)
+draw-replacement producers: PASS (8 rows, baseline frozen)
+Gate D PASS: 34 post-replacement continuation hits, all classified (27 rows, baseline frozen)
+=== rc=0
+=== testcarddata 03:44:23
+=== rc=0
+=== prelowered 03:44:28
+Gate P PASS (PreLowered ratchet: no producer count increased)
+=== rc=0
+=== skilldoc 03:44:28
+✓ oracle-parser skill references valid
+=== rc=0
+=== cranchors 03:44:32
+cr-citation-anchors: self-check — verdict path over planted text: exit 1, walked 1 source files, read 17 lines that cite a rule, matched 10
+cr-citation-anchors: self-check — planted per-line verdict: 1=named 2=named 3=cited 4=cited 5=cited 6=cited 8=cited-wrapped 10=cited-wrapped 11=cited 23=named 
+cr-citation-anchors: self-check — citation-free walk: exit 2, walked 1 source files, read 0 lines that cite a rule, matched 0
+cr-citation-anchors: self-check — exit status read from outside: matched tree exit 1, clean tree exit 0
+cr-citation-anchors: self-check OK — same function and same status capture as the walk below; planted exit, projection, per-line verdict and citation-free refusal all reproduced, and a child run of this script exited 1 over a matched tree and 0 over a clean one
+cr-citation-anchors: walked 4370 source files, read 86066 lines that cite a rule, matched 0 under crates client
+cr-citation-anchors: PASS — nothing this check matches stands on those lines.
+    What it matches is bounded, and the self-check above measured that in this
+    same run: it declined 1 planted rules coordinate(s) written outside
+    what it reads. So PASS says what this check matched, not that the tree
+    carries no rules coordinate.
+=== rc=0
+=== frames 03:44:42
+Resolution-frame boundary guard PASS
+=== rc=0
+=== drawcensus 03:44:59
+ERROR: /home/user/wt/complete/data/card-data.json not found.
+
+The corpus gate reads the generated card-data export, which is
+gitignored. Generate it first (Tilt `card-data` resource, or
+`cargo run --profile tool --features cli --bin oracle-gen -- data/ \
+  --stats --names-out data/card-names.json > data/card-data.json`),
+or point at another export with --card-data.
+
+This is an error, not a skip: a gate that passes when its input is
+missing would report green on a corpus it never read.
+=== rc=2
+=== costcensus 03:44:59
+ERROR: /home/user/wt/complete/data/card-data.json not found.
+
+This gate reads the generated card-data export, which is gitignored.
+Generate it first (Tilt `card-data` resource, or `cargo run --profile
+tool --features cli --bin oracle-gen -- data/ --stats --names-out
+data/card-names.json > data/card-data.json`), or point at another
+export with --card-data.
+
+This is an error, not a skip: a gate that passes when its input is
+missing would report green on a corpus it never read.
+=== rc=2
+=== bindings 03:44:59
+   Compiling phase-engine v0.111.0 (/home/user/wt/complete/crates/engine)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5m 46s
+     Running `/home/user/phase-personal/target/debug/interaction-bindings --check`
+=== rc=0
+=== clippy 03:50:46
+warning: excluded package(s) `phase-tauri` not found in workspace `/home/user/wt/complete`
+   Compiling phase-engine v0.111.0 (/home/user/wt/complete/crates/engine)
+    Checking phase-ai v0.111.0 (/home/user/wt/complete/crates/phase-ai)
+    Checking draft-core v0.111.0 (/home/user/wt/complete/crates/draft-core)
+    Checking seat-reducer v0.111.0 (/home/user/wt/complete/crates/seat-reducer)
+   Compiling server-core v0.111.0 (/home/user/wt/complete/crates/server-core)
+    Checking lobby-broker v0.111.0 (/home/user/wt/complete/crates/lobby-broker)
+    Checking probe-pin v0.111.0 (/home/user/wt/complete/crates/probe-pin)
+    Checking phase-llm v0.111.0 (/home/user/wt/complete/crates/phase-llm)
+    Checking phase-server v0.111.0 (/home/user/wt/complete/crates/phase-server)
+    Checking engine-inventory-gen v0.111.0 (/home/user/wt/complete/crates/engine-inventory-gen)
+    Checking manabrew-compat v0.111.0 (/home/user/wt/complete/crates/manabrew-compat)
+    Checking feed-scraper v0.111.0 (/home/user/wt/complete/crates/feed-scraper)
+    Checking engine-wasm v0.111.0 (/home/user/wt/complete/crates/engine-wasm)
+    Checking draft-wasm v0.111.0 (/home/user/wt/complete/crates/draft-wasm)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 30m 05s
+=== rc=0
+=== tests 04:20:51
+warning: excluded package(s) `phase-tauri` not found in workspace `/home/user/wt/complete`
+   Compiling syn v2.0.117
+   Compiling serde_core v1.0.228
+   Compiling serde_derive v1.0.228
+   Compiling serde v1.0.228
+   Compiling smallvec v1.15.1
+   Compiling memchr v2.8.0
+   Compiling log v0.4.29
+   Compiling indexmap v2.14.0
+   Compiling tracing-core v0.1.36
+   Compiling serde_json v1.0.149
+   Compiling tracing-attributes v0.1.31
+   Compiling thiserror-impl v2.0.18
+   Compiling thiserror v2.0.18
+   Compiling tracing v0.1.44
+   Compiling getrandom v0.3.4
+   Compiling fnv v1.0.7
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling toml_edit v0.22.27
+   Compiling rand_core v0.9.5
+   Compiling toml v0.8.23
+   Compiling regex-syntax v0.8.10
+   Compiling rand_chacha v0.9.0
+   Compiling rand v0.9.4
+   Compiling autocfg v1.5.0
+   Compiling num-traits v0.2.19
+   Compiling wait-timeout v0.2.1
+   Compiling quick-error v1.2.3
+   Compiling bit-vec v0.8.0
+   Compiling bit-set v0.8.0
+   Compiling rusty-fork v0.3.1
+   Compiling phase-engine v0.111.0 (/home/user/wt/complete/crates/engine)
+   Compiling rand_xorshift v0.4.0
+   Compiling strum_macros v0.27.2
+   Compiling unarray v0.1.4
+   Compiling petgraph v0.6.5
+   Compiling proptest v1.11.0
+   Compiling strum v0.27.2
+   Compiling im v15.1.0
+   Compiling nom v8.0.0
+   Compiling serde_ignored v0.1.14
+   Compiling shlex v1.3.0
+   Compiling find-msvc-tools v0.1.9
+   Compiling cc v1.2.62
+   Compiling lazy_static v1.5.0
+   Compiling aho-corasick v1.1.4
+   Compiling regex-automata v0.4.14
+   Compiling libmimalloc-sys v0.1.49
+   Compiling matchers v0.2.0
+   Compiling sharded-slab v0.1.7
+   Compiling tracing-serde v0.2.0
+   Compiling tracing-log v0.2.0
+   Compiling thread_local v1.1.9
+   Compiling nu-ansi-term v0.50.3
+   Compiling tracing-subscriber v0.3.23
+   Compiling mimalloc v0.1.52
+   Compiling phase-ai v0.111.0 (/home/user/wt/complete/crates/phase-ai)
+   Compiling parking_lot_core v0.9.12
+   Compiling scopeguard v1.2.0
+   Compiling lock_api v0.4.14
+   Compiling bytes v1.11.1
+   Compiling parking_lot v0.12.5
+   Compiling errno v0.3.14
+   Compiling signal-hook-registry v1.4.8
+   Compiling mio v1.2.0
+   Compiling socket2 v0.6.3
+   Compiling tokio-macros v2.7.0
+   Compiling synstructure v0.13.2
+   Compiling futures-core v0.3.32
+   Compiling stable_deref_trait v1.2.1
+   Compiling tokio v1.52.3
+   Compiling zerofrom-derive v0.1.7
+   Compiling zerofrom v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling futures-sink v0.3.32
+   Compiling yoke v0.8.2
+   Compiling zerovec-derive v0.11.3
+   Compiling slab v0.4.12
+   Compiling zerovec v0.11.6
+   Compiling displaydoc v0.2.5
+   Compiling rand_core v0.6.4
+   Compiling pkg-config v0.3.33
+   Compiling vcpkg v0.2.15
+   Compiling siphasher v1.0.3
+   Compiling phf_shared v0.11.3
+   Compiling rand v0.8.6
+   Compiling http v1.4.0
+   Compiling futures-macro v0.3.32
+   Compiling futures-task v0.3.32
+   Compiling futures-io v0.3.32
+   Compiling futures-util v0.3.32
+   Compiling phf_generator v0.11.3
+   Compiling proc-macro2 v1.0.106
+   Compiling tinystr v0.8.3
+   Compiling draft-core v0.111.0 (/home/user/wt/complete/crates/draft-core)
+   Compiling litemap v0.8.2
+   Compiling utf8parse v0.2.2
+   Compiling percent-encoding v2.3.2
+   Compiling writeable v0.6.3
+   Compiling icu_locale_core v2.2.0
+   Compiling anstyle-parse v1.0.0
+   Compiling zerotrie v0.2.4
+   Compiling potential_utf v0.1.5
+   Compiling icu_properties_data v2.2.0
+   Compiling icu_normalizer_data v2.2.0
+   Compiling anstyle-query v1.1.5
+   Compiling httparse v1.10.1
+   Compiling wasm-bindgen-shared v0.2.121
+   Compiling anstyle v1.0.14
+   Compiling colorchoice v1.0.5
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling utf8_iter v1.0.4
+   Compiling icu_collections v2.2.0
+   Compiling anstream v1.0.0
+   Compiling icu_provider v2.2.0
+   Compiling quote v1.0.45
+   Compiling http-body v1.0.1
+   Compiling openssl-sys v0.9.116
+   Compiling strsim v0.11.1
+   Compiling clap_lex v1.1.0
+   Compiling clap_builder v4.6.0
+   Compiling tokio-util v0.7.18
+   Compiling ring v0.17.14
+   Compiling clap_derive v4.6.1
+   Compiling anyhow v1.0.102
+   Compiling tower-service v0.3.3
+   Compiling rustversion v1.0.22
+   Compiling insta v1.47.2
+   Compiling clap v4.6.1
+   Compiling icu_normalizer v2.2.0
+   Compiling icu_properties v2.2.0
+   Compiling form_urlencoded v1.2.2
+   Compiling phf_codegen v0.11.3
+   Compiling zeroize v1.8.2
+   Compiling alloc-no-stdlib v2.0.4
+   Compiling atomic-waker v1.1.2
+   Compiling try-lock v0.2.5
+   Compiling want v0.3.1
+   Compiling h2 v0.4.14
+   Compiling alloc-stdlib v0.2.4
+   Compiling rustls-pki-types v1.14.1
+   Compiling idna_adapter v1.2.2
+   Compiling futures-channel v0.3.32
+   Compiling seat-reducer v0.111.0 (/home/user/wt/complete/crates/seat-reducer)
+   Compiling getrandom v0.2.17
+   Compiling foreign-types-shared v0.1.1
+   Compiling openssl v0.10.80
+   Compiling httpdate v1.0.3
+   Compiling untrusted v0.9.0
+   Compiling new_debug_unreachable v1.0.6
+   Compiling bumpalo v3.20.2
+   Compiling wasm-bindgen-macro-support v0.2.121
+   Compiling hyper v1.9.0
+   Compiling foreign-types v0.3.2
+   Compiling wasm-bindgen v0.2.121
+   Compiling idna v1.1.0
+   Compiling brotli-decompressor v5.0.3
+   Compiling http-body-util v0.1.3
+   Compiling phf_macros v0.11.3
+   Compiling sync_wrapper v1.0.2
+   Compiling lobby-broker v0.111.0 (/home/user/wt/complete/crates/lobby-broker)
+   Compiling openssl-macros v0.1.1
+   Compiling rustls v0.23.45
+   Compiling ipnet v2.12.0
+   Compiling server-core v0.111.0 (/home/user/wt/complete/crates/server-core)
+   Compiling tower-layer v0.3.3
+   Compiling native-tls v0.2.18
+   Compiling base64 v0.22.1
+   Compiling hyper-util v0.1.20
+   Compiling phf v0.11.3
+   Compiling brotli v8.0.4
+   Compiling url v2.5.8
+   Compiling rustls-webpki v0.103.15
+   Compiling wasm-bindgen-macro v0.2.121
+   Compiling string_cache_codegen v0.5.4
+   Compiling ahash v0.8.12
+   Compiling openssl-probe v0.2.1
+   Compiling termcolor v1.4.1
+   Compiling mac v0.1.1
+   Compiling compression-core v0.4.32
+   Compiling subtle v2.6.1
+   Compiling precomputed-hash v0.1.1
+   Compiling compression-codecs v0.4.38
+   Compiling futf v0.1.5
+   Compiling ts-rs-macros v10.1.0
+   Compiling markup5ever v0.14.1
+   Compiling tower v0.5.3
+   Compiling probe-pin v0.111.0 (/home/user/wt/complete/crates/probe-pin)
+   Compiling mime v0.3.17
+   Compiling dtoa v1.0.11
+   Compiling utf-8 v0.7.6
+   Compiling ryu v1.0.23
+   Compiling crossbeam-utils v0.8.21
+   Compiling serde_urlencoded v0.7.1
+   Compiling tendril v0.4.3
+   Compiling dtoa-short v0.3.5
+   Compiling tokio-native-tls v0.3.1
+   Compiling ts-rs v10.1.0
+   Compiling async-compression v0.4.42
+   Compiling tokio-rustls v0.26.4
+   Compiling string_cache v0.8.9
+   Compiling webpki-roots v1.0.9
+   Compiling selectors v0.26.0
+   Compiling libsqlite3-sys v0.30.1
+   Compiling sha1 v0.10.6
+   Compiling strum_macros v0.28.0
+   Compiling cssparser-macros v0.6.1
+   Compiling powerfmt v0.2.0
+   Compiling data-encoding v2.11.0
+   Compiling byteorder v1.5.0
+   Compiling fxhash v0.2.1
+   Compiling tungstenite v0.29.0
+   Compiling deranged v0.5.8
+   Compiling cssparser v0.34.0
+   Compiling manabrew-protocol v5.2.0
+   Compiling hyper-rustls v0.27.9
+   Compiling tower-http v0.6.10
+   Compiling hyper-tls v0.6.0
+   Compiling hashbrown v0.14.5
+   Compiling js-sys v0.3.98
+   Compiling phase-llm v0.111.0 (/home/user/wt/complete/crates/phase-llm)
+   Compiling servo_arc v0.4.3
+   Compiling encoding_rs v0.8.35
+   Compiling match_token v0.1.0
+   Compiling derive_more v0.99.20
+   Compiling num-conv v0.2.1
+   Compiling time-core v0.1.8
+   Compiling unicode-width v0.2.2
+   Compiling getopts v0.2.24
+   Compiling time v0.3.47
+   Compiling html5ever v0.29.1
+   Compiling reqwest v0.12.28
+   Compiling serde-wasm-bindgen v0.6.5
+   Compiling crossbeam-channel v0.5.15
+   Compiling hashlink v0.9.1
+   Compiling tokio-tungstenite v0.29.0
+   Compiling axum-core v0.5.6
+   Compiling console_error_panic_hook v0.1.7
+   Compiling serde_path_to_error v0.1.20
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling same-file v1.0.6
+   Compiling matchit v0.8.4
+   Compiling fallible-iterator v0.3.0
+   Compiling symlink v0.1.0
+   Compiling ego-tree v0.10.0
+   Compiling scraper v0.22.0
+   Compiling tracing-appender v0.2.5
+   Compiling rusqlite v0.32.1
+   Compiling axum v0.8.9
+   Compiling walkdir v2.5.0
+   Compiling manabrew-compat v0.111.0 (/home/user/wt/complete/crates/manabrew-compat)
+   Compiling regex v1.12.3
+   Compiling minisign-verify v0.2.5
+   Compiling phase-server v0.111.0 (/home/user/wt/complete/crates/phase-server)
+   Compiling engine-inventory-gen v0.111.0 (/home/user/wt/complete/crates/engine-inventory-gen)
+   Compiling feed-scraper v0.111.0 (/home/user/wt/complete/crates/feed-scraper)
+   Compiling engine-wasm v0.111.0 (/home/user/wt/complete/crates/engine-wasm)
+   Compiling draft-wasm v0.111.0 (/home/user/wt/complete/crates/draft-wasm)
+error: linking with `cc` failed: exit status: 1
+  |
+  = note:  "cc" "-m64" "/home/user/phase-personal/target/debug/deps/rustczHS8FM/symbols.o" "<115 object files omitted>" "-Wl,--as-needed" "-Wl,-Bstatic" "/home/user/phase-personal/target/debug/deps/{libflate2-d70117eaa6288963,libminiz_oxide-55721997d25ae652,libsimd_adler32-acdce6b73b40b74b,libcrc32fast-0515355d49043211}.rlib" "<sysroot>/lib/rustlib/x86_64-unknown-linux-gnu/lib/{libtest-*,libgetopts-*,librustc_std_workspace_std-*}.rlib" "/home/user/phase-personal/target/debug/deps/{libphase_ai-4aae8770dd6d4b0f,libtracing_subscriber-20dcd07ebf198ddd,libtracing_serde-e83b21630eb93caf,libsharded_slab-d48f7c8f9ac871bf,liblazy_static-cc6e900e56eb354c,libmatchers-c5a429aa68d43b7d,libregex_automata-64fe3d9db6050415,libaho_corasick-2a7172a730ab614d,libregex_syntax-42a14e1f1d394afc,libnu_ansi_term-b1bd7cc01d6352bf,libthread_local-7f631f8bc52f2de0,libtracing_log-daa4c28b2e778daf,libengine-de15a712342f0cdb,libtoml-5260434999d312b5,libtoml_edit-15d240e40c49d0b1,libserde_spanned-3ab2eda4459609f6,libwinnow-d039b55f97c14286,libtoml_write-932f7372d58db5aa,libtoml_datetime-27f744896b54bf13,libserde_ignored-abd4a7a7cdc13d07,libtracing-6809a5ffc1dd9789,liblog-ea1498aeea669608,libpin_project_lite-618733624f020948,libtracing_core-ddf0dbd16a9e55a4,libonce_cell-05a69522a0cc4127,libim-134cbbb7a566721d,librand_xoshiro-71cf46fba949abdd,librand_core-9a0144363531a945,libsized_chunks-825b684796c78cd1,libbitmaps-b85d44f5201396f0,libweb_time-e65940014775f1af,librustc_hash-a4e7e8899a36cc62,libsmallvec-d63303af1d381de2,libserde_json-0b2c1170da18bc7c,libitoa-0c82b0c4eb6d63f0,libzmij-187daa0b3832b036,libsha2-b1a8c86d996756c2,libcpufeatures-1d62cf39ddbce3b8,libdigest-dadab3bbd6b1fbdb,libblock_buffer-2ee045238e065018,libcrypto_common-42b7de9a012ae98a,libgeneric_array-1866c1c102e77f3e,libtypenum-a753c6b3837ac020,libthiserror-b0da0b01b9d6a9f6,libnom-60d09830392c6880,libmemchr-56de9fe78e9ba120,librand-04baff74a236b063,librand_chacha-0eb3459ba5be1ca6,libppv_lite86-2f38d43c82981b97,libzerocopy-938d8c82baff58f1,librand_core-578ffb12243ac063,libgetrandom-e3d3b37d7b95a0c0,liblibc-b29bcc8f100e4846,libcfg_if-e5943f1e9c3051c1,libstrum-4844fb3ae851e4d3,libpetgraph-863ad49cc8b225f7,libindexmap-eccc8f1f67518190,libequivalent-462449de2307eb1b,libhashbrown-9fc761fedda8b4ea,libfixedbitset-bd73324fce49b6da,libserde-f725e9fbc501a2c2,libserde_core-0295b89f76894371}.rlib" "<sysroot>/lib/rustlib/x86_64-unknown-linux-gnu/lib/{libstd-*,libpanic_unwind-*,libobject-*,libmemchr-*,libaddr2line-*,libgimli-*,libcfg_if-*,librustc_demangle-*,libstd_detect-*,libhashbrown-*,librustc_std_workspace_alloc-*,libminiz_oxide-*,libadler2-*,libunwind-*,liblibc-*,librustc_std_workspace_core-*,liballoc-*,libcore-*,libcompiler_builtins-*}.rlib" "-Wl,-Bdynamic" "-lgcc_s" "-lutil" "-lrt" "-lpthread" "-lm" "-ldl" "-lc" "-L" "/home/user/phase-personal/target/debug/deps/rustczHS8FM/raw-dylibs" "-B<sysroot>/lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld" "-fuse-ld=lld" "-Wl,--eh-frame-hdr" "-Wl,-z,noexecstack" "-L" "/home/user/phase-personal/target/debug/build/libmimalloc-sys-780c351ba2108e1e/out" "-L" "<sysroot>/lib/rustlib/x86_64-unknown-linux-gnu/lib" "-o" "/home/user/phase-personal/target/debug/deps/manapayment_finalize_from_floating_pool-cf5b5c67da905456" "-Wl,--gc-sections" "-pie" "-Wl,-z,relro,-z,now" "-Wl,--strip-debug" "-nodefaultlibs"
+  = note: some arguments are omitted. use `--verbose` to show all linker arguments
+  = note: PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace and instructions to reproduce the bug.
+          collect2: fatal error: ld terminated with signal 7 [Bus error]
+          compilation terminated.
+          
+
+error: could not compile `phase-ai` (test "manapayment_finalize_from_floating_pool") due to 1 previous error
+=== rc=101
