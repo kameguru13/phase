@@ -36,9 +36,9 @@
 //!   `effects::change_zone::enter_with_counters_for_object` and
 //!   `recommission_reads_march_projection` gets 0 counters (expected 1),
 //!   `recommission_reads_entrants_own_isnt_a_creature_static` gets 1 counter in
-//!   its (2, 1) case (expected 1 only because devotion is already five before
-//!   entry; its (0, 0) case gets 0), and the What Must Be Done March /
-//!   Opalescence rows get 0 counters (expected 2).
+//!   its (0, 0) and (2, 0) cases (expected 0: the graveyard card is a creature),
+//!   and the What Must Be Done March / Opalescence rows get 0 counters
+//!   (expected 2).
 //! * Revert the anaphoric-rider conversion in
 //!   `parser::oracle_effect::parse_effect_chain_ir_body` and the What Must Be
 //!   Done rows fail their slot premise and their "no later `PutCounter`" check.
