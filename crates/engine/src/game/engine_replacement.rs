@@ -563,6 +563,7 @@ fn handle_replacement_choice_inner(
                     }
                 },
                 // CR 122.1: Counter removal accepted after replacement choice.
+                // CR 118.11: the cost owner settles this removal by measurement.
                 ProposedEvent::RemoveCounter {
                     object_id,
                     counter_type,
@@ -1615,7 +1616,9 @@ fn handle_replacement_choice_inner(
                 }
                 return Ok(state.waiting_for.clone());
             }
-            if pending_was_counter_removal {
+            // CR 616.1: only the effect queue owns this drain; a cost removal
+            // falls through to the typed cost-move drain below.
+            if pending_was_counter_removal && state.active_counter_removals().is_some() {
                 state.waiting_for = WaitingFor::Priority {
                     player: state.active_player,
                 };

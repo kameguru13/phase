@@ -24,21 +24,26 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use engine::game::casting::ActivationCostGuardSite;
 use engine::game::effects::attach::attach_to;
+use engine::game::perf_counters;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
     AbilityCost, AbilityDefinition, AggregateFunction, DamageChannel, Effect, QuantityExpr,
-    QuantityRef, RoundingMode, TargetFilter, TargetRef,
+    QuantityRef, ReplacementDefinition, ReplacementMode, RoundingMode, TargetFilter, TargetRef,
 };
 use engine::types::actions::GameAction;
 use engine::types::counter::{parse_counter_type, CounterType};
 use engine::types::game_state::{
-    CounterCostChoice, GameState, ManaChoice, ManaChoiceContext, PayCostKind, StackEntryKind,
-    WaitingFor,
+    CounterCostChoice, GameState, ManaAbilityCostCursor, ManaChoice, ManaChoiceContext,
+    PausedCounterCostRemoval, PayCostKind, PendingCast, PendingCostMoveCompletion,
+    PendingCostMoveResume, ReplacementChoiceKind, StackEntryKind, WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
+use engine::types::replacements::ReplacementEvent;
+use engine::types::zones::Zone;
 
 const ESSENCE_BOTTLE: &str = "{3}, {T}: Put an elixir counter on this artifact.\n{T}, Remove all elixir counters from this artifact: You gain 2 life for each elixir counter removed this way.";
 const MOLTEN_HYDRA: &str = "{1}{R}{R}: Put a +1/+1 counter on this creature.\n{T}, Remove all +1/+1 counters from this creature: It deals damage to any target equal to the number of +1/+1 counters removed this way.";
@@ -63,6 +68,7 @@ const CRYPTOLITH_RITE: &str = "Creatures you control have \"{T}: Add one mana of
 const EXPERIMENT_KRAJ: &str = "Experiment Kraj has all activated abilities of each other creature with a +1/+1 counter on it.\n{T}: Put a +1/+1 counter on target creature.";
 const MARCH_OF_THE_MACHINES: &str = "Each noncreature artifact is an artifact creature with power and toughness each equal to its mana value. (Equipment that's a creature can't equip a creature.)";
 const PENTAD_PRISM: &str = "Sunburst (This artifact enters with a charge counter on it for each color of mana spent to cast it.)\nRemove a charge counter from this artifact: Add one mana of any color.";
+const MAGOSI: &str = "This land enters tapped.\n{T}: Add {U}.\n{U}, {T}: Put an eon counter on this land. Skip your next turn.\n{T}, Remove an eon counter from this land and return it to its owner's hand: Take an extra turn after this one.";
 /// C5a: the effect-path control — counters removed by an EFFECT, not a cost.
 const EFFECT_PATH_CONTROL: &str = "{T}: Remove all charge counters from this artifact. You gain 1 life for each charge counter removed this way.";
 /// C7d: a reader of X itself (not of the counters removed).
@@ -231,6 +237,10 @@ struct Answers {
     dig_offered: Option<usize>,
     /// The colour chosen at a `ChooseManaColor` prompt.
     mana_color: Option<ManaType>,
+    /// The option picked at each `ReplacementChoice` prompt, in order.
+    replacement_choices: VecDeque<usize>,
+    /// The permanents returned at a `PayCost { kind: ReturnToHand }` prompt.
+    return_choice: Vec<ObjectId>,
 }
 
 impl Answers {
@@ -315,6 +325,18 @@ fn drive(runner: &mut GameRunner, stop: impl Fn(&GameState) -> bool, answers: &m
                     .distribution
                     .clone()
                     .expect("a counter distribution for this row"),
+            },
+            WaitingFor::PayCost {
+                kind: PayCostKind::ReturnToHand,
+                ..
+            } => GameAction::SelectCards {
+                cards: answers.return_choice.clone(),
+            },
+            WaitingFor::ReplacementChoice { .. } => GameAction::ChooseReplacement {
+                index: answers
+                    .replacement_choices
+                    .pop_front()
+                    .expect("a replacement choice for this row"),
             },
             other => panic!("unexpected prompt: {}", other.variant_name()),
         };
@@ -1121,6 +1143,441 @@ fn kraj_nested_same_source_counter_cost_mana_payment_keeps_each_count() {
     assert_eq!(counters_on(&runner, first, &CounterType::Plus1Plus1), 0);
     assert_eq!(counters_on(&runner, second, &CounterType::Plus1Plus1), 0);
     assert!(payment_ownership_is_clear(&runner));
+}
+
+// ---------------------------------------------------------------------------
+// R2 — a counter-cost removal deferred by a replacement choice (CR 616.1)
+// ---------------------------------------------------------------------------
+//
+// No printed card replaces a counter removal, so these rows install the typed
+// optional replacement `ReplacementDefinition::new(RemoveCounter)
+// .mode(Optional { decline: None })` (the fixture of the effect-path tests in
+// `effects/counters.rs`). Its applier hands the event back unchanged, so
+// accepting and declining both remove what the cost asked for: the replacement
+// leg's reading is derived from that applier, not from a card. What the rows
+// pin is the payment around it — the removal waits for the choice, the cost is
+// still paid (CR 601.2h), and the activation reads the count actually removed
+// once it is settled (CR 118.11), never a zero recorded while it waited.
+
+/// Accept the optional replacement at a `ReplacementChoice`.
+const ACCEPT: usize = 0;
+/// Decline it: the removal happens unreplaced.
+const DECLINE: usize = 1;
+
+/// A P0 permanent carrying the optional counter-removal replacement.
+fn install_optional_counter_removal_replacement(runner: &mut GameRunner) {
+    let holder = runner
+        .state()
+        .battlefield
+        .iter()
+        .copied()
+        .find(|id| runner.state().objects[id].name == "Steward")
+        .expect("the board has the replacement's holder");
+    let replacement = ReplacementDefinition::new(ReplacementEvent::RemoveCounter)
+        .mode(ReplacementMode::Optional { decline: None });
+    let obj = runner.state_mut().objects.get_mut(&holder).unwrap();
+    Arc::make_mut(&mut obj.base_replacement_definitions).push(replacement.clone());
+    obj.replacement_definitions.push(replacement);
+}
+
+/// `main_phase` with the replacement's holder on P0's side.
+fn replacement_board() -> GameScenario {
+    let mut scenario = main_phase();
+    scenario.add_creature(P0, "Steward", 1, 1);
+    scenario
+}
+
+/// The optional replacement's accept/decline prompt is up (positive reach).
+fn assert_optional_replacement_prompt(runner: &GameRunner) {
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice {
+                candidate_count: 2,
+                kind: ReplacementChoiceKind::OptionalBranch,
+                ..
+            }
+        ),
+        "reach: the counter removal waits on the optional replacement: {:?}",
+        runner.state().waiting_for
+    );
+}
+
+fn choose_replacement(runner: &mut GameRunner, index: usize) {
+    runner
+        .act(GameAction::ChooseReplacement { index })
+        .unwrap_or_else(|err| panic!("the replacement choice is accepted: {err:?}"));
+}
+
+/// The parked stack-route counter-cost root: its attached payment, record and
+/// completion.
+fn parked_counter_cost_root(
+    runner: &GameRunner,
+) -> (
+    &PendingCast,
+    &PausedCounterCostRemoval,
+    &PendingCostMoveCompletion,
+) {
+    match &runner.state().pending_cost_move_resume {
+        Some(PendingCostMoveResume::CounterCostRemovalPayment {
+            pending: Some(pending),
+            removal,
+            completion,
+            ..
+        }) => (pending, removal, completion),
+        other => panic!("the payment is parked on its counter-cost removal: {other:?}"),
+    }
+}
+
+/// The parked mana-route cursor.
+fn parked_mana_cursor(runner: &GameRunner) -> &ManaAbilityCostCursor {
+    match &runner.state().pending_cost_move_resume {
+        Some(PendingCostMoveResume::ManaAbilityPayment { cursor, .. }) => cursor,
+        other => panic!("the mana ability is parked on its cost cursor: {other:?}"),
+    }
+}
+
+/// R2 stack route, direct pay: Essence Bottle's "Remove all elixir counters"
+/// waits on the replacement choice, so the activation pauses with the cost
+/// unpaid and no count. After the choice, the stack entry reads the 3 counters
+/// actually removed: +6 life. Declining removes the same 3 unreplaced.
+#[test]
+fn deferred_cost_removal_is_counted_after_its_replacement_choice() {
+    for choice in [ACCEPT, DECLINE] {
+        let mut scenario = replacement_board();
+        let bottle = scenario
+            .add_artifact_from_oracle(P0, "Essence Bottle", ESSENCE_BOTTLE)
+            .id();
+        scenario.with_counter(bottle, counter("elixir"), 3);
+        let mut runner = scenario.build();
+        install_optional_counter_removal_replacement(&mut runner);
+        let life_before = runner.life(P0);
+
+        let index = counter_cost_ability(&runner, bottle, 0);
+        activate(&mut runner, bottle, index);
+        assert_optional_replacement_prompt(&runner);
+        assert!(runner.state().stack.is_empty(), "not activated yet");
+        assert_eq!(
+            counters_on(&runner, bottle, &counter("elixir")),
+            3,
+            "the removal waits on the choice"
+        );
+        let (pending, _, _) = parked_counter_cost_root(&runner);
+        assert_eq!(
+            pending.ability.context.cost_removed_counter_amount, None,
+            "a parked payment holds no count for a removal still waiting"
+        );
+
+        choose_replacement(&mut runner, choice);
+        assert_eq!(runner.state().stack.len(), 1, "choice {choice}: placed");
+        assert_eq!(top_stack_count(&runner), Some(3), "choice {choice}");
+        assert_eq!(counters_on(&runner, bottle, &counter("elixir")), 0);
+
+        drive(
+            &mut runner,
+            priority_with_empty_stack,
+            &mut Answers::default(),
+        );
+        assert_eq!(runner.life(P0) - life_before, 6, "choice {choice}");
+        assert!(payment_ownership_is_clear(&runner), "choice {choice}");
+    }
+}
+
+/// R2 stack route, selected handler with a re-park: Ooze Flux removes 2 from
+/// First and 1 from Second; each removal waits on its own choice and is settled
+/// before the next one is made. The Ooze is 3/3.
+#[test]
+fn deferred_removals_from_among_settle_one_at_a_time() {
+    let mut scenario = replacement_board();
+    let flux = scenario
+        .add_enchantment_from_oracle(P0, "Ooze Flux", OOZE_FLUX)
+        .id();
+    let first = scenario.add_creature(P0, "First", 1, 1).id();
+    let second = scenario.add_creature(P0, "Second", 1, 1).id();
+    scenario.with_counter(first, CounterType::Plus1Plus1, 2);
+    scenario.with_counter(second, CounterType::Plus1Plus1, 1);
+    add_mana(&mut scenario, &[ManaType::Colorless, ManaType::Green]);
+    let mut runner = scenario.build();
+    install_optional_counter_removal_replacement(&mut runner);
+    let mut answers = Answers {
+        x: Some(3),
+        pay_amount: Some(3),
+        distribution: Some(vec![
+            CounterCostChoice {
+                object_id: first,
+                counter_type: CounterType::Plus1Plus1,
+                count: 2,
+            },
+            CounterCostChoice {
+                object_id: second,
+                counter_type: CounterType::Plus1Plus1,
+                count: 1,
+            },
+        ]),
+        ..Answers::default()
+    };
+
+    let index = counter_cost_ability(&runner, flux, 0);
+    activate(&mut runner, flux, index);
+    drive(
+        &mut runner,
+        |state| matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }),
+        &mut answers,
+    );
+    assert_optional_replacement_prompt(&runner);
+    let (pending, removal, _) = parked_counter_cost_root(&runner);
+    assert_eq!(pending.ability.context.cost_removed_counter_amount, None);
+    assert_eq!(removal.in_flight.removal.object_id, first);
+    assert_eq!(removal.remaining.len(), 1, "Second's removal is still owed");
+
+    choose_replacement(&mut runner, ACCEPT);
+    assert_optional_replacement_prompt(&runner);
+    assert_eq!(counters_on(&runner, first, &CounterType::Plus1Plus1), 0);
+    assert_eq!(counters_on(&runner, second, &CounterType::Plus1Plus1), 1);
+    let (pending, removal, _) = parked_counter_cost_root(&runner);
+    assert_eq!(
+        pending.ability.context.cost_removed_counter_amount,
+        Some(2),
+        "First's settled 2 are credited before Second's removal is made"
+    );
+    assert_eq!(removal.in_flight.removal.object_id, second);
+    assert!(removal.remaining.is_empty());
+
+    answers.replacement_choices.push_back(ACCEPT);
+    drive(&mut runner, priority_with_stack(1), &mut answers);
+    assert!(
+        answers.replacement_choices.is_empty(),
+        "Second's removal raised its own prompt"
+    );
+    assert!(
+        runner.state().players[0].mana_pool.is_empty(),
+        "reach: the activation went on to pay {{1}}{{G}}"
+    );
+    assert_eq!(top_stack_count(&runner), Some(3));
+
+    drive(&mut runner, priority_with_empty_stack, &mut answers);
+    assert_one_three_three_ooze(&runner, first, second);
+}
+
+/// R2 mana route, chosen-count leaf: Saprazzan Cove's "Remove any number of
+/// storage counters" (2 of 3) waits on the choice. The cursor holds the removal,
+/// has moved past the counter component and holds no count; after the choice
+/// the mana ability reads the 2 removed: {U}{U}.
+#[test]
+fn deferred_mana_cost_removal_is_counted_after_its_replacement_choice() {
+    let mut scenario = replacement_board();
+    let cove = scenario
+        .add_land_from_oracle(P0, "Saprazzan Cove", SAPRAZZAN_COVE)
+        .id();
+    scenario.with_counter(cove, counter("storage"), 3);
+    let mut runner = scenario.build();
+    install_optional_counter_removal_replacement(&mut runner);
+
+    let index = counter_cost_ability(&runner, cove, 0);
+    activate(&mut runner, cove, index);
+    drive(
+        &mut runner,
+        |state| matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }),
+        &mut Answers::pay(2),
+    );
+    assert_optional_replacement_prompt(&runner);
+    let cursor = parked_mana_cursor(&runner);
+    assert!(
+        cursor.counter_removal.is_some(),
+        "the cursor holds the removal"
+    );
+    assert!(
+        !cursor.remaining.iter().any(cost_removes_counters),
+        "the cursor moved past the counter component: {:?}",
+        cursor.remaining
+    );
+    assert_eq!(cursor.cost_removed_counters, None);
+    assert_eq!(counters_on(&runner, cove, &counter("storage")), 3);
+
+    choose_replacement(&mut runner, ACCEPT);
+    assert_eq!(pool(&runner, ManaType::Blue), 2);
+    assert_eq!(counters_on(&runner, cove, &counter("storage")), 1);
+    assert!(payment_ownership_is_clear(&runner));
+}
+
+/// B1-B, mana route, fixed-count self leaf: Pentad Prism's "Remove a charge
+/// counter" is paid by the cursor's self-contained arm. It waits on the choice
+/// inside the cursor, and after the choice the mana activation owns the 1
+/// counter removed: one mana, charge 2 -> 1. Declining reads the same.
+#[test]
+fn deferred_fixed_mana_cost_removal_pauses_in_the_cursor() {
+    for choice in [ACCEPT, DECLINE] {
+        let mut scenario = replacement_board();
+        let prism = scenario
+            .add_artifact_from_oracle(P0, "Pentad Prism", PENTAD_PRISM)
+            .id();
+        scenario.with_counter(prism, counter("charge"), 2);
+        let mut runner = scenario.build();
+        install_optional_counter_removal_replacement(&mut runner);
+
+        let index = counter_cost_ability(&runner, prism, 0);
+        activate(&mut runner, prism, index);
+        assert_optional_replacement_prompt(&runner);
+        let cursor = parked_mana_cursor(&runner);
+        assert!(
+            cursor.counter_removal.is_some(),
+            "the cursor holds the removal"
+        );
+        assert!(!cursor.remaining.iter().any(cost_removes_counters));
+        assert_eq!(
+            cursor.cost_removed_counters, None,
+            "nothing is credited while the removal waits"
+        );
+        assert_eq!(counters_on(&runner, prism, &counter("charge")), 2);
+
+        choose_replacement(&mut runner, choice);
+        let WaitingFor::ChooseManaColor {
+            context: ManaChoiceContext::ManaAbility(pending),
+            ..
+        } = &runner.state().waiting_for
+        else {
+            panic!(
+                "choice {choice}: the mana ability asks for its colour: {:?}",
+                runner.state().waiting_for
+            );
+        };
+        assert_eq!(pending.cost_removed_counters, Some(1), "choice {choice}");
+        assert_eq!(counters_on(&runner, prism, &counter("charge")), 1);
+
+        runner
+            .act(GameAction::ChooseManaColor {
+                choice: ManaChoice::SingleColor(ManaType::Red),
+                count: 1,
+            })
+            .expect("the colour is chosen");
+        assert_eq!(runner.state().players[0].mana_pool.total(), 1);
+        assert_eq!(counters_on(&runner, prism, &counter("charge")), 1);
+        assert!(payment_ownership_is_clear(&runner), "choice {choice}");
+    }
+}
+
+/// B4-a: Geometric Nexus pays {6} first through the mana-first detour; its
+/// residual "{T}, Remove all charge counters" is paid as the ability is pushed
+/// and waits on the choice. The count rides the paused activation across both
+/// entries into the payment: the Fractal gets the 3 counters removed.
+#[test]
+fn geometric_nexus_deferred_residual_counter_leg_counts_after_the_choice() {
+    let mut scenario = replacement_board();
+    let nexus = scenario
+        .add_artifact_from_oracle(P0, "Geometric Nexus", GEOMETRIC_NEXUS)
+        .id();
+    scenario.with_counter(nexus, counter("charge"), 3);
+    add_mana(&mut scenario, &colorless(6));
+    let mut runner = scenario.build();
+    install_optional_counter_removal_replacement(&mut runner);
+
+    let index = counter_cost_ability(&runner, nexus, 0);
+    perf_counters::reset();
+    activate(&mut runner, nexus, index);
+    let reaches = perf_counters::activation_cost_route_snapshot().guard_reaches;
+    assert!(
+        reaches[ActivationCostGuardSite::PushToStack as usize] > 0
+            && reaches[ActivationCostGuardSite::ManaResume as usize] > 0,
+        "reach: the mana was paid first and the counter leg as the push's residual: {reaches:?}"
+    );
+    assert_optional_replacement_prompt(&runner);
+    assert!(runner.state().players[0].mana_pool.is_empty(), "{{6}} paid");
+    assert!(runner.state().stack.is_empty());
+    assert_eq!(counters_on(&runner, nexus, &counter("charge")), 3);
+    let (pending, _, _) = parked_counter_cost_root(&runner);
+    assert_eq!(pending.activation_cost, None, "no residual is left");
+    assert_eq!(pending.ability.context.cost_removed_counter_amount, None);
+
+    choose_replacement(&mut runner, ACCEPT);
+    assert_eq!(runner.state().stack.len(), 1);
+    assert_eq!(top_stack_count(&runner), Some(3));
+    assert_eq!(counters_on(&runner, nexus, &counter("charge")), 0);
+
+    drive(
+        &mut runner,
+        priority_with_empty_stack,
+        &mut Answers::default(),
+    );
+    let fractals = battlefield_named(&runner, "Fractal");
+    assert_eq!(fractals.len(), 1, "the Fractal survives on the battlefield");
+    assert_eq!(
+        counters_on(&runner, fractals[0], &CounterType::Plus1Plus1),
+        3
+    );
+    assert!(payment_ownership_is_clear(&runner));
+}
+
+/// B4-b: Magosi's automatic "{T}, Remove an eon counter" is paid before its
+/// selected self-return; the removal waits on the choice, so the root carries
+/// the selected return. After the choice the removal is settled first, then
+/// Magosi returns to hand, and the activation reads its 1 counter removed.
+/// Unreplaced control first: the return completes in the same action.
+#[test]
+fn magosi_deferred_counter_leg_completes_its_selected_return_after_the_choice() {
+    for replaced in [false, true] {
+        let mut scenario = replacement_board();
+        let magosi = scenario
+            .add_land_from_oracle(P0, "Magosi, the Waterveil", MAGOSI)
+            .id();
+        scenario.with_counter(magosi, counter("eon"), 1);
+        let mut runner = scenario.build();
+        runner.state_mut().objects.get_mut(&magosi).unwrap().tapped = false;
+        if replaced {
+            install_optional_counter_removal_replacement(&mut runner);
+        }
+
+        let index = counter_cost_ability(&runner, magosi, 0);
+        activate(&mut runner, magosi, index);
+        assert!(
+            matches!(
+                runner.state().waiting_for,
+                WaitingFor::PayCost {
+                    kind: PayCostKind::ReturnToHand,
+                    ..
+                }
+            ),
+            "reach: the self-return is a selected cost: {:?}",
+            runner.state().waiting_for
+        );
+        let mut answers = Answers {
+            return_choice: vec![magosi],
+            ..Answers::default()
+        };
+        drive(
+            &mut runner,
+            |state| {
+                priority_with_stack(1)(state)
+                    || matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. })
+            },
+            &mut answers,
+        );
+
+        if replaced {
+            assert_optional_replacement_prompt(&runner);
+            assert!(runner.state().stack.is_empty());
+            assert_eq!(runner.state().objects[&magosi].zone, Zone::Battlefield);
+            assert_eq!(counters_on(&runner, magosi, &counter("eon")), 1);
+            let (pending, _, completion) = parked_counter_cost_root(&runner);
+            assert_eq!(pending.ability.context.cost_removed_counter_amount, None);
+            assert!(
+                matches!(
+                    completion,
+                    PendingCostMoveCompletion::CompleteSelectedReturnToHand { selected, .. }
+                        if selected == &vec![magosi]
+                ),
+                "the root carries the selected return: {completion:?}"
+            );
+            choose_replacement(&mut runner, ACCEPT);
+        }
+
+        assert_eq!(runner.state().stack.len(), 1, "replaced {replaced}");
+        assert_eq!(runner.state().objects[&magosi].zone, Zone::Hand);
+        assert_eq!(top_stack_count(&runner), Some(1), "replaced {replaced}");
+
+        drive(&mut runner, priority_with_empty_stack, &mut answers);
+        assert_eq!(runner.state().extra_turns.len(), 1, "replaced {replaced}");
+        assert!(payment_ownership_is_clear(&runner), "replaced {replaced}");
+    }
 }
 
 // ---------------------------------------------------------------------------

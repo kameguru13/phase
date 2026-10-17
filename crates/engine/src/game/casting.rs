@@ -29835,10 +29835,13 @@ pub enum ActivationCostGuardSite {
     ManaResume = 6,
     /// `finalize_mana_payment_with_phyrexian_choices`'s activation branch.
     PhyrexianResume = 7,
+    /// `finish_counter_cost_payment`, the counter-cost tail shared by the
+    /// selected handlers and the deferred-removal resume.
+    CounterCostTail = 8,
 }
 
 impl ActivationCostGuardSite {
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 9;
 }
 
 /// CR 601.2f + CR 601.2h: an activation's cost is paid only after its total is

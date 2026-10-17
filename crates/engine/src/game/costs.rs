@@ -48,8 +48,9 @@ use crate::types::ability::{
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    CostResume, GameState, ManaAbilityResume, PayCostKind, PendingCostMoveCompletion,
-    PendingCostMoveResume, WaitingFor,
+    CostResume, GameState, ManaAbilityResume, PausedCounterCostRemoval, PayCostKind,
+    PendingCostMoveCompletion, PendingCostMoveResume, PendingCounterRemoval,
+    PendingCounterRemovalInFlight, WaitingFor,
 };
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::player::PlayerId;
@@ -751,6 +752,77 @@ fn pay_ability_cost_for_resolution_with_cost_move_root(
         None,
         Some(cost),
     )
+}
+
+/// How [`pay_counter_cost_removals`] left a counter-removal cost.
+pub(crate) enum CounterCostRemovalProgress {
+    /// Every removal of the cost is over.
+    Complete,
+    /// A removal waits on a replacement choice. The record holds it and the
+    /// cost's later removals, none of which has been made.
+    AwaitingReplacementChoice(PausedCounterCostRemoval),
+}
+
+/// CR 602.2b + CR 118.11: credit `removed` counters to an activation's own
+/// removed-counter count. A credited zero still reads `Some(0)`, distinct from
+/// "this payment removed no counters as a cost" (`None`, CR 107.1c).
+pub(crate) fn credit_cost_removed_counters(ledger: &mut Option<u32>, removed: u32) {
+    let total = ledger.get_or_insert(0);
+    *total = total.saturating_add(removed);
+}
+
+/// CR 118.3 + CR 122.1 + CR 601.2h + CR 616.1: the single applier of
+/// counter-removal COSTS. Makes each planned removal in order through the
+/// replacement pipeline and credits each completed removal's actual count to
+/// the paying activation's ledger (`None` for a spell's cost, a resolution-time
+/// payment and the `can_pay` dry run). A removal that waits on a replacement
+/// choice stops the payment: nothing is credited for it until its owner
+/// settles it, and the later removals wait for it (CR 601.2h: partial payments
+/// are not allowed, so the owner finishes them before the payment proceeds).
+/// Only a completed cost materializes the ledger, so a paid leg that removed
+/// none reads `Some(0)` and a paused one never does.
+pub(crate) fn pay_counter_cost_removals(
+    state: &mut GameState,
+    removals: Vec<PendingCounterRemoval>,
+    mut cost_removed_counters: Option<&mut Option<u32>>,
+    events: &mut Vec<GameEvent>,
+) -> CounterCostRemovalProgress {
+    for (index, removal) in removals.iter().enumerate() {
+        let counter_count_before = state
+            .objects
+            .get(&removal.object_id)
+            .and_then(|obj| obj.counters.get(&removal.counter_type))
+            .copied()
+            .unwrap_or(0);
+        match super::effects::counters::remove_counter_with_replacement(
+            state,
+            removal.object_id,
+            removal.counter_type.clone(),
+            removal.count,
+            events,
+        ) {
+            super::effects::counters::CounterRemovalOutcome::Removed(removed) => {
+                if let Some(ledger) = cost_removed_counters.as_deref_mut() {
+                    credit_cost_removed_counters(ledger, removed);
+                }
+            }
+            super::effects::counters::CounterRemovalOutcome::AwaitingReplacementChoice => {
+                return CounterCostRemovalProgress::AwaitingReplacementChoice(
+                    PausedCounterCostRemoval {
+                        in_flight: PendingCounterRemovalInFlight {
+                            removal: removal.clone(),
+                            counter_count_before,
+                        },
+                        remaining: removals[index + 1..].to_vec(),
+                    },
+                );
+            }
+        }
+    }
+    if let Some(ledger) = cost_removed_counters {
+        ledger.get_or_insert(0);
+    }
+    CounterCostRemovalProgress::Complete
 }
 
 /// `cost_removed_counters` is the paying activation's ledger (CR 602.2b). `None`
@@ -1764,16 +1836,13 @@ fn pay_ability_cost_inner(
                 }
                 _ => source_id,
             };
-            // CR 602.2b + CR 601.2h + CR 118.3: the activation's effect reads the
-            // count actually removed; a resolution-time PayCost has no activation
-            // to bind (its ledger is `None`). A paid leaf that removed nothing
-            // still records `Some(0)`, distinct from "no counter cost" (CR 107.1c).
-            let mut record_removed = |removed: u32| {
-                if let Some(ledger) = cost_removed_counters.as_deref_mut() {
-                    *ledger = Some(ledger.unwrap_or(0).saturating_add(removed));
-                }
-            };
-            if *count == REMOVE_COUNTER_COST_ALL
+            // CR 601.2h: plan the removal before any counter moves. ALL of every
+            // type removes each type present; otherwise `CounterMatch::Any`
+            // resolves to the concrete type currently present on the payer
+            // before the replacement pipeline sees it —
+            // `remove_counter_with_replacement` operates on a single concrete
+            // kind. `OfType(t)` passes through unchanged.
+            let removals: Vec<PendingCounterRemoval> = if *count == REMOVE_COUNTER_COST_ALL
                 && matches!(counter_type, crate::types::counter::CounterMatch::Any)
             {
                 let mut counters: Vec<_> = state
@@ -1790,31 +1859,21 @@ fn pay_ability_cost_inner(
                 // sort by CounterType so the removal (and any per-type triggers
                 // it emits) happen in a deterministic, process-independent order.
                 counters.sort_by(|a, b| a.0.cmp(&b.0));
-                let mut removed = 0u32;
-                for (counter_type, count) in counters {
-                    removed = removed.saturating_add(
-                        super::effects::counters::remove_counter_with_replacement(
-                            state,
-                            payer,
-                            counter_type,
-                            count,
-                            events,
-                        ),
-                    );
-                }
-                record_removed(removed);
-                return Ok(PaymentOutcome::Paid);
-            }
-            // CR 601.2h: Resolve `CounterMatch::Any` to the concrete counter
-            // type currently present on the source before the replacement
-            // pipeline sees it — `remove_counter_with_replacement` operates on
-            // a single concrete kind. `OfType(t)` passes through unchanged.
-            let removed = match super::effects::counters::resolve_counter_match_for_removal(
-                state,
-                payer,
-                counter_type,
-            ) {
-                Some(resolved) => {
+                counters
+                    .into_iter()
+                    .map(|(counter_type, count)| PendingCounterRemoval {
+                        object_id: payer,
+                        counter_type,
+                        count,
+                    })
+                    .collect()
+            } else {
+                super::effects::counters::resolve_counter_match_for_removal(
+                    state,
+                    payer,
+                    counter_type,
+                )
+                .map(|resolved| {
                     let count = if *count == REMOVE_COUNTER_COST_ALL {
                         state
                             .objects
@@ -1825,13 +1884,48 @@ fn pay_ability_cost_inner(
                     } else {
                         *count
                     };
-                    super::effects::counters::remove_counter_with_replacement(
-                        state, payer, resolved, count, events,
-                    )
-                }
-                None => 0,
+                    PendingCounterRemoval {
+                        object_id: payer,
+                        counter_type: resolved,
+                        count,
+                    }
+                })
+                .into_iter()
+                .collect()
             };
-            record_removed(removed);
+            // CR 602.2b + CR 601.2h + CR 118.3: the activation's effect reads the
+            // count actually removed; a resolution-time PayCost has no activation
+            // to bind (its ledger is `None`).
+            match pay_counter_cost_removals(
+                state,
+                removals,
+                cost_removed_counters,
+                events,
+            ) {
+                CounterCostRemovalProgress::Complete => {}
+                CounterCostRemovalProgress::AwaitingReplacementChoice(removal) => match scope {
+                    // CR 601.2h + CR 616.1: the activation pauses until the
+                    // replacement choice settles this removal; its caller
+                    // attaches the paused payment to this root, whose resume
+                    // credits the measured count before anything later is paid.
+                    PaymentScope::Activation { .. } => {
+                        state.pending_cost_move_resume =
+                            Some(PendingCostMoveResume::CounterCostRemovalPayment {
+                                player,
+                                pending: None,
+                                removal: Box::new(removal),
+                                cost_paid_object: None,
+                                completion: PendingCostMoveCompletion::FinishPending,
+                            });
+                        return Ok(PaymentOutcome::Paused {
+                            remaining_cost: None,
+                        });
+                    }
+                    // CR 118.12: a resolution-time payment keeps no root and no
+                    // count; the replacement pipeline owns the paused removal.
+                    PaymentScope::Resolution { .. } => {}
+                },
+            }
         }
         // Targeted remove-counter costs are paid by the interactive
         // WaitingFor::RemoveCounterForCost path before automatic cost

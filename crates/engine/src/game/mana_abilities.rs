@@ -14,8 +14,8 @@ use crate::types::game_state::{
     CostResume, GameState, ManaAbilityCostCursor, ManaAbilityCostParent,
     ManaAbilityCostParentLifecycle, ManaAbilityCostResolutionMode, ManaAbilityResume, ManaChoice,
     ManaChoiceContext, ManaChoicePrompt, ManaColorChoiceResume, ManaTriggerFixedPointResume,
-    PayCostKind, PayableResource, PendingCostMoveResume, PendingManaAbility, ProductionOverride,
-    WaitingFor,
+    PausedCounterCostRemoval, PayCostKind, PayableResource, PendingCostMoveResume,
+    PendingCounterRemoval, PendingManaAbility, ProductionOverride, WaitingFor,
 };
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::mana::{ManaColor, ManaCost, ManaPool, ManaType, PaymentContext};
@@ -2640,6 +2640,7 @@ fn mana_ability_cost_cursor(
         next_sacrificed: 0,
         next_counter_choice: 0,
         cost_removed_counters: None,
+        counter_removal: None,
         selected_exile_remaining: None,
         selected_sacrifice_remaining: None,
         // CR 603.2 + CR 603.3b: A nested child starts with an empty frame-local
@@ -3185,23 +3186,33 @@ fn pay_mana_ability_cost_component(
             )? {
                 super::costs::PaymentOutcome::Paid => Ok(ManaAbilityPaymentProgress::Complete),
                 super::costs::PaymentOutcome::Paused { .. } => {
-                    let Some(PendingCostMoveResume::Cast { .. }) =
-                        state.pending_cost_move_resume.take()
-                    else {
-                        unreachable!(
-                            "a paused delegated mana-ability cost must retain the activation cost move"
-                        );
+                    // CR 118.11 + CR 616.1: the replacement pipeline delivers this
+                    // removal; the cursor settles it by measurement on resume.
+                    // The payer parked it with no attached payment and a
+                    // `FinishPending` tail, neither of which the cursor needs.
+                    let counter_removal = match state.pending_cost_move_resume.take() {
+                        Some(PendingCostMoveResume::Cast { .. }) => None,
+                        Some(PendingCostMoveResume::CounterCostRemovalPayment {
+                            pending: None,
+                            removal,
+                            ..
+                        }) => Some(removal),
+                        _ => unreachable!(
+                            "a paused delegated mana-ability cost must retain the activation cost move or its deferred counter removal"
+                        ),
                     };
                     let pre_delivery_choice_player = state
                         .pending_replacement
                         .is_some()
                         .then(|| state.waiting_for.acting_player())
                         .flatten();
+                    let mut resumed = mana_ability_cursor_after_current_component(cursor);
+                    resumed.counter_removal = counter_removal;
                     pause_mana_ability_cost_payment(
                         state,
                         pre_delivery_choice_player,
                         pending,
-                        mana_ability_cursor_after_current_component(cursor),
+                        resumed,
                         events,
                         cost_event_start,
                     );
@@ -3310,11 +3321,13 @@ fn pay_mana_ability_cost_component(
                 ManaAbilityCostComponentProgress::Complete => None,
                 ManaAbilityCostComponentProgress::HandedToReplacement {
                     remaining_life_payments,
+                    counter_removal,
                     choice_player,
                 } => {
                     cursor
                         .remaining_life_payments
                         .clone_from(remaining_life_payments);
+                    cursor.counter_removal.clone_from(counter_removal);
                     Some(*choice_player)
                 }
             };
@@ -4055,6 +4068,31 @@ fn continue_mana_ability_cost_payment_in_node(
             "This permanent is already committed to a spell sacrifice cost".to_string(),
         ));
     }
+    // CR 118.11 + CR 616.1 + CR 602.2b: a counter leg's removal that waited on a
+    // replacement choice is settled first: its measured count is this
+    // activation's (a modified removal has still been paid), then the leg's
+    // later removals are paid before any later component.
+    if let Some(paused) = cursor.counter_removal.take() {
+        let PausedCounterCostRemoval {
+            in_flight,
+            remaining,
+        } = *paused;
+        let settled =
+            super::effects::counters::settled_in_flight_counter_removal(state, &in_flight);
+        super::costs::credit_cost_removed_counters(&mut cursor.cost_removed_counters, settled);
+        if let super::costs::CounterCostRemovalProgress::AwaitingReplacementChoice(paused) =
+            super::costs::pay_counter_cost_removals(
+                state,
+                remaining,
+                Some(&mut cursor.cost_removed_counters),
+                events,
+            )
+        {
+            cursor.counter_removal = Some(Box::new(paused));
+            pause_mana_ability_cost_payment(state, None, pending, cursor, events, cost_event_start);
+            return Ok(state.waiting_for.clone());
+        }
+    }
     while let Some(amount) = cursor.remaining_life_payments.first().copied() {
         cursor.remaining_life_payments.remove(0);
         // CR 118.3b + CR 119.4 + CR 616.1: Paying life is a life-loss event,
@@ -4517,13 +4555,27 @@ where
                 }
                 count => count,
             };
-            let removed =
-                remove_counters_for_mana_cost(state, source_id, counter_type, count, events);
+            let removals =
+                plan_counter_removals_for_mana_cost(state, source_id, counter_type, count);
             // CR 605.3b + CR 602.2b + CR 601.2h: the mana ability's production
             // reads the count actually removed, credited to this activation's
-            // own cursor ledger (`produce_mana_from_ability`).
-            *cost_removed_counters =
-                Some(cost_removed_counters.unwrap_or(0).saturating_add(removed));
+            // own cursor ledger (`produce_mana_from_ability`). CR 616.1: a
+            // removal waiting on a replacement choice is handed to the cursor,
+            // which settles it on resume.
+            if let super::costs::CounterCostRemovalProgress::AwaitingReplacementChoice(paused) =
+                super::costs::pay_counter_cost_removals(
+                    state,
+                    removals,
+                    Some(cost_removed_counters),
+                    events,
+                )
+            {
+                return Ok(ManaAbilityCostComponentProgress::HandedToReplacement {
+                    remaining_life_payments: Vec::new(),
+                    counter_removal: Some(Box::new(paused)),
+                    choice_player: None,
+                });
+            }
         }
         Some(other) => {
             return Err(EngineError::InvalidAction(format!(
@@ -4547,8 +4599,12 @@ enum ManaAbilityCostComponentProgress {
     /// the same way. Resuming continues after the component rather than paying
     /// it again. A payment that pauses before it spends anything (a nested
     /// source's own cost) never reaches here: that child parks its own cursor.
+    /// `counter_removal` is a counter-removal component whose current removal
+    /// waits on a replacement choice (CR 118.11): the cursor settles it by
+    /// measurement on resume and then pays its later removals.
     HandedToReplacement {
         remaining_life_payments: Vec<u32>,
+        counter_removal: Option<Box<PausedCounterCostRemoval>>,
         choice_player: Option<PlayerId>,
     },
 }
@@ -4681,12 +4737,14 @@ fn pay_life_cost(
         PayLifeCostResult::PaidWithDeferredSubstitution { .. } => {
             Ok(ManaAbilityCostComponentProgress::HandedToReplacement {
                 remaining_life_payments: Vec::new(),
+                counter_removal: None,
                 choice_player: None,
             })
         }
         PayLifeCostResult::DeferredReplacementChoice { choice_player, .. } => {
             Ok(ManaAbilityCostComponentProgress::HandedToReplacement {
                 remaining_life_payments: Vec::new(),
+                counter_removal: None,
                 choice_player: Some(choice_player),
             })
         }
@@ -5018,6 +5076,7 @@ fn pay_mana_sub_cost(
                 ..
             } => ManaAbilityCostComponentProgress::HandedToReplacement {
                 remaining_life_payments,
+                counter_removal: None,
                 choice_player,
             },
         });
@@ -5252,27 +5311,24 @@ fn removable_counter_count_for_mana_cost(
     }
 }
 
-/// CR 118.3 + CR 122.1: pay a mana ability's remove-counter cost leaf and
-/// return the number of counters actually removed.
-fn remove_counters_for_mana_cost(
-    state: &mut GameState,
+/// CR 118.3 + CR 122.1 + CR 601.2h: plan a mana ability's remove-counter cost
+/// leaf as removals from `source_id`, before any counter moves. `Any` takes
+/// counters type by type, in `CounterType` order (issue #4878: the counter map
+/// is a default-RandomState HashMap, so its own order is per-process).
+fn plan_counter_removals_for_mana_cost(
+    state: &GameState,
     source_id: ObjectId,
     counter_type: &CounterMatch,
     mut count: u32,
-    events: &mut Vec<GameEvent>,
-) -> u32 {
+) -> Vec<PendingCounterRemoval> {
     match counter_type {
-        CounterMatch::OfType(counter_type) => {
-            super::effects::counters::remove_counter_with_replacement(
-                state,
-                source_id,
-                counter_type.clone(),
-                count,
-                events,
-            )
-        }
+        CounterMatch::OfType(counter_type) => vec![PendingCounterRemoval {
+            object_id: source_id,
+            counter_type: counter_type.clone(),
+            count,
+        }],
         CounterMatch::Any => {
-            let counters: Vec<(CounterType, u32)> = state
+            let mut counters: Vec<(CounterType, u32)> = state
                 .objects
                 .get(&source_id)
                 .map(|obj| {
@@ -5282,26 +5338,23 @@ fn remove_counters_for_mana_cost(
                         .collect()
                 })
                 .unwrap_or_default();
-            let mut removed = 0u32;
+            counters.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut removals = Vec::new();
             for (counter_type, available) in counters {
                 if count == 0 {
                     break;
                 }
                 let to_remove = available.min(count);
                 if to_remove > 0 {
-                    removed = removed.saturating_add(
-                        super::effects::counters::remove_counter_with_replacement(
-                            state,
-                            source_id,
-                            counter_type,
-                            to_remove,
-                            events,
-                        ),
-                    );
+                    removals.push(PendingCounterRemoval {
+                        object_id: source_id,
+                        counter_type,
+                        count: to_remove,
+                    });
                     count -= to_remove;
                 }
             }
-            removed
+            removals
         }
     }
 }

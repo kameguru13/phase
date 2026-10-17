@@ -1256,7 +1256,8 @@ fn redact_activation_records(filtered: &mut GameState) {
     if let Some(resume) = filtered.pending_cost_move_resume.as_mut() {
         match resume {
             PendingCostMoveResume::Cast { pending, .. }
-            | PendingCostMoveResume::SacrificeForCost { pending, .. } => {
+            | PendingCostMoveResume::SacrificeForCost { pending, .. }
+            | PendingCostMoveResume::CounterCostRemovalPayment { pending, .. } => {
                 if let Some(pending) = pending.as_deref_mut() {
                     clear(pending);
                 }
@@ -7091,6 +7092,7 @@ mod tests {
                 next_sacrificed: 0,
                 next_counter_choice: 0,
                 cost_removed_counters: None,
+                counter_removal: None,
                 selected_exile_remaining: None,
                 selected_sacrifice_remaining: None,
                 deferred_cost_events: Vec::new(),
@@ -11598,6 +11600,7 @@ mod tests {
                 next_sacrificed: 0,
                 next_counter_choice: 0,
                 cost_removed_counters: None,
+                counter_removal: None,
                 selected_exile_remaining: Some(vec![hidden]),
                 selected_sacrifice_remaining: None,
                 deferred_cost_events: Vec::new(),

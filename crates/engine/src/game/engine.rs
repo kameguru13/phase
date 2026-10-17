@@ -8471,6 +8471,7 @@ pub(crate) fn drain_pending_cost_move_resume(
                     | PendingCostMoveResume::UnlessBouncePayment { .. }
                     | PendingCostMoveResume::ManaAbilityPayment { .. }
                     | PendingCostMoveResume::ActivationMillPayment { .. }
+                    | PendingCostMoveResume::CounterCostRemovalPayment { .. }
                     | PendingCostMoveResume::LoyaltyActivation { .. }
                     | PendingCostMoveResume::CounterAdditionUnlessPayment { .. }
                     | PendingCostMoveResume::RandomDiscardUnlessPayment(..)
@@ -8479,7 +8480,9 @@ pub(crate) fn drain_pending_cost_move_resume(
         // CR 606.4 + CR 616.1: a fully-prevented loyalty counter add (e.g. an
         // opponent's Solemnity would prevent the counters) must still complete the
         // parked activation instead of wedging, so `LoyaltyActivation` is eligible
-        // at the Prevented boundary as well. Counter-addition unless payments
+        // at the Prevented boundary as well. CR 614.6 + CR 118.11: likewise a
+        // prevented counter-cost removal removed none, which its resume measures,
+        // and the payment continues. Counter-addition unless payments
         // are eligible here too: whether a prevented placement leaves that
         // payment paid or failed is `resume_counter_addition_unless_payment`'s
         // call, argued in its own header; either way the pending unless branch
@@ -8496,6 +8499,7 @@ pub(crate) fn drain_pending_cost_move_resume(
                     | PendingCostMoveResume::UnlessBouncePayment { .. }
                     | PendingCostMoveResume::ManaAbilityPayment { .. }
                     | PendingCostMoveResume::ActivationMillPayment { .. }
+                    | PendingCostMoveResume::CounterCostRemovalPayment { .. }
                     | PendingCostMoveResume::LoyaltyActivation { .. }
                     | PendingCostMoveResume::CounterAdditionUnlessPayment { .. }
                     | PendingCostMoveResume::RandomDiscardUnlessPayment(..)
@@ -8562,6 +8566,11 @@ pub(crate) fn drain_pending_cost_move_resume(
         Some(PendingCostMoveResume::ActivationMillPayment { .. })
     ) {
         casting_costs::resume_activation_mill_cost_payment(state, events)?
+    } else if matches!(
+        state.pending_cost_move_resume,
+        Some(PendingCostMoveResume::CounterCostRemovalPayment { .. })
+    ) {
+        casting_costs::resume_counter_cost_removal_payment(state, events, action_event_start)?
     } else if matches!(
         state.pending_cost_move_resume,
         Some(PendingCostMoveResume::LoyaltyActivation { .. })

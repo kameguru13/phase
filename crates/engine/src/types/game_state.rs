@@ -5979,6 +5979,18 @@ pub struct PendingCounterRemovalInFlight {
     pub counter_count_before: u32,
 }
 
+/// CR 118.3 + CR 601.2h + CR 616.1: a counter-removal cost whose current removal
+/// waits on a replacement choice. `in_flight` is that removal (settled by
+/// measurement once the replacement pipeline delivers it, CR 118.11);
+/// `remaining` are the cost's later removals, still unpaid. Held by
+/// [`PendingCostMoveResume::CounterCostRemovalPayment`] on the stack route and
+/// by [`ManaAbilityCostCursor::counter_removal`] on the mana route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PausedCounterCostRemoval {
+    pub in_flight: PendingCounterRemovalInFlight,
+    pub remaining: Vec<PendingCounterRemoval>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PendingCounterRemovalQueue {
     /// Remaining per-object counter removals.
@@ -8029,6 +8041,13 @@ pub struct ManaAbilityCostCursor {
     /// activation's counter legs so far; `Some(0)` = a counter leg removed none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_removed_counters: Option<u32>,
+    /// CR 118.11 + CR 616.1: a counter leg of this cost whose removal waits on a
+    /// replacement choice. The cursor has already advanced past that leg; on
+    /// resume the removal is settled by measurement, credited to
+    /// `cost_removed_counters`, and the leg's later removals are paid before
+    /// any later component.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counter_removal: Option<Box<PausedCounterCostRemoval>>,
     /// The current selected-exile component, after the move that paused has
     /// been consumed. Its remaining objects must move before the cost cursor
     /// advances to the next component.
@@ -8202,6 +8221,21 @@ pub enum PendingCostMoveResume {
         player: PlayerId,
         pending: Box<PendingCast>,
     },
+    /// CR 118.3 + CR 122.1 + CR 601.2h + CR 602.2b + CR 616.1: A counter-removal
+    /// cost of a cast or activation paused while a replacement choice settles
+    /// its current removal. The resume settles that removal by measurement,
+    /// credits an activation's own removed-counter count (CR 118.11), pays the
+    /// cost's later removals, then runs `completion`. `pending` is `None` only
+    /// between the cost payer parking this root and its caller attaching the
+    /// payment (`unattached_activation_slot_mut`); `cost_paid_object` is the
+    /// selected object the handlers stamp once the cost is paid.
+    CounterCostRemovalPayment {
+        player: PlayerId,
+        pending: Option<Box<PendingCast>>,
+        removal: Box<PausedCounterCostRemoval>,
+        cost_paid_object: Option<ObjectId>,
+        completion: PendingCostMoveCompletion,
+    },
     /// CR 606.4 + CR 614.1a + CR 616.1: A loyalty activation paused on a
     /// counter-cost replacement-ordering choice (e.g. Doubling Season vs an
     /// opponent's Vorinclex halving the loyalty counters). The counter is
@@ -8273,6 +8307,7 @@ impl PendingCostMoveResume {
             PendingCostMoveResume::Cast { .. }
             | PendingCostMoveResume::ManaAbilityPayment { .. }
             | PendingCostMoveResume::ActivationMillPayment { .. }
+            | PendingCostMoveResume::CounterCostRemovalPayment { .. }
             | PendingCostMoveResume::LoyaltyActivation { .. } => true,
             // CR 116.2h: foretelling is a special action; its {2} is paid before
             // its exile move, which can then pause on a replacement.
@@ -8293,6 +8328,43 @@ impl PendingCostMoveResume {
             | PendingCostMoveResume::UnlessBouncePayment { .. }
             | PendingCostMoveResume::CounterAdditionUnlessPayment { .. }
             | PendingCostMoveResume::RandomDiscardUnlessPayment(_) => false,
+        }
+    }
+
+    /// CR 601.2h + CR 602.2b: the payment slot and completion of a root the
+    /// cost payer parked before its caller could attach the paused cast or
+    /// activation. `None` for an attached root and for every root that never
+    /// takes a caller's payment.
+    pub(crate) fn unattached_activation_slot_mut(
+        &mut self,
+    ) -> Option<(
+        &mut Option<Box<PendingCast>>,
+        &mut PendingCostMoveCompletion,
+    )> {
+        match self {
+            PendingCostMoveResume::Cast {
+                pending: slot @ None,
+                completion,
+                ..
+            }
+            | PendingCostMoveResume::CounterCostRemovalPayment {
+                pending: slot @ None,
+                completion,
+                ..
+            } => Some((slot, completion)),
+            PendingCostMoveResume::Cast { .. }
+            | PendingCostMoveResume::CounterCostRemovalPayment { .. }
+            | PendingCostMoveResume::SacrificeForCost { .. }
+            | PendingCostMoveResume::WardSacrificePayment { .. }
+            | PendingCostMoveResume::ReplacementMayCost { .. }
+            | PendingCostMoveResume::Foretell { .. }
+            | PendingCostMoveResume::CollectEvidencePayment { .. }
+            | PendingCostMoveResume::UnlessBouncePayment { .. }
+            | PendingCostMoveResume::ManaAbilityPayment { .. }
+            | PendingCostMoveResume::ActivationMillPayment { .. }
+            | PendingCostMoveResume::LoyaltyActivation { .. }
+            | PendingCostMoveResume::CounterAdditionUnlessPayment { .. }
+            | PendingCostMoveResume::RandomDiscardUnlessPayment(_) => None,
         }
     }
 }
@@ -8823,7 +8895,10 @@ impl GameState {
             }
             PendingCastOwner::CostMove => match self.pending_cost_move_resume.as_ref()? {
                 PendingCostMoveResume::Cast { pending, .. }
-                | PendingCostMoveResume::SacrificeForCost { pending, .. } => pending.as_deref(),
+                | PendingCostMoveResume::SacrificeForCost { pending, .. }
+                | PendingCostMoveResume::CounterCostRemovalPayment { pending, .. } => {
+                    pending.as_deref()
+                }
                 PendingCostMoveResume::CollectEvidencePayment { resume, .. } => {
                     match resume.as_ref() {
                         CollectEvidenceResume::Casting { pending_cast, .. } => Some(pending_cast),
@@ -8865,7 +8940,10 @@ impl GameState {
             }
             PendingCastOwner::CostMove => match self.pending_cost_move_resume.as_mut()? {
                 PendingCostMoveResume::Cast { pending, .. }
-                | PendingCostMoveResume::SacrificeForCost { pending, .. } => pending.as_deref_mut(),
+                | PendingCostMoveResume::SacrificeForCost { pending, .. }
+                | PendingCostMoveResume::CounterCostRemovalPayment { pending, .. } => {
+                    pending.as_deref_mut()
+                }
                 PendingCostMoveResume::CollectEvidencePayment { resume, .. } => {
                     match resume.as_mut() {
                         CollectEvidenceResume::Casting { pending_cast, .. } => Some(pending_cast),
@@ -9212,6 +9290,7 @@ fn visit_cost_move_resume_events(
         | PendingCostMoveResume::Foretell { .. }
         | PendingCostMoveResume::UnlessBouncePayment { .. }
         | PendingCostMoveResume::ActivationMillPayment { .. }
+        | PendingCostMoveResume::CounterCostRemovalPayment { .. }
         | PendingCostMoveResume::LoyaltyActivation { .. } => {}
     }
 }
