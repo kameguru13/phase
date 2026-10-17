@@ -581,6 +581,7 @@ fn redundancy_delta(
         | Effect::GivePlayerCounter { .. }
         | Effect::ExileFromTopUntil { .. }
         | Effect::RevealUntil { .. }
+        | Effect::PhysicalContest { .. }
         | Effect::Discover { .. }
         | Effect::PutAtLibraryPosition { .. }
         | Effect::PutOnTopOrBottom { .. }
