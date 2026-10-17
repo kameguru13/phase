@@ -18,14 +18,17 @@
 //! A created-token placement is the one cross-effect reading this module owns:
 //! a `PutCounter { target: LastCreated }` whose nearest preceding publisher of
 //! the created referent (`Effect::publishes_created_referent`, the engine's
-//! classification) in the same unconditional chain is an `Effect::Token` puts
-//! its counters on the token(s) that `Token` just created, so a consumer reads
-//! it as part of that token's creation, the way it reads
+//! classification) in the same unconditional branch chain is an
+//! `Effect::Token` puts its counters on the token(s) that `Token` just created,
+//! so a consumer reads it as part of that token's creation, the way it reads
 //! `Token { enter_with_counters }`.
-//! [`created_token_placement_source`] answers the pairing question and
-//! [`AbilityWalk::without_created_token_placements`] is the filtering view
-//! every consumer uses; neither ever pairs across abilities or into an
-//! `else_ability` / mode branch.
+//! [`created_token_placement_source`] answers the pairing question for one
+//! chain, and [`AbilityWalk::created_token_pairs`] collects the pairs of every
+//! branch chain of an ability: the root chain, and each `else_ability` /
+//! mode branch head's own chain. The filtering view
+//! ([`AbilityWalk::without_created_token_placements`]) and X attribution share
+//! those pairs. Pairing never crosses abilities or chains: a `Token` in one
+//! branch never pairs with a placement in another, or in the root.
 //!
 //! Keep this module small — it is a single building block shared across
 //! `features/*` and `policies/*`.
@@ -118,9 +121,9 @@ pub(crate) fn collect_chain_effects(ability: &AbilityDefinition) -> Vec<&Effect>
 /// or a wrapper whose inline payload publishes) also returns `None`, so every
 /// consumer keeps its existing reading of the placement.
 ///
-/// `chain` must be one ability's unconditional chain
-/// ([`collect_chain_effects`]), never a concatenation of several abilities'
-/// walks or a walk that includes `else_ability` / mode branches.
+/// `chain` must be one unconditional branch chain ([`collect_chain_effects`]
+/// of the root or of one `else_ability` / mode head), never a concatenation of
+/// several abilities' or branches' walks.
 pub(crate) fn created_token_placement_source(chain: &[&Effect], index: usize) -> Option<usize> {
     match chain.get(index)? {
         Effect::PutCounter {
@@ -136,9 +139,40 @@ pub(crate) fn created_token_placement_source(chain: &[&Effect], index: usize) ->
     }
 }
 
+/// A created-token placement and the `Token` it pairs with, both nodes of one
+/// branch chain (compared by `std::ptr::eq`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CreatedTokenPair<'a> {
+    pub(crate) token: &'a Effect,
+    pub(crate) placement: &'a Effect,
+}
+
+/// Every unconditional chain of `ability`'s tree, each as its own sequence:
+/// the root chain ([`collect_chain_effects`]), then, for every node of a
+/// collected chain, its `else_ability` (CR 608.2c: the "Otherwise" leg replaces
+/// the chain it guards) and each of its `mode_abilities` (CR 700.2: each mode
+/// is an alternative), recursively. Chains are never concatenated.
+fn branch_chains(ability: &AbilityDefinition) -> Vec<Vec<&Effect>> {
+    let mut chains = Vec::new();
+    push_branch_chains(ability, &mut chains);
+    chains
+}
+
+fn push_branch_chains<'a>(head: &'a AbilityDefinition, chains: &mut Vec<Vec<&'a Effect>>) {
+    chains.push(collect_chain_effects(head));
+    for node in std::iter::successors(Some(head), |node| node.sub_ability.as_deref()) {
+        if let Some(other) = node.else_ability.as_deref() {
+            push_branch_chains(other, chains);
+        }
+        for mode in &node.mode_abilities {
+            push_branch_chains(mode, chains);
+        }
+    }
+}
+
 /// One ability's effects as a consumer walks them, plus the ability they came
-/// from. The ability's unconditional chain, the only sequence the created-token
-/// predicate reads, is built on demand, never at construction.
+/// from. The ability's branch chains, the only sequences the created-token
+/// predicate reads, are built on demand, never at construction.
 pub(crate) struct AbilityWalk<'a> {
     ability: Option<&'a AbilityDefinition>,
     effects: Vec<&'a Effect>,
@@ -169,10 +203,27 @@ impl<'a> AbilityWalk<'a> {
         }
     }
 
-    /// The unconditional chain, built on each call by [`collect_chain_effects`];
-    /// empty when there is no ability behind the walk.
-    pub(crate) fn chain(&self) -> Vec<&'a Effect> {
-        self.ability.map(collect_chain_effects).unwrap_or_default()
+    /// Every created-token pair of the ability's branch chains, each read
+    /// within its own chain ([`created_token_placement_source`]); empty when
+    /// there is no ability behind the walk. Built on each call.
+    pub(crate) fn created_token_pairs(&self) -> Vec<CreatedTokenPair<'a>> {
+        self.ability
+            .map(branch_chains)
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|chain| {
+                (0..chain.len())
+                    .filter_map(|index| {
+                        created_token_placement_source(&chain, index).map(|token| {
+                            CreatedTokenPair {
+                                token: chain[token],
+                                placement: chain[index],
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     pub(crate) fn effects(&self) -> &[&'a Effect] {
@@ -184,23 +235,20 @@ impl<'a> AbilityWalk<'a> {
     }
 
     /// The filtering view: this walk without its created-token placements. An
-    /// entry is dropped iff it is (by `std::ptr::eq`) a chain entry whose
-    /// [`created_token_placement_source`] is `Some`. A placement reached only
-    /// through an `else_ability` or mode branch is not a chain entry, so it is
-    /// kept. Builds the chain once per call.
+    /// entry is dropped iff it is (by `std::ptr::eq`) the placement of one of
+    /// [`Self::created_token_pairs`]. A placement in an `else_ability` or mode
+    /// branch is dropped only when its own branch chain pairs it; a placement
+    /// whose `Token` sits in another chain is kept. Builds the pairs once per
+    /// call.
     pub(crate) fn without_created_token_placements(&self) -> Vec<&'a Effect> {
-        let chain = self.chain();
-        let placements: Vec<&Effect> = (0..chain.len())
-            .filter(|&index| created_token_placement_source(&chain, index).is_some())
-            .map(|index| chain[index])
-            .collect();
+        let pairs = self.created_token_pairs();
         self.effects
             .iter()
             .copied()
             .filter(|effect| {
-                !placements
+                !pairs
                     .iter()
-                    .any(|placement| std::ptr::eq(*placement, *effect))
+                    .any(|pair| std::ptr::eq(pair.placement, *effect))
             })
             .collect()
     }
@@ -330,7 +378,7 @@ mod tests {
         ));
         // A walk with no ability behind it keeps every entry.
         let unpaired = AbilityWalk::unpaired(collect_chain_effects(&ability));
-        assert!(unpaired.chain().is_empty());
+        assert!(unpaired.created_token_pairs().is_empty());
         assert_eq!(unpaired.without_created_token_placements().len(), 3);
     }
 
@@ -373,6 +421,62 @@ mod tests {
         let walk = AbilityWalk::of(&ability, collect_definition_effects(&ability));
         assert_eq!(walk.effects().len(), 3);
         assert_eq!(walk.without_created_token_placements().len(), 3);
+    }
+
+    /// N3 (CR 608.2c): an "otherwise" leg is its own chain, so a complete
+    /// `[Token, P]` pair inside it pairs within that chain. The root `Token`
+    /// still never pairs with a placement in the else leg (the test above).
+    #[test]
+    fn else_branch_complete_pair_pairs_within_its_chain() {
+        let mut ability = AbilityDefinition::new(AbilityKind::Spell, gain_life());
+        ability.condition = Some(AbilityCondition::IsYourTurn);
+        ability.else_ability = Some(Box::new(spell(vec![token(), placement()])));
+        let walk = AbilityWalk::of(&ability, collect_definition_effects(&ability));
+        assert_eq!(walk.effects().len(), 3);
+        let kept = walk.without_created_token_placements();
+        assert_eq!(kept.len(), 2, "the else leg's own placement is dropped");
+        assert!(kept
+            .iter()
+            .all(|effect| !matches!(effect, Effect::PutCounter { .. })));
+        assert_eq!(walk.created_token_pairs().len(), 1);
+    }
+
+    /// N3 (CR 700.2): a mode is its own chain, so a complete `[Token, P]` pair
+    /// inside one mode pairs; the other mode is untouched.
+    #[test]
+    fn mode_branch_complete_pair_pairs_within_its_mode() {
+        let mut ability = AbilityDefinition::new(AbilityKind::Spell, Effect::NoOp);
+        ability.mode_abilities = vec![
+            spell(vec![token(), placement()]),
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: one(),
+                    target: TargetFilter::Controller,
+                },
+            ),
+        ];
+        let walk = AbilityWalk::of(&ability, collect_definition_effects(&ability));
+        assert_eq!(walk.effects().len(), 4);
+        let kept = walk.without_created_token_placements();
+        assert_eq!(kept.len(), 3);
+        assert!(kept
+            .iter()
+            .all(|effect| !matches!(effect, Effect::PutCounter { .. })));
+    }
+
+    /// N3: the nearest-publisher rule holds inside a branch chain too: a
+    /// Conjure between the mode's `Token` and its placement blocks the pairing.
+    #[test]
+    fn branch_intervening_conjure_blocks_the_pairing() {
+        let mut ability = AbilityDefinition::new(AbilityKind::Spell, Effect::NoOp);
+        ability.mode_abilities = vec![spell(vec![token(), conjure(), placement()])];
+        let walk = AbilityWalk::of(&ability, collect_definition_effects(&ability));
+        assert!(walk.created_token_pairs().is_empty());
+        assert_eq!(
+            walk.without_created_token_placements().len(),
+            walk.effects().len()
+        );
     }
 
     // ─── F4: the nearest publisher decides (engine classification) ──────────

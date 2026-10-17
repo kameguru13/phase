@@ -6626,6 +6626,15 @@ fn effect_manages_own_outcome_flag(effect: &Effect) -> bool {
 ///      stamps the whole local chain including grandchildren, which is correct
 ///      only when every gate below belongs to THIS instruction (Volatile
 ///      Stormdrake's two-level "If you do ... then ..." is the pinned case).
+///
+/// `Effect::NoOp` is admitted on all three points: (1) it never succeeds, so
+/// its verdict is the constant `false` and needs no success event; (2) it never
+/// parks; (3) the stamp is chain-local to the instruction it heads. Its member
+/// in practice is a player-scope seat leg that has no referent to act on
+/// (`no_referent_leg`): on the paused remaining-legs route the later seats'
+/// legs follow it on every route, and each later head re-derives its own
+/// outcome (its own accept latch, its own mandatory seed, or its own `NoOp`
+/// head), so `false` is the fresh state those heads start from.
 fn resolver_performed_outcome(
     ability: &ResolvedAbility,
     effect_events: &[GameEvent],
@@ -6657,6 +6666,14 @@ fn resolver_performed_outcome(
         )),
         // CR 701.3b: an attach that attached nothing was not done.
         Effect::Attach { .. } => Some(mandatory_parent_effect_performed(
+            &ability.effect,
+            effect_events,
+        )),
+        // CR 608.2c + CR 609.3: an instruction with no game action performed
+        // nothing, so its verdict overrides an inherited accept latch or a
+        // previous seat's copied context (CR 118.12: "if you do" checks this
+        // instruction's own action).
+        Effect::NoOp => Some(mandatory_parent_effect_performed(
             &ability.effect,
             effect_events,
         )),
@@ -10249,6 +10266,8 @@ fn mandatory_parent_effect_performed(effect: &Effect, events: &[GameEvent]) -> b
         } => events
             .iter()
             .any(|event| matches!(event, GameEvent::PermanentUntapped { .. })),
+        // CR 608.2c + CR 609.3: an instruction with no game action performed nothing.
+        Effect::NoOp => false,
         Effect::GainLife { .. } => events
             .iter()
             .any(|event| matches!(event, GameEvent::LifeChanged { amount, .. } if *amount > 0)),
@@ -13996,7 +14015,10 @@ fn tail_links_exile(scope: &PendingPlayerScopeTail) -> bool {
 /// CR 608.2c: does `tail` read the created referent ("the tokens", "it") that
 /// the preceding player-scope token clause publishes? A node reads it through
 /// its effect ([`effect_reads_created_referent`]), its condition, or its
-/// `repeat_for` count ([`node_reads_created_referent`]).
+/// `repeat_for` count ([`node_reads_created_referent`]), or through a nested
+/// branch: its `else_ability` chain (CR 608.2c) or a `mode_abilities` chain
+/// (CR 700.2: each mode is an alternative chain; CR 700.2b + CR 603.12 for a
+/// reflexive modal trigger), each walked as its own chain.
 /// The walk stops at the tail's first own created-referent publisher: a later
 /// anaphor names that publisher's product, not the clause's (nearest publisher).
 /// A node that both reads and publishes reads first, so the read check precedes
@@ -14011,6 +14033,10 @@ fn tail_reads_created_referent(tail: &ResolvedAbility) -> bool {
             .else_ability
             .as_deref()
             .is_some_and(tail_reads_created_referent)
+            || node
+                .mode_abilities
+                .iter()
+                .any(definition_reads_created_referent)
         {
             return true;
         }
@@ -14021,8 +14047,9 @@ fn tail_reads_created_referent(tail: &ResolvedAbility) -> bool {
     false
 }
 
-/// [`tail_reads_created_referent`] over a delayed trigger's payload definition
-/// chain, with the same nearest-publisher stop inside the payload.
+/// [`tail_reads_created_referent`] over a nested definition chain (an inline
+/// branch, a mode, a delayed or registered payload, a granted ability), with
+/// the same nearest-publisher stop inside that chain.
 fn definition_reads_created_referent(definition: &AbilityDefinition) -> bool {
     for node in std::iter::successors(Some(definition), |node| node.sub_ability.as_deref()) {
         if node_reads_created_referent(
@@ -14033,6 +14060,10 @@ fn definition_reads_created_referent(definition: &AbilityDefinition) -> bool {
             .else_ability
             .as_deref()
             .is_some_and(definition_reads_created_referent)
+            || node
+                .mode_abilities
+                .iter()
+                .any(definition_reads_created_referent)
         {
             return true;
         }
@@ -14058,14 +14089,18 @@ fn node_reads_created_referent(
         })
 }
 
-/// Whether one effect reads the created referent: through its target filter, a
-/// `GenericEffect` grant's `affected`, a quantity it resolves that counts the
-/// referent's population (`Effect::for_each_quantity_expr`, the exhaustive
-/// quantity authority), or a delayed trigger's payload. CR 603.7c: a delayed
-/// trigger that refers to "those tokens" affects the objects fixed when it is
-/// created, in this resolution (`delayed_trigger::resolve` snapshots a payload
-/// whose root target is `LastCreated`); a payload that reads the referent
-/// elsewhere is evaluated against the ledger when the trigger resolves.
+/// Whether one effect reads the created referent. Readers are the hidden and
+/// mass slots (`effect_parent_ref_slots`, which includes the target filter, and
+/// `mass_population_target`), the quantities (`Effect::for_each_quantity_expr`,
+/// the exhaustive quantity authority), and every nested carrier of the scoped
+/// traversal (`nested_payload_reads_created_referent`), including the statics,
+/// granted abilities and token/emblem abilities this resolution creates;
+/// publishers stop at `publishes_created_referent` (`OwnResolutionOnly`).
+/// CR 603.7c: a delayed trigger that refers to "those tokens" affects the
+/// objects fixed when it is created, in this resolution
+/// (`delayed_trigger::resolve` snapshots a payload whose root target is
+/// `LastCreated`); a payload that reads the referent elsewhere is evaluated
+/// against the ledger when the trigger resolves.
 fn effect_reads_created_referent(effect: &Effect) -> bool {
     let mut counts_referent = false;
     effect.for_each_quantity_expr(&mut |quantity| {
@@ -14073,21 +14108,164 @@ fn effect_reads_created_referent(effect: &Effect) -> bool {
             || quantity_expr_counts_population_matching(quantity, &filter_contains_last_created);
     });
     counts_referent
-        || effect
-            .target_filter()
-            .is_some_and(filter_contains_last_created)
-        || matches!(
-            effect,
-            Effect::GenericEffect { static_abilities, .. }
-                if static_abilities
-                    .iter()
-                    .any(|s| s.affected.as_ref().is_some_and(filter_contains_last_created))
-        )
-        || matches!(
-            effect,
-            Effect::CreateDelayedTrigger { effect: definition, .. }
-                if definition_reads_created_referent(definition)
-        )
+        || effect_parent_ref_slots(effect)
+            .into_iter()
+            .chain(mass_population_target(effect))
+            .any(filter_contains_last_created)
+        || nested_payload_reads_created_referent(effect)
+}
+
+/// Every carrier that the scoped traversal (`ability_visit::visit_effect_scoped`
+/// under `IncludeRegisteredLater`) descends is a reader position of the created
+/// referent; there is no excluded class. Each nested definition is walked as its
+/// own chain by [`definition_reads_created_referent`], which applies that
+/// chain's nearest-publisher stop; the publisher stop stays
+/// `publishes_created_referent` (`OwnResolutionOnly`), so a registered-later
+/// publisher never ends the outer walk.
+///
+/// - Inline payloads are this resolution's own instructions: vote outcomes
+///   (CR 701.38 + CR 608.2d), piles (CR 700.3), a reveal's decline branch, coin
+///   flips (CR 705.1), die results (CR 706.3a) and chosen branches (CR 608.2d),
+///   all in order (CR 608.2c).
+/// - Delayed payloads (CR 603.7a) refer to the objects fixed at creation
+///   (CR 603.7c); a boon is installed and read the same way.
+/// - Replacement carriers are replacement effects generated by this resolution
+///   whose substitute is this ability's own text (CR 611.2 + CR 614.1a).
+/// - Static, granted, token and emblem payloads are continuous effects or
+///   abilities this resolution creates (CR 611.2c, CR 611.3a, CR 113.1a,
+///   CR 114.4).
+///
+/// Only a delayed trigger snapshots `LastCreated` at creation
+/// (`delayed_trigger::rebind_last_created_to_parent_target`); every other
+/// payload reads `last_created_token_ids` live when it applies, so an
+/// unpublished paused union would reach it as the last seat's tokens.
+///
+/// The `_ => false` arm is the "no definition carrier" class: which effects
+/// descend is decided by the traversal's wildcard-free match. A carrier later
+/// added to `visit_effect_scoped` must add a fixture to
+/// `created_referent_reader_walk_matches_the_traversal`, since this arm would
+/// compile it silently.
+fn nested_payload_reads_created_referent(effect: &Effect) -> bool {
+    let mut reads = false;
+    effect.for_each_nested_definition(&mut |_, definition| {
+        reads = reads || definition_reads_created_referent(definition);
+    });
+    reads
+        || match effect {
+            Effect::CreateDrawReplacement { replacement_effect }
+            | Effect::CreatePlaneswalkReplacement { replacement_effect } => {
+                effect_reads_created_referent(replacement_effect)
+            }
+            Effect::AddTargetReplacement { replacement, .. } => {
+                replacement_reads_created_referent(replacement)
+            }
+            Effect::GenericEffect {
+                static_abilities, ..
+            }
+            | Effect::Token {
+                static_abilities, ..
+            } => static_abilities.iter().any(static_reads_created_referent),
+            Effect::Counter {
+                source_rider:
+                    Some(crate::types::ability::CounterSourceRider::LosesAbilities {
+                        static_def, ..
+                    }),
+                ..
+            } => static_reads_created_referent(static_def),
+            Effect::CreateEmblem { statics, triggers } => {
+                statics.iter().any(static_reads_created_referent)
+                    || triggers.iter().any(trigger_reads_created_referent)
+            }
+            _ => false,
+        }
+}
+
+/// Mirrors `ability_visit::visit_trigger_scoped`: a granted, copied or emblem
+/// trigger reads the created referent through its `execute` chain. Its
+/// `unless_pay` is the cost axis, outside the carrier question.
+fn trigger_reads_created_referent(trigger: &crate::types::ability::TriggerDefinition) -> bool {
+    trigger
+        .execute
+        .as_deref()
+        .is_some_and(definition_reads_created_referent)
+}
+
+/// Mirrors `ability_visit::visit_replacement_scoped`: a registered, granted or
+/// copied replacement (CR 614.1a) reads the created referent through its
+/// `execute` chain or its decline branch. `MayCost.cost` is the cost axis.
+fn replacement_reads_created_referent(
+    replacement: &crate::types::ability::ReplacementDefinition,
+) -> bool {
+    replacement
+        .execute
+        .as_deref()
+        .is_some_and(definition_reads_created_referent)
+        || match &replacement.mode {
+            crate::types::ability::ReplacementMode::Optional { decline }
+            | crate::types::ability::ReplacementMode::MayCost { decline, .. } => decline
+                .as_deref()
+                .is_some_and(definition_reads_created_referent),
+            crate::types::ability::ReplacementMode::Mandatory => false,
+        }
+}
+
+/// Mirrors `ability_visit::visit_static_scoped`. A static definition this
+/// resolution creates (CR 611.2c; CR 611.3a: its effect applies to whatever its
+/// text indicates at each moment) reads the created referent through three
+/// positions: its `affected` set, each modification's dynamic magnitude
+/// (`quantity::continuous_modification_dynamic_quantity`, the exhaustive
+/// magnitude authority), and the definitions its modifications carry
+/// (CR 113.1a: an ability an effect grants is defined by that effect's text) —
+/// exactly the descending arms of `visit_continuous_mod_scoped`. The
+/// modification match's `_ => false` defers to those two wildcard-free
+/// authorities; a new descending modification must add a census fixture.
+fn static_reads_created_referent(static_def: &StaticDefinition) -> bool {
+    static_def
+        .affected
+        .as_ref()
+        .is_some_and(filter_contains_last_created)
+        || static_def.modifications.iter().any(|modification| {
+            crate::game::quantity::continuous_modification_dynamic_quantity(modification)
+                .is_some_and(|quantity| {
+                    quantity_expr_counts_population_matching(
+                        quantity,
+                        &filter_contains_last_created,
+                    )
+                })
+                || match modification {
+                    ContinuousModification::GrantAbility { definition } => {
+                        definition_reads_created_referent(definition)
+                    }
+                    ContinuousModification::GrantTrigger { trigger } => {
+                        trigger_reads_created_referent(trigger)
+                    }
+                    ContinuousModification::GrantReplacement { replacement } => {
+                        replacement_reads_created_referent(replacement)
+                    }
+                    ContinuousModification::GrantStaticAbility { definition } => {
+                        static_reads_created_referent(definition)
+                    }
+                    ContinuousModification::CopyValues { values, .. } => {
+                        values
+                            .abilities
+                            .iter()
+                            .any(definition_reads_created_referent)
+                            || values
+                                .trigger_definitions
+                                .iter()
+                                .any(trigger_reads_created_referent)
+                            || values
+                                .static_definitions
+                                .iter()
+                                .any(static_reads_created_referent)
+                            || values
+                                .replacement_definitions
+                                .iter()
+                                .any(replacement_reads_created_referent)
+                    }
+                    _ => false,
+                }
+        })
 }
 
 /// CR 400.7 + CR 608.2f: capture only current incarnations exiled by this
@@ -16477,7 +16655,11 @@ fn resolve_chain_body(
         let ability = wheel.as_ref().unwrap_or(ability);
         let scoped_search_delivery_is_safe =
             scoped_library_search::has_only_detachable_shuffle_tail(ability);
-        let (scoped_template, after_scope) = split_player_scope_chain(ability, scope);
+        let (scoped_template, mut after_scope) = split_player_scope_chain(ability, scope);
+        // CR 608.2e + CR 111.2: prove the per-seat created-referent partition at
+        // split time, before any completion route (sync, sidecar, sacrifice,
+        // search, draw, discard batch) takes the tail.
+        mark_co_scoped_created_referent_consumer(&scoped_template, scope, &mut after_scope);
         let after_scope_needs_linked_exile = after_scope.as_ref().is_some_and(|tail| {
             crate::game::exile_links::ability_contains_linked_exile_consumer(tail)
         });
@@ -16670,7 +16852,8 @@ fn resolve_chain_body(
                 bind_scoped_seat(&scoped_template, controller, *pid),
                 *pid,
                 created_referent.as_deref(),
-            ) else {
+            )
+            .into_leg() else {
                 continue;
             };
             progress = resolve_ability_chain_step(state, &scoped, events, depth + 1)?;
@@ -16736,7 +16919,17 @@ fn resolve_chain_body(
                 let mut tail = if after_scope_owned_by_sidecar {
                     None
                 } else {
-                    after_scope.clone()
+                    // CR 608.2c: linearized after the per-seat legs, the
+                    // instruction printed after the clause depends on no seat's
+                    // gate (the synchronous path resolves `after_scope`
+                    // unconditionally after the last seat), so it starts an
+                    // independent instruction whatever link it was parsed with;
+                    // a false gate's forward walk and a declined "may" then
+                    // reach it on every leg.
+                    after_scope.clone().map(|mut next| {
+                        next.sub_link = SubAbilityLink::SequentialSibling;
+                        next
+                    })
                 };
                 // Build continuation chain for remaining players in APNAP order.
                 // Each remaining player gets the scoped instruction only; the
@@ -16745,12 +16938,15 @@ fn resolve_chain_body(
                     // Each pending leg carries its own binding, so a pause in
                     // this action (e.g. a counter-replacement order, CR 616.1)
                     // resumes against the same objects.
-                    let Some(mut remaining_scoped) = bind_seat_created_referent(
+                    let bound_leg = bind_seat_created_referent(
                         state,
                         bind_scoped_seat(&scoped_template, controller, remaining_pid),
                         remaining_pid,
                         created_referent.as_deref(),
-                    ) else {
+                    );
+                    let closes_every_route =
+                        matches!(bound_leg, SeatCreatedReferent::NoReferent(_));
+                    let Some(mut remaining_scoped) = bound_leg.into_leg() else {
                         continue;
                     };
                     // CR 608.2c: each remaining player's clause is an INDEPENDENT
@@ -16763,8 +16959,16 @@ fn resolve_chain_body(
                     // false (it ran for a player who DID perform the action), so
                     // the per-opponent fan-out is not truncated after the first.
                     remaining_scoped.sub_link = SubAbilityLink::SequentialSibling;
+                    // CR 608.2c: a `NoReferent` leg replaces a seat that would
+                    // otherwise be skipped (so what follows always ran); every
+                    // route through it, the "otherwise" leg included, ends at the
+                    // next seat's independent instruction.
                     if let Some(prev) = tail {
-                        super::ability_utils::append_to_sub_chain(&mut remaining_scoped, *prev);
+                        if closes_every_route {
+                            append_after_every_route(&mut remaining_scoped, *prev);
+                        } else {
+                            super::ability_utils::append_to_sub_chain(&mut remaining_scoped, *prev);
+                        }
                     }
                     tail = Some(Box::new(remaining_scoped));
                 }
@@ -20133,25 +20337,93 @@ fn record_player_actions_performed(state: &mut GameState, new_events: &[GameEven
     }
 }
 
+/// CR 608.2e + CR 111.2: "it" in a co-scoped second action — the members of
+/// the created referent the acting seat owns. The typed carrier of the
+/// split-time proof (`mark_co_scoped_created_referent_consumer`); it rides the
+/// consumer's existing serialized `TargetFilter`, so a paused fan-out carries
+/// it inside the sidecar's `after_scope`.
+fn seat_created_referent_filter() -> TargetFilter {
+    TargetFilter::And {
+        filters: vec![
+            TargetFilter::LastCreated,
+            TargetFilter::Typed(TypedFilter::default().properties(vec![FilterProp::Owned {
+                controller: ControllerRef::ScopedPlayer,
+            }])),
+        ],
+    }
+}
+
+/// CR 608.2e + CR 111.2: "it" in a co-scoped second action — the members of the
+/// created referent the acting seat owns. Ownership (CR 111.2: the player who
+/// creates a token is its owner) supports the per-seat binding only when the
+/// consumer's player domain is the producer's: the detached head is marked
+/// with [`seat_created_referent_filter`] only when
+/// - the scoped template creates tokens and nothing in its retained chain
+///   publishes a later created referent (it is the nearest publisher),
+/// - the head has the same `player_scope`, and
+/// - the head's own target is `LastCreated`.
+///
+/// Every other shape keeps a bare `LastCreated`, which every seat reads as the
+/// full latest-created set (`game/filter.rs`, `game/targeting.rs`).
+fn mark_co_scoped_created_referent_consumer(
+    scoped_template: &ResolvedAbility,
+    scope: &PlayerFilter,
+    after_scope: &mut Option<Box<ResolvedAbility>>,
+) {
+    let Some(head) = after_scope.as_deref_mut() else {
+        return;
+    };
+    let producer_is_nearest = scoped_template.effect.is_token_creator()
+        && std::iter::successors(scoped_template.sub_ability.as_deref(), |n| {
+            n.sub_ability.as_deref()
+        })
+        .all(|n| !n.effect.publishes_created_referent());
+    if producer_is_nearest
+        && head.player_scope.as_ref() == Some(scope)
+        && head.effect.target_filter() == Some(&TargetFilter::LastCreated)
+    {
+        if let Some(filter) = head.effect.target_filter_mut() {
+            *filter = seat_created_referent_filter();
+        }
+    }
+}
+
+/// The binder's typed outcome for one seat of a co-scoped second action.
+enum SeatCreatedReferent {
+    /// No partition was proven (no snapshot): the leg reads the full set.
+    Unpartitioned(ResolvedAbility),
+    /// The seat owns members of the snapshot; the leg is bound to them.
+    Bound(ResolvedAbility),
+    /// The seat owns none. `None` when no route of its leg can run anything
+    /// (the bare placement is skipped); otherwise the leg built by
+    /// [`no_referent_leg`].
+    NoReferent(Option<ResolvedAbility>),
+}
+
+impl SeatCreatedReferent {
+    /// The leg to resolve or linearize for this seat, if any.
+    fn into_leg(self) -> Option<ResolvedAbility> {
+        match self {
+            SeatCreatedReferent::Unpartitioned(leg) | SeatCreatedReferent::Bound(leg) => Some(leg),
+            SeatCreatedReferent::NoReferent(leg) => leg,
+        }
+    }
+}
+
 /// CR 608.2e + CR 111.2 + CR 400.7: the created referent a co-scoped second
 /// action reads ("Each player creates a token and puts counters on it"),
 /// snapshotted once when that action's all-seats loop begins — after every
 /// seat's creation and after the clause published its created-token union.
-/// `None` unless the scoped template's own target is `LastCreated`; that is
-/// the only reader slot the per-seat binding rewrites. A template reading the
-/// referent elsewhere (a grant's `affected`, a condition, a sub) keeps reading
-/// the published union, and the binding assumes the referent was produced by
-/// a co-scoped creation (no printed card has a scoped reader of any other
-/// producer).
+/// The partition is proven at split time: `None` unless the scoped template's
+/// own target carries [`seat_created_referent_filter`]
+/// (`mark_co_scoped_created_referent_consumer`). A bare `LastCreated` under a
+/// player scope is the full latest-created set for every seat, as is a template
+/// reading the referent elsewhere (a grant's `affected`, a condition, a sub).
 fn seat_created_referent_snapshot(
     state: &GameState,
     template: &ResolvedAbility,
 ) -> Option<Vec<ObjectIncarnationRef>> {
-    matches!(
-        template.effect.target_filter(),
-        Some(TargetFilter::LastCreated)
-    )
-    .then(|| {
+    (template.effect.target_filter() == Some(&seat_created_referent_filter())).then(|| {
         state
             .last_created_token_ids
             .iter()
@@ -20167,19 +20439,22 @@ fn seat_created_referent_snapshot(
 /// since; ownership cannot) — as explicit objects pinned to their current
 /// incarnations (CR 400.7), rewriting `LastCreated` to `ParentTarget` as the
 /// delayed-trigger snapshot does. These are affected objects, not targets
-/// (CR 115.10a). Returns `None` when the seat created none: its "puts
-/// counters on it" has nothing to act on (CR 609.3), and an empty
-/// `ParentTarget` would fall back to unrelated referents. The caller then
-/// skips the seat's whole leg, which is exact only while the template is the
-/// placement alone (no printed card keeps a continuation under it).
+/// (CR 115.10a). Outcomes:
+/// - `Unpartitioned` when there is no snapshot (no proven partition);
+/// - `Bound` when the seat owns members of the snapshot;
+/// - `NoReferent` when the seat created none: its "puts counters on it" has
+///   nothing to act on (CR 609.3), an impossible "may" is not offered
+///   (CR 608.2d), and an empty `ParentTarget` would fall back to unrelated
+///   referents. Its continuation and "otherwise" leg stay that seat's
+///   instructions, in order (CR 608.2c + CR 608.2e); see [`no_referent_leg`].
 fn bind_seat_created_referent(
     state: &GameState,
     mut seat_leg: ResolvedAbility,
     seat: PlayerId,
     snapshot: Option<&[ObjectIncarnationRef]>,
-) -> Option<ResolvedAbility> {
+) -> SeatCreatedReferent {
     let Some(snapshot) = snapshot else {
-        return Some(seat_leg);
+        return SeatCreatedReferent::Unpartitioned(seat_leg);
     };
     let owned: Vec<ObjectIncarnationRef> = snapshot
         .iter()
@@ -20192,7 +20467,7 @@ fn bind_seat_created_referent(
         .cloned()
         .collect();
     if owned.is_empty() {
-        return None;
+        return SeatCreatedReferent::NoReferent(no_referent_leg(seat_leg));
     }
     if let Some(filter) = seat_leg.effect.target_filter_mut() {
         *filter = TargetFilter::ParentTarget;
@@ -20204,7 +20479,86 @@ fn bind_seat_created_referent(
             .collect(),
     );
     seat_leg.set_target_incarnations_recursive(owned);
+    SeatCreatedReferent::Bound(seat_leg)
+}
+
+/// The leg of a seat that owns none of the created referent.
+///
+/// `None` when no route of the leg can run anything: no `sub_ability`, and no
+/// `else_ability` under a `condition` (an else without a condition is
+/// unreachable). Otherwise:
+/// - **Head (always).** The placement becomes `Effect::NoOp` (CR 609.3: the
+///   placement on "it" acts on nothing), not optional (CR 608.2d: an impossible
+///   "may" is not offered), unconditional, with no else and no targets. Because
+///   it has no condition it always resolves, so its "not performed" outcome
+///   (`resolver_performed_outcome`, CR 118.12) is stamped before any route of
+///   the leg runs, over an inherited accept latch or a previous seat's context.
+/// - **Gate (only when the placement had a `condition`).** A second `NoOp`, the
+///   head's `ContinuationStep` sub, carrying the `condition`, the
+///   `else_ability` and the retained continuation (CR 608.2c: the condition
+///   and the "otherwise" leg stay the seat's instructions, in order).
+///
+/// The gate is a sub of the head so that its condition is decided parent-side
+/// (the sub hand-off in `resolve_chain_body`), against this seat's own head.
+/// The two false-condition routes: with an else, the else runs; without one,
+/// the hand-off walks forward to the next independent instruction, skipping the
+/// dependent `ContinuationStep` nodes exactly as for a `Bound` seat. A
+/// conditioned node resolved as a chain root (the root false route) is reached
+/// only when the retained continuation itself pauses and resumes there.
+///
+/// Known limitation: an optional placement's dependent same-clause continuation
+/// runs without a prompt for an empty seat whose condition holds
+/// (suppress-to-no-op class, CR 608.2d).
+fn no_referent_leg(mut seat_leg: ResolvedAbility) -> Option<ResolvedAbility> {
+    let keeps_continuation = seat_leg.sub_ability.is_some()
+        || (seat_leg.condition.is_some() && seat_leg.else_ability.is_some());
+    if !keeps_continuation {
+        return None;
+    }
+    seat_leg.effect = Effect::NoOp;
+    seat_leg.optional = false;
+    seat_leg.optional_for = None;
+    seat_leg.repeat_for = None;
+    seat_leg.set_unpinned_targets(vec![]);
+    let Some(condition) = seat_leg.condition.take() else {
+        seat_leg.else_ability = None;
+        return Some(seat_leg);
+    };
+    let mut gate = seat_leg.clone();
+    gate.condition = Some(condition);
+    gate.sub_link = SubAbilityLink::ContinuationStep;
+    seat_leg.else_ability = None;
+    seat_leg.sub_ability = Some(Box::new(gate));
     Some(seat_leg)
+}
+
+/// CR 608.2c: `next` is an independent following instruction (later seats'
+/// legs, then the instruction printed after the clause). Its head must start
+/// one (`SubAbilityLink::SequentialSibling`); the remaining-legs loop in
+/// `resolve_chain_body` establishes that for every leg and for the trailing
+/// tail. Appends `next` at the end of `leg`'s `sub_ability` chain and at the
+/// end of every `else_ability` chain in it (recursively), so each exit of the
+/// leg reaches `next`:
+/// - a resolved node hands off along `sub_ability`, whose end holds `next`;
+/// - a false node with an else runs the else, whose end holds `next`;
+/// - a false node without an else walks forward to the next independent
+///   instruction, which `next`'s head is.
+///
+/// Only one branch of a node runs, so `next` runs once. Each else holds its own
+/// copy of `next`, so k consecutive else-bearing empty seats hold up to 2^k
+/// copies of what follows them, bounded by the seat count. Boundary routes left
+/// as they are: a conditioned node resolved as a chain root keeps only an
+/// admitted direct sub, and the parent-side check reads a conditioned
+/// following leg against the parent ability. The every-branch sibling of
+/// `ability_utils::append_to_sub_chain`.
+fn append_after_every_route(leg: &mut ResolvedAbility, next: ResolvedAbility) {
+    if let Some(else_branch) = leg.else_ability.as_deref_mut() {
+        append_after_every_route(else_branch, next.clone());
+    }
+    match leg.sub_ability.as_deref_mut() {
+        Some(sub) => append_after_every_route(sub, next),
+        None => leg.sub_ability = Some(Box::new(next)),
+    }
 }
 
 /// CR 608.2 + CR 109.5: `template` bound to run for `seat`. The scoped player is
@@ -20743,10 +21097,14 @@ fn revealed_card_type_condition_subject<'a>(
 ///   (`quantity_expr_missing_resolution_only_referent`) — `Not` of a predicate
 ///   over "the cost-paid object's mana value" with no such object is not true.
 ///
-/// Known limitation: `And` / `Or` are not recursed. The guard covers a negated
-/// subject-dependent leaf; a negated compound with a subject-dependent operand
-/// (for example `Not(And(QuantityQuality { absent }, …))`) remains vacuously
-/// true. No printed card reaches it.
+/// Compound carriers are recursed, so the guard reaches a negated compound
+/// (for example `Not(And([QuantityQuality { absent }, IsYourTurn]))`). The
+/// reading is three-valued (CR 608.2c: a predicate over an absent
+/// resolution-only subject tests nothing): `Not` and `ConditionInstead` carry
+/// their operand's absence; an `And` is undecided only when an operand lacks
+/// its subject and no present operand already decides it false; an `Or` is
+/// undecided only when an operand lacks its subject and no present operand
+/// already decides it true. A present zero is a value, not an absence.
 fn subject_dependent_condition_has_no_subject(
     condition: &AbilityCondition,
     state: &GameState,
@@ -20768,8 +21126,31 @@ fn subject_dependent_condition_has_no_subject(
                 state, quantity, ability,
             )
         }
-        AbilityCondition::Not { condition } => {
+        AbilityCondition::Not { condition }
+        | AbilityCondition::ConditionInstead { inner: condition } => {
             subject_dependent_condition_has_no_subject(condition, state, ability)
+        }
+        // Undecided only when an operand lacks its subject and no present
+        // operand already decides it false.
+        AbilityCondition::And { conditions } => {
+            conditions
+                .iter()
+                .any(|c| subject_dependent_condition_has_no_subject(c, state, ability))
+                && conditions.iter().all(|c| {
+                    subject_dependent_condition_has_no_subject(c, state, ability)
+                        || evaluate_condition(c, state, ability)
+                })
+        }
+        // Undecided only when an operand lacks its subject and no present
+        // operand already decides it true.
+        AbilityCondition::Or { conditions } => {
+            conditions
+                .iter()
+                .any(|c| subject_dependent_condition_has_no_subject(c, state, ability))
+                && conditions.iter().all(|c| {
+                    subject_dependent_condition_has_no_subject(c, state, ability)
+                        || !evaluate_condition(c, state, ability)
+                })
         }
         _ => false,
     }
@@ -38057,9 +38438,11 @@ mod tests {
     /// CR 608.2e + CR 111.2 + CR 400.7 — the per-seat binding of a co-scoped
     /// second action's created referent: each seat's leg names exactly the
     /// tokens that seat owns, as pinned explicit objects behind a
-    /// `ParentTarget`; a seat that owns none gets no leg (CR 609.3); a template
-    /// not reading `LastCreated` is untouched; and a pin that went stale before
-    /// placement is dropped by the consumer.
+    /// `ParentTarget`; a seat that owns none gets no leg when nothing of it can
+    /// run (CR 609.3), and otherwise a `NoOp` head (plus a gate carrying its
+    /// condition and "otherwise" leg) in front of its retained continuation; a
+    /// bare `LastCreated` template (no split-time proof) is unpartitioned; and a
+    /// pin that went stale before placement is dropped by the consumer.
     #[test]
     fn bind_seat_created_referent_binds_each_seat_to_the_tokens_it_owns() {
         let mut state = GameState::new_two_player(42);
@@ -38087,15 +38470,17 @@ mod tests {
             leg.player_scope = Some(PlayerFilter::All);
             leg
         };
-        let template = placement(TargetFilter::LastCreated);
+        let template = placement(seat_created_referent_filter());
         let snapshot = seat_created_referent_snapshot(&state, &template)
-            .expect("a LastCreated template snapshots the created referent");
+            .expect("a marked template snapshots the created referent");
         assert_eq!(snapshot.len(), 3);
         let pin = |id: ObjectId| ObjectIncarnationRef::from_object(&state.objects[&id]);
 
-        let p0_leg =
+        let SeatCreatedReferent::Bound(p0_leg) =
             bind_seat_created_referent(&state, template.clone(), PlayerId(0), Some(&snapshot))
-                .expect("P0 owns two created tokens");
+        else {
+            panic!("P0 owns two created tokens");
+        };
         assert!(matches!(
             p0_leg.effect,
             Effect::PutCounter {
@@ -38112,28 +38497,126 @@ mod tests {
             vec![pin(p0_first), pin(p0_second)]
         );
 
-        let p1_leg =
+        let SeatCreatedReferent::Bound(p1_leg) =
             bind_seat_created_referent(&state, template.clone(), PlayerId(1), Some(&snapshot))
-                .expect("P1 owns one created token");
+        else {
+            panic!("P1 owns one created token");
+        };
         assert_eq!(p1_leg.targets, vec![TargetRef::Object(p1_only)]);
         assert_eq!(p1_leg.target_incarnations, vec![pin(p1_only)]);
 
-        // A seat that owns none of the referent has no "it" (CR 609.3).
+        // A seat that owns none of the referent has no "it" (CR 609.3). A bare
+        // placement, or a conditioned one with neither sub nor else, has no
+        // route that runs anything: no leg.
         let p1_only_snapshot = vec![pin(p1_only)];
-        assert!(bind_seat_created_referent(
-            &state,
-            template.clone(),
+        let bind_empty = |leg: ResolvedAbility| {
+            bind_seat_created_referent(&state, leg, PlayerId(0), Some(&p1_only_snapshot))
+        };
+        assert!(matches!(
+            bind_empty(template.clone()),
+            SeatCreatedReferent::NoReferent(None)
+        ));
+        let your_turn = AbilityCondition::IsYourTurn;
+        let mut conditioned = template.clone();
+        conditioned.condition = Some(your_turn.clone());
+        assert!(matches!(
+            bind_empty(conditioned.clone()),
+            SeatCreatedReferent::NoReferent(None)
+        ));
+
+        // A retained performed-gated rider, no condition: an unconditional,
+        // non-optional `NoOp` head whose sub is the rider, intact.
+        let mut rider = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(99),
             PlayerId(0),
-            Some(&p1_only_snapshot),
-        )
-        .is_none());
+        );
+        rider.sub_link = SubAbilityLink::SequentialSibling;
+        rider.condition = Some(AbilityCondition::Not {
+            condition: Box::new(AbilityCondition::EffectOutcome {
+                signal: crate::types::ability::EffectOutcomeSignal::OptionalEffectPerformed,
+            }),
+        });
+        let mut with_rider = template.clone();
+        with_rider.optional = true;
+        with_rider.sub_ability = Some(Box::new(rider.clone()));
+        let SeatCreatedReferent::NoReferent(Some(leg)) = bind_empty(with_rider.clone()) else {
+            panic!("a retained rider keeps the empty seat's leg");
+        };
+        assert_eq!(leg.effect, Effect::NoOp);
+        assert!(!leg.optional);
+        assert!(leg.condition.is_none());
+        assert!(leg.targets.is_empty());
+        assert_eq!(leg.sub_ability.as_deref(), Some(&rider));
+
+        // A condition and an "otherwise" leg, no sub: unconditional `NoOp` head
+        // with no else; its sub is the gate, a `NoOp` `ContinuationStep`
+        // carrying the condition and the else, with no sub.
+        let otherwise = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 2 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(99),
+            PlayerId(0),
+        );
+        let mut with_else = conditioned.clone();
+        with_else.else_ability = Some(Box::new(otherwise.clone()));
+        let SeatCreatedReferent::NoReferent(Some(head)) = bind_empty(with_else) else {
+            panic!("a conditioned \"otherwise\" leg keeps the empty seat's leg");
+        };
+        assert_eq!(head.effect, Effect::NoOp);
+        assert!(head.condition.is_none());
+        assert!(head.else_ability.is_none());
+        let gate = head
+            .sub_ability
+            .as_deref()
+            .expect("the gate follows the head");
+        assert_eq!(gate.effect, Effect::NoOp);
+        assert_eq!(gate.sub_link, SubAbilityLink::ContinuationStep);
+        assert_eq!(gate.condition.as_ref(), Some(&your_turn));
+        assert_eq!(gate.else_ability.as_deref(), Some(&otherwise));
+        assert!(gate.sub_ability.is_none());
+
+        // A condition and a retained rider: head, then the gate with the
+        // condition, then the rider.
+        let mut conditioned_rider = with_rider.clone();
+        conditioned_rider.condition = Some(your_turn.clone());
+        let SeatCreatedReferent::NoReferent(Some(head)) = bind_empty(conditioned_rider) else {
+            panic!("a conditioned rider keeps the empty seat's leg");
+        };
+        assert!(head.condition.is_none());
+        let gate = head
+            .sub_ability
+            .as_deref()
+            .expect("the gate follows the head");
+        assert_eq!(gate.effect, Effect::NoOp);
+        assert_eq!(gate.condition.as_ref(), Some(&your_turn));
+        assert_eq!(gate.sub_ability.as_deref(), Some(&rider));
+
+        // A bare `LastCreated` template carries no split-time proof: no
+        // snapshot, so every seat reads the full set.
+        let bare = placement(TargetFilter::LastCreated);
+        assert!(seat_created_referent_snapshot(&state, &bare).is_none());
+        assert!(matches!(
+            bind_seat_created_referent(&state, bare, PlayerId(0), None),
+            SeatCreatedReferent::Unpartitioned(_)
+        ));
 
         // Gate: a template whose own target is not `LastCreated` reads no
         // created referent, and with no snapshot the binder is the identity.
         let any = placement(TargetFilter::Any);
         assert!(seat_created_referent_snapshot(&state, &any).is_none());
-        let unchanged = bind_seat_created_referent(&state, any.clone(), PlayerId(0), None)
-            .expect("no snapshot leaves the leg as bound");
+        let SeatCreatedReferent::Unpartitioned(unchanged) =
+            bind_seat_created_referent(&state, any.clone(), PlayerId(0), None)
+        else {
+            panic!("no snapshot leaves the leg as bound");
+        };
         assert!(matches!(
             unchanged.effect,
             Effect::PutCounter {
@@ -38154,6 +38637,178 @@ mod tests {
             p0_leg.live_object_targets(&state),
             vec![TargetRef::Object(p0_first)]
         );
+    }
+
+    /// CR 608.2c: `append_after_every_route` ends every route through a leg (its
+    /// sub chain and every else chain, nested elses included) at `next`, once
+    /// per branch end; `append_to_sub_chain` follows only `sub_ability` links.
+    #[test]
+    fn append_after_every_route_ends_every_branch_at_next() {
+        let life = |amount: i32| {
+            ResolvedAbility::new(
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: amount },
+                    player: TargetFilter::Controller,
+                },
+                vec![],
+                ObjectId(1),
+                PlayerId(0),
+            )
+        };
+        let mut next = life(100);
+        next.sub_link = SubAbilityLink::SequentialSibling;
+
+        // head -> gate { else: E1 { else: E3 } -> E2 } -> rider
+        let mut e1 = life(10);
+        e1.else_ability = Some(Box::new(life(30)));
+        e1.sub_ability = Some(Box::new(life(20)));
+        let mut gate = life(2);
+        gate.condition = Some(AbilityCondition::IsYourTurn);
+        gate.else_ability = Some(Box::new(e1));
+        gate.sub_ability = Some(Box::new(life(3)));
+        let mut leg = life(1);
+        leg.sub_ability = Some(Box::new(gate));
+        let original = leg.clone();
+
+        let ends = |chain: &ResolvedAbility| -> Vec<ResolvedAbility> {
+            std::iter::successors(Some(chain), |node| node.sub_ability.as_deref())
+                .cloned()
+                .collect()
+        };
+
+        let mut every = leg.clone();
+        append_after_every_route(&mut every, next.clone());
+        // Sub chain: head -> gate -> rider -> next.
+        let sub_chain = ends(&every);
+        assert_eq!(sub_chain.len(), 4);
+        assert_eq!(sub_chain.last(), Some(&next));
+        let gate = every.sub_ability.as_deref().unwrap();
+        // Else chain: E1 -> E2 -> next.
+        let e1 = gate.else_ability.as_deref().unwrap();
+        let else_chain = ends(e1);
+        assert_eq!(else_chain.len(), 3);
+        assert_eq!(else_chain.last(), Some(&next));
+        // Nested else: E3 -> next.
+        let e3 = e1.else_ability.as_deref().unwrap();
+        assert_eq!(ends(e3).len(), 2);
+        assert_eq!(e3.sub_ability.as_deref(), Some(&next));
+        // `next` itself is not extended (once per branch end).
+        assert!(sub_chain.last().unwrap().sub_ability.is_none());
+        // The leg's own nodes are otherwise unchanged.
+        assert_eq!(every.effect, original.effect);
+        assert_eq!(gate.condition, Some(AbilityCondition::IsYourTurn));
+
+        // BASE linkage: `append_to_sub_chain` leaves the else chains without `next`.
+        let mut sub_only = leg;
+        super::super::ability_utils::append_to_sub_chain(&mut sub_only, next.clone());
+        assert_eq!(ends(&sub_only).last(), Some(&next));
+        let e1 = sub_only
+            .sub_ability
+            .as_deref()
+            .unwrap()
+            .else_ability
+            .as_deref()
+            .unwrap();
+        assert_ne!(ends(e1).last(), Some(&next));
+    }
+
+    /// CR 608.2c + CR 609.3: an instruction with no game action performed
+    /// nothing, and the resolver says so over any inherited latch.
+    #[test]
+    fn no_op_instruction_is_never_performed() {
+        assert!(!mandatory_parent_effect_performed(&Effect::NoOp, &[]));
+        let noop = ResolvedAbility::new(Effect::NoOp, vec![], ObjectId(1), PlayerId(0));
+        assert_eq!(resolver_performed_outcome(&noop, &[]), Some(false));
+    }
+
+    /// CR 608.2e + CR 111.2: the per-seat partition is proven only for the
+    /// immediately preceding co-scoped token clause and a same-scope consumer
+    /// whose own target is `LastCreated`.
+    #[test]
+    fn mark_co_scoped_created_referent_consumer_requires_the_matching_producer() {
+        let token = || Effect::Token {
+            name: "Fractal".to_string(),
+            power: PtValue::Fixed(0),
+            toughness: PtValue::Fixed(0),
+            types: vec!["Creature".to_string(), "Fractal".to_string()],
+            colors: vec![],
+            keywords: vec![],
+            tapped: false,
+            count: QuantityExpr::Fixed { value: 1 },
+            owner: TargetFilter::Controller,
+            attach_to: None,
+            enters_attacking: false,
+            supertypes: vec![],
+            static_abilities: vec![],
+            enter_with_counters: vec![],
+        };
+        let scoped = |effect: Effect, scope: Option<PlayerFilter>| {
+            let mut node = ResolvedAbility::new(effect, vec![], ObjectId(1), PlayerId(0));
+            node.player_scope = scope;
+            node
+        };
+        let head = |target: TargetFilter, scope: PlayerFilter| {
+            Some(Box::new(scoped(
+                Effect::PutCounter {
+                    counter_type: CounterType::Plus1Plus1,
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target,
+                },
+                Some(scope),
+            )))
+        };
+        let marked = |after_scope: &Option<Box<ResolvedAbility>>| {
+            after_scope.as_ref().unwrap().effect.target_filter()
+                == Some(&seat_created_referent_filter())
+        };
+        let all = PlayerFilter::All;
+
+        // Matching: `Token { All }` then `PutCounter { LastCreated, All }`.
+        let producer = scoped(token(), Some(all.clone()));
+        let mut tail = head(TargetFilter::LastCreated, all.clone());
+        mark_co_scoped_created_referent_consumer(&producer, &all, &mut tail);
+        assert!(marked(&tail), "the matching co-scoped consumer is marked");
+
+        // Producer scope differs from the head's (Opponent vs All).
+        let mut tail = head(TargetFilter::LastCreated, all.clone());
+        mark_co_scoped_created_referent_consumer(&producer, &PlayerFilter::Opponent, &mut tail);
+        assert!(!marked(&tail), "producer Opponent vs head All");
+
+        // The producer is not a token creator.
+        let drawer = scoped(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            Some(all.clone()),
+        );
+        let mut tail = head(TargetFilter::LastCreated, all.clone());
+        mark_co_scoped_created_referent_consumer(&drawer, &all, &mut tail);
+        assert!(!marked(&tail), "a Draw producer");
+
+        // The producer template retains a later publisher after the Token.
+        let mut republishing = producer.clone();
+        republishing.sub_ability = Some(Box::new(scoped(token(), None)));
+        let mut tail = head(TargetFilter::LastCreated, all.clone());
+        mark_co_scoped_created_referent_consumer(&republishing, &all, &mut tail);
+        assert!(!marked(&tail), "a retained later publisher");
+
+        // The head's target is not `LastCreated`.
+        let mut tail = head(TargetFilter::Typed(TypedFilter::creature()), all.clone());
+        mark_co_scoped_created_referent_consumer(&producer, &all, &mut tail);
+        assert!(!marked(&tail), "a typed head target");
+
+        // An unscoped head (the producer's scope is not the head's).
+        let mut tail = Some(Box::new(scoped(
+            Effect::PutCounter {
+                counter_type: CounterType::Plus1Plus1,
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::LastCreated,
+            },
+            None,
+        )));
+        mark_co_scoped_created_referent_consumer(&producer, &all, &mut tail);
+        assert!(!marked(&tail), "an unscoped head");
     }
 
     /// CR 608.2c — the created-token channel of a paused player-scope token
@@ -38267,6 +38922,573 @@ mod tests {
         let mut repeated = node(Effect::NoOp);
         repeated.repeat_for = Some(count_last_created());
         assert!(tail_reads_created_referent(&repeated));
+
+        let put_counter = |target: TargetFilter| Effect::PutCounter {
+            counter_type: CounterType::Plus1Plus1,
+            count: QuantityExpr::Fixed { value: 1 },
+            target,
+        };
+        let def = |effect: Effect| AbilityDefinition::new(AbilityKind::Spell, effect);
+
+        // (x) U-N1-mode: a resolved node's `mode_abilities` (CR 700.2) and a
+        // definition's `mode_abilities` inside a delayed payload are read.
+        let mut modal = node(Effect::NoOp);
+        modal.mode_abilities = vec![def(put_counter(TargetFilter::LastCreated))];
+        assert!(tail_reads_created_referent(&modal));
+        let mut modal_payload = def(Effect::NoOp);
+        modal_payload.mode_abilities = vec![def(put_counter(TargetFilter::LastCreated))];
+        assert!(tail_reads_created_referent(&node(delayed(modal_payload))));
+
+        // (xi) U-N1-a: the mass-population slot reads; a typed population does not.
+        let put_counter_all = |target: TargetFilter| Effect::PutCounterAll {
+            counter_type: CounterType::Plus1Plus1,
+            count: QuantityExpr::Fixed { value: 1 },
+            target,
+        };
+        assert!(tail_reads_created_referent(&node(put_counter_all(
+            TargetFilter::LastCreated
+        ))));
+        assert!(tail_reads_created_referent(&node(Effect::ChangeZoneAll {
+            origin: None,
+            destination: Zone::Exile,
+            target: TargetFilter::LastCreated,
+            enters_under: None,
+            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+            enters_attacking: false,
+            enter_with_counters: vec![],
+            face_down_profile: None,
+            library_position: None,
+            library_shuffle: Default::default(),
+            random_order: false,
+        })));
+        assert!(!tail_reads_created_referent(&node(put_counter_all(
+            TargetFilter::Typed(TypedFilter::creature())
+        ))));
+
+        // (xii) U-N1-b: a hidden object slot reads; a self attachment does not.
+        let attach = |attachment: TargetFilter| Effect::Attach {
+            attachment,
+            target: TargetFilter::Any,
+            selection: Default::default(),
+        };
+        assert!(tail_reads_created_referent(&node(attach(
+            TargetFilter::LastCreated
+        ))));
+        assert!(!tail_reads_created_referent(&node(attach(
+            TargetFilter::SelfRef
+        ))));
+
+        // (xiii) U-N1-c: inline alternatives read.
+        let gain_one = || Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 1 },
+            player: TargetFilter::Controller,
+        };
+        assert!(tail_reads_created_referent(&node(Effect::ChooseOneOf {
+            chooser: PlayerFilter::Controller,
+            branches: vec![def(gain_one()), def(put_counter(TargetFilter::LastCreated))],
+            kind: ChooseOneOfKind::Ordinary,
+        })));
+        assert!(tail_reads_created_referent(&node(Effect::RollDie {
+            count: QuantityExpr::Fixed { value: 1 },
+            sides: 6,
+            results: vec![crate::types::ability::DieResultBranch {
+                min: 1,
+                max: 6,
+                effect: Box::new(def(put_counter(TargetFilter::LastCreated))),
+            }],
+            modifier: None,
+        })));
+
+        // (xiv) U-N1-d: the inline branch's own creation is its placement's
+        // nearest publisher.
+        let mut own_branch = def(elemental());
+        own_branch.sub_ability = Some(Box::new(def(put_counter(TargetFilter::LastCreated))));
+        assert!(!tail_reads_created_referent(&node(Effect::ChooseOneOf {
+            chooser: PlayerFilter::Controller,
+            branches: vec![own_branch],
+            kind: ChooseOneOfKind::Ordinary,
+        })));
+
+        // (xv) U-N1-e: an outer node whose inline branch creates is the
+        // nearest publisher for the sub after it.
+        let mut outer_creation = node(Effect::ChooseOneOf {
+            chooser: PlayerFilter::Controller,
+            branches: vec![def(elemental())],
+            kind: ChooseOneOfKind::Ordinary,
+        });
+        outer_creation.sub_ability = Some(Box::new(node(put_counter(TargetFilter::LastCreated))));
+        assert!(!tail_reads_created_referent(&outer_creation));
+    }
+
+    /// CR 608.2c + CR 611.2c + CR 113.1a: every carrier that the scoped
+    /// traversal (`ability_visit::visit_effect`, `IncludeRegisteredLater`)
+    /// descends is a reader position of the created referent. One fixture per
+    /// carrier, each wrapping a bare `PutCounter { LastCreated }`: (i) the
+    /// traversal reaches it (the fixture's reach-guard) and (ii) the reader walk
+    /// reads it. No fixture has (i) without (ii).
+    #[test]
+    fn created_referent_reader_walk_matches_the_traversal() {
+        use crate::types::ability::{
+            CopiableValues, CounterSourceRider, DieResultBranch, PileSource, PlayerScope,
+            ReplacementDefinition, ReplacementMode, TriggerDefinition, VoteSubject, VoteTally,
+            VoteVisibility, VoterScope,
+        };
+        let placement = || Effect::PutCounter {
+            counter_type: CounterType::Plus1Plus1,
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::LastCreated,
+        };
+        let payload = || Box::new(AbilityDefinition::new(AbilityKind::Spell, placement()));
+        let trigger = || {
+            let mut trigger = TriggerDefinition::new(TriggerMode::Attacks);
+            trigger.execute = Some(payload());
+            trigger
+        };
+        let replacement = |execute: bool, mode: ReplacementMode| {
+            let mut replacement = ReplacementDefinition::new(ReplacementEvent::DamageDone);
+            if execute {
+                replacement.execute = Some(payload());
+            }
+            replacement.mode = mode;
+            replacement
+        };
+        let granting = |modification: ContinuousModification| {
+            StaticDefinition::continuous()
+                .affected(TargetFilter::SelfRef)
+                .modifications(vec![modification])
+        };
+        let grant_ability = || ContinuousModification::GrantAbility {
+            definition: payload(),
+        };
+        let generic = |static_def: StaticDefinition| Effect::GenericEffect {
+            static_abilities: vec![static_def],
+            duration: None,
+            target: None,
+            end_cost: None,
+        };
+        let empty_values = || CopiableValues {
+            name: "Copy".to_string(),
+            mana_cost: Default::default(),
+            color: vec![],
+            card_types: Default::default(),
+            power: None,
+            toughness: None,
+            loyalty: None,
+            printed_loyalty: None,
+            keywords: vec![],
+            abilities: Default::default(),
+            trigger_definitions: Default::default(),
+            trigger_printed_origins: Default::default(),
+            replacement_definitions: Default::default(),
+            static_definitions: Default::default(),
+            room_halves: None,
+            prepare_face: None,
+            name_origin: Default::default(),
+        };
+        let copy_values = |values: CopiableValues| {
+            generic(granting(ContinuousModification::CopyValues {
+                values: Box::new(values),
+                display_source: Default::default(),
+                printed_ref: None,
+                token_image_ref: None,
+                token_art: None,
+            }))
+        };
+        let token = |static_abilities: Vec<StaticDefinition>| Effect::Token {
+            name: "Soldier".to_string(),
+            power: PtValue::Fixed(1),
+            toughness: PtValue::Fixed(1),
+            types: vec!["Creature".to_string(), "Soldier".to_string()],
+            colors: vec![],
+            keywords: vec![],
+            tapped: false,
+            count: QuantityExpr::Fixed { value: 1 },
+            owner: TargetFilter::Controller,
+            attach_to: None,
+            enters_attacking: false,
+            supertypes: vec![],
+            static_abilities,
+            enter_with_counters: vec![],
+        };
+        let mut modal_payload = AbilityDefinition::new(AbilityKind::Spell, Effect::NoOp);
+        modal_payload.mode_abilities = vec![*payload()];
+
+        let fixtures: Vec<(&str, Effect)> = vec![
+            (
+                "Vote per-choice",
+                Effect::Vote {
+                    choices: vec!["one".into()],
+                    per_choice_effect: vec![payload()],
+                    starting_with: ControllerRef::You,
+                    voter_scope: VoterScope::AllPlayers,
+                    tally_mode: VoteTally::PerVote,
+                    subject: VoteSubject::Named,
+                    visibility: VoteVisibility::Open,
+                },
+            ),
+            (
+                "Vote object outcome",
+                Effect::Vote {
+                    choices: vec![],
+                    per_choice_effect: vec![],
+                    starting_with: ControllerRef::You,
+                    voter_scope: VoterScope::AllPlayers,
+                    tally_mode: VoteTally::PerVote,
+                    subject: VoteSubject::Objects {
+                        candidate_filter: TargetFilter::Any,
+                        outcome_template: payload(),
+                    },
+                    visibility: VoteVisibility::Open,
+                },
+            ),
+            (
+                "piles chosen",
+                Effect::SeparateIntoPiles {
+                    partition_subject: VoterScope::EachOpponent,
+                    object_filter: TargetFilter::Any,
+                    chooser: PlayerScope::Controller,
+                    chosen_pile_effect: payload(),
+                    pile_source: PileSource::Battlefield,
+                    unchosen_pile_effect: None,
+                },
+            ),
+            (
+                "piles unchosen",
+                Effect::SeparateIntoPiles {
+                    partition_subject: VoterScope::EachOpponent,
+                    object_filter: TargetFilter::Any,
+                    chooser: PlayerScope::Controller,
+                    chosen_pile_effect: Box::new(AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::NoOp,
+                    )),
+                    pile_source: PileSource::Battlefield,
+                    unchosen_pile_effect: Some(payload()),
+                },
+            ),
+            (
+                "RevealFromHand decline",
+                Effect::RevealFromHand {
+                    filter: TargetFilter::Any,
+                    on_decline: Some(payload()),
+                },
+            ),
+            (
+                "FlipCoin win",
+                Effect::FlipCoin {
+                    win_effect: Some(payload()),
+                    lose_effect: None,
+                    flipper: TargetFilter::Controller,
+                },
+            ),
+            (
+                "FlipCoin lose",
+                Effect::FlipCoin {
+                    win_effect: None,
+                    lose_effect: Some(payload()),
+                    flipper: TargetFilter::Controller,
+                },
+            ),
+            (
+                "FlipCoins win",
+                Effect::FlipCoins {
+                    count: QuantityExpr::Fixed { value: 2 },
+                    win_effect: Some(payload()),
+                    lose_effect: None,
+                    flipper: TargetFilter::Controller,
+                },
+            ),
+            (
+                "FlipCoins lose",
+                Effect::FlipCoins {
+                    count: QuantityExpr::Fixed { value: 2 },
+                    win_effect: None,
+                    lose_effect: Some(payload()),
+                    flipper: TargetFilter::Controller,
+                },
+            ),
+            (
+                "FlipCoinUntilLose",
+                Effect::FlipCoinUntilLose {
+                    win_effect: payload(),
+                },
+            ),
+            (
+                "RollDie",
+                Effect::RollDie {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    sides: 6,
+                    results: vec![DieResultBranch {
+                        min: 1,
+                        max: 6,
+                        effect: payload(),
+                    }],
+                    modifier: None,
+                },
+            ),
+            (
+                "ChooseOneOf",
+                Effect::ChooseOneOf {
+                    chooser: PlayerFilter::Controller,
+                    branches: vec![*payload()],
+                    kind: ChooseOneOfKind::Ordinary,
+                },
+            ),
+            (
+                "CreateDelayedTrigger",
+                Effect::CreateDelayedTrigger {
+                    condition: DelayedTriggerCondition::AtNextPhase { phase: Phase::End },
+                    effect: payload(),
+                    uses_tracked_set: false,
+                },
+            ),
+            (
+                "CreateBoon",
+                Effect::CreateBoon {
+                    recipient: TargetFilter::Controller,
+                    trigger: Box::new(trigger()),
+                },
+            ),
+            (
+                "CreateDrawReplacement",
+                Effect::CreateDrawReplacement {
+                    replacement_effect: Box::new(placement()),
+                },
+            ),
+            (
+                "CreatePlaneswalkReplacement",
+                Effect::CreatePlaneswalkReplacement {
+                    replacement_effect: Box::new(placement()),
+                },
+            ),
+            (
+                "AddTargetReplacement execute",
+                Effect::AddTargetReplacement {
+                    replacement: Box::new(replacement(true, ReplacementMode::Mandatory)),
+                    target: TargetFilter::Any,
+                },
+            ),
+            (
+                "AddTargetReplacement Optional decline",
+                Effect::AddTargetReplacement {
+                    replacement: Box::new(replacement(
+                        false,
+                        ReplacementMode::Optional {
+                            decline: Some(payload()),
+                        },
+                    )),
+                    target: TargetFilter::Any,
+                },
+            ),
+            (
+                "AddTargetReplacement MayCost decline",
+                Effect::AddTargetReplacement {
+                    replacement: Box::new(replacement(
+                        false,
+                        ReplacementMode::MayCost {
+                            cost: crate::types::ability::AbilityCost::Tap,
+                            decline: Some(payload()),
+                        },
+                    )),
+                    target: TargetFilter::Any,
+                },
+            ),
+            (
+                "GenericEffect GrantAbility",
+                generic(granting(grant_ability())),
+            ),
+            (
+                "GenericEffect GrantTrigger",
+                generic(granting(ContinuousModification::GrantTrigger {
+                    trigger: Box::new(trigger()),
+                })),
+            ),
+            (
+                "GenericEffect GrantReplacement execute",
+                generic(granting(ContinuousModification::GrantReplacement {
+                    replacement: Box::new(replacement(true, ReplacementMode::Mandatory)),
+                })),
+            ),
+            (
+                "GenericEffect GrantReplacement decline",
+                generic(granting(ContinuousModification::GrantReplacement {
+                    replacement: Box::new(replacement(
+                        false,
+                        ReplacementMode::Optional {
+                            decline: Some(payload()),
+                        },
+                    )),
+                })),
+            ),
+            (
+                "GenericEffect GrantStaticAbility(GrantAbility)",
+                generic(granting(ContinuousModification::GrantStaticAbility {
+                    definition: Box::new(granting(grant_ability())),
+                })),
+            ),
+            ("CopyValues abilities", {
+                let mut values = empty_values();
+                values.abilities = std::sync::Arc::new(vec![*payload()]);
+                copy_values(values)
+            }),
+            ("CopyValues trigger_definitions", {
+                let mut values = empty_values();
+                values.trigger_definitions = std::sync::Arc::new(vec![trigger()]);
+                copy_values(values)
+            }),
+            ("CopyValues static_definitions", {
+                let mut values = empty_values();
+                values.static_definitions = std::sync::Arc::new(vec![granting(grant_ability())]);
+                copy_values(values)
+            }),
+            ("CopyValues replacement_definitions", {
+                let mut values = empty_values();
+                values.replacement_definitions =
+                    std::sync::Arc::new(vec![replacement(true, ReplacementMode::Mandatory)]);
+                copy_values(values)
+            }),
+            (
+                "Counter source_rider",
+                Effect::Counter {
+                    target: TargetFilter::Any,
+                    source_rider: Some(CounterSourceRider::LosesAbilities {
+                        static_def: Box::new(granting(grant_ability())),
+                        source_filter: None,
+                        duration: Box::new(Duration::UntilEndOfTurn),
+                    }),
+                    countered_spell_zone: None,
+                },
+            ),
+            (
+                "Token static GrantTrigger",
+                token(vec![granting(ContinuousModification::GrantTrigger {
+                    trigger: Box::new(trigger()),
+                })]),
+            ),
+            (
+                "CreateEmblem trigger",
+                Effect::CreateEmblem {
+                    statics: vec![],
+                    triggers: vec![trigger()],
+                },
+            ),
+            (
+                "CreateEmblem static GrantAbility",
+                Effect::CreateEmblem {
+                    statics: vec![granting(grant_ability())],
+                    triggers: vec![],
+                },
+            ),
+            (
+                "definition mode_abilities in a delayed payload",
+                Effect::CreateDelayedTrigger {
+                    condition: DelayedTriggerCondition::AtNextPhase { phase: Phase::End },
+                    effect: Box::new(modal_payload),
+                    uses_tracked_set: false,
+                },
+            ),
+        ];
+        for (label, effect) in fixtures {
+            let mut reached = false;
+            let _ = crate::types::ability_visit::visit_effect(&effect, &mut |inner: &Effect| {
+                if inner.target_filter() == Some(&TargetFilter::LastCreated) {
+                    reached = true;
+                }
+                std::ops::ControlFlow::Continue(())
+            });
+            assert!(reached, "{label}: the traversal descends to the placement");
+            let node = ResolvedAbility::new(effect, vec![], ObjectId(1), PlayerId(0));
+            assert!(
+                tail_reads_created_referent(&node),
+                "{label}: a carrier the traversal descends is a reader"
+            );
+        }
+
+        // U-N1-f: the payload's own creation is its placement's nearest
+        // publisher (registered-later boundary).
+        let mut own_payload = AbilityDefinition::new(AbilityKind::Spell, token(vec![]));
+        own_payload.sub_ability = Some(payload());
+        let delayed_own = ResolvedAbility::new(
+            Effect::CreateDelayedTrigger {
+                condition: DelayedTriggerCondition::AtNextPhase { phase: Phase::End },
+                effect: Box::new(own_payload.clone()),
+                uses_tracked_set: false,
+            },
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        );
+        assert!(!tail_reads_created_referent(&delayed_own));
+        // U-N1-g: the same inside a granted definition.
+        let granted_own = ResolvedAbility::new(
+            generic(granting(ContinuousModification::GrantAbility {
+                definition: Box::new(own_payload),
+            })),
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        );
+        assert!(!tail_reads_created_referent(&granted_own));
+    }
+
+    /// CR 611.2c + CR 611.3a: a static this resolution creates reads the created
+    /// referent through its `affected` set and its dynamic magnitudes, whether it
+    /// hangs from a `GenericEffect`, a token or an emblem.
+    #[test]
+    fn created_referent_static_positions_read() {
+        let node = |effect: Effect| ResolvedAbility::new(effect, vec![], ObjectId(1), PlayerId(0));
+        let affected = |filter: TargetFilter| {
+            StaticDefinition::continuous()
+                .affected(filter)
+                .modifications(vec![ContinuousModification::AddPower { value: 1 }])
+        };
+        let generic = |static_def: StaticDefinition| Effect::GenericEffect {
+            static_abilities: vec![static_def],
+            duration: None,
+            target: None,
+            end_cost: None,
+        };
+        let token = |static_def: StaticDefinition| Effect::Token {
+            name: "Soldier".to_string(),
+            power: PtValue::Fixed(1),
+            toughness: PtValue::Fixed(1),
+            types: vec!["Creature".to_string(), "Soldier".to_string()],
+            colors: vec![],
+            keywords: vec![],
+            tapped: false,
+            count: QuantityExpr::Fixed { value: 1 },
+            owner: TargetFilter::Controller,
+            attach_to: None,
+            enters_attacking: false,
+            supertypes: vec![],
+            static_abilities: vec![static_def],
+            enter_with_counters: vec![],
+        };
+        assert!(tail_reads_created_referent(&node(token(affected(
+            TargetFilter::LastCreated
+        )))));
+        assert!(tail_reads_created_referent(&node(Effect::CreateEmblem {
+            statics: vec![affected(TargetFilter::LastCreated)],
+            triggers: vec![],
+        })));
+        assert!(tail_reads_created_referent(&node(generic(affected(
+            TargetFilter::LastCreated
+        )))));
+        assert!(tail_reads_created_referent(&node(generic(
+            StaticDefinition::continuous()
+                .affected(TargetFilter::SelfRef)
+                .modifications(vec![ContinuousModification::AddDynamicPower {
+                    value: QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectCount {
+                            filter: TargetFilter::LastCreated,
+                        },
+                    },
+                }])
+        ))));
+        // Negative: a self-affecting static with a fixed magnitude reads nothing.
+        assert!(!tail_reads_created_referent(&node(generic(affected(
+            TargetFilter::SelfRef
+        )))));
     }
 
     /// CR 608.2c — a non-choosing per-player reveal introduces no per-iteration
@@ -39050,7 +40272,18 @@ mod tests {
     /// `resolve_ability_chain` (the production entry that evaluates
     /// `ability.condition`) and returns P0's life gained.
     fn life_gained_under_condition(condition: AbilityCondition, subject: ConditionSubject) -> i32 {
+        life_gained_under_condition_on_turn(condition, subject, PlayerId(0))
+    }
+
+    /// [`life_gained_under_condition`] with `active` as the active player, so a
+    /// compound's `IsYourTurn` operand can be false.
+    fn life_gained_under_condition_on_turn(
+        condition: AbilityCondition,
+        subject: ConditionSubject,
+        active: PlayerId,
+    ) -> i32 {
         let mut state = GameState::new_two_player(42);
+        state.active_player = active;
         let source = create_object(
             &mut state,
             CardId(0x0C200),
@@ -39259,6 +40492,111 @@ mod tests {
                 ConditionSubject::EffectContext(3)
             ),
             3
+        );
+    }
+
+    /// CR 608.2c: the presence guard is carried through the compound carriers
+    /// (`And`, `Or`, `ConditionInstead`) before negation. A compound is undecided
+    /// only when an operand lacks its resolution-only subject and no present
+    /// operand already decides it; negating an undecided compound must not make
+    /// it true. Present subjects (including a present zero) read as values.
+    #[test]
+    fn subject_dependent_negated_compound_needs_its_subject() {
+        let and_your_turn = || AbilityCondition::And {
+            conditions: vec![cost_paid_mana_value_is_even(), AbilityCondition::IsYourTurn],
+        };
+        let or_your_turn = || AbilityCondition::Or {
+            conditions: vec![cost_paid_mana_value_is_even(), AbilityCondition::IsYourTurn],
+        };
+
+        // N4-1: `Not(And([MV-even, IsYourTurn]))` on P0's turn, subject absent:
+        // the `And` is undecided, so its negation does not hold.
+        assert_eq!(
+            life_gained_under_condition_on_turn(
+                negated(and_your_turn()),
+                ConditionSubject::Absent,
+                PlayerId(0),
+            ),
+            0,
+            "an absent subject inside a negated And must not run the rider"
+        );
+        // N4-2 / N4-3 (present controls, reach-guard for N4-1): MV 3 makes the
+        // And false, so the negation holds; MV 2 makes it true.
+        assert_eq!(
+            life_gained_under_condition_on_turn(
+                negated(and_your_turn()),
+                ConditionSubject::CostPaid(3),
+                PlayerId(0),
+            ),
+            3
+        );
+        assert_eq!(
+            life_gained_under_condition_on_turn(
+                negated(and_your_turn()),
+                ConditionSubject::CostPaid(2),
+                PlayerId(0),
+            ),
+            0
+        );
+        // N4-4: a present MV-0 subject is a value, not an absence.
+        let mana_value_at_least_one = AbilityCondition::QuantityCheck {
+            lhs: cost_paid_mana_value(),
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        };
+        assert_eq!(
+            life_gained_under_condition_on_turn(
+                negated(AbilityCondition::And {
+                    conditions: vec![mana_value_at_least_one, AbilityCondition::IsYourTurn],
+                }),
+                ConditionSubject::CostPaid(0),
+                PlayerId(0),
+            ),
+            3,
+            "a present MV-0 subject: the And is false, so the negation holds"
+        );
+        // N4-5: `Not(Or([MV-even, IsYourTurn]))` on P1's turn, subject absent:
+        // no present operand decides the Or true, so it is undecided.
+        assert_eq!(
+            life_gained_under_condition_on_turn(
+                negated(or_your_turn()),
+                ConditionSubject::Absent,
+                PlayerId(1),
+            ),
+            0,
+            "an absent subject inside a negated Or must not run the rider"
+        );
+        // N4-6: `Not(And(...))` on P1's turn, subject absent: the present
+        // `IsYourTurn` operand already decides the And false, so the negation
+        // holds (no over-refusal).
+        assert_eq!(
+            life_gained_under_condition_on_turn(
+                negated(and_your_turn()),
+                ConditionSubject::Absent,
+                PlayerId(1),
+            ),
+            3
+        );
+        // N4-7: `Not(ConditionInstead { MV-even })`, subject absent.
+        assert_eq!(
+            life_gained_under_condition_on_turn(
+                negated(AbilityCondition::ConditionInstead {
+                    inner: Box::new(cost_paid_mana_value_is_even()),
+                }),
+                ConditionSubject::Absent,
+                PlayerId(0),
+            ),
+            0,
+            "an absent subject inside a negated ConditionInstead must not run the rider"
+        );
+        // N4-8: a double negation of the undecided compound stays undecided.
+        assert_eq!(
+            life_gained_under_condition_on_turn(
+                negated(negated(and_your_turn())),
+                ConditionSubject::Absent,
+                PlayerId(0),
+            ),
+            0
         );
     }
 

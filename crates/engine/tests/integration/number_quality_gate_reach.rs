@@ -365,3 +365,94 @@ fn casting_restriction_quality_gate_fails_closed() {
         &[],
     ));
 }
+
+/// Whether any ability on the face carries an `Unimplemented` named `name`
+/// (`None`: any name).
+fn has_unimplemented(face: &CardFace, name: Option<&str>) -> bool {
+    face.abilities.iter().any(|ability| {
+        visit_ability_def(ability, &mut |effect| match effect {
+            Effect::Unimplemented { name: found, .. }
+                if name.is_none_or(|wanted| found == wanted) =>
+            {
+                ControlFlow::Break(())
+            }
+            _ => ControlFlow::Continue(()),
+        })
+        .is_break()
+    })
+}
+
+/// CR 614.1d: "As long as <gate>, this creature enters tapped" (route: the
+/// singular unconditional enters-tapped fallback). The shared quality parser
+/// admits the gate, the specialized replacement conversion declines it, and the
+/// fallback must decline too, so the line lands as an explicit gap instead of
+/// an unconditional self replacement.
+#[test]
+fn as_long_as_singular_enters_tapped_quality_gate_fails_closed() {
+    // Reach-guard: Diregraf Ghoul, verbatim, takes the same fallback and yields
+    // its unconditional self replacement.
+    let ghoul = face(
+        "Diregraf Ghoul",
+        "This creature enters tapped.",
+        CoreType::Creature,
+        &["Zombie"],
+    );
+    assert_eq!(ghoul.replacements.len(), 1);
+    let replacement = &ghoul.replacements[0];
+    assert!(replacement.condition.is_none());
+    assert!(matches!(
+        replacement
+            .execute
+            .as_deref()
+            .map(|def| def.effect.as_ref()),
+        Some(Effect::SetTapState {
+            target: TargetFilter::SelfRef,
+            ..
+        })
+    ));
+    assert!(card_face_gaps(&ghoul).is_empty());
+
+    // Leading form: the router's `as_long_as_gate` diagnostic.
+    let leading = face(
+        "Test Odd Tapper",
+        "As long as you control an odd number of creatures, this creature enters tapped.",
+        CoreType::Creature,
+        &[],
+    );
+    assert_fails_closed(&leading);
+    assert!(leading.replacements.is_empty());
+    assert!(has_unimplemented(&leading, Some("as_long_as_gate")));
+
+    // Trailing form: the router's replacement-structure gap.
+    let trailing = face(
+        "Test Odd Trailing Tapper",
+        "This creature enters tapped as long as you control an odd number of creatures.",
+        CoreType::Creature,
+        &[],
+    );
+    assert_fails_closed(&trailing);
+    assert!(trailing.replacements.is_empty());
+    assert!(has_unimplemented(&trailing, None));
+}
+
+/// CR 614.1d: a quoted perpetual grant ("This permanent enters the battlefield
+/// tapped.") inside a "for as long as" sentence is not the spell's own self
+/// replacement.
+#[test]
+fn divine_purge_quoted_enters_tapped_is_not_a_self_replacement() {
+    let purge = face(
+        "Divine Purge",
+        "Exile all artifacts and creatures with mana value 3 or less. They perpetually gain \"This spell costs {2} more to cast\" and \"This permanent enters the battlefield tapped.\" For as long as each of them remain exiled, its owner may play it.",
+        CoreType::Sorcery,
+        &[],
+    );
+    assert!(purge.replacements.is_empty());
+    // Reach-guard: the spell's exile instruction is parsed.
+    assert!(matches!(
+        purge.abilities.first().map(|def| def.effect.as_ref()),
+        Some(Effect::ChangeZoneAll {
+            destination: Zone::Exile,
+            ..
+        })
+    ));
+}

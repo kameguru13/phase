@@ -264,14 +264,16 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
     }
 
     // --- "~ enters the battlefield tapped" (unconditional) ---
-    // Guard: reject text with " unless " or "if you control" — all conditional
-    // patterns must be handled above. Counter-bearing variants fall through to
-    // `parse_enters_with_counters`, which composes the tap and counter modifiers.
+    // Guard: a conditional gate word (`unless`, `if you control`, `if x`,
+    // `as long as`) means a conditional pattern above should have claimed the
+    // line; when none did, the line is declined so the router lands it as an
+    // explicit gap instead of an unconditional self replacement (CR 614.1d).
+    // Counter-bearing variants fall through to `parse_enters_with_counters`,
+    // which composes the tap and counter modifiers.
     if (nom_primitives::scan_contains(&norm_lower, "enters the battlefield tapped")
         || nom_primitives::scan_contains(&norm_lower, "enters tapped"))
-        && !nom_primitives::scan_contains(&norm_lower, "unless")
-        && !nom_primitives::scan_contains(&norm_lower, "if you control")
-        && !nom_primitives::scan_contains(&norm_lower, "if x")
+        && nom_primitives::scan_at_word_boundaries(&norm_lower, enters_tapped_conditional_marker)
+            .is_none()
         && !has_enters_tapped_with_counter(&norm_lower)
     {
         return Some(
@@ -5228,6 +5230,21 @@ fn compose_enters_with_keyword_grant(
         },
     )
     .sub_ability(inner)
+}
+
+/// CR 614.1d: a gate word the unconditional "enters tapped" fallback cannot
+/// carry. `as long as` also matches "for as long as" at its word boundary.
+fn enters_tapped_conditional_marker(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        alt((
+            tag("unless"),
+            tag("if you control"),
+            tag("if x"),
+            tag("as long as"),
+        )),
+    )
+    .parse(input)
 }
 
 fn has_enters_tapped_with_counter(text: &str) -> bool {

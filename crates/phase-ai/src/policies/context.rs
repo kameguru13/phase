@@ -174,8 +174,9 @@ impl<'a> PolicyContext<'a> {
     /// [`Self::effects`] without its created-token placements (CR 608.2c +
     /// CR 111.1: a `PutCounter { LastCreated }` whose nearest preceding publisher
     /// in the same chain is a `Token` lands on that token). Each ability's walk is
-    /// filtered against its own unconditional chain, so a `Token` in one
-    /// ability never pairs with a placement in another.
+    /// filtered against its own branch chains (the root chain and each
+    /// `else_ability` / mode head's chain), so a `Token` in one ability or
+    /// branch never pairs with a placement in another.
     pub(crate) fn effects_without_created_token_placements(&self) -> Vec<&'a Effect> {
         self.ability_walks()
             .iter()
@@ -1486,6 +1487,26 @@ mod tests {
             AbilityDefinition::new(AbilityKind::Activated, p1p1_placement()),
         ]);
         assert_eq!(paired, (2, 3, 2), "only A's own placement is filtered");
+    }
+
+    /// N3 (CR 700.2): the CastSpell walk includes every mode, and a mode's own
+    /// `[Token, P]` pair is filtered within that mode's chain.
+    #[test]
+    fn cast_walk_filters_a_mode_branch_created_token_placement() {
+        let mut modal = AbilityDefinition::new(AbilityKind::Spell, Effect::NoOp);
+        modal.mode_abilities = vec![
+            effect_chain(
+                AbilityKind::Spell,
+                SubAbilityLink::ContinuationStep,
+                vec![token_effect(0, 0, vec![]), p1p1_placement()],
+            ),
+            AbilityDefinition::new(AbilityKind::Spell, draw(1)),
+        ];
+        assert_eq!(
+            cast_ctx_effects(vec![modal]),
+            (1, 4, 3),
+            "effects() includes the mode placement; the filtered view drops it"
+        );
     }
 
     /// An activation reads exactly one walk: the activated ability's.

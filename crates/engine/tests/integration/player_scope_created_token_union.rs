@@ -15,11 +15,12 @@ use engine::game::layers::evaluate_layers;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::zones::{create_object, move_to_zone};
 use engine::types::ability::{
-    AbilityDefinition, AbilityKind, ContinuousModification, DelayedTriggerCondition, Duration,
-    Effect, FilterProp, PlayerFilter, PtValue, QuantityExpr, QuantityRef, ResolvedAbility,
-    StaticDefinition, TargetFilter, TargetRef, TypedFilter,
+    AbilityDefinition, AbilityKind, ContinuousModification, DelayedTriggerCondition,
+    DieResultBranch, Duration, Effect, FilterProp, PlayerFilter, PtValue, QuantityExpr,
+    QuantityRef, ResolvedAbility, StaticDefinition, TargetFilter, TargetRef, TypedFilter,
 };
 use engine::types::actions::GameAction;
+use engine::types::counter::CounterType;
 use engine::types::format::FormatConfig;
 use engine::types::game_state::{GameState, WaitingFor};
 use engine::types::identifiers::{CardId, ObjectId};
@@ -711,4 +712,201 @@ fn count_warriors_created() -> QuantityExpr {
             filter: TargetFilter::LastCreated,
         },
     }
+}
+
+/// The +1/+1 counters on `id`.
+fn plus_one_counters(state: &GameState, id: ObjectId) -> u32 {
+    state.objects[&id]
+        .counters
+        .get(&CounterType::Plus1Plus1)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// "Put a +1/+1 counter on each of those tokens": the mass-population slot of
+/// `PutCounterAll` (hidden from `target_filter()`).
+fn put_counter_on_each_created() -> Effect {
+    Effect::PutCounterAll {
+        counter_type: CounterType::Plus1Plus1,
+        count: QuantityExpr::Fixed { value: 1 },
+        target: TargetFilter::LastCreated,
+    }
+}
+
+/// "Roll a die. 1-6 | You gain 1 life for each of those tokens.": an inline
+/// results-table branch (CR 706.3a) reading the created referent.
+fn roll_then_gain_per_created() -> Effect {
+    Effect::RollDie {
+        count: QuantityExpr::Fixed { value: 1 },
+        sides: 6,
+        results: vec![DieResultBranch {
+            min: 1,
+            max: 6,
+            effect: Box::new(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::GainLife {
+                    amount: count_warriors_created(),
+                    player: TargetFilter::Controller,
+                },
+            )),
+        }],
+        modifier: None,
+    }
+}
+
+/// "You get an emblem with 'Those tokens get +1/+0.'": a registered static
+/// payload whose `affected` reads the live created-token ledger (CR 611.3a).
+fn emblem_pumping_created() -> Effect {
+    Effect::CreateEmblem {
+        statics: vec![StaticDefinition::continuous()
+            .affected(TargetFilter::LastCreated)
+            .modifications(vec![ContinuousModification::AddPower { value: 1 }])],
+        triggers: vec![],
+    }
+}
+
+/// The synchronous sibling of [`paused_constructed_fan_out`]: no replacement
+/// effects, so every seat creates three Warriors and nothing pauses.
+fn sync_constructed_fan_out(tail: Effect) -> GameRunner {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let mut runner = scenario.build();
+    let source = create_object(
+        runner.state_mut(),
+        CardId(900),
+        P0,
+        "Union source".to_string(),
+        Zone::Battlefield,
+    );
+    let mut warriors = ResolvedAbility::new(vanilla_token("Warrior", 3), vec![], source, P0);
+    warriors.player_scope = Some(PlayerFilter::All);
+    warriors.sub_ability = Some(Box::new(ResolvedAbility::new(tail, vec![], source, P0)));
+    resolve_ability_chain(runner.state_mut(), &warriors, &mut Vec::new(), 0)
+        .expect("chain resolves");
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "reach guard: the synchronous fan-out does not pause"
+    );
+    assert_eq!(all_tokens(runner.state(), "Warrior").len(), 9);
+    runner
+}
+
+/// N1-P1 — "Put a +1/+1 counter on each of those tokens" after a paused fan-out:
+/// the mass slot reads the completed clause union (CR 608.2e), not the last
+/// seat's tokens.
+#[test]
+fn paused_fan_out_mass_counter_placement_reads_every_seats_tokens() {
+    let (runner, _) = paused_constructed_fan_out(put_counter_on_each_created(), None);
+    let state = runner.state();
+    let warriors = all_tokens(state, "Warrior");
+    assert_eq!(warriors.len(), 7);
+    assert!(
+        warriors.iter().all(|id| plus_one_counters(state, *id) == 1),
+        "every seat's Warrior has exactly one counter"
+    );
+    assert!(
+        state
+            .battlefield
+            .iter()
+            .filter(|id| state.objects[id].name != "Warrior")
+            .all(|id| plus_one_counters(state, *id) == 0),
+        "no non-Warrior has a counter"
+    );
+}
+
+/// N1-P2 — an inline die-result branch reading "those tokens" after a paused
+/// fan-out counts every seat's tokens.
+#[test]
+fn paused_fan_out_inline_branch_reads_every_seats_tokens() {
+    let starting = GameScenario::new_n_player(3, 42).build().state().players[0].life;
+    let (runner, _) = paused_constructed_fan_out(roll_then_gain_per_created(), None);
+    assert_eq!(runner.state().players[0].life, starting + 7);
+}
+
+/// N1-P3 — nearest publisher inside an inline branch: the branch's own Soldier
+/// is its placement's referent, so no Warrior gets the counter.
+#[test]
+fn paused_fan_out_inline_branch_own_token_is_its_placements_referent() {
+    let mut branch = AbilityDefinition::new(AbilityKind::Spell, vanilla_token("Soldier", 1));
+    branch.sub_ability = Some(Box::new(AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::PutCounter {
+            counter_type: CounterType::Plus1Plus1,
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::LastCreated,
+        },
+    )));
+    let tail = Effect::RollDie {
+        count: QuantityExpr::Fixed { value: 1 },
+        sides: 6,
+        results: vec![DieResultBranch {
+            min: 1,
+            max: 6,
+            effect: Box::new(branch),
+        }],
+        modifier: None,
+    };
+    let (runner, _) = paused_constructed_fan_out(tail, None);
+    let state = runner.state();
+    let soldiers = tokens(state, P0, "Soldier");
+    assert_eq!(
+        soldiers.len(),
+        1,
+        "reach guard: the branch created its Soldier"
+    );
+    assert_eq!(plus_one_counters(state, soldiers[0]), 1);
+    assert!(all_tokens(state, "Warrior")
+        .iter()
+        .all(|id| plus_one_counters(state, *id) == 0));
+}
+
+/// N1-P4 — a registered static payload (an emblem's "those tokens get +1/+0")
+/// reads the live ledger after the paused fan-out, so it must see the union.
+#[test]
+fn paused_fan_out_emblem_static_reads_every_seats_tokens() {
+    let (mut runner, _) = paused_constructed_fan_out(emblem_pumping_created(), None);
+    evaluate_layers(runner.state_mut());
+    let state = runner.state();
+    assert_eq!(
+        state
+            .objects
+            .values()
+            .filter(|object| object.zone == Zone::Command)
+            .count(),
+        1,
+        "reach guard: one emblem in the command zone"
+    );
+    let warriors = all_tokens(state, "Warrior");
+    assert_eq!(warriors.len(), 7);
+    assert!(
+        warriors.iter().all(|id| state.objects[id].power == Some(2)),
+        "every seat's Warrior gets +1/+0"
+    );
+}
+
+/// N1 synchronous siblings: the same tails without a pause read all nine.
+#[test]
+fn sync_fan_out_mass_counter_placement_reads_every_seats_tokens() {
+    let runner = sync_constructed_fan_out(put_counter_on_each_created());
+    let state = runner.state();
+    assert!(all_tokens(state, "Warrior")
+        .iter()
+        .all(|id| plus_one_counters(state, *id) == 1));
+}
+
+#[test]
+fn sync_fan_out_inline_branch_reads_every_seats_tokens() {
+    let starting = GameScenario::new_n_player(3, 42).build().state().players[0].life;
+    let runner = sync_constructed_fan_out(roll_then_gain_per_created());
+    assert_eq!(runner.state().players[0].life, starting + 9);
+}
+
+#[test]
+fn sync_fan_out_emblem_static_reads_every_seats_tokens() {
+    let mut runner = sync_constructed_fan_out(emblem_pumping_created());
+    evaluate_layers(runner.state_mut());
+    let state = runner.state();
+    assert!(all_tokens(state, "Warrior")
+        .iter()
+        .all(|id| state.objects[id].power == Some(2)));
 }

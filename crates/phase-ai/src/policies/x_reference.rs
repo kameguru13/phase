@@ -28,7 +28,7 @@ use engine::types::game_state::GameState;
 use engine::types::identifiers::ObjectId;
 use engine::types::statics::{HandSizeModification, StaticMode};
 
-use crate::ability_chain::{created_token_placement_source, AbilityWalk};
+use crate::ability_chain::AbilityWalk;
 
 /// True when the spell-object-on-stack's printed triggers or replacement
 /// effects reference X. Covers X-cost creature spells whose X is consumed by
@@ -315,11 +315,15 @@ pub(crate) fn effect_references_x(effect: &Effect) -> bool {
 /// CR 107.3 + CR 608.2c: a `Token` whose own chain later puts counters on it
 /// (a created-token placement) is sized by that placement, exactly as
 /// [`effect_references_x`] / [`effect_references_previous_amount`] read
-/// `Token { enter_with_counters }`. True iff `pred(effect)`, or `effect` is a
-/// chain `Token` with a later placement paired to it for which `pred` holds.
+/// `Token { enter_with_counters }`. True iff `pred(effect)`, or `effect` is the
+/// `Token` of one of the walk's created-token pairs whose placement satisfies
+/// `pred`.
 ///
 /// `pred` is one of this module's per-effect X predicates; the walk supplies
-/// the ability whose unconditional chain the pairing is read from.
+/// the ability whose branch chains the pairing is read from
+/// ([`AbilityWalk::created_token_pairs`], shared with the filtering view), so a
+/// `Token` in an `else_ability` or mode branch is sized by its own branch's
+/// placement and never by another chain's.
 pub(crate) fn effect_matches_in_walk(
     walk: &AbilityWalk<'_>,
     effect: &Effect,
@@ -331,13 +335,9 @@ pub(crate) fn effect_matches_in_walk(
     if !matches!(effect, Effect::Token { .. }) {
         return false;
     }
-    let chain = walk.chain();
-    let Some(token_index) = chain.iter().position(|entry| std::ptr::eq(*entry, effect)) else {
-        return false;
-    };
-    (token_index + 1..chain.len()).any(|index| {
-        created_token_placement_source(&chain, index) == Some(token_index) && pred(chain[index])
-    })
+    walk.created_token_pairs()
+        .iter()
+        .any(|pair| std::ptr::eq(pair.token, effect) && pred(pair.placement))
 }
 
 /// True when a `Pump` power/toughness modifier scales with the chosen X.
@@ -612,6 +612,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::cast_facts::collect_definition_effects;
     use crate::policies::tests::created_token_placement_parity::{
         effect_chain, last_created_placement, token_effect, x_quantity,
     };
@@ -684,6 +685,41 @@ mod tests {
         assert!(!effect_matches_in_walk(
             &walk,
             &nearest.effect,
+            effect_references_x
+        ));
+    }
+
+    /// N3 (CR 700.2): a mode's own `[Token, P(X)]` sizes that mode's `Token`
+    /// under the definition walk; a `Token` in one mode is never sized by a
+    /// placement in another, and a bare `Token` is not X-scaled.
+    #[test]
+    fn branch_token_is_sized_by_its_branch_placement() {
+        let mut modal = AbilityDefinition::new(AbilityKind::Spell, Effect::NoOp);
+        modal.mode_abilities = vec![chain_of(vec![
+            token_effect(0, 0, vec![]),
+            last_created_placement(CounterType::Plus1Plus1, x_quantity()),
+        ])];
+        let walk = AbilityWalk::of(&modal, collect_definition_effects(&modal));
+        let mode_token = &modal.mode_abilities[0].effect;
+        assert!(!effect_references_x(mode_token), "reach guard: bare Token");
+        assert!(effect_matches_in_walk(
+            &walk,
+            mode_token,
+            effect_references_x
+        ));
+
+        let mut split = AbilityDefinition::new(AbilityKind::Spell, Effect::NoOp);
+        split.mode_abilities = vec![
+            chain_of(vec![token_effect(0, 0, vec![])]),
+            chain_of(vec![last_created_placement(
+                CounterType::Plus1Plus1,
+                x_quantity(),
+            )]),
+        ];
+        let walk = AbilityWalk::of(&split, collect_definition_effects(&split));
+        assert!(!effect_matches_in_walk(
+            &walk,
+            &split.mode_abilities[0].effect,
             effect_references_x
         ));
     }

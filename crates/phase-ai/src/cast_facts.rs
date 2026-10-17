@@ -370,8 +370,8 @@ pub fn cast_facts_for_object(object: &GameObject) -> CastFacts<'_> {
 
     // CR 115.10a: being affected is not being targeted. A created-token
     // placement (`PutCounter { LastCreated }` whose nearest preceding publisher in the
-    // same chain is a `Token`) puts counters on the token its own ability created, so it declares
-    // no target; both flags read the walk without those placements.
+    // same branch chain is a `Token`) puts counters on the token its own ability created, so it
+    // declares no target; both flags read the walk without those placements.
     let requires_targets_in_spell_text = primary_effects
         .iter()
         .copied()
@@ -1200,6 +1200,38 @@ mod tests {
             AbilityDefinition::new(AbilityKind::Spell, token_effect(0, 0, vec![])),
             AbilityDefinition::new(AbilityKind::Spell, p1p1_placement(one())),
         ];
+        assert!(cast_facts_for_object(&sorcery_with(modal)).requires_targets_in_spell_text);
+    }
+
+    /// N3 (CR 700.2 + CR 115.10a): a mode whose own chain creates a token and
+    /// puts counters on it declares no target at cast commitment. Control: a
+    /// mode that does declare a target still makes the spell target-requiring.
+    #[test]
+    fn branch_created_token_placement_is_not_a_target_requirement() {
+        let gain = || Effect::GainLife {
+            amount: one(),
+            player: TargetFilter::Controller,
+        };
+        let pair = || {
+            effect_chain(
+                AbilityKind::Spell,
+                SubAbilityLink::ContinuationStep,
+                vec![token_effect(0, 0, vec![]), p1p1_placement(one())],
+            )
+        };
+        let mut modal = AbilityDefinition::new(AbilityKind::Spell, Effect::NoOp);
+        modal.mode_abilities = vec![pair(), AbilityDefinition::new(AbilityKind::Spell, gain())];
+        assert!(
+            !cast_facts_for_object(&sorcery_with(modal.clone())).requires_targets_in_spell_text
+        );
+
+        modal.mode_abilities.push(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Destroy {
+                target: TargetFilter::Typed(engine::types::ability::TypedFilter::creature()),
+                cant_regenerate: false,
+            },
+        ));
         assert!(cast_facts_for_object(&sorcery_with(modal)).requires_targets_in_spell_text);
     }
 
