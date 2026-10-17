@@ -725,3 +725,55 @@ fn oversimplify_substituted_tokens_are_it() {
     assert_eq!(fractals(&runner), vec![(P1, P1, 3)]);
     assert_settled(&runner);
 }
+
+/// A pause in the second action leaves a seat with no Fractal as a REMAINING
+/// leg: P0's counter-order choice parks P1's placement, and P1 created none
+/// (Halving Season halves P1's one Fractal to zero), so that queued leg has no
+/// "it" and does nothing (CR 609.3) instead of putting P1's count on P0's
+/// Fractal. P0's Fractal gets P0's 2 with Hardened Scales first:
+/// (2 + 1) × 2 = 6 (Halving Season halves only an opponent's counters).
+#[test]
+fn oversimplify_remaining_player_without_a_fractal_places_nothing_after_a_pause() {
+    let mut scenario = two_player_board();
+    scenario.add_enchantment_from_oracle(P0, "Halving Season", HALVING_SEASON);
+    with_scales_and_evolution(&mut scenario, &[P0]);
+    let mut runner = cast_oversimplify(scenario);
+
+    // Any further counter prompt (e.g. one for P1 placing on P0's Fractal) is
+    // answered too, so the prompt count below is what reports it.
+    let prompts = drive(
+        &mut runner,
+        &|names| {
+            if names.iter().any(|name| name == "Hardened Scales") {
+                "Hardened Scales"
+            } else {
+                "Branching Evolution"
+            }
+        },
+        &mut no_board_edit,
+    );
+
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert_counter_choice(&prompts[0], P0);
+    assert_eq!(
+        prompts[0].fractals,
+        vec![(P0, P0, 0)],
+        "P0 pauses on its own placement with P1's leg still remaining, and P1 \
+         created no Fractal: {prompts:?}"
+    );
+    assert_eq!(
+        fractals(&runner),
+        vec![(P0, P0, 6)],
+        "P0's Fractal gets exactly P0's count; P1 created none"
+    );
+    let state = runner.state();
+    let countered: Vec<&str> = state
+        .battlefield
+        .iter()
+        .filter_map(|id| state.objects.get(id))
+        .filter(|object| object.counters.values().any(|&count| count > 0))
+        .map(|object| object.name.as_str())
+        .collect();
+    assert_eq!(countered, ["Fractal"], "no other permanent has counters");
+    assert_settled(&runner);
+}

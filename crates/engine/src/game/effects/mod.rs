@@ -19880,7 +19880,9 @@ fn seat_created_referent_snapshot(
 /// delayed-trigger snapshot does. These are affected objects, not targets
 /// (CR 115.10a). Returns `None` when the seat created none: its "puts
 /// counters on it" has nothing to act on (CR 609.3), and an empty
-/// `ParentTarget` would fall back to unrelated referents.
+/// `ParentTarget` would fall back to unrelated referents. The caller then
+/// skips the seat's whole leg, which is exact only while the template is the
+/// placement alone (no printed card keeps a continuation under it).
 fn bind_seat_created_referent(
     state: &GameState,
     mut seat_leg: ResolvedAbility,
