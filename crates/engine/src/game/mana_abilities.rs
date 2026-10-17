@@ -675,6 +675,7 @@ pub(super) fn resolve_mana_ability_excluding(
         chosen_exiled: Vec::new(),
         chosen_sacrificed_battlefield: Vec::new(),
         cost_paid_object: None,
+        cost_removed_counters: None,
         batch_siblings: Vec::new(),
     };
     // CR 605.3b + CR 616.1: This direct path is used by auto-tap and retains
@@ -719,6 +720,8 @@ pub(super) fn resolve_mana_ability_excluding(
 /// `cost_paid_object` carries the captured public characteristics of any
 /// object exiled or sacrificed as part of cost payment so production counts can
 /// resolve cost-paid-object refs (Food Chain / Burnt Offering class).
+/// `cost_removed_counters` is this activation's own payment's removed-counter
+/// count (`PendingManaAbility::cost_removed_counters`).
 #[allow(clippy::too_many_arguments)]
 fn produce_mana_from_ability(
     state: &mut GameState,
@@ -729,6 +732,7 @@ fn produce_mana_from_ability(
     color_override: Option<ProductionOverride>,
     chosen_x: Option<u32>,
     cost_paid_object: Option<CostPaidObjectSnapshot>,
+    cost_removed_counters: Option<u32>,
 ) {
     // CR 117.1 + CR 202.3: Build a transient `ResolvedAbility` carrying the
     // cost-paid object snapshot so quantity resolution sees it. Reused for
@@ -743,22 +747,13 @@ fn produce_mana_from_ability(
         cost_paid_object,
     );
     // CR 605.3b + CR 602.2b + CR 608.2h: a mana ability resolves immediately, so
-    // its cost-removed counter count binds here instead of at a stack placement.
-    // The count is the preceding "this way" amount for the head production and
-    // the sub-chain. A mana ability can resolve inside another resolution's
-    // payment, so the outer `last_effect_amount` is restored afterwards.
-    // Only a mana ability whose own cost removes counters drains the latch: a
-    // non-mana activation of this source paused for its mana payment may hold
-    // its own count there, and a mana ability activated in that window (CR 601.2g
-    // + CR 605.3a) must neither read it nor strip it from that activation.
-    let pays_counter_cost = mana_sources::cost_has_component(&ability_def.cost, |cost| {
-        matches!(cost, AbilityCost::RemoveCounter { .. })
-    });
-    let cost_removed = pays_counter_cost
-        .then(|| super::costs::take_cost_removed_counters(state, source_id))
-        .flatten();
-    resolved_for_quantity.context.cost_removed_counter_amount = cost_removed;
-    let outer_last_effect_amount = cost_removed.map(|n| {
+    // its own payment's count binds here; another activation's payment cannot
+    // reach it. The count is the preceding "this way" amount for the head
+    // production and the sub-chain. A mana ability can resolve inside another
+    // resolution's payment, so the outer `last_effect_amount` is restored
+    // afterwards.
+    resolved_for_quantity.context.cost_removed_counter_amount = cost_removed_counters;
+    let outer_last_effect_amount = cost_removed_counters.map(|n| {
         state
             .last_effect_amount
             .replace(super::arithmetic::u32_to_i32_saturating(n))
@@ -1104,6 +1099,7 @@ pub fn activate_mana_ability(
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
+            cost_removed_counters: None,
             batch_siblings: Vec::new(),
         },
         events,
@@ -1456,6 +1452,7 @@ pub fn handle_choose_mana_color(
             Some(override_value),
             pending.chosen_x,
             pending.cost_paid_object.clone(),
+            pending.cost_removed_counters,
         );
         complete_mana_ability_activation(
             state,
@@ -2642,6 +2639,7 @@ fn mana_ability_cost_cursor(
         next_exiled: 0,
         next_sacrificed: 0,
         next_counter_choice: 0,
+        cost_removed_counters: None,
         selected_exile_remaining: None,
         selected_sacrifice_remaining: None,
         // CR 603.2 + CR 603.3b: A nested child starts with an empty frame-local
@@ -3174,12 +3172,15 @@ fn pay_mana_ability_cost_component(
             )
         }
         cost if is_self_contained_mana_subcost(cost) => {
+            // CR 602.2b + CR 605.3b: a fixed- or ALL-count self counter leg
+            // (Pentad Prism) credits this activation's own cursor ledger.
             match super::costs::pay_ability_cost_for_activation(
                 state,
                 pending.player,
                 pending.source_id,
                 cost,
                 pending.ability_index,
+                &mut cursor.cost_removed_counters,
                 events,
             )? {
                 super::costs::PaymentOutcome::Paid => Ok(ManaAbilityPaymentProgress::Complete),
@@ -3283,6 +3284,7 @@ fn pay_mana_ability_cost_component(
                 &mut sacrificed,
                 pending.chosen_mana_payment.as_deref(),
                 chosen_counter_count,
+                &mut cursor.cost_removed_counters,
                 pending.chosen_x,
                 &excluded_sources,
                 cursor.sub_cost_demand.as_ref(),
@@ -3389,6 +3391,10 @@ fn finish_mana_ability_cost_payment(
         .take()
         .filter(|parent| matches!(parent.lifecycle, ManaAbilityCostParentLifecycle::Suspended));
     let ability_def = mana_ability_definition(state, &pending)?;
+    // CR 602.2b + CR 605.3b: every cost leg is paid, so the cursor's ledger is
+    // this activation's final removed-counter count. It rides `pending` across
+    // the colour prompt to production.
+    pending.cost_removed_counters = cursor.cost_removed_counters;
     // CR 602.2b + CR 601.2i + CR 605.3: every cost is paid, so the mana ability
     // has become activated. Publish it here — before the colour prompt and
     // before production — for every resolution mode (manual, auto-tap, nested
@@ -3484,6 +3490,7 @@ fn finish_mana_ability_cost_payment(
         pending.color_override.clone(),
         pending.chosen_x,
         pending.cost_paid_object,
+        pending.cost_removed_counters,
     );
     if !resolves_automatically {
         complete_mana_ability_activation(
@@ -4190,6 +4197,7 @@ fn pay_mana_ability_cost_with_choices<I, J, L>(
     chosen_sacrificed_battlefield: &mut L,
     chosen_hybrid_payment: Option<&[ManaType]>,
     chosen_counter_count: Option<u32>,
+    cost_removed_counters: &mut Option<u32>,
     chosen_x: Option<u32>,
     excluded_sources: &HashSet<ObjectId>,
     sub_cost_demand: Option<&mana_payment::ColorDemand>,
@@ -4427,6 +4435,7 @@ where
                     source_id,
                     &cost,
                     ability_index,
+                    cost_removed_counters,
                     events,
                 )?,
                 super::costs::PaymentOutcome::Paused { .. }
@@ -4447,6 +4456,7 @@ where
                     source_id,
                     c,
                     ability_index,
+                    cost_removed_counters,
                     events,
                 )?,
                 super::costs::PaymentOutcome::Paused { .. }
@@ -4510,8 +4520,10 @@ where
             let removed =
                 remove_counters_for_mana_cost(state, source_id, counter_type, count, events);
             // CR 605.3b + CR 602.2b + CR 601.2h: the mana ability's production
-            // reads the count actually removed (`produce_mana_from_ability`).
-            super::costs::record_cost_removed_counters(state, source_id, removed);
+            // reads the count actually removed, credited to this activation's
+            // own cursor ledger (`produce_mana_from_ability`).
+            *cost_removed_counters =
+                Some(cost_removed_counters.unwrap_or(0).saturating_add(removed));
         }
         Some(other) => {
             return Err(EngineError::InvalidAction(format!(
@@ -11803,6 +11815,7 @@ mod tests {
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
+            cost_removed_counters: None,
             batch_siblings: Vec::new(),
         };
         let prompt = ManaChoicePrompt::SingleColor {
@@ -11905,6 +11918,7 @@ mod tests {
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
+            cost_removed_counters: None,
             batch_siblings: Vec::new(),
         }
     }
@@ -12116,6 +12130,7 @@ mod tests {
                 chosen_exiled: Vec::new(),
                 chosen_sacrificed_battlefield: Vec::new(),
                 cost_paid_object: None,
+                cost_removed_counters: None,
                 batch_siblings: Vec::new(),
             };
             let prompt = ManaChoicePrompt::SingleColor {
@@ -12349,6 +12364,7 @@ mod tests {
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
+            cost_removed_counters: None,
             batch_siblings: Vec::new(),
         };
         let prompt = ManaChoicePrompt::Combination {
@@ -12455,6 +12471,7 @@ mod tests {
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
+            cost_removed_counters: None,
             batch_siblings: Vec::new(),
         };
         let prompt = ManaChoicePrompt::Combination {
@@ -13589,6 +13606,7 @@ mod tests {
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
+            cost_removed_counters: None,
             batch_siblings: Vec::new(),
         };
         let options = vec![vec![ManaType::Blue], vec![ManaType::Black]];
@@ -14508,6 +14526,7 @@ mod tests {
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
+            cost_removed_counters: None,
             batch_siblings: Vec::new(),
         };
 
@@ -14954,6 +14973,7 @@ mod tests {
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
+            cost_removed_counters: None,
             batch_siblings: Vec::new(),
         };
         let prompt = ManaChoicePrompt::SingleColor {
@@ -15519,6 +15539,7 @@ mod tests {
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
+            cost_removed_counters: None,
             batch_siblings: Vec::new(),
         };
 
@@ -15592,6 +15613,7 @@ mod tests {
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
+            cost_removed_counters: None,
             batch_siblings: Vec::new(),
         };
 
@@ -15723,6 +15745,7 @@ mod tests {
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
+            cost_removed_counters: None,
             batch_siblings: Vec::new(),
         };
         let mut events = Vec::new();
@@ -15789,6 +15812,7 @@ mod tests {
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
+            cost_removed_counters: None,
             batch_siblings: Vec::new(),
         };
         let mut events = Vec::new();
@@ -15947,6 +15971,7 @@ mod tests {
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
+            cost_removed_counters: None,
             batch_siblings: Vec::new(),
         };
         let mut events = Vec::new();
@@ -16668,6 +16693,7 @@ mod tests {
                 &mut sacrificed,
                 None,
                 None,
+                &mut None,
                 chosen_x,
                 &HashSet::new(),
                 None,

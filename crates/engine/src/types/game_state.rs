@@ -8025,6 +8025,10 @@ pub struct ManaAbilityCostCursor {
     /// count rather than sharing one value.
     #[serde(default)]
     pub next_counter_choice: usize,
+    /// CR 602.2b + CR 605.3b + CR 118.11: counters actually removed by this
+    /// activation's counter legs so far; `Some(0)` = a counter leg removed none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_removed_counters: Option<u32>,
     /// The current selected-exile component, after the move that paused has
     /// been consumed. Its remaining objects must move before the cost cursor
     /// advances to the next component.
@@ -9557,6 +9561,11 @@ pub struct PendingManaAbility {
     /// resolve in inline mana ability resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_paid_object: Option<CostPaidObjectSnapshot>,
+    /// CR 602.2b + CR 605.3b + CR 118.11: the cost cursor's final
+    /// `ManaAbilityCostCursor::cost_removed_counters` total, carried across the
+    /// CR 605.3b colour prompt into `produce_mana_from_ability`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_removed_counters: Option<u32>,
     /// CR 605.3a: Other identical, choice-free mana sources the controller
     /// could activate for the same `SingleColor` prompt (their other
     /// Treasures, etc.). Computed only when the prompt is `SingleColor` and the
@@ -38784,6 +38793,7 @@ mod tests {
                         chosen_exiled: Vec::new(),
                         chosen_sacrificed_battlefield: Vec::new(),
                         cost_paid_object: None,
+                        cost_removed_counters: None,
                         batch_siblings: Vec::new(),
                     }),
                 },
@@ -38897,6 +38907,7 @@ mod tests {
                     chosen_exiled: Vec::new(),
                     chosen_sacrificed_battlefield: Vec::new(),
                     cost_paid_object: None,
+                    cost_removed_counters: None,
                     batch_siblings: Vec::new(),
                 })),
             };
@@ -41257,6 +41268,7 @@ mod tests {
                 chosen_exiled: Vec::new(),
                 chosen_sacrificed_battlefield: Vec::new(),
                 cost_paid_object: None,
+                cost_removed_counters: None,
                 batch_siblings: Vec::new(),
             };
             let mut state = GameState::new_two_player(7);
@@ -44409,6 +44421,7 @@ mod tests {
                     chosen_exiled: Vec::new(),
                     chosen_sacrificed_battlefield: Vec::new(),
                     cost_paid_object: None,
+                    cost_removed_counters: None,
                     batch_siblings: Vec::new(),
                 }),
             },
@@ -44639,6 +44652,7 @@ mod tests {
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
+            cost_removed_counters: None,
             batch_siblings: Vec::new(),
         };
         let mut state = GameState::new_two_player(42);

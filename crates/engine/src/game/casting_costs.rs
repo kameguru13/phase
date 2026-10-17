@@ -2876,7 +2876,7 @@ fn finish_cost_object_moves(
 fn finish_selected_return_to_hand_after_automatic(
     state: &mut GameState,
     player: PlayerId,
-    pending: PendingCast,
+    mut pending: PendingCast,
     selected: Vec<ObjectId>,
     automatic_remaining: Option<AbilityCost>,
     cost_event_start: usize,
@@ -2899,6 +2899,7 @@ fn finish_selected_return_to_hand_after_automatic(
             pending.object_id,
             &cost,
             Some(ability_index),
+            &mut pending.ability.context.cost_removed_counter_amount,
             events,
         )? {
             super::casting::PaymentOutcome::Paid => {}
@@ -4606,6 +4607,7 @@ pub(crate) fn handle_return_to_hand_for_cost(
                     pending.object_id,
                     &cost,
                     Some(ability_index),
+                    &mut pending.ability.context.cost_removed_counter_amount,
                     events,
                 )? {
                     super::casting::PaymentOutcome::Paid => {}
@@ -4762,9 +4764,11 @@ pub(crate) fn handle_remove_counter_for_cost(
         ));
     }
     // CR 602.2b + CR 601.2h + CR 118.3: an activation's effect reads the count
-    // actually removed; a spell's additional counter cost has no activation.
+    // actually removed, credited to this activation's own ledger; a spell's
+    // additional counter cost has no activation.
     if pending.activation_ability_index.is_some() {
-        super::costs::record_cost_removed_counters(state, pending.object_id, removed);
+        let ledger = &mut pending.ability.context.cost_removed_counter_amount;
+        *ledger = Some(ledger.unwrap_or(0).saturating_add(removed));
     }
 
     if let Some(obj) = paid_object.and_then(|id| state.objects.get(&id).map(|obj| (id, obj))) {
@@ -4790,6 +4794,7 @@ pub(crate) fn handle_remove_counter_for_cost(
                 pending.object_id,
                 &cost,
                 Some(ability_index),
+                &mut pending.ability.context.cost_removed_counter_amount,
                 events,
             )? {
                 super::casting::PaymentOutcome::Paid => {}
@@ -4946,9 +4951,11 @@ pub(crate) fn handle_remove_counter_distribution_for_cost(
             ));
     }
     // CR 602.2b + CR 601.2h + CR 118.3: an activation's effect reads the count
-    // actually removed; a spell's additional counter cost has no activation.
+    // actually removed, credited to this activation's own ledger; a spell's
+    // additional counter cost has no activation.
     if pending.activation_ability_index.is_some() {
-        super::costs::record_cost_removed_counters(state, pending.object_id, removed);
+        let ledger = &mut pending.ability.context.cost_removed_counter_amount;
+        *ledger = Some(ledger.unwrap_or(0).saturating_add(removed));
     }
 
     if let Some(choice) = distribution.first() {
@@ -4975,6 +4982,7 @@ pub(crate) fn handle_remove_counter_distribution_for_cost(
                 pending.object_id,
                 &cost,
                 Some(ability_index),
+                &mut pending.ability.context.cost_removed_counter_amount,
                 events,
             )? {
                 super::casting::PaymentOutcome::Paid => {}
@@ -7027,6 +7035,7 @@ pub(super) fn push_activated_ability_to_stack(
                 source_id,
                 cost,
                 Some(ability_index),
+                &mut resolved.context.cost_removed_counter_amount,
                 events,
             )?
         {
@@ -7210,10 +7219,8 @@ pub(super) fn push_ability_entry(
         }
     }
 
-    // CR 602.2b + CR 601.2h + CR 608.2h: bind this activation's cost-removed
-    // counter count to its own resolving ability.
-    resolved.context.cost_removed_counter_amount =
-        super::costs::take_cost_removed_counters(state, source_id);
+    // CR 602.2b + CR 608.2h: `resolved.context.cost_removed_counter_amount`
+    // already holds the count this activation's own payment removed.
 
     // CR 603.4: Stamp the printed-ability index for per-turn resolution tracking.
     resolved.ability_index = Some(ability_index);

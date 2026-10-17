@@ -7090,6 +7090,7 @@ mod tests {
                 next_exiled: 0,
                 next_sacrificed: 0,
                 next_counter_choice: 0,
+                cost_removed_counters: None,
                 selected_exile_remaining: None,
                 selected_sacrifice_remaining: None,
                 deferred_cost_events: Vec::new(),
@@ -7444,6 +7445,7 @@ mod tests {
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
+            cost_removed_counters: None,
             batch_siblings: Vec::new(),
         })
     }
@@ -11595,6 +11597,7 @@ mod tests {
                 next_exiled: 0,
                 next_sacrificed: 0,
                 next_counter_choice: 0,
+                cost_removed_counters: None,
                 selected_exile_remaining: Some(vec![hidden]),
                 selected_sacrifice_remaining: None,
                 deferred_cost_events: Vec::new(),

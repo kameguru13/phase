@@ -621,12 +621,18 @@ pub(crate) fn resume_replacement_may_cost_move(
     super::engine_replacement::handle_replacement_choice(state, 0, events)
 }
 
+/// CR 602.2b + CR 601.2h: pay an activated ability's cost. `cost_removed_counters`
+/// is the ledger owned by this activation in flight (its continuing
+/// `ResolvedAbility.context.cost_removed_counter_amount` on the stack route, its
+/// `ManaAbilityCostCursor::cost_removed_counters` on the mana route): every
+/// counter leg this payment completes adds the number it actually removed.
 pub fn pay_ability_cost_for_activation(
     state: &mut GameState,
     player: PlayerId,
     source_id: ObjectId,
     cost: &AbilityCost,
     ability_index: Option<usize>,
+    cost_removed_counters: &mut Option<u32>,
     events: &mut Vec<GameEvent>,
 ) -> Result<PaymentOutcome, EngineError> {
     pay_ability_cost_for_activation_with_cost_move_replacement(
@@ -635,6 +641,7 @@ pub fn pay_ability_cost_for_activation(
         source_id,
         cost,
         ability_index,
+        cost_removed_counters,
         events,
     )
 }
@@ -645,6 +652,7 @@ fn pay_ability_cost_for_activation_with_cost_move_replacement(
     source_id: ObjectId,
     cost: &AbilityCost,
     ability_index: Option<usize>,
+    cost_removed_counters: &mut Option<u32>,
     events: &mut Vec<GameEvent>,
 ) -> Result<PaymentOutcome, EngineError> {
     let excluded_sources = ability_mana_payment_excluded_sources(cost, source_id);
@@ -658,6 +666,7 @@ fn pay_ability_cost_for_activation_with_cost_move_replacement(
             excluded_sources: &excluded_sources,
             ability_index,
         },
+        Some(cost_removed_counters),
         None,
     )?;
     // CR 601.2h: "Unpayable costs can't be paid." Activation scope maps a
@@ -701,35 +710,6 @@ pub(crate) fn pay_ability_cost_for_resolution(
     Ok(outcome)
 }
 
-/// CR 602.2b + CR 601.2h + CR 118.3: the single writer of an activation's
-/// cost-removed counter count. Every payer of a counter leaf of an activated
-/// ability's cost reports the number it actually removed; composite costs and
-/// several payers of one activation add up. A paid leaf that removed nothing
-/// still records `Some(0)`, distinct from "no counter cost".
-pub(crate) fn record_cost_removed_counters(
-    state: &mut GameState,
-    activating_source: ObjectId,
-    removed: u32,
-) {
-    if let Some(obj) = state.objects.get_mut(&activating_source) {
-        let total = obj.cost_removed_counters_to_activate.get_or_insert(0);
-        *total = total.saturating_add(removed);
-    }
-}
-
-/// CR 602.2b + CR 608.2h: drain the activation's cost-removed counter count
-/// so it binds to exactly one activation (its stack entry or its mana
-/// production); the latch is empty again before any later activation.
-pub(crate) fn take_cost_removed_counters(
-    state: &mut GameState,
-    activating_source: ObjectId,
-) -> Option<u32> {
-    state
-        .objects
-        .get_mut(&activating_source)
-        .and_then(|obj| obj.cost_removed_counters_to_activate.take())
-}
-
 /// Pays a replacement's MayCost. Its dedicated root owns the outer
 /// replacement state required by [`PendingCostMoveResume::ReplacementMayCost`].
 pub(crate) fn pay_ability_cost_for_replacement_may_cost(
@@ -767,10 +747,16 @@ fn pay_ability_cost_for_resolution_with_cost_move_root(
             ability,
             cost_move_root,
         },
+        // CR 118.12: a resolution-time PayCost has no activation to own a count.
+        None,
         Some(cost),
     )
 }
 
+/// `cost_removed_counters` is the paying activation's ledger (CR 602.2b). `None`
+/// is resolution scope (CR 118.12) and the `can_pay` dry run: no activation
+/// reads the count.
+#[allow(clippy::too_many_arguments)]
 fn pay_ability_cost_inner(
     state: &mut GameState,
     player: PlayerId,
@@ -778,6 +764,7 @@ fn pay_ability_cost_inner(
     cost: &AbilityCost,
     events: &mut Vec<GameEvent>,
     scope: &PaymentScope,
+    mut cost_removed_counters: Option<&mut Option<u32>>,
     resume_cost: Option<&AbilityCost>,
 ) -> Result<PaymentOutcome, EngineError> {
     // CR 118.3 / CR 601.2h: at resolution there is no interactive interceptor or
@@ -1007,6 +994,7 @@ fn pay_ability_cost_inner(
                     sub_cost,
                     events,
                     scope,
+                    cost_removed_counters.as_deref_mut(),
                     matches!(scope, PaymentScope::Resolution { .. }).then_some(&sub_resume_cost),
                 )?;
                 match outcome {
@@ -1778,10 +1766,11 @@ fn pay_ability_cost_inner(
             };
             // CR 602.2b + CR 601.2h + CR 118.3: the activation's effect reads the
             // count actually removed; a resolution-time PayCost has no activation
-            // to bind.
-            let record_removed = |state: &mut GameState, removed: u32| {
-                if matches!(scope, PaymentScope::Activation { .. }) {
-                    record_cost_removed_counters(state, source_id, removed);
+            // to bind (its ledger is `None`). A paid leaf that removed nothing
+            // still records `Some(0)`, distinct from "no counter cost" (CR 107.1c).
+            let mut record_removed = |removed: u32| {
+                if let Some(ledger) = cost_removed_counters.as_deref_mut() {
+                    *ledger = Some(ledger.unwrap_or(0).saturating_add(removed));
                 }
             };
             if *count == REMOVE_COUNTER_COST_ALL
@@ -1813,7 +1802,7 @@ fn pay_ability_cost_inner(
                         ),
                     );
                 }
-                record_removed(state, removed);
+                record_removed(removed);
                 return Ok(PaymentOutcome::Paid);
             }
             // CR 601.2h: Resolve `CounterMatch::Any` to the concrete counter
@@ -1842,7 +1831,7 @@ fn pay_ability_cost_inner(
                 }
                 None => 0,
             };
-            record_removed(state, removed);
+            record_removed(removed);
         }
         // Targeted remove-counter costs are paid by the interactive
         // WaitingFor::RemoveCounterForCost path before automatic cost
@@ -2110,6 +2099,7 @@ pub(crate) fn can_pay(
                     cost,
                     &mut Vec::new(),
                     scope,
+                    None,
                     None,
                 ),
                 Ok(PaymentOutcome::Paid | PaymentOutcome::Paused { .. })
@@ -3197,9 +3187,17 @@ mod tests {
             // Dry-run on a clone (each iteration independent): can_pay == true
             // must mean the authority does not report Failed.
             let mut sim = scenario.state.clone();
-            let outcome =
-                pay_ability_cost_inner(&mut sim, P0, src, &cost, &mut Vec::new(), &scope, None)
-                    .unwrap();
+            let outcome = pay_ability_cost_inner(
+                &mut sim,
+                P0,
+                src,
+                &cost,
+                &mut Vec::new(),
+                &scope,
+                None,
+                None,
+            )
+            .unwrap();
             assert!(
                 !matches!(outcome, PaymentOutcome::Failed { .. }),
                 "can_pay==true but pay_cost returned Failed for {cost:?}"
@@ -3228,6 +3226,7 @@ mod tests {
             &mut events,
             &scope,
             None,
+            None,
         )
         .unwrap();
         assert!(matches!(outcome, PaymentOutcome::Paid));
@@ -3245,6 +3244,7 @@ mod tests {
             &cost,
             &mut events,
             &scope,
+            None,
             None,
         );
         assert!(
@@ -3271,6 +3271,7 @@ mod tests {
             src,
             &graveyard_cost,
             Some(0),
+            &mut None,
             &mut Vec::new(),
         );
         assert!(matches!(rejected, Err(EngineError::ActionNotAllowed(_))));
@@ -3287,6 +3288,7 @@ mod tests {
             src,
             &battlefield_cost,
             Some(0),
+            &mut None,
             &mut Vec::new(),
         )
         .expect("battlefield self-return cost should be payable");
@@ -3323,6 +3325,7 @@ mod tests {
                 src,
                 &cost,
                 Some(0),
+                &mut None,
                 &mut Vec::new(),
             )
             .is_ok_and(|outcome| matches!(outcome, PaymentOutcome::Paid));
@@ -3941,6 +3944,7 @@ mod tests {
             &mut Vec::new(),
             &scope,
             None,
+            None,
         )
         .unwrap();
         assert!(
@@ -3957,6 +3961,7 @@ mod tests {
             &AbilityCost::Tap,
             &mut Vec::new(),
             &scope,
+            None,
             None,
         )
         .unwrap();
@@ -4191,6 +4196,7 @@ mod tests {
             wall,
             &cost,
             Some(0),
+            &mut None,
             &mut Vec::new(),
         );
         assert!(
@@ -4252,6 +4258,7 @@ mod tests {
                 ability,
                 cost_move_root: ResolutionCostMoveRoot::EffectPayCost,
             },
+            None,
             None,
         )
         .expect("resolution-time tap-creatures payment must not error")

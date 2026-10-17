@@ -2,7 +2,10 @@
 //! counters reads the number of counters actually removed while paying that
 //! cost ("… counters removed this way", "for each counter removed", and, for a
 //! remove-all cost, "that much"). The count is bound to the one activation that
-//! paid it, on both the stack route and the mana route (CR 605.3b).
+//! paid it, on both the stack route and the mana route (CR 605.3b): the
+//! activation's own payment owns the count while it is in flight, so two
+//! activations of one source in flight at once (CR 601.2g + CR 605.3a) each
+//! read their own.
 //!
 //! CR 707.10: a copy of such an ability copies all decisions made for it,
 //! including the value of X, and isn't activated, so the copy reads the original's
@@ -30,7 +33,8 @@ use engine::types::ability::{
 use engine::types::actions::GameAction;
 use engine::types::counter::{parse_counter_type, CounterType};
 use engine::types::game_state::{
-    CounterCostChoice, GameState, PayCostKind, StackEntryKind, WaitingFor,
+    CounterCostChoice, GameState, ManaChoice, ManaChoiceContext, PayCostKind, StackEntryKind,
+    WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
@@ -56,6 +60,9 @@ const RINGS_OF_BRIGHTHEARTH: &str = "Whenever you activate an ability, if it isn
 const ILLUSIONISTS_BRACERS: &str = "Whenever an ability of equipped creature is activated, if it isn't a mana ability, copy that ability. You may choose new targets for the copy.\nEquip {3}";
 const OPALESCENCE: &str = "Each other non-Aura enchantment is a creature in addition to its other types and has base power and base toughness each equal to its mana value.";
 const CRYPTOLITH_RITE: &str = "Creatures you control have \"{T}: Add one mana of any color.\"";
+const EXPERIMENT_KRAJ: &str = "Experiment Kraj has all activated abilities of each other creature with a +1/+1 counter on it.\n{T}: Put a +1/+1 counter on target creature.";
+const MARCH_OF_THE_MACHINES: &str = "Each noncreature artifact is an artifact creature with power and toughness each equal to its mana value. (Equipment that's a creature can't equip a creature.)";
+const PENTAD_PRISM: &str = "Sunburst (This artifact enters with a charge counter on it for each color of mana spent to cast it.)\nRemove a charge counter from this artifact: Add one mana of any color.";
 /// C5a: the effect-path control — counters removed by an EFFECT, not a cost.
 const EFFECT_PATH_CONTROL: &str = "{T}: Remove all charge counters from this artifact. You gain 1 life for each charge counter removed this way.";
 /// C7d: a reader of X itself (not of the counters removed).
@@ -126,10 +133,47 @@ fn pool(runner: &GameRunner, color: ManaType) -> usize {
     runner.state().players[0].mana_pool.count_color(color)
 }
 
-fn latch_is_empty(runner: &GameRunner, id: ObjectId) -> bool {
-    runner.state().objects[&id]
-        .cost_removed_counters_to_activate
-        .is_none()
+/// CR 602.2b: the count lives only with the payment that removed the counters,
+/// so once that activation is placed or has produced its mana no payment state
+/// is left to hold it.
+fn payment_ownership_is_clear(runner: &GameRunner) -> bool {
+    let state = runner.state();
+    state.pending_cast.is_none()
+        && state.pending_cost_move_resume.is_none()
+        && state.pending_replacement.is_none()
+        && !matches!(state.waiting_for, WaitingFor::ChooseManaColor { .. })
+}
+
+/// The removed-counter count the paused activation's own payment holds.
+fn pending_activation_count(runner: &GameRunner) -> Option<u32> {
+    runner
+        .state()
+        .pending_cast
+        .as_ref()
+        .expect("an activation is paused for its mana payment")
+        .ability
+        .context
+        .cost_removed_counter_amount
+}
+
+/// The removed-counter count bound to the top stack entry's activated ability.
+fn top_stack_count(runner: &GameRunner) -> Option<u32> {
+    match &runner
+        .state()
+        .stack
+        .last()
+        .expect("an ability waits on the stack")
+        .kind
+    {
+        StackEntryKind::ActivatedAbility { ability, .. } => {
+            ability.context.cost_removed_counter_amount
+        }
+        other => panic!("the top of the stack is an activated ability: {other:?}"),
+    }
+}
+
+fn is_mana_payment(state: &GameState) -> bool {
+    matches!(state.waiting_for, WaitingFor::ManaPayment { .. })
 }
 
 fn cost_removes_counters(cost: &AbilityCost) -> bool {
@@ -150,6 +194,18 @@ fn counter_cost_ability(runner: &GameRunner, id: ObjectId, nth: usize) -> usize 
         .map(|(index, _)| index)
         .nth(nth)
         .expect("the card has a counter-cost activated ability")
+}
+
+/// Index of the activated mana ability of `id` whose cost removes no counters.
+fn mana_ability_without_counter_cost(runner: &GameRunner, id: ObjectId) -> usize {
+    runner.state().objects[&id]
+        .abilities
+        .iter()
+        .position(|def| {
+            matches!(&*def.effect, Effect::Mana { .. })
+                && !def.cost.as_ref().is_some_and(cost_removes_counters)
+        })
+        .expect("the object has a mana ability without a counter cost")
 }
 
 fn battlefield_named(runner: &GameRunner, name: &str) -> Vec<ObjectId> {
@@ -173,6 +229,8 @@ struct Answers {
     copier_last: Option<ObjectId>,
     /// Cards a `DigChoice` offered, recorded for the Jar of Eyeballs row.
     dig_offered: Option<usize>,
+    /// The colour chosen at a `ChooseManaColor` prompt.
+    mana_color: Option<ManaType>,
 }
 
 impl Answers {
@@ -243,6 +301,12 @@ fn drive(runner: &mut GameRunner, stop: impl Fn(&GameState) -> bool, answers: &m
                     cards: cards.iter().copied().take(*keep_count).collect(),
                 }
             }
+            WaitingFor::ChooseManaColor { .. } => GameAction::ChooseManaColor {
+                choice: ManaChoice::SingleColor(
+                    answers.mana_color.expect("a mana colour for this row"),
+                ),
+                count: 1,
+            },
             WaitingFor::PayCost {
                 kind: PayCostKind::RemoveCounter { .. },
                 ..
@@ -310,7 +374,7 @@ fn activate_and_resolve(
 // ---------------------------------------------------------------------------
 
 /// C1a + C4c: Essence Bottle (remove all, direct push) gains 2 life per elixir
-/// counter removed, and the activation latch is drained at placement.
+/// counter removed; the count is bound to its own stack entry at placement.
 #[test]
 fn essence_bottle_gains_two_life_per_counter_removed_by_its_cost() {
     let mut scenario = main_phase();
@@ -321,15 +385,28 @@ fn essence_bottle_gains_two_life_per_counter_removed_by_its_cost() {
     let mut runner = scenario.build();
     let life_before = runner.life(P0);
 
-    activate_and_resolve(&mut runner, bottle, 0, Answers::default());
-
+    let index = counter_cost_ability(&runner, bottle, 0);
+    activate(&mut runner, bottle, index);
+    let mut answers = Answers::default();
+    drive(&mut runner, priority_with_stack(1), &mut answers);
     assert_eq!(
         counters_on(&runner, bottle, &counter("elixir")),
         0,
         "reach: the cost removed every elixir counter"
     );
+    assert_eq!(
+        top_stack_count(&runner),
+        Some(3),
+        "the stack entry carries its own payment's count"
+    );
+    assert!(
+        payment_ownership_is_clear(&runner),
+        "C4c: nothing else holds it"
+    );
+
+    drive(&mut runner, priority_with_empty_stack, &mut answers);
     assert_eq!(runner.life(P0) - life_before, 6);
-    assert!(latch_is_empty(&runner, bottle), "C4c: the latch drained");
+    assert!(payment_ownership_is_clear(&runner));
 }
 
 /// C1b: Molten Hydra deals damage to any target equal to the +1/+1 counters its
@@ -648,7 +725,10 @@ fn saprazzan_cove_adds_blue_per_storage_counter_removed() {
 
     assert_eq!(counters_on(&runner, cove, &counter("storage")), 1);
     assert_eq!(pool(&runner, ManaType::Blue), 2);
-    assert!(latch_is_empty(&runner, cove), "C4c: the latch drained");
+    assert!(
+        payment_ownership_is_clear(&runner),
+        "C4c: no payment state outlives the mana ability"
+    );
 }
 
 /// C3b: Black Mana Battery removes 2 charge counters: {B}, then {B}{B} more from
@@ -668,13 +748,11 @@ fn black_mana_battery_adds_an_additional_black_per_counter_removed() {
     assert_eq!(pool(&runner, ManaType::Black), 3);
 }
 
-/// C3c: Ooze Flux, a 4/4 creature under Opalescence with the mana ability
-/// Cryptolith Rite grants, pays its interactive counter cost (3 from among),
-/// then taps itself for mana to pay the rest of {1}{G} (CR 601.2g + CR 605.3a).
-/// That mana ability removed no counters, so it must neither read nor drain
-/// Ooze Flux's pending count: the Ooze is 3/3.
-#[test]
-fn a_mana_ability_activated_while_paying_does_not_take_the_pending_count() {
+/// The C3c board: Ooze Flux, a 4/4 creature under Opalescence with the mana
+/// ability Cryptolith Rite grants, is the only untapped mana source (the animated
+/// Rite, First and Second are tapped). Its counter cost removes 3 +1/+1 counters
+/// from among First (2) and Second (1).
+fn ooze_flux_with_granted_mana(pool: &[ManaType]) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
     let mut scenario = main_phase();
     scenario.add_enchantment_from_oracle(P0, "Opalescence", OPALESCENCE);
     let rite = scenario
@@ -692,11 +770,9 @@ fn a_mana_ability_activated_while_paying_does_not_take_the_pending_count() {
     let second = scenario.add_creature(P0, "Second", 1, 1).id();
     scenario.with_counter(first, CounterType::Plus1Plus1, 2);
     scenario.with_counter(second, CounterType::Plus1Plus1, 1);
-    add_mana(&mut scenario, &[ManaType::Green]);
+    add_mana(&mut scenario, pool);
     let mut runner = scenario.build();
     engine::game::layers::evaluate_layers(runner.state_mut());
-    // The animated Rite, First and Second could also tap for mana; tapping them
-    // leaves Ooze Flux the only untapped source for the {1}.
     for id in [rite, first, second] {
         runner.state_mut().objects.get_mut(&id).unwrap().tapped = true;
     }
@@ -707,7 +783,284 @@ fn a_mana_ability_activated_while_paying_does_not_take_the_pending_count() {
             .contains(&engine::types::card_type::CoreType::Creature),
         "reach: Opalescence makes Ooze Flux a creature"
     );
-    let mut answers = Answers {
+    (runner, flux, first, second)
+}
+
+fn ooze_flux_answers(first: ObjectId, second: ObjectId) -> Answers {
+    Answers {
+        x: Some(3),
+        pay_amount: Some(3),
+        distribution: Some(vec![
+            CounterCostChoice {
+                object_id: first,
+                counter_type: CounterType::Plus1Plus1,
+                count: 2,
+            },
+            CounterCostChoice {
+                object_id: second,
+                counter_type: CounterType::Plus1Plus1,
+                count: 1,
+            },
+        ]),
+        mana_color: Some(ManaType::Green),
+        ..Answers::default()
+    }
+}
+
+fn assert_one_three_three_ooze(runner: &GameRunner, first: ObjectId, second: ObjectId) {
+    assert_eq!(counters_on(runner, first, &CounterType::Plus1Plus1), 0);
+    assert_eq!(counters_on(runner, second, &CounterType::Plus1Plus1), 0);
+    let oozes = battlefield_named(runner, "Ooze");
+    assert_eq!(oozes.len(), 1, "the Ooze survives: it is not 0/0");
+    assert_eq!(
+        (power(runner, oozes[0]), toughness(runner, oozes[0])),
+        (3, 3),
+        "Ooze Flux reads its own 3 counters removed"
+    );
+    assert!(payment_ownership_is_clear(runner));
+}
+
+/// C3c: Ooze Flux pays its interactive counter cost (3 from among), then, with
+/// its {1}{G} waiting for mana, activates the mana ability Cryptolith Rite grants
+/// it (CR 601.2g + CR 605.3a). That mana ability removed no counters, so it must
+/// neither read nor strip Ooze Flux's pending count: the Ooze is 3/3.
+#[test]
+fn a_mana_ability_activated_while_paying_does_not_take_the_pending_count() {
+    // An empty pool: Ooze Flux's one mana can't pay {1}{G}, so the payment
+    // waits at `ManaPayment` instead of auto-paying.
+    let (mut runner, flux, first, second) = ooze_flux_with_granted_mana(&[]);
+    let mut answers = ooze_flux_answers(first, second);
+
+    let index = counter_cost_ability(&runner, flux, 0);
+    activate(&mut runner, flux, index);
+    drive(&mut runner, is_mana_payment, &mut answers);
+    assert_eq!(
+        pending_activation_count(&runner),
+        Some(3),
+        "the paused activation owns its 3 counters removed"
+    );
+
+    let granted_mana = mana_ability_without_counter_cost(&runner, flux);
+    activate(&mut runner, flux, granted_mana);
+    drive(&mut runner, is_mana_payment, &mut answers);
+    assert!(
+        runner.state().objects[&flux].tapped,
+        "reach: Ooze Flux tapped for mana with the granted ability"
+    );
+    assert_eq!(
+        pool(&runner, ManaType::Green),
+        1,
+        "reach: the granted mana ability produced its mana"
+    );
+    assert_eq!(
+        pending_activation_count(&runner),
+        Some(3),
+        "the mana ability neither read nor stripped the pending count"
+    );
+
+    // The rest of {1}{G}.
+    let _ = runner.state_mut().add_mana_to_pool(
+        P0,
+        ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]),
+    );
+    drive(&mut runner, priority_with_stack(1), &mut answers);
+    assert!(
+        runner.state().players[0].mana_pool.is_empty(),
+        "reach: the pool paid {{1}}{{G}}"
+    );
+    assert_eq!(top_stack_count(&runner), Some(3));
+
+    drive(&mut runner, priority_with_empty_stack, &mut answers);
+    assert_one_three_three_ooze(&runner, first, second);
+}
+
+/// C3c (auto-tap): with {G} in the pool, the payment auto-taps Ooze Flux for the
+/// {1} with its granted mana ability (CR 605.3a). That mana ability removed no
+/// counters either: the stack entry still carries Ooze Flux's own 3.
+#[test]
+fn an_auto_tapped_mana_ability_does_not_take_the_pending_count() {
+    let (mut runner, flux, first, second) = ooze_flux_with_granted_mana(&[ManaType::Green]);
+    let mut answers = ooze_flux_answers(first, second);
+
+    let index = counter_cost_ability(&runner, flux, 0);
+    activate(&mut runner, flux, index);
+    drive(&mut runner, priority_with_stack(1), &mut answers);
+    assert!(
+        runner.state().objects[&flux].tapped,
+        "reach: Ooze Flux tapped for mana with the granted ability"
+    );
+    assert!(
+        runner.state().players[0].mana_pool.is_empty(),
+        "reach: the pool and the granted mana paid {{1}}{{G}}"
+    );
+    assert_eq!(top_stack_count(&runner), Some(3));
+
+    drive(&mut runner, priority_with_empty_stack, &mut answers);
+    assert_one_three_three_ooze(&runner, first, second);
+}
+
+/// R3: a counter cost nested at any `Composite` depth is still this mana
+/// ability's own counter leg — Saprazzan Cove's cost rewritten to
+/// `Composite[Composite[{T}, Composite[<remove any number of storage counters>]]]`
+/// removes 2 storage counters and adds {U}{U}.
+#[test]
+fn nested_composite_counter_cost_mana_ability_adds_per_counter_removed() {
+    let mut scenario = main_phase();
+    let cove = scenario
+        .add_land_from_oracle(P0, "Saprazzan Cove", SAPRAZZAN_COVE)
+        .id();
+    scenario.with_counter(cove, counter("storage"), 3);
+    let mut runner = scenario.build();
+    let index = counter_cost_ability(&runner, cove, 0);
+    let mut def = runner.state().objects[&cove].abilities[index].clone();
+    let Some(AbilityCost::Composite { costs }) = def.cost.take() else {
+        panic!(
+            "structural guard: the parsed cost is composite: {:?}",
+            def.cost
+        );
+    };
+    let [tap @ AbilityCost::Tap, remove @ AbilityCost::RemoveCounter { .. }] = costs.as_slice()
+    else {
+        panic!("structural guard: the parsed cost is {{T}} + a counter removal: {costs:?}");
+    };
+    def.cost = Some(AbilityCost::Composite {
+        costs: vec![AbilityCost::Composite {
+            costs: vec![
+                tap.clone(),
+                AbilityCost::Composite {
+                    costs: vec![remove.clone()],
+                },
+            ],
+        }],
+    });
+    let obj = runner.state_mut().objects.get_mut(&cove).unwrap();
+    Arc::make_mut(&mut obj.abilities)[index] = def.clone();
+    Arc::make_mut(&mut obj.base_abilities)[index] = def;
+
+    activate(&mut runner, cove, index);
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::PayAmountChoice { .. }
+        ),
+        "reach: the nested counter leg was found and prompted: {:?}",
+        runner.state().waiting_for
+    );
+    drive(&mut runner, priority_with_empty_stack, &mut Answers::pay(2));
+
+    assert_eq!(counters_on(&runner, cove, &counter("storage")), 1);
+    assert_eq!(pool(&runner, ManaType::Blue), 2);
+    assert!(payment_ownership_is_clear(&runner));
+}
+
+/// B1-A: Pentad Prism's fixed-count self counter cost is paid by the mana cost
+/// cursor's self-contained arm, and its count belongs to that mana activation:
+/// it is on the pending mana ability at the colour prompt (CR 605.3b), and
+/// "Remove a charge counter from this artifact: Add one mana of any color."
+/// removes one counter and adds one mana.
+#[test]
+fn pentad_prism_fixed_counter_cost_is_owned_by_its_mana_activation() {
+    let mut scenario = main_phase();
+    let prism = scenario
+        .add_artifact_from_oracle(P0, "Pentad Prism", PENTAD_PRISM)
+        .id();
+    scenario.with_counter(prism, counter("charge"), 2);
+    let mut runner = scenario.build();
+
+    let index = counter_cost_ability(&runner, prism, 0);
+    activate(&mut runner, prism, index);
+    let WaitingFor::ChooseManaColor {
+        context: ManaChoiceContext::ManaAbility(pending),
+        ..
+    } = &runner.state().waiting_for
+    else {
+        panic!(
+            "reach: the mana ability asks for its colour: {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(
+        pending.cost_removed_counters,
+        Some(1),
+        "the mana activation owns the one counter its cost removed"
+    );
+    assert_eq!(
+        counters_on(&runner, prism, &counter("charge")),
+        1,
+        "reach: the cost removed one charge counter"
+    );
+
+    runner
+        .act(GameAction::ChooseManaColor {
+            choice: ManaChoice::SingleColor(ManaType::Red),
+            count: 1,
+        })
+        .expect("the colour is chosen");
+
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { .. }
+    ));
+    assert_eq!(pool(&runner, ManaType::Red), 1);
+    assert_eq!(runner.state().players[0].mana_pool.total(), 1);
+    assert_eq!(counters_on(&runner, prism, &counter("charge")), 1);
+    assert!(payment_ownership_is_clear(&runner));
+}
+
+/// R1: two activations of one source in flight at once (CR 601.2g + CR 605.3a).
+/// Under Opalescence and March of the Machines, Ooze Flux and Black Mana Battery
+/// are creatures with a +1/+1 counter, so Experiment Kraj has both of their
+/// counter-cost abilities. Kraj activates Ooze Flux's (3 counters from among
+/// First and Second), then, while paying its {1}{G}, activates Battery's mana
+/// ability (CR 201.5b: "this artifact" is Kraj, which loses 2 charge counters).
+/// Each reads its own count: {B}{B}{B}, then one 3/3 Ooze.
+#[test]
+fn kraj_nested_same_source_counter_cost_mana_payment_keeps_each_count() {
+    let mut scenario = main_phase();
+    scenario.add_enchantment_from_oracle(P0, "Opalescence", OPALESCENCE);
+    scenario.add_enchantment_from_oracle(P0, "March of the Machines", MARCH_OF_THE_MACHINES);
+    let kraj = scenario
+        .add_creature_from_oracle(P0, "Experiment Kraj", 4, 6, EXPERIMENT_KRAJ)
+        .id();
+    // Printed mana costs {3}{G} and {4}: each becomes a 4/4 creature.
+    let flux = scenario
+        .add_enchantment_from_oracle(P0, "Ooze Flux", OOZE_FLUX)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Green],
+            generic: 3,
+        })
+        .id();
+    let battery = scenario
+        .add_artifact_from_oracle(P0, "Black Mana Battery", BLACK_MANA_BATTERY)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![],
+            generic: 4,
+        })
+        .id();
+    let first = scenario.add_creature(P0, "First", 1, 1).id();
+    let second = scenario.add_creature(P0, "Second", 1, 1).id();
+    scenario.with_counter(flux, CounterType::Plus1Plus1, 1);
+    scenario.with_counter(battery, CounterType::Plus1Plus1, 1);
+    scenario.with_counter(first, CounterType::Plus1Plus1, 2);
+    scenario.with_counter(second, CounterType::Plus1Plus1, 1);
+    scenario.with_counter(kraj, counter("charge"), 2);
+    add_mana(&mut scenario, &[ManaType::Green]);
+    let mut runner = scenario.build();
+    engine::game::layers::evaluate_layers(runner.state_mut());
+
+    let flux_ability = counter_cost_ability(&runner, kraj, 0);
+    let battery_ability = counter_cost_ability(&runner, kraj, 1);
+    let kraj_abilities = &runner.state().objects[&kraj].abilities;
+    assert!(
+        matches!(&*kraj_abilities[flux_ability].effect, Effect::Token { .. })
+            && matches!(
+                &*kraj_abilities[battery_ability].effect,
+                Effect::Mana { .. }
+            ),
+        "reach: Kraj has Ooze Flux's and Battery's counter-cost abilities"
+    );
+
+    let mut outer = Answers {
         x: Some(3),
         pay_amount: Some(3),
         distribution: Some(vec![
@@ -724,30 +1077,50 @@ fn a_mana_ability_activated_while_paying_does_not_take_the_pending_count() {
         ]),
         ..Answers::default()
     };
-
-    let index = counter_cost_ability(&runner, flux, 0);
-    activate(&mut runner, flux, index);
-    drive(&mut runner, priority_with_stack(1), &mut answers);
-    assert!(
-        runner.state().objects[&flux].tapped,
-        "reach: Ooze Flux tapped for mana with the granted ability"
-    );
-    assert!(
-        runner.state().players[0].mana_pool.is_empty(),
-        "reach: the pool and the granted mana paid {{1}}{{G}}"
+    activate(&mut runner, kraj, flux_ability);
+    drive(&mut runner, is_mana_payment, &mut outer);
+    assert_eq!(
+        pending_activation_count(&runner),
+        Some(3),
+        "the outer activation owns its 3 counters removed"
     );
 
-    drive(&mut runner, priority_with_empty_stack, &mut answers);
-    assert_eq!(counters_on(&runner, first, &CounterType::Plus1Plus1), 0);
-    assert_eq!(counters_on(&runner, second, &CounterType::Plus1Plus1), 0);
+    activate(&mut runner, kraj, battery_ability);
+    drive(&mut runner, is_mana_payment, &mut Answers::pay(2));
+    assert_eq!(
+        counters_on(&runner, kraj, &counter("charge")),
+        0,
+        "reach: the inner mana ability removed Kraj's 2 charge counters"
+    );
+    assert_eq!(
+        pool(&runner, ManaType::Black),
+        3,
+        "the inner mana ability reads only its own 2: {{B}} + {{B}}{{B}}"
+    );
+    assert_eq!(pool(&runner, ManaType::Green), 1);
+    assert_eq!(
+        pending_activation_count(&runner),
+        Some(3),
+        "the inner mana ability left the outer count in place"
+    );
+
+    drive(&mut runner, priority_with_empty_stack, &mut outer);
     let oozes = battlefield_named(&runner, "Ooze");
-    assert_eq!(oozes.len(), 1, "the Ooze survives: it is not 0/0");
+    assert_eq!(oozes.len(), 1, "exactly one Ooze on the battlefield");
     assert_eq!(
         (power(&runner, oozes[0]), toughness(&runner, oozes[0])),
         (3, 3),
-        "Ooze Flux reads its own 3 counters removed"
+        "the outer activation reads its own 3 counters removed"
     );
-    assert!(latch_is_empty(&runner, flux));
+    assert_eq!(
+        pool(&runner, ManaType::Black),
+        2,
+        "{{1}}{{G}} took the {{G}} and one {{B}}"
+    );
+    assert_eq!(counters_on(&runner, kraj, &counter("charge")), 0);
+    assert_eq!(counters_on(&runner, first, &CounterType::Plus1Plus1), 0);
+    assert_eq!(counters_on(&runner, second, &CounterType::Plus1Plus1), 0);
+    assert!(payment_ownership_is_clear(&runner));
 }
 
 // ---------------------------------------------------------------------------
@@ -897,7 +1270,10 @@ fn rasputin_chosen_count_adds_that_much_colorless() {
 
     assert_eq!(counters_on(&runner, rasputin, &counter("dream")), 1);
     assert_eq!(pool(&runner, ManaType::Colorless), 2);
-    assert!(latch_is_empty(&runner, rasputin), "C4c: the latch drained");
+    assert!(
+        payment_ownership_is_clear(&runner),
+        "C4c: no payment state outlives the mana ability"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -924,7 +1300,7 @@ fn effect_path_removal_still_reads_its_own_count() {
 
     assert_eq!(counters_on(&runner, relic, &counter("charge")), 0);
     assert_eq!(runner.life(P0) - life_before, 3);
-    assert!(latch_is_empty(&runner, relic));
+    assert!(payment_ownership_is_clear(&runner));
 }
 
 /// C5b: a fixed counter cost with no reader creates exactly one Knight.

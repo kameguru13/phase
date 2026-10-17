@@ -30287,8 +30287,9 @@ pub struct SpellContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pay_cost_paid_life_amount: Option<u32>,
     /// CR 602.2b + CR 601.2h + CR 608.2h: counters actually removed while paying
-    /// THIS activated ability's cost (summed over its counter leaves), bound when the
-    /// activation is placed on the stack or produces mana (CR 605.3b). Taken off the
+    /// THIS activated ability's cost (summed over its counter leaves), written by the
+    /// activation's own cost payment while it is pending (no per-object latch); the
+    /// mana route binds it at production (CR 605.3b). Taken off the
     /// root at the chain's depth-0 entry and seeded into `last_effect_amount`, so
     /// "… removed this way" / "that much" read it. `None` = no counter cost;
     /// `Some(0)` = a counter cost that removed none. CR 707.10: a copy of the
