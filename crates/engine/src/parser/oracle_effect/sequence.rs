@@ -6306,7 +6306,9 @@ pub(super) fn apply_clause_continuation(
             // creating instruction skips it, so the game-lifetime `LastCreated`
             // ledger is never read stale (G'raha Tia). Kind `Spell`: a sub is a
             // resolution step; `append_definition_to_sub_chain` bypasses the
-            // fold's kind normalization.
+            // fold's kind normalization. Under a player-scoped creation the
+            // placement is co-scoped (CR 608.2e); the driver binds each
+            // player's "it" to the tokens that player created.
             let mut placement = AbilityDefinition::new(
                 AbilityKind::Spell,
                 Effect::PutCounter {
@@ -6318,6 +6320,12 @@ pub(super) fn apply_clause_continuation(
             placement.sub_link = SubAbilityLink::ContinuationStep;
             match defs.last_mut() {
                 Some(previous) if matches!(&*previous.effect, Effect::Token { .. }) => {
+                    // CR 608.2e: "Each player creates a token and puts counters on it" — the
+                    // subject governs both actions, so the placement is the same players'
+                    // second action, processed after every player completed the first. It
+                    // carries the creating clause's player scope; an unscoped creation stays
+                    // unscoped. (Same co-scoped stamp as the `RevealHandFilter` step above.)
+                    placement.player_scope = previous.player_scope.clone();
                     append_definition_to_sub_chain(previous, placement);
                 }
                 // Recognition is gated on a `Token` antecedent; fail closed
@@ -15009,10 +15017,22 @@ mod tests {
     /// the token enters first, then receives the counters.
     #[test]
     fn created_token_counter_followup_lowers_to_last_created_placement() {
-        for text in [
-            "create a 0/0 green and blue fractal creature token, then put three +1/+1 counters on it",
-            "create a 0/0 green and blue fractal creature token. put three +1/+1 counters on it",
-            "each player creates a 0/0 green and blue fractal creature token and puts three +1/+1 counters on it",
+        // CR 608.2e: the placement carries the creating clause's player scope —
+        // a scoped creation's "puts … on it" is the same players' second
+        // action; an unscoped creation's stays unscoped.
+        for (text, scope) in [
+            (
+                "create a 0/0 green and blue fractal creature token, then put three +1/+1 counters on it",
+                None,
+            ),
+            (
+                "create a 0/0 green and blue fractal creature token. put three +1/+1 counters on it",
+                None,
+            ),
+            (
+                "each player creates a 0/0 green and blue fractal creature token and puts three +1/+1 counters on it",
+                Some(PlayerFilter::All),
+            ),
         ] {
             let def = super::super::parse_effect_chain(text, AbilityKind::Spell);
             assert_eq!(
@@ -15020,6 +15040,9 @@ mod tests {
                 (&CounterType::Plus1Plus1, &QuantityExpr::Fixed { value: 3 }),
                 "{text:?}"
             );
+            let sub = def.sub_ability.as_deref().expect("placement sub");
+            assert_eq!(def.player_scope, scope, "{text:?}: creation scope");
+            assert_eq!(sub.player_scope, def.player_scope, "{text:?}: co-scoped");
         }
 
         // An activated ability: the head keeps its kind; the sub is a `Spell`

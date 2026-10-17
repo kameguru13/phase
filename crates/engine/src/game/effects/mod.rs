@@ -7033,18 +7033,6 @@ fn is_player_scope_local_continuation(
                     ..
                 }
             )
-            // CR 608.2c + CR 111.1: "Each player creates a … token and puts …
-            // counters on it" (Oversimplify) — "it" is the token THIS
-            // iteration's player just created, so the placement is part of that
-            // player's instruction and runs inside the same iteration, never as
-            // the unscoped tail that would read only the last player's token.
-            | (
-                Effect::Token { .. },
-                Effect::PutCounter {
-                    target: TargetFilter::LastCreated,
-                    ..
-                }
-            )
     );
     if generic_local_continuation {
         return true;
@@ -16393,6 +16381,9 @@ fn resolve_chain_body(
         // the driver with the field `None` and re-captures against the
         // post-clause-N board. See §8 of the Balance plan.
         capture_clause_minimum_snapshot(state, &scoped_template);
+        // CR 608.2e: a co-scoped second action ("… and puts counters on it")
+        // reads each seat's own created tokens; snapshot them before any seat acts.
+        let created_referent = seat_created_referent_snapshot(state, &scoped_template);
         for (i, pid) in matching_players.iter().enumerate() {
             // CR 608.2c + CR 101.3: Each scoped iteration is a fresh
             // sub-resolution of the scoped template — read the whole
@@ -16407,7 +16398,14 @@ fn resolve_chain_body(
             // safety: no corpus card relies on cross-iteration carry-over
             // of this flag.
             state.cost_payment_failed_flag = false;
-            let scoped = bind_scoped_seat(&scoped_template, controller, *pid);
+            let Some(scoped) = bind_seat_created_referent(
+                state,
+                bind_scoped_seat(&scoped_template, controller, *pid),
+                *pid,
+                created_referent.as_deref(),
+            ) else {
+                continue;
+            };
             resolve_ability_chain(state, &scoped, events, depth + 1)?;
 
             // CR 608.2e: Break if inner effect entered a player-choice state —
@@ -16477,8 +16475,17 @@ fn resolve_chain_body(
                 // Each remaining player gets the scoped instruction only; the
                 // unscoped tail runs once after the final scoped iteration.
                 for &remaining_pid in remaining.iter().rev() {
-                    let mut remaining_scoped =
-                        bind_scoped_seat(&scoped_template, controller, remaining_pid);
+                    // Each pending leg carries its own binding, so a pause in
+                    // this action (e.g. a counter-replacement order, CR 616.1)
+                    // resumes against the same objects.
+                    let Some(mut remaining_scoped) = bind_seat_created_referent(
+                        state,
+                        bind_scoped_seat(&scoped_template, controller, remaining_pid),
+                        remaining_pid,
+                        created_referent.as_deref(),
+                    ) else {
+                        continue;
+                    };
                     // CR 608.2c: each remaining player's clause is an INDEPENDENT
                     // following instruction, not a continuation of the prior
                     // player's. When the scoped template carries a conditional
@@ -19835,6 +19842,78 @@ fn record_player_actions_performed(state: &mut GameState, new_events: &[GameEven
             }
         }
     }
+}
+
+/// CR 608.2e + CR 111.2 + CR 400.7: the created referent a co-scoped second
+/// action reads ("Each player creates a token and puts counters on it"),
+/// snapshotted once when that action's all-seats loop begins — after every
+/// seat's creation and after the clause published its created-token union.
+/// `None` unless the scoped template's own target is `LastCreated`; that is
+/// the only reader slot the per-seat binding rewrites. A template reading the
+/// referent elsewhere (a grant's `affected`, a condition, a sub) keeps reading
+/// the published union, and the binding assumes the referent was produced by
+/// a co-scoped creation (no printed card has a scoped reader of any other
+/// producer).
+fn seat_created_referent_snapshot(
+    state: &GameState,
+    template: &ResolvedAbility,
+) -> Option<Vec<ObjectIncarnationRef>> {
+    matches!(
+        template.effect.target_filter(),
+        Some(TargetFilter::LastCreated)
+    )
+    .then(|| {
+        state
+            .last_created_token_ids
+            .iter()
+            .filter_map(|id| state.objects.get(id))
+            .filter(|object| object.zone == Zone::Battlefield)
+            .map(ObjectIncarnationRef::from_object)
+            .collect()
+    })
+}
+
+/// CR 608.2e + CR 111.2: bind `seat`'s leg of a co-scoped second action to
+/// the tokens that seat created — the ones it owns (control may have changed
+/// since; ownership cannot) — as explicit objects pinned to their current
+/// incarnations (CR 400.7), rewriting `LastCreated` to `ParentTarget` as the
+/// delayed-trigger snapshot does. These are affected objects, not targets
+/// (CR 115.10a). Returns `None` when the seat created none: its "puts
+/// counters on it" has nothing to act on (CR 609.3), and an empty
+/// `ParentTarget` would fall back to unrelated referents.
+fn bind_seat_created_referent(
+    state: &GameState,
+    mut seat_leg: ResolvedAbility,
+    seat: PlayerId,
+    snapshot: Option<&[ObjectIncarnationRef]>,
+) -> Option<ResolvedAbility> {
+    let Some(snapshot) = snapshot else {
+        return Some(seat_leg);
+    };
+    let owned: Vec<ObjectIncarnationRef> = snapshot
+        .iter()
+        .filter(|pin| {
+            state
+                .objects
+                .get(&pin.object_id)
+                .is_some_and(|object| object.owner == seat)
+        })
+        .cloned()
+        .collect();
+    if owned.is_empty() {
+        return None;
+    }
+    if let Some(filter) = seat_leg.effect.target_filter_mut() {
+        *filter = TargetFilter::ParentTarget;
+    }
+    seat_leg.set_unpinned_targets(
+        owned
+            .iter()
+            .map(|pin| TargetRef::Object(pin.object_id))
+            .collect(),
+    );
+    seat_leg.set_target_incarnations_recursive(owned);
+    Some(seat_leg)
 }
 
 /// CR 608.2 + CR 109.5: `template` bound to run for `seat`. The scoped player is
@@ -37084,13 +37163,14 @@ mod tests {
         assert!(matches!(tail.effect, Effect::ChangeZone { .. }));
     }
 
-    /// CR 608.2c + CR 111.1 — "Each player creates a … token and puts … counters
-    /// on it" (Oversimplify): the `ContinuationStep` `PutCounter { LastCreated }`
-    /// directly under a player-scoped `Token` is part of that player's
-    /// instruction, so it stays inside the scoped iteration and reads that
-    /// player's token. Any other shape still detaches as the unscoped tail.
+    /// CR 608.2e — "Each player creates a … token and puts … counters on it"
+    /// (Oversimplify): the co-scoped `ContinuationStep` `PutCounter
+    /// { LastCreated }` is the same players' SECOND action, so it detaches from
+    /// the `Token` template as the tail with its own `player_scope` intact and
+    /// re-enters the driver as a second all-seats loop after every seat
+    /// created. The hostile siblings detach too.
     #[test]
-    fn split_player_scope_keeps_created_token_counter_placement_in_iteration() {
+    fn split_player_scope_detaches_co_scoped_created_token_placement() {
         let make_chain = |child_effect: Effect, link: SubAbilityLink| {
             let mut token = ResolvedAbility::new(
                 Effect::Token {
@@ -37131,22 +37211,26 @@ mod tests {
             SubAbilityLink::ContinuationStep,
         );
         let (scoped, tail) = split_player_scope_chain(&chain, &PlayerFilter::All);
-        assert!(tail.is_none(), "the placement stays in the iteration");
-        let kept = scoped
-            .sub_ability
-            .as_ref()
-            .expect("the PutCounter stays attached to the Token");
+        assert!(matches!(scoped.effect, Effect::Token { .. }));
+        assert!(
+            scoped.sub_ability.is_none(),
+            "the template is the creation alone: {:?}",
+            scoped.sub_ability
+        );
+        let tail = tail.expect("the placement detaches as the co-scoped tail");
         assert!(matches!(
-            kept.effect,
+            tail.effect,
             Effect::PutCounter {
                 target: TargetFilter::LastCreated,
                 ..
             }
         ));
-        assert!(
-            kept.player_scope.is_none(),
-            "the kept placement's redundant player_scope is cleared so it does not re-loop"
+        assert_eq!(
+            tail.player_scope,
+            Some(PlayerFilter::All),
+            "the tail keeps its scope so it re-enters the driver as the second action"
         );
+        assert_eq!(tail.sub_link, SubAbilityLink::ContinuationStep);
 
         // Hostile siblings: a non-`LastCreated` recipient, an independent
         // instruction, and a non-counter `LastCreated` consumer (F-U2) detach.
@@ -37175,8 +37259,110 @@ mod tests {
             let (scoped, tail) =
                 split_player_scope_chain(&make_chain(effect, link), &PlayerFilter::All);
             assert!(scoped.sub_ability.is_none(), "{label}: detaches");
-            assert!(tail.is_some(), "{label}: runs as the unscoped tail");
+            assert!(tail.is_some(), "{label}: runs as the tail");
         }
+    }
+
+    /// CR 608.2e + CR 111.2 + CR 400.7 — the per-seat binding of a co-scoped
+    /// second action's created referent: each seat's leg names exactly the
+    /// tokens that seat owns, as pinned explicit objects behind a
+    /// `ParentTarget`; a seat that owns none gets no leg (CR 609.3); a template
+    /// not reading `LastCreated` is untouched; and a pin that went stale before
+    /// placement is dropped by the consumer.
+    #[test]
+    fn bind_seat_created_referent_binds_each_seat_to_the_tokens_it_owns() {
+        let mut state = GameState::new_two_player(42);
+        let token = |state: &mut GameState, owner: PlayerId, name: &str| {
+            let id = create_object(state, CardId(0), owner, name.to_string(), Zone::Battlefield);
+            state.objects.get_mut(&id).unwrap().is_token = true;
+            id
+        };
+        let p0_first = token(&mut state, PlayerId(0), "Angel A");
+        let p0_second = token(&mut state, PlayerId(0), "Angel B");
+        let p1_only = token(&mut state, PlayerId(1), "Fractal");
+        state.last_created_token_ids = vec![p0_first, p0_second, p1_only];
+
+        let placement = |target: TargetFilter| {
+            let mut leg = ResolvedAbility::new(
+                Effect::PutCounter {
+                    counter_type: CounterType::Plus1Plus1,
+                    count: QuantityExpr::Fixed { value: 2 },
+                    target,
+                },
+                vec![],
+                ObjectId(99),
+                PlayerId(0),
+            );
+            leg.player_scope = Some(PlayerFilter::All);
+            leg
+        };
+        let template = placement(TargetFilter::LastCreated);
+        let snapshot = seat_created_referent_snapshot(&state, &template)
+            .expect("a LastCreated template snapshots the created referent");
+        assert_eq!(snapshot.len(), 3);
+        let pin = |id: ObjectId| ObjectIncarnationRef::from_object(&state.objects[&id]);
+
+        let p0_leg =
+            bind_seat_created_referent(&state, template.clone(), PlayerId(0), Some(&snapshot))
+                .expect("P0 owns two created tokens");
+        assert!(matches!(
+            p0_leg.effect,
+            Effect::PutCounter {
+                target: TargetFilter::ParentTarget,
+                ..
+            }
+        ));
+        assert_eq!(
+            p0_leg.targets,
+            vec![TargetRef::Object(p0_first), TargetRef::Object(p0_second)]
+        );
+        assert_eq!(
+            p0_leg.target_incarnations,
+            vec![pin(p0_first), pin(p0_second)]
+        );
+
+        let p1_leg =
+            bind_seat_created_referent(&state, template.clone(), PlayerId(1), Some(&snapshot))
+                .expect("P1 owns one created token");
+        assert_eq!(p1_leg.targets, vec![TargetRef::Object(p1_only)]);
+        assert_eq!(p1_leg.target_incarnations, vec![pin(p1_only)]);
+
+        // A seat that owns none of the referent has no "it" (CR 609.3).
+        let p1_only_snapshot = vec![pin(p1_only)];
+        assert!(bind_seat_created_referent(
+            &state,
+            template.clone(),
+            PlayerId(0),
+            Some(&p1_only_snapshot),
+        )
+        .is_none());
+
+        // Gate: a template whose own target is not `LastCreated` reads no
+        // created referent, and with no snapshot the binder is the identity.
+        let any = placement(TargetFilter::Any);
+        assert!(seat_created_referent_snapshot(&state, &any).is_none());
+        let unchanged = bind_seat_created_referent(&state, any.clone(), PlayerId(0), None)
+            .expect("no snapshot leaves the leg as bound");
+        assert!(matches!(
+            unchanged.effect,
+            Effect::PutCounter {
+                target: TargetFilter::Any,
+                ..
+            }
+        ));
+        assert!(unchanged.targets.is_empty());
+        assert!(unchanged.target_incarnations.is_empty());
+
+        // CR 400.7 + CR 704.5d: a member that left the battlefield before
+        // placement is a new object (or none); the bound pin no longer matches
+        // and the consumer drops it.
+        assert_eq!(p0_leg.live_object_targets(&state).len(), 2);
+        let mut events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, p0_second, Zone::Exile, &mut events);
+        assert_eq!(
+            p0_leg.live_object_targets(&state),
+            vec![TargetRef::Object(p0_first)]
+        );
     }
 
     /// CR 608.2c — the created-token channel of a paused player-scope token
