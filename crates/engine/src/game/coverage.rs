@@ -10770,7 +10770,8 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         // REACHABILITY: this arm is reached from static conditions (`extract_static_features`),
         // ability conditions at any depth (`extract_ability_condition_features`), trigger
         // conditions at any depth — including `EventTime` and delayed-trigger definitions —
-        // (`extract_trigger_condition_features`, called from `extract_trigger_features`),
+        // (`extract_trigger_condition_features`, called from `extract_trigger_features` and,
+        // for delayed definitions, from `extract_ability_features_with_token_statics`),
         // `repeat_for`, and effect positions. Tunnel Tipster's intervening-if reads
         // `FilterProp::FaceDown`, which the entry record cannot answer, so this arm marks it
         // unsupported. Measure the walked positions with
