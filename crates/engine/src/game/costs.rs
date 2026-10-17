@@ -770,16 +770,18 @@ pub(crate) fn credit_cost_removed_counters(ledger: &mut Option<u32>, removed: u3
     *total = total.saturating_add(removed);
 }
 
-/// CR 118.3 + CR 122.1 + CR 601.2h + CR 616.1: the single applier of
-/// counter-removal COSTS. Makes each planned removal in order through the
+/// CR 118.3 + CR 122.1 + CR 601.2h + CR 616.1: the applier of planned
+/// counter-removal costs (the Loyalty arm and the resolution-time unless
+/// payments remove their counters directly). Makes each planned removal in order through the
 /// replacement pipeline and credits each completed removal's actual count to
 /// the paying activation's ledger (`None` for a spell's cost, a resolution-time
 /// payment and the `can_pay` dry run). A removal that waits on a replacement
 /// choice stops the payment: nothing is credited for it until its owner
 /// settles it, and the later removals wait for it (CR 601.2h: partial payments
 /// are not allowed, so the owner finishes them before the payment proceeds).
-/// Only a completed cost materializes the ledger, so a paid leg that removed
-/// none reads `Some(0)` and a paused one never does.
+/// Only a completed removal materializes the ledger, so a completed cost that
+/// removed none reads `Some(0)`, and a cost paused on its first removal still
+/// reads `None`.
 pub(crate) fn pay_counter_cost_removals(
     state: &mut GameState,
     removals: Vec<PendingCounterRemoval>,
