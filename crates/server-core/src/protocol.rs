@@ -3346,12 +3346,17 @@ mod tests {
         }
     }
 
-    /// v145: `PendingCostMoveResume` gains `CounterCostRemovalPayment` (a
+    /// v146: `PendingCostMoveResume` gains `CounterCostRemovalPayment` (a
     /// counter-removal cost paused on a CR 616.1 replacement choice, whose
     /// settled count the activation reads, CR 118.11) and
     /// `ManaAbilityCostCursor` gains `counter_removal`, both carried in
-    /// `GameState::pending_cost_move_resume`; a v144 peer cannot parse the new
-    /// tag, so it must be refused before it receives v145 state.
+    /// `GameState::pending_cost_move_resume`; a v145 peer cannot parse the new
+    /// tag, so it must be refused before it receives v146 state.
+    ///
+    /// v145: `ParentTargetMissingReason` gains `SearchLibrary` (CR 701.23b),
+    /// serialized on `ResolvedAbility.parent_target_missing_reason`; a v144
+    /// peer cannot parse the tag. P2P moves in lockstep (wire 127); lobby
+    /// messages unchanged.
     ///
     /// v144: one-time boons (#7495) add `Effect::CreateBoon`, `Effect::NoteNumber`,
     /// the `HasBoon` conditions, and `WaitingFor::ChooseTokenHost` tags, and
@@ -3571,8 +3576,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_145_for_counter_cost_removal_payment() {
-        assert_eq!(PROTOCOL_VERSION, 145);
+    fn protocol_version_is_146_for_counter_cost_removal_payment() {
+        assert_eq!(PROTOCOL_VERSION, 146);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3583,7 +3588,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_145_for_counter_cost_removal_payment` stays
+    /// `protocol_version_is_146_for_counter_cost_removal_payment` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
