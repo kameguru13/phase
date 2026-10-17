@@ -2250,6 +2250,11 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
                     state,
                     source_id,
                     *obj_id,
+                    crate::game::effects::change_zone::EntryGateContext {
+                        destination,
+                        controller_override: enters_under_player,
+                        enter_transformed,
+                    },
                     &enter_with_counters,
                     &conditional_enter_with_counters,
                 );

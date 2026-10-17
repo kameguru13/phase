@@ -1688,13 +1688,27 @@ pub(crate) fn enter_with_counters_for_object(
     base: &[(CounterType, u32)],
     conditional: &[(TargetFilter, CounterType, QuantityExpr)],
 ) -> Vec<(CounterType, u32)> {
+    let entry = EntryGateContext::from_change_zone(state, ability);
+    enter_with_counters_for_entry(state, ability, obj_id, entry, base, conditional)
+}
+
+/// CR 614.12: the entry-counter merge with the entry descriptor supplied by the
+/// caller; `None` keeps the pre-move read. `ability` binds the gate filters and
+/// the counter quantities.
+fn enter_with_counters_for_entry(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    obj_id: ObjectId,
+    entry: Option<EntryGateContext>,
+    base: &[(CounterType, u32)],
+    conditional: &[(TargetFilter, CounterType, QuantityExpr)],
+) -> Vec<(CounterType, u32)> {
     let mut counters = base.to_vec();
     if conditional.is_empty() {
         return counters;
     }
     let ctx = crate::game::filter::FilterContext::from_ability(ability);
-    let projection = EntryGateContext::from_change_zone(state, ability)
-        .and_then(|entry| entry_gate_projection(state, obj_id, entry));
+    let projection = entry.and_then(|entry| entry_gate_projection(state, obj_id, entry));
     for (filter, counter_type, count) in conditional {
         if entry_gate_matches(state, obj_id, projection.as_ref(), filter, &ctx) {
             let n = crate::game::quantity::resolve_quantity_with_targets(state, count, ability)
@@ -1728,10 +1742,15 @@ pub(crate) fn resolving_stack_ability_for_source(
 
 /// Merge unconditional and conditional entry counters for one object during a
 /// paused multi-object `ChangeZone` resume.
+///
+/// CR 614.12: `entry` is the paused move's own descriptor. The resolving stack
+/// ability may be a root whose effect is not this move (the move can be any
+/// sub-ability), so it binds only the gate filters and counter quantities.
 pub(crate) fn enter_with_counters_for_pending_object(
     state: &GameState,
     source_id: ObjectId,
     obj_id: ObjectId,
+    entry: EntryGateContext,
     base: &[(CounterType, u32)],
     conditional: &[(TargetFilter, CounterType, QuantityExpr)],
 ) -> Vec<(CounterType, u32)> {
@@ -1739,7 +1758,7 @@ pub(crate) fn enter_with_counters_for_pending_object(
         return vec![];
     }
     if let Some(ability) = resolving_stack_ability_for_source(state, source_id) {
-        enter_with_counters_for_object(state, &ability, obj_id, base, conditional)
+        enter_with_counters_for_entry(state, &ability, obj_id, Some(entry), base, conditional)
     } else {
         base.to_vec()
     }
@@ -4515,6 +4534,115 @@ mod tests {
             vec![(CounterType::Plus1Plus1, 1)],
             "entering under P1 (CR 110.2a), P1's static applies on the projection"
         );
+    }
+
+    /// CR 614.12: a paused multi-object `ChangeZone` resume reads each entrant
+    /// through the paused move's own entry descriptor, not the resolving stack
+    /// root. Here the root is a `Draw` whose sub-ability returns up to two
+    /// graveyard noncreature artifacts to the battlefield with the "if a creature
+    /// enters this way" gate, chosen at resolution. On a March of the Machines
+    /// board each would be a creature on the battlefield, so both get the counter.
+    /// REVERT: deriving the descriptor from the root (`Draw`, no battlefield
+    /// entry) drops the projection and both enter with no counter.
+    #[test]
+    fn paused_multi_object_resume_projects_the_paused_move() {
+        let mut scenario = crate::game::scenario::GameScenario::new();
+        scenario.add_enchantment_from_oracle(
+            PlayerId(0),
+            "March of the Machines",
+            MARCH_OF_THE_MACHINES,
+        );
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        let first = graveyard_noncreature_artifact(state, PlayerId(0));
+        let second = graveyard_noncreature_artifact(state, PlayerId(0));
+
+        let mut move_ability = ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Battlefield,
+                target: TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Artifact],
+                    controller: Some(ControllerRef::You),
+                    properties: vec![FilterProp::InZone {
+                        zone: Zone::Graveyard,
+                    }],
+                }),
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: true,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![(
+                    typed(TypeFilter::Creature),
+                    CounterType::Plus1Plus1,
+                    QuantityExpr::Fixed { value: 1 },
+                )],
+                face_down_profile: None,
+                enters_modified_if: None,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        move_ability.multi_target = Some(MultiTargetSpec::fixed(0, 2));
+        move_ability.target_choice_timing = TargetChoiceTiming::Resolution;
+        let root = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        )
+        .sub_ability(move_ability.clone());
+        state.resolving_stack_entry = Some(StackEntry {
+            id: ObjectId(1000),
+            controller: PlayerId(0),
+            source_id: ObjectId(100),
+            kind: StackEntryKind::TriggeredAbility {
+                source_id: ObjectId(100),
+                ability: Box::new(root),
+                condition: None,
+                trigger_event: None,
+                description: None,
+                source_name: String::new(),
+                subject_match_count: None,
+                die_result: None,
+                provenance: None,
+            },
+        });
+
+        let mut events = Vec::new();
+        resolve(state, &move_ability, &mut events).unwrap();
+        assert!(
+            matches!(state.waiting_for, WaitingFor::EffectZoneChoice { .. }),
+            "premise: the move pauses for its resolution-time choice, got {:?}",
+            state.waiting_for
+        );
+        apply_as_current(
+            state,
+            GameAction::SelectCards {
+                cards: vec![first, second],
+            },
+        )
+        .expect("the paused move resumes with both chosen artifacts");
+
+        for id in [first, second] {
+            assert_eq!(state.objects[&id].zone, Zone::Battlefield);
+            assert_eq!(
+                state.objects[&id]
+                    .counters
+                    .get(&CounterType::Plus1Plus1)
+                    .copied()
+                    .unwrap_or(0),
+                1,
+                "the March-projected entrant gets the gated counter (CR 614.12)"
+            );
+        }
     }
 
     /// CR 614.12 (V-P7): the `enters_modified_if` gate reads the projected

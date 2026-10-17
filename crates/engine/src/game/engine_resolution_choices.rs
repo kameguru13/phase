@@ -6694,6 +6694,11 @@ pub(super) fn handle_resolution_choice(
                                 state,
                                 source_id,
                                 *card_id,
+                                effects::change_zone::EntryGateContext {
+                                    destination: dest_zone,
+                                    controller_override: enters_under_player,
+                                    enter_transformed,
+                                },
                                 &enter_with_counters,
                                 &conditional_enter_with_counters,
                             );
