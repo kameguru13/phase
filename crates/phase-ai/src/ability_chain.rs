@@ -16,10 +16,12 @@
 //! both walks; `collect_chain_effects` is the unconditional shorthand.
 //!
 //! A created-token placement is the one cross-effect reading this module owns:
-//! a `PutCounter { target: LastCreated }` that follows an `Effect::Token` in
-//! the same unconditional chain puts its counters on the token(s) that chain
-//! just created, so a consumer reads it as part of that token's creation, the
-//! way it reads `Token { enter_with_counters }`.
+//! a `PutCounter { target: LastCreated }` whose nearest preceding publisher of
+//! the created referent (`Effect::publishes_created_referent`, the engine's
+//! classification) in the same unconditional chain is an `Effect::Token` puts
+//! its counters on the token(s) that `Token` just created, so a consumer reads
+//! it as part of that token's creation, the way it reads
+//! `Token { enter_with_counters }`.
 //! [`created_token_placement_source`] answers the pairing question and
 //! [`AbilityWalk::without_created_token_placements`] is the filtering view
 //! every consumer uses; neither ever pairs across abilities or into an
@@ -100,25 +102,36 @@ pub(crate) fn collect_chain_effects(ability: &AbilityDefinition) -> Vec<&Effect>
     collect_scoped_effects(ability, AbilityScope::Unconditional)
 }
 
-/// CR 608.2c + CR 111.1: an ability's instructions resolve in order, so a
-/// `PutCounter { target: LastCreated }` that follows an `Effect::Token` in the
-/// same unconditional chain puts its counters on the token(s) that chain just
-/// created (CR 122.6: counters put on an object after it entered). Returns the
-/// chain index of the nearest preceding `Token`. Counter-type agnostic.
+/// CR 608.2c + CR 111.1: an ability's instructions resolve in order, and each
+/// publisher of the created referent assigns it, so a
+/// `PutCounter { target: LastCreated }` puts its counters on what the NEAREST
+/// preceding publisher in the same unconditional chain produced (CR 122.6:
+/// counters put on an object after it entered). The publisher set is the
+/// engine's (`Effect::publishes_created_referent`). Returns that publisher's
+/// chain index only when it is an `Effect::Token`. Counter-type agnostic.
+///
+/// The pairing gives the imperative "create … then put counters on it" the
+/// reading of the declarative `Token { enter_with_counters }`. `CopyTokenOf`
+/// and `Populate` publish tokens too but have no `enter_with_counters` twin, so
+/// pairing them would invent a reading no consumer defines: they stay
+/// unpaired. Any other nearest publisher (a Conjure, Manifest, keyword action,
+/// or a wrapper whose inline payload publishes) also returns `None`, so every
+/// consumer keeps its existing reading of the placement.
 ///
 /// `chain` must be one ability's unconditional chain
 /// ([`collect_chain_effects`]), never a concatenation of several abilities'
-/// walks or a walk that includes `else_ability` / mode branches. A placement
-/// with no preceding `Token` (a Conjure, Manifest or copy-token publisher)
-/// returns `None`, so every consumer keeps its existing reading of it.
+/// walks or a walk that includes `else_ability` / mode branches.
 pub(crate) fn created_token_placement_source(chain: &[&Effect], index: usize) -> Option<usize> {
     match chain.get(index)? {
         Effect::PutCounter {
             target: TargetFilter::LastCreated,
             ..
-        } => chain[..index]
-            .iter()
-            .rposition(|effect| matches!(effect, Effect::Token { .. })),
+        } => {
+            let publisher = chain[..index]
+                .iter()
+                .rposition(|effect| effect.publishes_created_referent())?;
+            matches!(chain[publisher], Effect::Token { .. }).then_some(publisher)
+        }
         _ => None,
     }
 }
@@ -197,12 +210,13 @@ impl<'a> AbilityWalk<'a> {
 mod tests {
     use super::*;
     use crate::cast_facts::collect_definition_effects;
+    use crate::features::plus_one_counters::ability_creates_token_with_plus_one_counters;
     use crate::policies::tests::created_token_placement_parity::{
         effect_chain, last_created_placement, token_effect,
     };
     use engine::types::ability::{
-        AbilityCondition, AbilityKind, ConjureCard, ConjureSource, QuantityExpr, SubAbilityLink,
-        TypedFilter,
+        AbilityCondition, AbilityKind, ChooseOneOfKind, ConjureCard, ConjureSource,
+        DieResultBranch, PlayerFilter, QuantityExpr, SubAbilityLink, TypedFilter,
     };
     use engine::types::counter::CounterType;
     use engine::types::zones::Zone;
@@ -248,10 +262,10 @@ mod tests {
     }
 
     /// CR 608.2c + CR 111.1: the placement pairs with the NEAREST preceding
-    /// `Token` of its own chain, whatever sits between them and whatever the
-    /// counter type.
+    /// publisher of its own chain when that publisher is a `Token`, whatever
+    /// non-publisher sits between them and whatever the counter type.
     #[test]
-    fn placement_pairs_with_the_nearest_preceding_token() {
+    fn placement_pairs_with_the_nearest_publisher_when_it_is_a_token() {
         assert_eq!(source_at(&[token(), placement()], 1), Some(0));
         assert_eq!(source_at(&[token(), token(), placement()], 2), Some(1));
         assert_eq!(
@@ -359,5 +373,231 @@ mod tests {
         let walk = AbilityWalk::of(&ability, collect_definition_effects(&ability));
         assert_eq!(walk.effects().len(), 3);
         assert_eq!(walk.without_created_token_placements().len(), 3);
+    }
+
+    // ─── F4: the nearest publisher decides (engine classification) ──────────
+
+    fn effect(value: serde_json::Value) -> Effect {
+        serde_json::from_value(value).expect("fixture effect deserializes")
+    }
+
+    fn fixed(value: i32) -> serde_json::Value {
+        serde_json::json!({ "type": "Fixed", "value": value })
+    }
+
+    fn copy_token_of() -> Effect {
+        effect(serde_json::json!({
+            "type": "CopyTokenOf",
+            "target": { "type": "Any" },
+            "owner": { "type": "Controller" },
+            "count": fixed(1)
+        }))
+    }
+
+    fn draft_from_spellbook() -> Effect {
+        effect(serde_json::json!({
+            "type": "DraftFromSpellbook",
+            "destination": "Battlefield",
+            "random": true
+        }))
+    }
+
+    fn gain_life() -> Effect {
+        Effect::GainLife {
+            amount: one(),
+            player: TargetFilter::Controller,
+        }
+    }
+
+    /// One fixture per publisher the engine classifies as an `OtherProducer`.
+    fn other_producers() -> Vec<Effect> {
+        use serde_json::json;
+        vec![
+            effect(
+                json!({ "type": "Manifest", "target": { "type": "Controller" }, "count": fixed(1) }),
+            ),
+            Effect::ManifestDread,
+            effect(
+                json!({ "type": "Cloak", "target": { "type": "Controller" }, "count": fixed(1) }),
+            ),
+            conjure(),
+            draft_from_spellbook(),
+            effect(json!({
+                "type": "CopyTokenBlockingAttacker",
+                "source_filter": { "type": "Any" },
+                "owner": { "type": "Controller" }
+            })),
+            effect(json!({
+                "type": "EachPlayerCopyChosen",
+                "choose_filter": { "type": "Any" },
+                "min": 1,
+                "max": 1
+            })),
+            effect(json!({
+                "type": "CreateTokenCopyFromPool",
+                "mv": "LE",
+                "mv_bound": fixed(3),
+                "selection": "Random"
+            })),
+            Effect::Investigate,
+            effect(json!({ "type": "Amass", "subtype": "Orc", "count": fixed(1) })),
+            effect(
+                json!({ "type": "Endure", "amount": fixed(2), "subject": { "type": "SelfRef" } }),
+            ),
+            Effect::Myriad,
+            Effect::Encore,
+            effect(json!({ "type": "EmpowerJace", "count": fixed(2) })),
+        ]
+    }
+
+    fn choose_one_of(branches: Vec<Effect>) -> Effect {
+        Effect::ChooseOneOf {
+            chooser: PlayerFilter::Controller,
+            branches: branches
+                .into_iter()
+                .map(|branch| AbilityDefinition::new(AbilityKind::Spell, branch))
+                .collect(),
+            kind: ChooseOneOfKind::Ordinary,
+        }
+    }
+
+    fn roll_die_creating_a_token() -> Effect {
+        Effect::RollDie {
+            count: one(),
+            sides: 6,
+            results: vec![DieResultBranch {
+                min: 1,
+                max: 6,
+                effect: Box::new(AbilityDefinition::new(AbilityKind::Spell, token())),
+            }],
+            modifier: None,
+        }
+    }
+
+    fn spell(effects: Vec<Effect>) -> AbilityDefinition {
+        effect_chain(
+            AbilityKind::Spell,
+            SubAbilityLink::ContinuationStep,
+            effects,
+        )
+    }
+
+    /// F4 (CR 608.2c): `[Token, Conjure, P]` — the Conjure assigns the referent
+    /// after the Token, so the placement's counters go on the conjured card. It
+    /// is not paired, and every consumer keeps it as a plain counter placement.
+    /// Control: `[Token, P]` pairs through the same consumers.
+    #[test]
+    fn an_intervening_conjure_blocks_the_pairing() {
+        let ordinary = spell(vec![token(), placement()]);
+        assert_eq!(source_at(&[token(), placement()], 1), Some(0));
+        assert!(ability_creates_token_with_plus_one_counters(&ordinary));
+        assert_eq!(
+            AbilityWalk::unconditional(&ordinary)
+                .without_created_token_placements()
+                .len(),
+            1
+        );
+
+        let interleaved = spell(vec![token(), conjure(), placement()]);
+        assert_eq!(source_at(&[token(), conjure(), placement()], 2), None);
+        assert!(!ability_creates_token_with_plus_one_counters(&interleaved));
+        assert_eq!(
+            AbilityWalk::unconditional(&interleaved)
+                .without_created_token_placements()
+                .len(),
+            3
+        );
+        // The walk-level view the `x_reference` / `plus_one_counters` consumers
+        // build over the definition walk keeps the placement too.
+        let walk = AbilityWalk::of(&interleaved, collect_definition_effects(&interleaved));
+        assert_eq!(walk.without_created_token_placements().len(), 3);
+    }
+
+    /// F4 class: every other producer between the `Token` and the placement is
+    /// the nearest publisher, so none pairs.
+    #[test]
+    fn every_intervening_other_producer_blocks_the_pairing() {
+        let producers = other_producers();
+        assert_eq!(producers.len(), 14);
+        for producer in producers {
+            assert!(producer.publishes_created_referent(), "{producer:?}");
+            assert_eq!(
+                source_at(&[token(), producer.clone(), placement()], 2),
+                None,
+                "{producer:?}"
+            );
+        }
+    }
+
+    /// D1.2: `CopyTokenOf` and `Populate` publish tokens but have no
+    /// `enter_with_counters` twin, so they stay unpaired — also when they are
+    /// nearer than an earlier `Token`. An earlier publisher never shadows a
+    /// nearer `Token`.
+    #[test]
+    fn copy_publishers_stay_unpaired_and_order_decides() {
+        assert_eq!(source_at(&[copy_token_of(), placement()], 1), None);
+        assert_eq!(source_at(&[Effect::Populate, placement()], 1), None);
+        assert_eq!(source_at(&[token(), copy_token_of(), placement()], 2), None);
+
+        assert_eq!(source_at(&[conjure(), token(), placement()], 2), Some(1));
+        assert_eq!(
+            source_at(&[copy_token_of(), token(), placement()], 2),
+            Some(1)
+        );
+        assert_eq!(
+            source_at(&[draft_from_spellbook(), token(), placement()], 2),
+            Some(1)
+        );
+    }
+
+    /// The rule is "publisher", not "creates a token": Incubate creates an
+    /// Incubator token without assigning the referent, so it is transparent.
+    #[test]
+    fn a_token_creator_that_does_not_publish_is_transparent() {
+        let incubate = effect(serde_json::json!({ "type": "Incubate", "count": fixed(2) }));
+        assert!(!incubate.publishes_created_referent());
+        assert_eq!(source_at(&[token(), incubate, placement()], 2), Some(0));
+    }
+
+    /// CR 608.2c + CR 608.2d: a wrapper whose inline payload publishes is the
+    /// nearest publisher (its chosen payload assigns the referent before the
+    /// placement), nested wrappers included; a wrapper whose payload creates
+    /// nothing is transparent.
+    #[test]
+    fn a_wrapper_blocks_the_pairing_only_when_its_payload_publishes() {
+        let choose = choose_one_of(vec![token(), gain_life()]);
+        assert!(choose.publishes_created_referent());
+        assert_eq!(source_at(&[token(), choose, placement()], 2), None);
+
+        let roll = roll_die_creating_a_token();
+        assert!(roll.publishes_created_referent());
+        assert_eq!(source_at(&[token(), roll, placement()], 2), None);
+
+        let nested = choose_one_of(vec![roll_die_creating_a_token()]);
+        assert_eq!(source_at(&[token(), nested, placement()], 2), None);
+
+        let quiet = choose_one_of(vec![
+            gain_life(),
+            Effect::Draw {
+                count: one(),
+                target: TargetFilter::Controller,
+            },
+        ]);
+        assert!(!quiet.publishes_created_referent());
+        assert_eq!(source_at(&[token(), quiet, placement()], 2), Some(0));
+    }
+
+    /// CR 603.7a: a delayed trigger's `Token` resolves later as its own ability,
+    /// so the carrier never blocks the pairing.
+    #[test]
+    fn a_later_resolution_payload_never_blocks_the_pairing() {
+        let carrier = effect(serde_json::json!({
+            "type": "CreateDelayedTrigger",
+            "condition": { "type": "WhenDies", "filter": { "type": "SelfRef" } },
+            "effect": serde_json::to_value(AbilityDefinition::new(AbilityKind::Spell, token()))
+                .expect("payload serializes")
+        }));
+        assert!(!carrier.publishes_created_referent());
+        assert_eq!(source_at(&[token(), carrier, placement()], 2), Some(0));
     }
 }

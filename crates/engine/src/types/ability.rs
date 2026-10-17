@@ -22714,6 +22714,20 @@ pub(crate) enum AttachmentHostSlot {
     Donor,
 }
 
+/// CR 608.2c: which kind of created-referent publisher an `Effect` node's own
+/// resolver is. The return type of `Effect::created_referent_publication`, the
+/// single classification `Effect::is_token_creator` and
+/// `Effect::publishes_created_referent` derive from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreatedReferentPublisher {
+    /// CR 111.1 + CR 701.36a + CR 707.2: a token-creation effect whose own
+    /// parameters define the token(s) — a spec, a copy source, the populated token.
+    TokenCreator,
+    /// Every other resolver that assigns the referent: face-down entry, conjure /
+    /// spellbook draft, a keyword action or copy batch that creates as one step.
+    OtherProducer,
+}
+
 impl Effect {
     /// Single authority for constructing the "parser couldn't handle this"
     /// effect. Parser code must use this instead of a literal
@@ -25005,6 +25019,351 @@ impl Effect {
             | Effect::ReproduceEventCounters { .. }
             | Effect::WinTheGame { .. } => false,
         }
+    }
+
+    /// CR 608.2c: which kind of created-referent publisher THIS node's own
+    /// resolver is — the single classification both
+    /// [`Effect::is_token_creator`] and [`Effect::publishes_created_referent`]
+    /// derive from.
+    ///
+    /// A publisher's resolver assigns the referent `TargetFilter::LastCreated`
+    /// reads (`GameState::last_created_token_ids`) on at least one resolution
+    /// path. This method answers for **THIS NODE ONLY**; an `AbilityDefinition`
+    /// payload the node resolves inline is classified by the own-resolution walk
+    /// in [`Effect::publishes_created_referent`].
+    ///
+    /// The match is **wildcard-free on purpose**: a new `Effect` variant is a
+    /// compile error here, forcing its author to answer "does this resolver
+    /// publish the created referent, and is it a token creator?" at the one
+    /// place both predicates read. Do not add an `_ =>` arm.
+    fn created_referent_publication(&self) -> Option<CreatedReferentPublisher> {
+        match self {
+            // CR 111.1 + CR 701.36a + CR 707.2: the token-creation effects whose
+            // own parameters define the token(s) — a spec, a copy source, the
+            // populated token.
+            Effect::Token { .. } | Effect::CopyTokenOf { .. } | Effect::Populate => {
+                Some(CreatedReferentPublisher::TokenCreator)
+            }
+
+            // CR 701.40a + CR 701.58a + CR 701.62a: a face-down entry puts a new
+            // 2/2 permanent onto the battlefield; `ChainReferentIntent::Publishes`
+            // makes it the chain's referent.
+            Effect::Manifest { .. }
+            | Effect::ManifestDread
+            | Effect::Cloak { .. }
+            // Digital-only (no CR entry): conjure and the spellbook draft (which
+            // conjures the drafted card) assign the referent to the card they
+            // just made, including after a paused draft choice resumes.
+            | Effect::Conjure { .. }
+            | Effect::DraftFromSpellbook { .. }
+            // CR 707.2: token copies made by a batch or per-player resolver,
+            // which republish every token they created.
+            | Effect::CopyTokenBlockingAttacker { .. }
+            | Effect::EachPlayerCopyChosen { .. }
+            | Effect::CreateTokenCopyFromPool { .. }
+            // Keyword actions and abilities that create a token as one step of a
+            // larger action: CR 701.16a (investigate), CR 701.47a (amass),
+            // CR 701.63a (endure), CR 702.116a (myriad), CR 702.141a (encore),
+            // and the digital-only empower Jace. `Amass`, `EmpowerJace` and
+            // `Endure` write the referent only on the path that creates a token
+            // (no Army, no Jace, the Spirit branch); on the other path an earlier
+            // referent stays in place.
+            | Effect::Investigate
+            | Effect::Amass { .. }
+            | Effect::Endure { .. }
+            | Effect::Myriad
+            | Effect::Encore
+            | Effect::EmpowerJace { .. } => Some(CreatedReferentPublisher::OtherProducer),
+
+            // CR 608.2c + CR 608.2d: inline-payload wrappers. Their own node
+            // writes nothing; the payload they resolve inline is classified by the
+            // own-resolution walk in `publishes_created_referent`.
+            Effect::ChooseOneOf { .. }
+            | Effect::RollDie { .. }
+            | Effect::FlipCoin { .. }
+            | Effect::FlipCoins { .. }
+            | Effect::FlipCoinUntilLose { .. }
+            | Effect::SeparateIntoPiles { .. }
+            | Effect::Vote { .. }
+            | Effect::RevealFromHand { .. }
+            // CR 603.7a + CR 603.3: boundary carriers. Their payload resolves
+            // later as a separate ability, so it never writes this resolution's
+            // referent; the own-resolution walk stops at them.
+            | Effect::CreateDelayedTrigger { .. }
+            | Effect::CreateBoon { .. }
+            // CR 614.1 + CR 611.2 + CR 114.1: registered replacements, continuous
+            // effects and emblems apply to a later event or another object.
+            | Effect::CreateDrawReplacement { .. }
+            | Effect::CreatePlaneswalkReplacement { .. }
+            | Effect::AddTargetReplacement { .. }
+            | Effect::GenericEffect { .. }
+            | Effect::CreateEmblem { .. }
+            // CR 701.53a: incubate creates its token outside the token pipeline
+            // and assigns no referent; a gift token likewise records no referent.
+            | Effect::Incubate { .. }
+            | Effect::GiftDelivery { .. }
+            // Every other resolver assigns no created referent. The match is
+            // wildcard-free, so the compiler is the census for this list.
+            | Effect::Adapt { .. }
+            | Effect::AddPendingETBCounters { .. }
+            | Effect::AddPendingEntersModifications { .. }
+            | Effect::AddRestriction { .. }
+            | Effect::AdditionalPhase { .. }
+            | Effect::Animate { .. }
+            | Effect::ApplyPerpetual { .. }
+            | Effect::ApplyPostReplacementDamage { .. }
+            | Effect::ApplySticker { .. }
+            | Effect::ArrangePlanarDeckTop { .. }
+            | Effect::AssembleContraptionOnSprocket { .. }
+            | Effect::AssembleContraptions { .. }
+            | Effect::AssembleContraptionsFromRollDifference
+            | Effect::Attach { .. }
+            | Effect::BecomeBlocked { .. }
+            | Effect::BecomeCopy { .. }
+            | Effect::BecomeMonarch { .. }
+            | Effect::BecomePrepared { .. }
+            | Effect::BecomeSaddled { .. }
+            | Effect::BecomeUnprepared { .. }
+            | Effect::Behold { .. }
+            | Effect::BlightEffect { .. }
+            | Effect::Bolster { .. }
+            | Effect::Bounce { .. }
+            | Effect::BounceAll { .. }
+            | Effect::Cascade
+            | Effect::CastCopyOfCard { .. }
+            | Effect::CastFromZone { .. }
+            | Effect::ChangeSpeed { .. }
+            | Effect::ChangeTargets { .. }
+            | Effect::ChangeZone { .. }
+            | Effect::ChangeZoneAll { .. }
+            | Effect::ChaosEnsues
+            | Effect::Choose { .. }
+            | Effect::ChooseAndSacrificeRest { .. }
+            | Effect::ChooseAugmentAndCombineWithHost { .. }
+            | Effect::ChooseCard { .. }
+            | Effect::ChooseCounterAdjustment { .. }
+            | Effect::ChooseCounterKind { .. }
+            | Effect::ChooseDamageSource { .. }
+            | Effect::ChooseDrawnThisTurnPayOrTopdeck { .. }
+            | Effect::ChooseFromZone { .. }
+            | Effect::ChooseObjectsIntoTrackedSet { .. }
+            | Effect::ChoosePermanent { .. }
+            | Effect::Clash
+            | Effect::Cleanup { .. }
+            | Effect::CollectEvidence { .. }
+            | Effect::CombineHost { .. }
+            | Effect::CompletePlayerAction { .. }
+            | Effect::Connive { .. }
+            | Effect::ControlNextTurn { .. }
+            | Effect::CopySpell { .. }
+            | Effect::Counter { .. }
+            | Effect::CounterAll { .. }
+            | Effect::CrankContraptions { .. }
+            | Effect::CreateDamageReplacement { .. }
+            | Effect::DamageAll { .. }
+            | Effect::DamageEachPlayer { .. }
+            | Effect::DealDamage { .. }
+            | Effect::Destroy { .. }
+            | Effect::DestroyAll { .. }
+            | Effect::Detain { .. }
+            | Effect::Dig { .. }
+            | Effect::Discard { .. }
+            | Effect::DiscardCard { .. }
+            | Effect::Discover { .. }
+            | Effect::Double { .. }
+            | Effect::DoublePT { .. }
+            | Effect::DoublePTAll { .. }
+            | Effect::Draw { .. }
+            | Effect::EachDealsDamageEqualToPower { .. }
+            | Effect::EachSourceDealsDamage { .. }
+            | Effect::EndCombatPhase
+            | Effect::EndTheTurn
+            | Effect::EpicCopy { .. }
+            | Effect::ExchangeControl { .. }
+            | Effect::ExchangeLifeTotals { .. }
+            | Effect::ExchangeLifeWithStat { .. }
+            | Effect::ExileFaceDownPile { .. }
+            | Effect::ExileFromTopUntil { .. }
+            | Effect::ExileHaunting { .. }
+            | Effect::ExileResolvingSpellInsteadOfGraveyard { .. }
+            | Effect::ExileTop { .. }
+            | Effect::Exploit { .. }
+            | Effect::Explore
+            | Effect::ExploreAll { .. }
+            | Effect::ExtraTurn { .. }
+            | Effect::Fight { .. }
+            | Effect::FlipPermanent { .. }
+            | Effect::ForEachCategory { .. }
+            | Effect::Forage
+            | Effect::ForceAttack { .. }
+            | Effect::ForceBlock { .. }
+            | Effect::FreeCastFromZones { .. }
+            | Effect::GainActivatedAbilitiesOfTarget { .. }
+            | Effect::GainControl { .. }
+            | Effect::GainControlAll { .. }
+            | Effect::GainEnergy { .. }
+            | Effect::GainLife { .. }
+            | Effect::GiveControl { .. }
+            | Effect::GivePlayerCounter { .. }
+            | Effect::Goad { .. }
+            | Effect::GoadAll { .. }
+            | Effect::GrantCastingPermission { .. }
+            | Effect::GrantExtraLoyaltyActivations { .. }
+            | Effect::GrantNextSpellAbility { .. }
+            | Effect::Harness
+            | Effect::Heist { .. }
+            | Effect::HeistExile
+            | Effect::HideawayConceal { .. }
+            | Effect::Intensify { .. }
+            | Effect::Learn
+            | Effect::LoseAllPlayerCounters { .. }
+            | Effect::LoseLife { .. }
+            | Effect::LoseTheGame { .. }
+            | Effect::MadnessCast { .. }
+            | Effect::Mana { .. }
+            | Effect::Meld { .. }
+            | Effect::Mill { .. }
+            | Effect::MiracleCast { .. }
+            | Effect::Monstrosity { .. }
+            | Effect::MoveCounters { .. }
+            | Effect::MultiplyCounter { .. }
+            | Effect::NoOp
+            | Effect::NoteManaSpent
+            | Effect::NoteNumber { .. }
+            | Effect::OpenAttractions { .. }
+            | Effect::OpenBoosterPack { .. }
+            | Effect::OpponentGuess { .. }
+            | Effect::PairWith { .. }
+            | Effect::PayCost { .. }
+            | Effect::PhaseIn { .. }
+            | Effect::PhaseOut { .. }
+            | Effect::Planeswalk
+            | Effect::PreventDamage { .. }
+            | Effect::ProcessRadCounters
+            | Effect::Proliferate
+            | Effect::ProliferateTarget { .. }
+            | Effect::Pump { .. }
+            | Effect::PumpAll { .. }
+            | Effect::PutAtLibraryPosition { .. }
+            | Effect::PutChosenCounter { .. }
+            | Effect::PutCounter { .. }
+            | Effect::PutCounterAll { .. }
+            | Effect::PutOnTopOrBottom { .. }
+            | Effect::PutSticker { .. }
+            | Effect::ReassembleContraption { .. }
+            | Effect::ReassembleContraptionOnSprocket { .. }
+            | Effect::RedistributeLifeTotals
+            | Effect::ReduceNextSpellCost { .. }
+            | Effect::Regenerate { .. }
+            | Effect::RegisterBending { .. }
+            | Effect::RememberCard { .. }
+            | Effect::RemoveAllDamage { .. }
+            | Effect::RemoveCounter { .. }
+            | Effect::RemoveFromCombat { .. }
+            | Effect::Renown { .. }
+            | Effect::ReproduceEventCounters { .. }
+            | Effect::ReturnAsAura { .. }
+            | Effect::Reveal { .. }
+            | Effect::RevealChosenNumbers { .. }
+            | Effect::RevealHand { .. }
+            | Effect::RevealTop { .. }
+            | Effect::RevealUntil { .. }
+            | Effect::ReverseTurnOrder
+            | Effect::RingTemptsYou
+            | Effect::Ripple { .. }
+            | Effect::RollToVisitAttractions
+            | Effect::RuntimeHandled { .. }
+            | Effect::Sacrifice { .. }
+            | Effect::Scry { .. }
+            | Effect::SearchLibrary { .. }
+            | Effect::SearchOutsideGame { .. }
+            | Effect::Seek { .. }
+            | Effect::SetClassLevel { .. }
+            | Effect::SetDayNight { .. }
+            | Effect::SetLifeTotal { .. }
+            | Effect::SetRoomDoorLock { .. }
+            | Effect::SetTapState { .. }
+            | Effect::Shuffle { .. }
+            | Effect::SkipNextStep { .. }
+            | Effect::SkipNextTurn { .. }
+            | Effect::SolveCase
+            | Effect::Specialize
+            | Effect::StartYourEngines { .. }
+            | Effect::Surveil { .. }
+            | Effect::Suspect { .. }
+            | Effect::SwapChosenLabels { .. }
+            | Effect::SwitchPT { .. }
+            | Effect::TakeTheInitiative
+            | Effect::TargetOnly { .. }
+            | Effect::TimeTravel
+            | Effect::Transform { .. }
+            | Effect::Tribute { .. }
+            | Effect::TurnFaceDown { .. }
+            | Effect::TurnFaceUp { .. }
+            | Effect::UnattachAll { .. }
+            | Effect::Unimplemented { .. }
+            | Effect::Unsuspect { .. }
+            | Effect::VentureInto { .. }
+            | Effect::VentureIntoDungeon
+            | Effect::WinTheGame { .. }
+            => None,
+        }
+    }
+
+    /// CR 111.1: the token-creation effects whose own parameters define the
+    /// token(s) — a spec, a copy source, or the populated token.
+    ///
+    /// Node-only, and a subset of [`Effect::publishes_created_referent`] by
+    /// construction (both read `created_referent_publication`). Keyword actions
+    /// that create a token as one step, and wrappers whose payload creates one,
+    /// publish the referent but are deliberately not members: this set keys the
+    /// parser's nearest-token-creator and tracked-set scans and the player-scope
+    /// created-token union, and widening it moves those scans.
+    pub fn is_token_creator(&self) -> bool {
+        self.created_referent_publication() == Some(CreatedReferentPublisher::TokenCreator)
+    }
+
+    /// CR 608.2c: true when this effect's own resolution writes the referent
+    /// `TargetFilter::LastCreated` reads (`GameState::last_created_token_ids`) on
+    /// at least one resolution path: this node's resolver, or a publisher in an
+    /// `AbilityDefinition` payload it resolves inline (CR 608.2d). A payload
+    /// registered to resolve later (CR 603.3, CR 603.7a, CR 603.12) does not
+    /// count; `ResolutionScope::OwnResolutionOnly` is that boundary. Each write
+    /// is an assignment, so the referent a later instruction reads is the
+    /// nearest publisher's product.
+    ///
+    /// Known limitation: a conditional-write publisher may leave an earlier
+    /// referent in place on a path that does not write — `Amass` with an Army,
+    /// `EmpowerJace` with a Jace, `Endure`'s counter branch, a wrapper whose
+    /// chosen payload creates nothing. That is why a placement after one of them
+    /// must not be paired with an earlier `Token`.
+    ///
+    /// A created token, a face-down entry and a conjured card are
+    /// indistinguishable to a following same-chain anaphor: each clause produces
+    /// a new object and declares no target, so "it" / "that creature" has exactly
+    /// one possible referent — the object the clause just made. Keying the
+    /// referent on "token" alone left the face-down producers with no referent
+    /// (Conductive Machete attached to nothing, Weight Room put its counters on
+    /// the Room, #7531) and mis-bound Agent of Raffine's "Conjure a duplicate …
+    /// It perpetually gains …" to the ability's chosen target.
+    ///
+    /// Consumers: the parser's anaphor passes (through
+    /// `oracle_effect::lower::publishes_chain_created_referent`), the declined
+    /// "if you do" walk (`game::effects::declined_gate_surviving_instructions`),
+    /// and phase-ai's created-token pairing.
+    pub fn publishes_created_referent(&self) -> bool {
+        crate::types::ability_visit::visit_effect_scoped(
+            self,
+            crate::types::ability_visit::ResolutionScope::OwnResolutionOnly,
+            &mut |effect| {
+                if effect.created_referent_publication().is_some() {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        )
+        .is_break()
     }
 
     /// Visits every `QuantityExpr` carried by this effect —
@@ -45455,5 +45814,304 @@ mod chain_description_backfill_tests {
                 .as_deref(),
             Some("tap"),
         );
+    }
+}
+
+#[cfg(test)]
+mod created_referent_classification_tests {
+    //! `Effect::created_referent_publication` and the two predicates derived from
+    //! it, over the D1.1 membership: token creators, other producers, measured
+    //! non-members, inline-payload wrappers and later-resolution boundaries.
+    use super::*;
+    use serde_json::json;
+
+    fn effect(value: serde_json::Value) -> Effect {
+        serde_json::from_value(value).expect("fixture effect deserializes")
+    }
+
+    fn fixed(value: i32) -> serde_json::Value {
+        json!({ "type": "Fixed", "value": value })
+    }
+
+    fn token() -> Effect {
+        effect(json!({
+            "type": "Token",
+            "name": "Soldier",
+            "power": fixed(1),
+            "toughness": fixed(1),
+            "types": ["Creature", "Soldier"],
+            "colors": [],
+            "keywords": [],
+            "tapped": false,
+            "count": fixed(1),
+            "owner": { "type": "Controller" },
+            "enters_attacking": false
+        }))
+    }
+
+    fn gain_life() -> Effect {
+        Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 1 },
+            player: TargetFilter::Controller,
+        }
+    }
+
+    fn draw() -> Effect {
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        }
+    }
+
+    /// A `head` definition with `tail` as its sub-ability.
+    fn chain(head: Effect, tail: Effect) -> AbilityDefinition {
+        let mut def = AbilityDefinition::new(AbilityKind::Spell, head);
+        def.sub_ability = Some(Box::new(AbilityDefinition::new(AbilityKind::Spell, tail)));
+        def
+    }
+
+    /// A payload whose only `Token` is a non-head sub-node.
+    fn publishing_payload() -> AbilityDefinition {
+        chain(gain_life(), token())
+    }
+
+    fn quiet_payload() -> AbilityDefinition {
+        chain(gain_life(), draw())
+    }
+
+    /// One fixture per `OtherProducer` row of the D1.1 table.
+    fn other_producers() -> Vec<Effect> {
+        vec![
+            effect(
+                json!({ "type": "Manifest", "target": { "type": "Controller" }, "count": fixed(1) }),
+            ),
+            Effect::ManifestDread,
+            effect(
+                json!({ "type": "Cloak", "target": { "type": "Controller" }, "count": fixed(1) }),
+            ),
+            effect(json!({
+                "type": "Conjure",
+                "cards": [{ "name": "Forest", "count": fixed(1) }],
+                "destination": "Battlefield"
+            })),
+            effect(
+                json!({ "type": "DraftFromSpellbook", "destination": "Battlefield", "random": true }),
+            ),
+            effect(json!({
+                "type": "CopyTokenBlockingAttacker",
+                "source_filter": { "type": "Any" },
+                "owner": { "type": "Controller" }
+            })),
+            effect(json!({
+                "type": "EachPlayerCopyChosen",
+                "choose_filter": { "type": "Any" },
+                "min": 1,
+                "max": 1
+            })),
+            effect(json!({
+                "type": "CreateTokenCopyFromPool",
+                "mv": "LE",
+                "mv_bound": fixed(3),
+                "selection": "Random"
+            })),
+            Effect::Investigate,
+            effect(json!({ "type": "Amass", "subtype": "Orc", "count": fixed(1) })),
+            effect(
+                json!({ "type": "Endure", "amount": fixed(2), "subject": { "type": "SelfRef" } }),
+            ),
+            Effect::Myriad,
+            Effect::Encore,
+            effect(json!({ "type": "EmpowerJace", "count": fixed(2) })),
+        ]
+    }
+
+    /// Each inline-payload wrapper variant carrying `payload` in its own-resolution
+    /// slot.
+    fn wrappers(payload: &AbilityDefinition) -> Vec<Effect> {
+        let boxed = || Box::new(payload.clone());
+        let payload_json = serde_json::to_value(payload).expect("payload serializes");
+        vec![
+            Effect::ChooseOneOf {
+                chooser: PlayerFilter::Controller,
+                branches: vec![
+                    AbilityDefinition::new(AbilityKind::Spell, draw()),
+                    payload.clone(),
+                ],
+                kind: ChooseOneOfKind::Ordinary,
+            },
+            Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 1 },
+                sides: 6,
+                results: vec![DieResultBranch {
+                    min: 1,
+                    max: 6,
+                    effect: boxed(),
+                }],
+                modifier: None,
+            },
+            Effect::FlipCoin {
+                win_effect: None,
+                lose_effect: Some(boxed()),
+                flipper: TargetFilter::Controller,
+            },
+            Effect::FlipCoins {
+                count: QuantityExpr::Fixed { value: 2 },
+                win_effect: Some(boxed()),
+                lose_effect: None,
+                flipper: TargetFilter::Controller,
+            },
+            Effect::FlipCoinUntilLose {
+                win_effect: boxed(),
+            },
+            effect(json!({
+                "type": "SeparateIntoPiles",
+                "partition_subject": { "type": "EachOpponent" },
+                "chooser": { "type": "Controller" },
+                "chosen_pile_effect": payload_json.clone()
+            })),
+            effect(json!({
+                "type": "Vote",
+                "choices": ["a", "b"],
+                "per_choice_effect": [
+                    serde_json::to_value(AbilityDefinition::new(AbilityKind::Spell, draw()))
+                        .expect("payload serializes"),
+                    payload_json
+                ]
+            })),
+            Effect::RevealFromHand {
+                filter: TargetFilter::Any,
+                on_decline: Some(boxed()),
+            },
+        ]
+    }
+
+    /// P1 (subset invariant): the token creators are both token creators and
+    /// publishers.
+    #[test]
+    fn token_creators_are_publishers() {
+        let creators = [
+            token(),
+            effect(json!({
+                "type": "CopyTokenOf",
+                "target": { "type": "Any" },
+                "owner": { "type": "Controller" },
+                "count": fixed(1)
+            })),
+            Effect::Populate,
+        ];
+        for creator in &creators {
+            assert!(creator.is_token_creator(), "{creator:?}");
+            assert!(creator.publishes_created_referent(), "{creator:?}");
+        }
+    }
+
+    /// P2: every other producer publishes the referent but is not a token
+    /// creator.
+    #[test]
+    fn other_producers_publish_without_being_token_creators() {
+        let producers = other_producers();
+        assert_eq!(producers.len(), 14, "one fixture per OtherProducer row");
+        for producer in &producers {
+            assert!(producer.publishes_created_referent(), "{producer:?}");
+            assert!(!producer.is_token_creator(), "{producer:?}");
+        }
+    }
+
+    /// P3: measured non-members — effects that create a token without writing
+    /// the referent, battlefield movers, a plain counter placement, and the
+    /// sweep's false positive.
+    #[test]
+    fn non_members_neither_publish_nor_create_tokens() {
+        let non_members = [
+            effect(json!({ "type": "Incubate", "count": fixed(2) })),
+            effect(json!({ "type": "GiftDelivery", "kind": { "type": "Treasure" } })),
+            effect(json!({
+                "type": "Mill",
+                "count": fixed(2),
+                "target": { "type": "Controller" },
+                "destination": "Graveyard"
+            })),
+            Effect::PutCounter {
+                counter_type: crate::types::counter::CounterType::Plus1Plus1,
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::LastCreated,
+            },
+            effect(json!({
+                "type": "ChangeZone",
+                "origin": "Graveyard",
+                "destination": "Battlefield",
+                "target": { "type": "Any" }
+            })),
+            effect(json!({
+                "type": "Meld",
+                "source": "Graf Rats",
+                "partner": "Midnight Scavengers",
+                "result": "Chittering Host"
+            })),
+            effect(json!({ "type": "ChooseAndSacrificeRest", "categories": ["Creature"] })),
+            gain_life(),
+        ];
+        for non_member in &non_members {
+            assert!(!non_member.publishes_created_referent(), "{non_member:?}");
+            assert!(!non_member.is_token_creator(), "{non_member:?}");
+        }
+    }
+
+    /// P4 (option (a)): a wrapper publishes through its own-resolution payload,
+    /// and is never a token creator; with a payload that creates nothing it is
+    /// neither.
+    #[test]
+    fn wrappers_publish_through_their_inline_payload() {
+        let publishing = wrappers(&publishing_payload());
+        let quiet = wrappers(&quiet_payload());
+        assert_eq!(publishing.len(), 8, "one fixture per wrapper variant");
+        for wrapper in &publishing {
+            assert!(wrapper.publishes_created_referent(), "{wrapper:?}");
+            assert!(!wrapper.is_token_creator(), "{wrapper:?}");
+        }
+        for wrapper in &quiet {
+            assert!(!wrapper.publishes_created_referent(), "{wrapper:?}");
+            assert!(!wrapper.is_token_creator(), "{wrapper:?}");
+        }
+        // A wrapper nested in a wrapper publishes through both levels.
+        let nested = Effect::ChooseOneOf {
+            chooser: PlayerFilter::Controller,
+            branches: vec![AbilityDefinition::new(
+                AbilityKind::Spell,
+                wrappers(&publishing_payload()).swap_remove(1),
+            )],
+            kind: ChooseOneOfKind::Ordinary,
+        };
+        assert!(nested.publishes_created_referent());
+    }
+
+    /// P5 (CR 603.7a + CR 603.12): a payload registered to resolve later never
+    /// publishes this resolution's referent.
+    #[test]
+    fn later_resolution_payloads_do_not_publish() {
+        let delayed = effect(json!({
+            "type": "CreateDelayedTrigger",
+            "condition": { "type": "WhenDies", "filter": { "type": "SelfRef" } },
+            "effect": serde_json::to_value(AbilityDefinition::new(AbilityKind::Spell, token()))
+                .expect("payload serializes")
+        }));
+        assert!(!delayed.publishes_created_referent());
+        assert!(!delayed.is_token_creator());
+
+        let mut reflexive = AbilityDefinition::new(AbilityKind::Spell, token());
+        reflexive.condition = Some(AbilityCondition::WhenYouDo);
+        let reflexive_branch = Effect::ChooseOneOf {
+            chooser: PlayerFilter::Controller,
+            branches: vec![reflexive],
+            kind: ChooseOneOfKind::Ordinary,
+        };
+        assert!(!reflexive_branch.publishes_created_referent());
+        // Paired positive: the same branch without the reflexive marker publishes.
+        let ordinary_branch = Effect::ChooseOneOf {
+            chooser: PlayerFilter::Controller,
+            branches: vec![AbilityDefinition::new(AbilityKind::Spell, token())],
+            kind: ChooseOneOfKind::Ordinary,
+        };
+        assert!(ordinary_branch.publishes_created_referent());
     }
 }

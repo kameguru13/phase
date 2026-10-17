@@ -35197,8 +35197,13 @@ pub mod tests {
         assert_eq!(end_step_quality_trigger_stack_len(prime(), 5, 0), 1);
     }
 
+    /// Exercises `stack::bind_triggered_resolution_scope` with a constructed
+    /// scope: the bind function re-evaluates a `QuantityQuality` condition
+    /// against the live board. The production coverage of a stacked trigger's
+    /// resolution recheck is
+    /// `tests/integration/zimone_all_questioning.rs::resolution_recheck_and_live_count`.
     #[test]
-    fn quantity_quality_rechecked_at_resolution() {
+    fn bind_triggered_resolution_scope_rechecks_quantity_quality() {
         // CR 603.4 + Zimone ruling: "It won't resolve if you don't control a
         // prime number of lands as it resolves." The generic resolution recheck
         // re-evaluates the predicate against the live board.

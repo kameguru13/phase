@@ -16,17 +16,21 @@
 //! CR 122.6a, Printlifter Ooze) keeps `Token.enter_with_counters`.
 
 use engine::game::coverage::card_face_gaps;
-use engine::game::scenario::{GameScenario, P0};
+use engine::game::effects::resolve_ability_chain;
+use engine::game::scenario::{GameRunner, GameScenario, P0};
 use engine::parser::parse_oracle_text;
 use engine::types::ability::{
-    AbilityDefinition, AbilityKind, Effect, SubAbilityLink, TargetFilter,
+    AbilityDefinition, AbilityKind, ChooseOneOfKind, ConjureCard, ConjureSource, Effect,
+    PlayerFilter, PtValue, QuantityExpr, ResolvedAbility, SubAbilityLink, TargetFilter,
 };
+use engine::types::actions::GameAction;
 use engine::types::card::CardFace;
 use engine::types::card_type::{CardType, CoreType};
 use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
+use engine::types::game_state::{GameState, WaitingFor};
 use engine::types::identifiers::ObjectId;
-use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
+use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
@@ -656,4 +660,380 @@ fn activated_x_reaches_the_moved_placement() {
     let fractals = battlefield_named(outcome.state(), "Fractal");
     assert_eq!(fractals.len(), 1, "exactly one Fractal");
     assert_eq!(outcome.counters(fractals[0], CounterType::Plus1Plus1), 2);
+}
+
+// ─── D1.6: Wild Hypothesis (create, put counters on it, then surveil) ────────
+
+const WILD_HYPOTHESIS: &str = "Create a 0/0 green and blue Fractal creature token. Put X +1/+1 counters on it.\nSurveil 2. (Look at the top two cards of your library, then put any number of them into your graveyard and the rest on top of your library in any order.)";
+
+/// Wild Hypothesis ({X}{G}) cast with `x` and resolved up to its surveil
+/// prompt. The library holds three cards.
+fn wild_hypothesis_at_surveil(x: u32) -> GameRunner {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(P0, pool(&[ManaType::Green; 3]));
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Wild Hypothesis", false, WILD_HYPOTHESIS)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::X, ManaCostShard::Green],
+            generic: 0,
+        })
+        .id();
+    scenario.with_library_top(P0, &["Card A", "Card B", "Card C"]);
+    let mut runner = scenario.build();
+    let _ = runner.cast(spell).x(x).commit();
+    runner.resolve_top();
+    // Reach-guard: resolution stopped at the surveil prompt over two cards.
+    assert!(
+        matches!(
+            &runner.state().waiting_for,
+            WaitingFor::SurveilChoice { cards, .. } if cards.len() == 2
+        ),
+        "expected a two-card surveil prompt, got {:?}",
+        runner.state().waiting_for
+    );
+    runner
+}
+
+/// D1.6 (CR 608.2c + CR 122.1 + CR 701.25a): the Fractal is created and gets
+/// its X counters before the surveil instruction; Surveil is an independent
+/// later instruction and still resolves. Both looked-at cards go to the
+/// graveyard, then the sorcery does.
+#[test]
+fn wild_hypothesis_counters_land_before_surveil_and_surveil_resolves() {
+    let mut runner = wild_hypothesis_at_surveil(2);
+    let fractals = battlefield_named(runner.state(), "Fractal");
+    assert_eq!(fractals.len(), 1, "one Fractal at the surveil prompt");
+    let fractal = fractals[0];
+    assert_eq!(plus_one_counters(runner.state(), fractal), 2);
+
+    runner
+        .act(GameAction::SelectCards { cards: vec![] })
+        .expect("surveil choice accepted");
+    let state = runner.state();
+    assert_eq!(battlefield_named(state, "Fractal"), vec![fractal]);
+    assert_eq!(plus_one_counters(state, fractal), 2);
+    assert_eq!(state.objects[&fractal].power, Some(2));
+    assert_eq!(state.objects[&fractal].toughness, Some(2));
+    assert_eq!(
+        state.players[0].graveyard.len(),
+        3,
+        "two surveilled cards and the sorcery"
+    );
+    assert_eq!(state.players[0].library.len(), 1);
+}
+
+/// D1.6 sibling (X = 0): the surveil is independent of the placement and of
+/// the token's survival. The 0/0 Fractal dies to CR 704.5f at the next CR 704.3
+/// check and ceases to exist (CR 111.7); the surveil still resolves.
+#[test]
+fn wild_hypothesis_surveil_resolves_when_x_is_zero() {
+    let mut runner = wild_hypothesis_at_surveil(0);
+    runner
+        .act(GameAction::SelectCards { cards: vec![] })
+        .expect("surveil choice accepted");
+    let state = runner.state();
+    assert!(battlefield_named(state, "Fractal").is_empty());
+    assert_eq!(state.players[0].graveyard.len(), 3);
+    assert_eq!(state.players[0].library.len(), 1);
+}
+
+// ─── D1.1 premise: the nearest publisher's product is the referent ───────────
+
+fn plus_one_counters(state: &GameState, id: ObjectId) -> u32 {
+    state.objects[&id]
+        .counters
+        .get(&CounterType::Plus1Plus1)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn creature_token(name: &str, size: i32) -> Effect {
+    Effect::Token {
+        name: name.to_string(),
+        power: PtValue::Fixed(size),
+        toughness: PtValue::Fixed(size),
+        types: vec!["Creature".to_string(), name.to_string()],
+        colors: vec![ManaColor::White],
+        keywords: vec![],
+        tapped: false,
+        count: QuantityExpr::Fixed { value: 1 },
+        owner: TargetFilter::Controller,
+        attach_to: None,
+        enters_attacking: false,
+        supertypes: vec![],
+        static_abilities: vec![],
+        enter_with_counters: vec![],
+    }
+}
+
+fn plus_one_on_last_created() -> Effect {
+    Effect::PutCounter {
+        counter_type: CounterType::Plus1Plus1,
+        count: QuantityExpr::Fixed { value: 1 },
+        target: TargetFilter::LastCreated,
+    }
+}
+
+/// `effects` as one chain controlled by P0 from `source`, in order.
+fn chain(source: ObjectId, effects: Vec<Effect>) -> ResolvedAbility {
+    effects
+        .into_iter()
+        .rev()
+        .fold(None, |next: Option<ResolvedAbility>, effect| {
+            let node = ResolvedAbility::new(effect, vec![], source, P0);
+            Some(match next {
+                Some(next) => node.sub_ability(next),
+                None => node,
+            })
+        })
+        .expect("a non-empty chain")
+}
+
+/// A board with one P0 creature as the chain's source, and the runner.
+fn chain_board() -> (GameRunner, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario.add_creature(P0, "Chain Source", 1, 1).id();
+    (scenario.build(), source)
+}
+
+/// Resolves `ability` on the runner's board.
+fn resolve_chain(runner: &mut GameRunner, ability: &ResolvedAbility) {
+    let mut events = Vec::new();
+    resolve_ability_chain(runner.state_mut(), ability, &mut events, 0).expect("chain resolves");
+}
+
+/// The battlefield objects not in `before`, other than the Soldier.
+fn new_non_soldiers(state: &GameState, before: &[ObjectId]) -> Vec<ObjectId> {
+    state
+        .battlefield
+        .iter()
+        .copied()
+        .filter(|id| !before.contains(id) && state.objects[id].name != "Soldier")
+        .collect()
+}
+
+fn the_soldier(state: &GameState) -> ObjectId {
+    let soldiers = battlefield_named(state, "Soldier");
+    assert_eq!(soldiers.len(), 1, "the Soldier token exists");
+    soldiers[0]
+}
+
+/// R1 (CR 608.2c): after `[Token, Conjure, PutCounter { LastCreated }]` the
+/// counter goes on the conjured card — the nearest publisher's product — not
+/// on the Soldier. Control: `[Token, PutCounter]` puts it on the Soldier.
+#[test]
+fn a_later_conjure_is_the_placement_referent() {
+    let (mut runner, source) = chain_board();
+    resolve_chain(
+        &mut runner,
+        &chain(
+            source,
+            vec![creature_token("Soldier", 1), plus_one_on_last_created()],
+        ),
+    );
+    let soldier = the_soldier(runner.state());
+    assert_eq!(plus_one_counters(runner.state(), soldier), 1);
+
+    let (mut runner, source) = chain_board();
+    let before: Vec<ObjectId> = runner.state().battlefield.iter().copied().collect();
+    let conjure = Effect::Conjure {
+        cards: vec![ConjureCard {
+            source: ConjureSource::Named {
+                name: "Hangarback Walker".to_string(),
+            },
+            count: QuantityExpr::Fixed { value: 1 },
+        }],
+        destination: Zone::Battlefield,
+        tapped: false,
+        library_position: None,
+        library_players: None,
+    };
+    resolve_chain(
+        &mut runner,
+        &chain(
+            source,
+            vec![
+                creature_token("Soldier", 1),
+                conjure,
+                plus_one_on_last_created(),
+            ],
+        ),
+    );
+    let state = runner.state();
+    let conjured = new_non_soldiers(state, &before);
+    assert_eq!(conjured.len(), 1, "the conjured card is on the battlefield");
+    assert_eq!(plus_one_counters(state, conjured[0]), 1);
+    assert_eq!(plus_one_counters(state, the_soldier(state)), 0);
+}
+
+fn spellbook_chain_board(random: bool) -> (GameRunner, ResolvedAbility, Vec<ObjectId>) {
+    let (mut runner, source) = chain_board();
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&source)
+        .unwrap()
+        .spellbook = vec!["Lion Sash".to_string()];
+    let before = runner.state().battlefield.iter().copied().collect();
+    let ability = chain(
+        source,
+        vec![
+            creature_token("Soldier", 1),
+            Effect::DraftFromSpellbook {
+                destination: Zone::Battlefield,
+                tapped: false,
+                random,
+            },
+            plus_one_on_last_created(),
+        ],
+    );
+    (runner, ability, before)
+}
+
+fn assert_drafted_card_has_the_counter(state: &GameState, before: &[ObjectId]) {
+    let drafted = new_non_soldiers(state, before);
+    assert_eq!(drafted.len(), 1, "the drafted card is on the battlefield");
+    assert_eq!(state.objects[&drafted[0]].name, "Lion Sash");
+    assert_eq!(plus_one_counters(state, drafted[0]), 1);
+    assert_eq!(plus_one_counters(state, the_soldier(state)), 0);
+}
+
+/// R2 (CR 608.2c; constructed): a spellbook draft publishes the drafted card,
+/// so a later `LastCreated` placement goes on it (random path, no pause).
+#[test]
+fn a_later_random_spellbook_draft_is_the_placement_referent() {
+    let (mut runner, ability, before) = spellbook_chain_board(true);
+    resolve_chain(&mut runner, &ability);
+    assert_drafted_card_has_the_counter(runner.state(), &before);
+}
+
+/// R2b (CR 608.2c + CR 608.2d; constructed): the chosen draft pauses with the
+/// tail stashed; the drafted card is published at the resume, before the
+/// placement runs.
+#[test]
+fn a_later_chosen_spellbook_draft_is_the_placement_referent() {
+    let (mut runner, ability, before) = spellbook_chain_board(false);
+    resolve_chain(&mut runner, &ability);
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::SpellbookDraft { .. }
+        ),
+        "expected the draft choice, got {:?}",
+        runner.state().waiting_for
+    );
+    let soldier = the_soldier(runner.state());
+    assert_eq!(
+        plus_one_counters(runner.state(), soldier),
+        0,
+        "the placement is stashed behind the draft choice"
+    );
+    runner
+        .act(GameAction::SubmitSpellbookDraft {
+            card: "Lion Sash".to_string(),
+        })
+        .expect("draft accepted");
+    assert_drafted_card_has_the_counter(runner.state(), &before);
+}
+
+/// Answers the pending `ChooseOneOfBranch` with the branch whose description
+/// contains `needle`.
+fn choose_branch_describing(runner: &mut GameRunner, needle: &str) {
+    let index = match &runner.state().waiting_for {
+        WaitingFor::ChooseOneOfBranch {
+            branch_descriptions,
+            ..
+        } => branch_descriptions
+            .iter()
+            .position(|description| description.contains(needle))
+            .unwrap_or_else(|| panic!("no branch describes {needle}: {branch_descriptions:?}")),
+        other => panic!("expected a branch choice, got {other:?}"),
+    };
+    runner
+        .act(GameAction::ChooseBranch { index })
+        .expect("branch accepted");
+}
+
+/// The Spirit token among the new battlefield objects.
+fn the_spirit(state: &GameState, before: &[ObjectId]) -> ObjectId {
+    let spirits: Vec<ObjectId> = new_non_soldiers(state, before)
+        .into_iter()
+        .filter(|id| {
+            state.objects[id]
+                .card_types
+                .subtypes
+                .iter()
+                .any(|subtype| subtype == "Spirit")
+        })
+        .collect();
+    assert_eq!(spirits.len(), 1, "the Spirit token exists");
+    spirits[0]
+}
+
+/// R3 (CR 701.63a + CR 608.2c; constructed): endure's token branch creates the
+/// N/N Spirit, the nearest created object, so the placement goes on it.
+#[test]
+fn a_later_endure_token_branch_is_the_placement_referent() {
+    let (mut runner, source) = chain_board();
+    let before: Vec<ObjectId> = runner.state().battlefield.iter().copied().collect();
+    let ability = chain(
+        source,
+        vec![
+            creature_token("Soldier", 1),
+            Effect::Endure {
+                amount: QuantityExpr::Fixed { value: 2 },
+                subject: TargetFilter::SelfRef,
+            },
+            plus_one_on_last_created(),
+        ],
+    );
+    resolve_chain(&mut runner, &ability);
+    choose_branch_describing(&mut runner, "Spirit");
+    let state = runner.state();
+    let spirit = the_spirit(state, &before);
+    assert_eq!(
+        state.objects[&spirit].power,
+        Some(3),
+        "a 2/2 Spirit plus one"
+    );
+    assert_eq!(plus_one_counters(state, spirit), 1);
+    assert_eq!(plus_one_counters(state, the_soldier(state)), 0);
+}
+
+/// R4 (CR 608.2c + CR 608.2d; constructed): a choose-one-of's chosen branch is
+/// followed inside this resolution, so its token is the placement's referent.
+#[test]
+fn a_later_choose_one_of_token_branch_is_the_placement_referent() {
+    let (mut runner, source) = chain_board();
+    let before: Vec<ObjectId> = runner.state().battlefield.iter().copied().collect();
+    let mut spirit_branch = AbilityDefinition::new(AbilityKind::Spell, creature_token("Spirit", 1));
+    spirit_branch.description = Some("Create a 1/1 Spirit token.".to_string());
+    let mut life_branch = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 1 },
+            player: TargetFilter::Controller,
+        },
+    );
+    life_branch.description = Some("You gain 1 life.".to_string());
+    let ability = chain(
+        source,
+        vec![
+            creature_token("Soldier", 1),
+            Effect::ChooseOneOf {
+                chooser: PlayerFilter::Controller,
+                branches: vec![spirit_branch, life_branch],
+                kind: ChooseOneOfKind::Ordinary,
+            },
+            plus_one_on_last_created(),
+        ],
+    );
+    resolve_chain(&mut runner, &ability);
+    choose_branch_describing(&mut runner, "Spirit");
+    let state = runner.state();
+    let spirit = the_spirit(state, &before);
+    assert_eq!(plus_one_counters(state, spirit), 1);
+    assert_eq!(plus_one_counters(state, the_soldier(state)), 0);
 }
