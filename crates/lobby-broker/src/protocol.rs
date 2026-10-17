@@ -66,8 +66,12 @@ pub struct TournamentRequestId(pub u64);
 ///      activation, CR 118.11), with its `PausedCounterCostRemoval` record;
 ///      `ManaAbilityCostCursor` gains the optional `counter_removal` record.
 ///      Serialized in `GameState.pending_cost_move_resume`: a v144 peer cannot
-///      parse the new tag. Full-game peers and P2P move in lockstep (wire
-///      127); no lobby carrier names it.
+///      parse the new tag. The same version carries the activation-owned
+///      removed-counter count (`SpellContext.cost_removed_counter_amount`,
+///      `ManaAbilityCostCursor.cost_removed_counters`,
+///      `PendingManaAbility.cost_removed_counters`; optional, skipped when
+///      unset), which a v144 peer re-encoding state would drop. Full-game
+///      peers and P2P move in lockstep (wire 127); no lobby carrier names it.
 ///
 /// 144 — One-time boons (#7495) add serialized `GameState` tags, and the
 ///      perpetual P/T edit is retyped. `Effect::CreateBoon` (with its granted

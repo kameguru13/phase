@@ -4960,9 +4960,9 @@ fn finish_counter_cost_payment(
     if let Some(ability_index) = pending.activation_ability_index {
         if let Some(cost) = pending.activation_cost.take() {
             // CR 601.2h + CR 602.2b: The counter payment is complete before an
-            // automatic residual can pause on a self-move replacement, so the
-            // typed continuation resumes this pending activation without
-            // replaying the counters already removed.
+            // automatic residual can pause on a cost replacement (a self-move or
+            // a counter removal), so the typed continuation resumes this pending
+            // activation without replaying the counters already removed.
             match super::casting::pay_ability_cost_for_activation(
                 state,
                 player,
