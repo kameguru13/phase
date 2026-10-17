@@ -215,14 +215,18 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
- * 149 — PendingCostMoveResume gains CounterCostRemovalPayment (a counter-removal
+ * 150 — PendingCostMoveResume gains CounterCostRemovalPayment (a counter-removal
  *       cost paused on a CR 616.1 replacement choice; the activation reads the
  *       settled count, CR 118.11) and ManaAbilityCostCursor gains
  *       counter_removal, carried in GameState.pending_cost_move_resume — see
- *       PROTOCOL_VERSION's own `/// 149` entry in
- *       crates/lobby-broker/src/protocol.rs. A v148 peer cannot parse the tag;
- *       the exact-match version check at connect refuses the pairing. Wire 131
- *       moves with it. Follows #10004's 148.
+ *       PROTOCOL_VERSION's own `/// 150` entry in
+ *       crates/lobby-broker/src/protocol.rs. A v149 peer cannot parse the tag;
+ *       the exact-match version check at connect refuses the pairing. Wire 132
+ *       moves with it. Follows #10004's 149.
+ * 148 — Timesifter's top-card exile contest: Effect::ExileTopCardContest and
+ *      BatchCompletion::TopCardContestRoundComplete in GameState — see
+ *      PROTOCOL_VERSION's own `/// 148` entry in crates/lobby-broker/src/protocol.rs.
+ *      A v147 peer cannot parse them. Wire 130 moves with it.
  * 147 — Online physical contests: WaitingFor::PhysicalContest, Effect::PhysicalContest,
  *      the two PhysicalContest* GameEvents, ClientMessage::ContestClick and
  *      ServerMessage::ContestProgress — see PROTOCOL_VERSION's own `/// 147` entry
@@ -906,7 +910,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 149;
+export const PROTOCOL_VERSION = 150;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
