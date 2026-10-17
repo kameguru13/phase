@@ -281,8 +281,8 @@ mod tests {
         assert_eq!(source_at(&[token(), mill, deathtouch], 2), Some(0));
     }
 
-    /// Conservative default: anything other than a `LastCreated` placement after
-    /// a `Token` keeps today's reading.
+    /// Conservative default: anything other than a `LastCreated` placement whose
+    /// nearest preceding publisher is a `Token` keeps today's reading.
     #[test]
     fn non_token_publishers_and_other_targets_do_not_pair() {
         // A Conjure is a `LastCreated` publisher but not a token creation.
