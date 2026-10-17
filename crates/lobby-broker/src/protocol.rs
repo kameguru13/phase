@@ -60,19 +60,28 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
-/// 146 — `PendingCostMoveResume` gains `CounterCostRemovalPayment`, a
+/// 147 — `PendingCostMoveResume` gains `CounterCostRemovalPayment`, a
 ///      counter-removal cost paused while a replacement choice settles its
 ///      current removal (CR 616.1; the settled count is credited to the
 ///      activation, CR 118.11), with its `PausedCounterCostRemoval` record;
 ///      `ManaAbilityCostCursor` gains the optional `counter_removal` record.
-///      Serialized in `GameState.pending_cost_move_resume`: a v145 peer cannot
+///      Serialized in `GameState.pending_cost_move_resume`: a v146 peer cannot
 ///      parse the new tag. The same version carries the activation-owned
 ///      removed-counter count (`SpellContext.cost_removed_counter_amount`,
 ///      `ManaAbilityCostCursor.cost_removed_counters`,
 ///      `PendingManaAbility.cost_removed_counters`; optional, skipped when
-///      unset), which a v145 peer re-encoding state would drop. Full-game
-///      peers and P2P move in lockstep (wire 128); no lobby carrier names it.
+///      unset), which a v146 peer re-encoding state would drop. Full-game
+///      peers and P2P move in lockstep (wire 129); no lobby carrier names it.
 ///
+/// 146 — `ConfirmedPeriod` gains `performance` and `counted_by` (`CountedBy::Replay { departures }`, CR
+///      732.2a: the offer's count is the repetitions the counting replay performed,
+///      with the seats that left in each) and `PredictedDeparture` serializes inside
+///      it, carried in `WaitingFor::LoopShortcut` and `ShortcutProposal`; their
+///      `per_cycle` signature may carry `"scope": "OneRepetition"`, and their
+///      `win_kind` becomes optional beside a new optional `win_kind_at`. A v145
+///      peer drops the field and would take such an offer as the threshold
+///      authority's. Full-game peers and P2P move in lockstep (wire 128); no lobby
+///      carrier names it.
 /// 145 — `ParentTargetMissingReason` gains `SearchLibrary` (CR 701.23b),
 ///      serialized on `ResolvedAbility.parent_target_missing_reason`; a v144
 ///      peer cannot parse the tag. P2P moves in lockstep (wire 127); lobby
@@ -1106,7 +1115,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 146;
+pub const PROTOCOL_VERSION: u32 = 147;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2363,12 +2372,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 146);
+        assert_eq!(PROTOCOL_VERSION, 147);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 145);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 146);
     }
 
     #[test]

@@ -3346,13 +3346,16 @@ mod tests {
         }
     }
 
-    /// v146: `PendingCostMoveResume` gains `CounterCostRemovalPayment` (a
+    /// v147: `PendingCostMoveResume` gains `CounterCostRemovalPayment` (a
     /// counter-removal cost paused on a CR 616.1 replacement choice, whose
     /// settled count the activation reads, CR 118.11) and
     /// `ManaAbilityCostCursor` gains `counter_removal`, both carried in
-    /// `GameState::pending_cost_move_resume`; a v145 peer cannot parse the new
-    /// tag, so it must be refused before it receives v146 state.
+    /// `GameState::pending_cost_move_resume`; a v146 peer cannot parse the new
+    /// tag, so it must be refused before it receives v147 state.
     ///
+    /// v146: `ConfirmedPeriod` gains `counted_by` (CR 732.2a counted loop offers) and `performance`,
+    /// and a loop offer's `win_kind` becomes optional; a v145 peer drops the field
+    /// or cannot parse the offer, so it must be refused before it receives v146 state.
     /// v145: `ParentTargetMissingReason` gains `SearchLibrary` (CR 701.23b),
     /// serialized on `ResolvedAbility.parent_target_missing_reason`; a v144
     /// peer cannot parse the tag. P2P moves in lockstep (wire 127); lobby
@@ -3576,8 +3579,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_146_for_counter_cost_removal_payment() {
-        assert_eq!(PROTOCOL_VERSION, 146);
+    fn protocol_version_is_147_for_counter_cost_removal_payment() {
+        assert_eq!(PROTOCOL_VERSION, 147);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3588,7 +3591,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_146_for_counter_cost_removal_payment` stays
+    /// `protocol_version_is_147_for_counter_cost_removal_payment` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
