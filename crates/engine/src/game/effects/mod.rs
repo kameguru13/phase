@@ -2179,18 +2179,13 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
             origin,
             destination,
             enter_transformed,
-            enter_tapped,
             enters_under_player,
-            enters_attacking,
-            enter_with_counters,
-            conditional_enter_with_counters,
             duration,
             track_exiled_by_source,
             face_down_in_exile,
             mut moved_count,
             face_down_profile,
             library_placement,
-            enters_modified_if,
             enter_attached_to,
             effect_kind,
         } = pending;
@@ -2244,31 +2239,18 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
         // members moved in this resume join the logical co-departed group and
         // their observer triggers are collected with earlier pause segments.
         let events_before_drain = events.len();
-        for (i, obj_id) in remaining.iter().enumerate() {
-            let per_obj_enter_counters =
-                crate::game::effects::change_zone::enter_with_counters_for_pending_object(
-                    state,
-                    source_id,
-                    *obj_id,
-                    crate::game::effects::change_zone::EntryGateContext {
-                        destination,
-                        controller_override: enters_under_player,
-                        enter_transformed,
-                    },
-                    &enter_with_counters,
-                    &conditional_enter_with_counters,
-                );
+        // CR 603.6a + CR 614.12: each member applies the entry modifications
+        // resolved before the event's first member moved; never recompute
+        // against the partly-moved board.
+        for (i, member) in remaining.iter().enumerate() {
+            let obj_id = &member.object_id;
             let ctx = crate::game::effects::change_zone::ChangeZoneIterationCtx {
                 source_id,
                 controller,
                 origin,
                 destination,
                 enter_transformed,
-                enter_tapped,
                 enters_under_player,
-                enters_attacking,
-                enter_with_counters: per_obj_enter_counters,
-                conditional_enter_with_counters: vec![],
                 duration: duration.clone(),
                 track_exiled_by_source,
                 face_down_in_exile,
@@ -2277,13 +2259,9 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
                 // per-permanent replacement-ordering / as-enters choice resumes
                 // FACE DOWN with the same characteristics (Yedora-style return),
                 // instead of exposing the real object face up. Mirrors the
-                // `enter_tapped`/`enter_transformed`/`enters_under_player` carry-through.
+                // `enter_transformed`/`enters_under_player` carry-through.
                 face_down_profile: face_down_profile.clone(),
                 library_placement: library_placement.clone(),
-                // CR 614.12: thread the moved-object type gate into the per-object
-                // resume ctx so a resumed member is still gated on its type
-                // (Summoner's Grimoire), matching the synchronous move path.
-                enters_modified_if: enters_modified_if.clone(),
                 enter_attached_to,
             };
             let before_zone = state.objects.get(obj_id).map(|object| object.zone);
@@ -2309,7 +2287,7 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
             let delivery_start = events.len();
             let stack_depth_before_zone_move = state.resolution_stack.capture_child_boundary();
             match crate::game::effects::change_zone::process_one_zone_move_with_terminal(
-                state, &ctx, *obj_id, events,
+                state, &ctx, member, events,
             ) {
                 crate::game::zone_pipeline::ZoneMoveTerminalResult::Completed(completion) => {
                     logical_zone_change_group
@@ -2363,12 +2341,7 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
                             origin: ctx.origin,
                             destination: ctx.destination,
                             enter_transformed: ctx.enter_transformed,
-                            enter_tapped: ctx.enter_tapped,
                             enters_under_player: ctx.enters_under_player,
-                            enters_attacking: ctx.enters_attacking,
-                            enter_with_counters: enter_with_counters.clone(),
-                            conditional_enter_with_counters: conditional_enter_with_counters
-                                .clone(),
                             duration: ctx.duration.clone(),
                             track_exiled_by_source: ctx.track_exiled_by_source,
                             face_down_in_exile: ctx.face_down_in_exile,
@@ -2377,9 +2350,6 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
                             // across a further pause so resumed members stay face down.
                             face_down_profile: ctx.face_down_profile.clone(),
                             library_placement: ctx.library_placement.clone(),
-                            // CR 614.12: preserve the moved-object type gate
-                            // across a further pause.
-                            enters_modified_if: ctx.enters_modified_if.clone(),
                             enter_attached_to: ctx.enter_attached_to,
                             effect_kind,
                         },
@@ -2424,12 +2394,7 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
                             origin: ctx.origin,
                             destination: ctx.destination,
                             enter_transformed: ctx.enter_transformed,
-                            enter_tapped: ctx.enter_tapped,
                             enters_under_player: ctx.enters_under_player,
-                            enters_attacking: ctx.enters_attacking,
-                            enter_with_counters: enter_with_counters.clone(),
-                            conditional_enter_with_counters: conditional_enter_with_counters
-                                .clone(),
                             duration: ctx.duration.clone(),
                             track_exiled_by_source: ctx.track_exiled_by_source,
                             face_down_in_exile: ctx.face_down_in_exile,
@@ -2439,9 +2404,6 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
                             // across a further pause so resumed members stay face down.
                             face_down_profile: ctx.face_down_profile.clone(),
                             library_placement: ctx.library_placement.clone(),
-                            // CR 614.12: preserve the moved-object type gate
-                            // across a further pause.
-                            enters_modified_if: ctx.enters_modified_if.clone(),
                             enter_attached_to: ctx.enter_attached_to,
                             effect_kind,
                         },

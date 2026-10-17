@@ -4833,7 +4833,9 @@ impl EntryProjection {
 /// scratch can apply (printed on any object, copied by a layer-1 copy effect)
 /// and of every transient are evaluated against the pre-entry state
 /// (`layers::pin_entry_population_conditions`); the live game, triggers and
-/// entry observations keep the realized battlefield.
+/// entry observations keep the realized battlefield. `state` must be the board
+/// before the entry event's first member moved (CR 603.6a); multi-object callers
+/// resolve every member first (`change_zone::resolve_change_zone_member_entries`).
 pub(crate) struct BattlefieldEntrantProjection {
     scratch: GameState,
     entrant: ObjectId,

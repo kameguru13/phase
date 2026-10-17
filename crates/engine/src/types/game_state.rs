@@ -4306,7 +4306,9 @@ impl PendingZoneChangeDelivery {
 /// chooses two shock lands; only the first ever entered the battlefield).
 ///
 /// The struct stashes the per-iteration context (`ChangeZoneIterationCtx`)
-/// plus the unprocessed object ids; `drain_pending_change_zone_iteration`
+/// plus the unprocessed members, each carrying the entry modifications it was
+/// resolved to before the event's first member moved (`ChangeZoneMemberEntry`),
+/// not the raw gate spec; `drain_pending_change_zone_iteration`
 /// (in `effects/mod.rs`) re-enters the loop after each `ReplacementChoice`
 /// resolves. Drained before the repeat-for frame because the outer
 /// `repeat_for` loop may have stashed a chain that contains this inner
@@ -4325,18 +4327,14 @@ pub struct PendingChangeZoneIteration {
     /// The chosen member that is currently completing outside the ordinary
     /// `remaining` loop. Required even when the tail is empty.
     pub paused_current: Option<PendingZoneChangeDelivery>,
-    pub remaining: Vec<ObjectId>,
+    /// The unprocessed members with their pre-event entry modifications
+    /// (CR 603.6a).
+    pub remaining: Vec<ChangeZoneMemberEntry>,
     pub source_id: ObjectId,
     pub controller: PlayerId,
     pub origin: Option<crate::types::zones::Zone>,
     pub destination: crate::types::zones::Zone,
     pub enter_transformed: bool,
-    #[serde(
-        default,
-        with = "crate::types::zones::etb_tap_bool_compat",
-        skip_serializing_if = "EtbTapState::is_unspecified"
-    )]
-    pub enter_tapped: EtbTapState,
     /// CR 110.2a: Resolved-once controller override on ETB. `Some(pid)`
     /// routes the object to `pid`. `None` leaves the object under its
     /// owner's control. Resolved from `Effect::ChangeZone.enters_under`
@@ -4344,18 +4342,6 @@ pub struct PendingChangeZoneIteration {
     /// across an interactive pause.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enters_under_player: Option<PlayerId>,
-    pub enters_attacking: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub enter_with_counters: Vec<(crate::types::counter::CounterType, u32)>,
-    /// Conditional entry-counter specs carried across a pause so each remaining
-    /// object can be re-evaluated per-object on resume (Winter Soldier Hero
-    /// rider through `EffectZoneChoice`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub conditional_enter_with_counters: Vec<(
-        crate::types::ability::TargetFilter,
-        crate::types::counter::CounterType,
-        crate::types::ability::QuantityExpr,
-    )>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration: Option<crate::types::ability::Duration>,
     pub track_exiled_by_source: bool,
@@ -4374,8 +4360,8 @@ pub struct PendingChangeZoneIteration {
     /// replacement-ordering / as-enters pause so a paused-then-resumed
     /// face-down return (Yedora's dying creatures → face-down Forest lands)
     /// still applies the profile on resume. `None` = normal face-up entry.
-    /// Mirrors the `enter_tapped`/`enter_transformed`/`enters_under_player`
-    /// carry-through pattern on this same struct.
+    /// Mirrors the `enter_transformed`/`enters_under_player` carry-through
+    /// pattern on this same struct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub face_down_profile: Option<crate::types::ability::FaceDownProfile>,
     /// CR 401.4 + CR 701.24a: Library placement override carried across a
@@ -4383,18 +4369,26 @@ pub struct PendingChangeZoneIteration {
     /// library" still suppresses auto-shuffle on resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub library_placement: Option<crate::types::ability::LibraryPosition>,
-    /// CR 614.12: gates the `enter_tapped`/`enters_attacking` riders on the
-    /// moved object's type, carried across a replacement-ordering / as-enters
-    /// pause so a paused-then-resumed gated move (Summoner's Grimoire) still
-    /// applies the riders only to a matching object on resume. `None` = apply
-    /// unconditionally. Mirrors the `enter_tapped`/`face_down_profile`
-    /// carry-through pattern on this same struct.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enters_modified_if: Option<crate::types::ability::TargetFilter>,
     /// CR 303.4f: Pre-resolved Aura host carried across a paused ChangeZone loop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enter_attached_to: Option<AttachTarget>,
     pub effect_kind: crate::types::ability::EffectKind,
+}
+
+/// CR 603.6a + CR 614.12: one member of a ChangeZone event with the
+/// effect-carried modifications it enters with — its gated entry counters and
+/// gated tapped/attacking riders — resolved against the board as it was before
+/// the event's first member moved. A co-entrant is not on the battlefield then,
+/// so neither its statics nor its presence affect another member's gates
+/// (Heliod, Sun-Crowned ruling 2020-01-24).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeZoneMemberEntry {
+    pub object_id: ObjectId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enter_with_counters: Vec<(CounterType, u32)>,
+    #[serde(default, skip_serializing_if = "EtbTapState::is_unspecified")]
+    pub enter_tapped: EtbTapState,
+    pub enters_attacking: bool,
 }
 
 /// CR 707.2 + CR 614.1a + CR 616.1: Resume state for `CopyTokenOf` when a
@@ -35503,18 +35497,13 @@ mod tests {
             origin: Some(Zone::Battlefield),
             destination: Zone::Exile,
             enter_transformed: false,
-            enter_tapped: EtbTapState::Unspecified,
             enters_under_player: None,
-            enters_attacking: false,
-            enter_with_counters: Vec::new(),
-            conditional_enter_with_counters: Vec::new(),
             duration: None,
             track_exiled_by_source: false,
             face_down_in_exile: crate::types::ability::ExileConcealment::FaceDown,
             moved_count: None,
             face_down_profile: None,
             library_placement: None,
-            enters_modified_if: None,
             enter_attached_to: None,
             effect_kind: EffectKind::ChangeZone,
         });
@@ -45178,17 +45167,20 @@ mod tests {
             pending_return_result_producer: None,
             logical_zone_change_group,
             paused_current: None,
-            remaining: vec![],
+            // CR 603.6a + CR 614.12: a member carries the entry modifications
+            // resolved before the event's first member moved.
+            remaining: vec![ChangeZoneMemberEntry {
+                object_id: ObjectId(9),
+                enter_with_counters: vec![(CounterType::Plus1Plus1, 2)],
+                enter_tapped: EtbTapState::Tapped,
+                enters_attacking: true,
+            }],
             source_id: ObjectId(7),
             controller: PlayerId(0),
             origin: None,
             destination: Zone::Battlefield,
             enter_transformed: false,
-            enter_tapped: EtbTapState::Unspecified,
             enters_under_player: Some(PlayerId(1)),
-            enters_attacking: false,
-            enter_with_counters: vec![],
-            conditional_enter_with_counters: vec![],
             duration: None,
             track_exiled_by_source: false,
             face_down_in_exile: crate::types::ability::ExileConcealment::Public,
@@ -45207,10 +45199,24 @@ mod tests {
             }),
             library_placement: None,
             effect_kind: crate::types::ability::EffectKind::ChangeZone,
-            enters_modified_if: None,
             enter_attached_to: None,
         };
         let json = serde_json::to_string(&original).expect("serialize");
+        // The resolved members are the only entry-modification authority: the
+        // raw gate spec is no longer carried.
+        let carrier = serde_json::to_value(&original).expect("serialize carrier");
+        for removed in [
+            "enter_tapped",
+            "enters_attacking",
+            "enter_with_counters",
+            "conditional_enter_with_counters",
+            "enters_modified_if",
+        ] {
+            assert!(
+                carrier.get(removed).is_none(),
+                "carrier must not emit the removed `{removed}` field: {json}"
+            );
+        }
         // Modern shape must be emitted, NOT the legacy bool field.
         assert!(
             json.contains("\"enters_under_player\""),
@@ -45247,6 +45253,20 @@ mod tests {
         assert!(
             error.to_string().contains("immediately_before_latched"),
             "missing latch rejection must name the missing authority: {error}"
+        );
+
+        // A legacy carrier whose members are bare ids has no pre-event entry
+        // modifications to resume with, so it must reject rather than default.
+        let mut bare_ids = serde_json::to_value(&original).expect("serialize modern carrier");
+        bare_ids
+            .as_object_mut()
+            .expect("pending carrier serializes as an object")
+            .insert("remaining".to_string(), serde_json::json!([7]));
+        let error = serde_json::from_value::<PendingChangeZoneIteration>(bare_ids)
+            .expect_err("legacy bare-id members must reject");
+        assert!(
+            error.to_string().contains("ChangeZoneMemberEntry"),
+            "bare-id member rejection must name the member carrier: {error}"
         );
 
         // A same-kind child is a distinct operation. It must not absorb the
