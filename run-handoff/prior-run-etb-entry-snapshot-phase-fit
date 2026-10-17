@@ -1,0 +1,40 @@
+BASE_SHA=b1be411564bec8c6072a395192945d4c4b9cf10d
+1. budget=standard; unphased pending sizing. dispatch planning start 1792118448
+2. planning end 1792120084. Adjudication r1: T1 units=2 (fires), T2 scope paths=11 (<13, does not fire) -> single-phase verdict.
+3. plan review r1 start 1792120084
+4. plan review r1 end 1792120760: design round. behavior=4 (2 HIGH, 2 MED), text=4, machinery=0. Pre-existing: What Must Be Done misparse (triage: fix in change - plan would regress it), stale is-rider comment (drop unless R7 shows otherwise).
+5. planning r2 start 1792120760
+6. planning r2 end 1792122286. Adjudication r2: T1 units=2 (U-2 parser What Must Be Done, U-1 entry snapshot), T2=15 (>=13) -> gate FIRES mid-Step-2 on not-yet-clean draft -> charter-mode planner. Scout not run (no pack); recorded.
+7. charter planning start 1792122286
+8. charter planning end 1792122458: 2 phases (P1 parser What Must Be Done, 4 paths; P2 entry snapshot, 11 paths). charter review r1 start 1792122458
+9. charter review r1 end 1792123017: design round, behavior=2 (MED D-1, D-2), text=3. Orchestrator verdict D-1: option (a) widen phase 1 to make the conditional entry-counter gate read the battlefield projection (CR 614.12), rules-correct per CLAUDE.md. N-1 Evolve/intervening-if fire-time leg: accepted as run-level residual, follow-up issue. Pre-existing Theros-God gate: triage after phase 1. charter r2 planning start 1792123017
+10. charter r2 planning end 1792123282: P1 2 units/8 paths, P2 1 unit/11 paths; no phase trips gate. charter review r2 start 1792123282
+11. charter review r2 end 1792123587: clean round, behavior=0, text=2 (applied by orchestrator, two-sided verified: old 1->0, new 0->1 each). Charter FROZEN. Pre-existing Oviya put-rider fold: file follow-up issue. P1 plan start 1792123587 (phase plan loop continues at design round 2 of 5)
+12. P1 plan end 1792124618: Sizing 2 units / 8 paths, gate no-fire. P1 plan review r1 start 1792124618
+13. P1 plan review r1 end 1792125300: design round, behavior=3 (MED B-1 transform, B-2 Memnite, B-3 pipeline row), text=1. Pre-existing: Moritte parse (follow-up issue). P1 plan r2 start 1792125300; prediction next behavior<3.
+14. P1 plan r2 end 1792125481: Sizing unchanged 2/8. P1 plan review r2 start 1792125481
+15. P1 plan review r2 end 1792125745: design round, behavior=1 (LOW, wrong planned test V-P6 c', replacement supplied), text=1. Prediction <3: PASS. Process-effort note: planning+review dominant, no candidate yet; cut: fix round limited to supplied text; user informed. P1 plan r3 start 1792125745; prediction next behavior=0.
+16. P1 plan r3 end 1792125795: 5 spots changed (supplied text). P1 plan review r3 start 1792125795
+17. P1 plan review r3 end 1792125857: CLEAN (b=0,t=0,m=0); prediction PASS. Scope-freeze: 8 paths (p1-scope-paths); re-adjudication T1=2,T2=8 no fire. P1 implementation start 1792125857, START_SHA=b1be411, worktree=/home/user/phase-personal
+18. P1 impl end 1792129922. CANDIDATE_SHA=3df04f3 (8 paths, verified). measurement start 1792129922
+19. measurement end 1792132508: only What Must Be Done changes (+1 supported, -1 swallow). Step 5 completion start 1792132508
+20. completion (worktree /home/user/wt/complete @3df04f3): fmt rc0, parser-gate rc0, bindings rc0, clippy --workspace --all-targets -D warnings rc0. Container restart killed test run; rerunning tests only. Branch pushed to fork as backup.
+21. workspace tests @3df04f3: 40647 passed, 3 failed (phase-server data_bootstrap x2 permission tests under uid 0, jev_relay 504 vs 503 timing) - environmental, server code untouched; confirming at base. Step 6 review r1 start 1792140245 (no scout review pack).
+22. P1 impl review r1 end 1792140615: HIGH 0, MED 0, LOW 2 (resume-path untested residual; fixture idiom) -> residuals; loop closed pending semantic-audit + base server confirmation.
+23. P2 plan start 1792140621 (PHASE_BASE_SHA=3df04f3, provisional pending P1 semantic-audit).
+24. phase-server: data_bootstrap x2 fail at base too (pre-existing, uid 0); jev_relay passes 3/3 at candidate in isolation (full-run load flake). semantic-audit start 1792141747
+25. P2 plan r1 end 1792142201: 1 unit / 11 paths (12 if types/resolution.rs accessor), gate no-fire. 3 addenda lines written (decisions 3, 4, 8). P2 plan review r1 start 1792142201
+26. P2 plan review r1 end 1792143344: design round, behavior=2 (HIGH B-1 A4 fixture is Zimone-owned token path -> Fractal Harness X=3; LOW B-2 R10b derivation supplied), text=4. Addenda: 3 corrections applied (decision names). P2 plan r2 start 1792143344; prediction next behavior<2.
+27. semantic-audit: base 199 flagged / cand 199 flagged, identical per-card -> zero new findings. PHASE 1 ACCEPTED at 3df04f3 (residuals: resume-path row LOW, fixture idiom LOW; pre-existing server data_bootstrap x2). 1792143371
+28. P2 plan r2 end 1792143553: 1 unit/11 paths. P2 plan review r2 start 1792143553
+29. P2 plan review r2 end 1792143914: clean round (b=0, t=1 applied two-sided: old 1->0, new 0->1). Pre-existing: Oviya put-rider fold (follow-up issue). Scope-freeze 11 paths, T1=1 no fire. P2 impl start 1792143914 START_SHA=3df04f3
+30. P2 executor STOP-AND-RETURN 1792146250: P-4/R5c Clone counter dropped (pre-existing), P-5/R5b duplicate deferred-entry trigger (pre-existing), R7b Honor the Past Animate target None no-op (pre-existing), R5d PB=0 not revert-failing (S-b lacks discriminating row), R10b synthetic text unparseable, R11/R12 need manual drivers, P-6 extra frame carriers. Counts as phase-2 design round 4 of 5. Triage: R5b/R5c/R7b defects -> file follow-up issues (change does not depend on them); rows re-chosen. P2 plan r3 start 1792146250
+31. P2 plan r3 end 1792148474: measured rows; S-b structural-only; R7b dropped. Follow-ups F-1..F-5. Triage F-5 (Clear the Land) -> file issue. F-4 (Bronzehide Lion/Enduring Tenacity is-rider not seen by enter observers) is in the task's class: routed to reviewer to decide whether the design must cover it. P2 plan review r3 start 1792148474
+32. P2 plan review r3 end 1792149301: CLEAN (b=0, t=3 applied two-sided; C-1 charter correction as addendum). F-4 adjudicated follow-up (b). Scope-freeze unchanged 11 paths. P2 impl r1 (re-dispatch) start 1792149301
+33. P2 impl r1 returned 1792156266: full implementation, 26/26 rows, lib 24160/0, integration 11566/1 (CR733 matrix registration, shared-registration class). Patch saved scratchpad/p2-round1.patch; worktree restored to START_SHA; SCOPE_PATHS extended (fixtures excluded from T2 -> still 11); re-dispatch same round.
+34. P2 impl r1 (re-dispatch) returned + committed 1792159539: CANDIDATE_SHA=45ddf51 (13 paths: 11 scope + 2 CR733 fixtures, verified by pathspec), pushed to origin. Step 4/5 start.
+35. Completion clippy (all-targets) found 1 lint in phase-2 unit test (bool_assert_comparison, filter.rs:23585); fixed and amended. CANDIDATE_SHA=461359e. Completion rerun (container restart lost first run).
+36. P2 completion PASS at 461359e 1792169086: fmt, parser gate, bindings (at 45ddf51, test-only delta since), clippy --workspace --all-targets -D warnings, workspace tests 40694/2 (data_bootstrap uid-0, reproduced at base). Step 4: card-data byte-identical to P1 (3df04f3), parse-diff no changes, coverage 31957, semantic-audit 199 identical findings. P2 impl review r1 start.
+37. P2 impl review r1 end 1792169920: Completion PASS, Maint-Sim PASS; HIGH 0; MED 1 text, LOW 2 text, LOW 1 behavior (no wrong behavior; hot-path early return -> accepted residual). Text fixes applied two-sided (old present 1->0, new 0->1, comment-only diff), amended -> CANDIDATE_SHA=17eb94d. Phase 2 ACCEPTED. Run-level acceptance start.
+38. Integration review r1 end 1792170300: 0 findings (b0 t0 m0). Chain integrity: b1be411 -> 3df04f3 (1 commit) -> 17eb94d (1 commit) OK; superseded P2 candidates 45ddf51, 461359e (amends). RUN ACCEPTED at 17eb94d. Gate A PASS head=17eb94d. Upstream main +5 commits, merges clean; merged-tree check running.
+39. Merged-with-upstream check (33aa23a) PASS: clippy lib+integration clean, integration 11576/0. PR body + compare link at /mnt/project-files/etb-entry-snapshot/. Run complete; handed to Jakob.
