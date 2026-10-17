@@ -1645,8 +1645,7 @@ impl EntryGateContext {
 /// Each gate consumer (`enter_with_counters_for_object`, `effective_enter_mods`)
 /// builds its own projection, and only when its gate is non-empty, so an entrant
 /// costs at most two projections. No printed card carries both gates on one
-/// entrant (card-data census, phase-1 plan P7), so one shared projection is not
-/// threaded through the two call paths.
+/// entrant, so one shared projection is not threaded through the two call paths.
 fn entry_gate_projection(
     state: &GameState,
     obj_id: ObjectId,
