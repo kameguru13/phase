@@ -61,6 +61,7 @@ function helloFrame(
     mode: "Full" | "LobbyOnly";
     lobby_protocol_version: number;
     wire_formats: string[];
+    command_correlation: unknown;
   }> = {},
 ): string {
   return JSON.stringify({
@@ -104,6 +105,20 @@ describe("openPhaseSocket", () => {
     expect(ws.send).toHaveBeenCalledWith(
       expect.stringContaining('"type":"ClientHello"'),
     );
+  });
+
+  it.each([
+    ["CommandIdV1", "CommandIdV1"],
+    ["Other", undefined],
+    [1, undefined],
+    [undefined, undefined],
+  ])("parses command_correlation %j as %j", async (advertised, expected) => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ command_correlation: advertised }));
+
+    const socket = await promise;
+    expect(socket.serverInfo.commandCorrelation).toBe(expected);
   });
 
   it("negotiates the gzip envelope and queues binary sends in order", async () => {
@@ -330,7 +345,7 @@ describe("openPhaseSocket", () => {
     expect(ws.close).toHaveBeenCalled();
   });
 
-  it("rejects Full v146 before it can read a deferred counter-cost removal", async () => {
+  it("rejects Full v146 before it can read a physical contest", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
     ws.deliverMessage(helloFrame({ protocol_version: 146 }));
@@ -341,10 +356,21 @@ describe("openPhaseSocket", () => {
     expect(ws.close).toHaveBeenCalled();
   });
 
-  it("accepts the literal Full v147 deferred counter-cost removal and counted-loop protocol", async () => {
+  it("rejects Full v148 before it can read a deferred counter-cost removal", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
-    ws.deliverMessage(helloFrame({ protocol_version: 147 }));
+    ws.deliverMessage(helloFrame({ protocol_version: 148 }));
+
+    await expect(promise).rejects.toMatchObject({
+      kind: "protocol_mismatch",
+    });
+    expect(ws.close).toHaveBeenCalled();
+  });
+
+  it("accepts the literal Full v149 deferred counter-cost removal, physical-contest and counted-loop protocol", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: 149 }));
 
     await expect(promise).resolves.toBeDefined();
     expect(ws.close).not.toHaveBeenCalled();
@@ -360,7 +386,6 @@ describe("openPhaseSocket", () => {
     });
     expect(ws.close).toHaveBeenCalled();
   });
-
   it("rejects Full v140 before it can read a cast-cost exile link", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];

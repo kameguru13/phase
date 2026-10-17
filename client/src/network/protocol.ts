@@ -106,13 +106,17 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
- *  129 — game_setup and state_update carry GameState whose
+ *  131 — game_setup and state_update carry GameState whose
  *       pending_cost_move_resume may hold PendingCostMoveResume
  *       CounterCostRemovalPayment (a counter-removal cost paused on a CR 616.1
  *       replacement choice) and whose mana cost cursor may hold
- *       counter_removal. A v128 peer cannot parse the new tag, so first
+ *       counter_removal. A v130 peer cannot parse the new tag, so first
  *       contact rejects the skew. Bumped in lockstep with full-game protocol
- *       147.
+ *       149.
+ *  129 — game_setup and state_update carry GameState whose waiting_for may be
+ *       WaitingFor::PhysicalContest (Eye to Eye / Mouth to Mouth) and whose
+ *       abilities may hold Effect::PhysicalContest; a v128 peer cannot parse
+ *       either tag. Bumped in lockstep with full-game protocol 147.
  *  128 — game_setup and state_update carry GameState whose loop offers may carry
  *       ConfirmedPeriod counted_by and performance (CR 732.2a). Bumped in
  *       lockstep with full-game protocol 146.
@@ -699,7 +703,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 129 as const;
+export const WIRE_PROTOCOL_VERSION = 131 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {
@@ -720,6 +724,12 @@ export type P2PMessage = P2PAuthorityWire & (
       playerNames?: Record<number, string>;
     } & LegalActionsWire)
   | { type: "action"; senderPlayerId: number; action: GameAction }
+  /** One click in the running Eye to Eye / Mouth to Mouth contest. No `senderPlayerId`
+   *  and no timestamp: the host reads the seat from the authenticated connection and
+   *  stamps the instant on its own clock, so a guest can claim neither. `contest` is
+   *  the engine-authored identity of the contest the click was made in, so a frame
+   *  delayed from an earlier contest is never counted in a later one. */
+  | { type: "contest_click"; contest: number; seq: number }
   | { type: "interaction"; senderPlayerId: number; submission: InteractionSubmission }
   | { type: "preview_mana_payment"; requestId: number; action: GameAction }
   /** Carries the request VERBATIM. No `senderPlayerId`: the host reads the
@@ -818,6 +828,7 @@ const VALID_TYPES = new Set([
   "guest_deck",
   "game_setup",
   "action",
+  "contest_click",
   "interaction",
   "preview_mana_payment",
   "preview_interaction",
