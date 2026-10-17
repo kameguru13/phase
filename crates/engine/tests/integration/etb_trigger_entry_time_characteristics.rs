@@ -20,21 +20,33 @@
 //! Harness, Welcoming Vampire, Miraculous Recovery, library-search resume,
 //! single-candidate hand put, living weapon and departed-token rows fail. The
 //! settle in `drain_pending_continuation` is discriminated only by the
-//! `effects` unit test `resume_boundary_settles_completed_entry`.
+//! `effects` unit test `resume_boundary_settles_completed_entry`. Drop
+//! `drive_to_empty_within`'s postcondition and
+//! `drive_to_empty_refuses_an_unsettled_runner` fails; read liveness by address
+//! in the kind authority and `owner_zone_view_keeps_off_zone_granted_keyword_kind`
+//! fails; read kind-level keywords off the live object by id instead of the
+//! record skeleton and `attack_declaration_record_reads_declaration_time_keyword_kind`
+//! fails.
 
+use engine::game::filter::{
+    matches_target_filter_in_owner_zone, matches_target_filter_on_attack_declaration_record,
+    FilterContext,
+};
 use engine::game::game_object::AttachTarget;
+use engine::game::keywords::has_keyword_kind;
 use engine::game::scenario::GameRunner;
 use engine::game::scenario::{CastOutcome, GameScenario, P0, P1};
 use engine::types::ability::{
-    Effect, PtValue, QuantityExpr, QuantityRef, SubAbilityLink, TargetFilter,
+    Effect, FilterProp, PtValue, QuantityExpr, QuantityRef, SubAbilityLink, TargetFilter,
+    TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
-use engine::types::game_state::WaitingFor;
+use engine::types::game_state::{AttackDeclarationRecord, WaitingFor};
 use engine::types::identifiers::ObjectId;
-use engine::types::keywords::Keyword;
+use engine::types::keywords::{Keyword, KeywordKind};
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
@@ -113,6 +125,13 @@ const PATH_OF_THE_SCHEMER: &str = "Each player mills two cards. Then you put a c
      Will of the Planeswalkers \u{2014} Starting with you, each player votes for planeswalk or \
      chaos. If planeswalk gets more votes, planeswalk. If chaos gets more votes or the vote is \
      tied, chaos ensues.";
+
+/// Snapcaster Mage {1}{U} Creature — Human Wizard 2/1 — verbatim Oracle text.
+const SNAPCASTER_MAGE: &str = "Flash\nWhen this creature enters, target instant or sorcery card \
+     in your graveyard gains flashback until end of turn. The flashback cost is equal to its mana \
+     cost. (You may cast that card from your graveyard for its flashback cost. Then exile it.)";
+/// Divination {2}{U} Sorcery — verbatim Oracle text.
+const DIVINATION: &str = "Draw two cards.";
 
 /// Synthetic (no printed card): a hidden-zone search whose found card enters
 /// inside the resumed continuation, followed by a later counter instruction.
@@ -374,9 +393,21 @@ fn drive_to_empty(
     pick: &[ObjectId],
     branch: Option<&str>,
 ) -> (usize, Vec<String>) {
+    drive_to_empty_within(runner, pick, branch, 40)
+}
+
+/// `drive_to_empty` with an explicit step budget. After the loop it asserts
+/// the settled postcondition (Priority on an empty stack) on the state itself,
+/// so a run that exhausts its budget unsettled fails instead of returning.
+fn drive_to_empty_within(
+    runner: &mut GameRunner,
+    pick: &[ObjectId],
+    branch: Option<&str>,
+    max_steps: usize,
+) -> (usize, Vec<String>) {
     let mut draws = 0;
     let mut prompts = Vec::new();
-    for _ in 0..40 {
+    for _ in 0..max_steps {
         let w = runner.state().waiting_for.clone();
         prompts.push(
             format!("{w:?}")
@@ -423,6 +454,12 @@ fn drive_to_empty(
             .filter(|e| matches!(e, GameEvent::CardDrawn { player_id, .. } if *player_id == P0))
             .count();
     }
+    let state = runner.state();
+    assert!(
+        matches!(state.waiting_for, WaitingFor::Priority { .. }) && state.stack.is_empty(),
+        "drive_to_empty did not reach Priority on an empty stack within {max_steps} steps; \
+         prompts seen: {prompts:?}"
+    );
     (draws, prompts)
 }
 
@@ -910,4 +947,161 @@ fn r13_thwart_the_grave() {
     assert_eq!(outcome.zone_of(maja), Zone::Battlefield);
     assert_eq!(power_of(&outcome, bears), Some(3));
     outcome.assert_hand_drawn(P0, 1);
+}
+
+/// L1/C5: the harness refuses a runner it could not settle. A committed,
+/// unresolved spell leaves Priority with a non-empty stack; with no steps
+/// allowed the loop cannot resolve it, so the postcondition fires.
+#[test]
+#[should_panic(expected = "did not reach Priority on an empty stack")]
+fn drive_to_empty_refuses_an_unsettled_runner() {
+    let mut scenario = board();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Divination", false, DIVINATION)
+        .id();
+    let mut runner = scenario.build();
+    drop(runner.cast(spell).commit());
+    let _ = drive_to_empty_within(&mut runner, &[], None, 0);
+}
+
+/// L1/C5 paired positive: a runner already at Priority on an empty stack has
+/// nothing left to answer, so the postcondition holds with no steps taken.
+#[test]
+fn drive_to_empty_accepts_a_settled_runner() {
+    let mut runner = board().build();
+    assert_eq!(
+        drive_to_empty_within(&mut runner, &[], None, 0),
+        (0, vec![])
+    );
+}
+
+/// B2 (CR 702.34a + CR 109.5 + CR 400.3): Snapcaster Mage's enters trigger gives
+/// Divination in P0's graveyard flashback until end of turn. The owner-zone door
+/// reads "your" as the card's owner; when the card's `controller` field names
+/// another player the door evaluates a rescoped view of the same live card, which
+/// keeps the off-zone grant: `HasKeywordKind(Flashback)` stays true. The Bear was
+/// never targeted and stays false on both paths.
+#[test]
+fn owner_zone_view_keeps_off_zone_granted_keyword_kind() {
+    let mut scenario = board();
+    let snapcaster = scenario
+        .add_creature_to_hand_from_oracle(P0, "Snapcaster Mage", 2, 1, SNAPCASTER_MAGE)
+        .id();
+    let divination = scenario
+        .add_spell_to_graveyard(P0, "Divination", false)
+        .from_oracle_text(DIVINATION)
+        .id();
+    let bear = scenario.add_creature_to_graveyard(P0, "Bear", 2, 2).id();
+    let mut runner = scenario.build();
+    let _ = runner.cast(snapcaster).resolve();
+    for _ in 0..20 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => break,
+            WaitingFor::Priority { .. } => {
+                runner.act(GameAction::PassPriority).expect("pass");
+            }
+            WaitingFor::TargetSelection { .. } | WaitingFor::TriggerTargetSelection { .. } => {
+                runner.choose_first_legal_target().expect("target");
+            }
+            other => panic!("unexpected prompt {other:?}"),
+        }
+    }
+    assert_eq!(
+        runner.state().transient_continuous_effects.len(),
+        1,
+        "reach: Snapcaster Mage's trigger resolved and installed its grant"
+    );
+    assert!(
+        !has_keyword_kind(&runner.state().objects[&divination], KeywordKind::Flashback),
+        "guard: the grant reaches Divination only through the off-zone path"
+    );
+    let flashback =
+        TargetFilter::Typed(
+            TypedFilter::card().properties(vec![FilterProp::HasKeywordKind {
+                value: KeywordKind::Flashback,
+            }]),
+        );
+    let reads = |runner: &GameRunner| {
+        let state = runner.state();
+        let ctx = FilterContext::from_source(state, snapcaster);
+        (
+            matches_target_filter_in_owner_zone(state, divination, &flashback, &ctx),
+            matches_target_filter_in_owner_zone(state, bear, &flashback, &ctx),
+        )
+    };
+    assert_eq!(
+        reads(&runner),
+        (true, false),
+        "fast path: controller == owner"
+    );
+    for id in [divination, bear] {
+        runner.state_mut().objects.get_mut(&id).unwrap().controller = P1;
+    }
+    assert_eq!(
+        reads(&runner),
+        (true, false),
+        "clone path: controller != owner"
+    );
+}
+
+/// B2 (CR 508.1a + CR 608.2i): an attack-declaration record answers kind-level
+/// keyword predicates from its declaration-time snapshot, as `WithKeyword`
+/// already does, not from the live attacker that has since lost flying.
+#[test]
+fn attack_declaration_record_reads_declaration_time_keyword_kind() {
+    let mut scenario = board();
+    let bird = scenario.add_creature(P0, "Bird", 1, 1).id();
+    let mut runner = scenario.build();
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&bird)
+        .unwrap()
+        .keywords
+        .push(Keyword::Flying);
+    let obj = runner.state().objects[&bird].clone();
+    let record = AttackDeclarationRecord {
+        object_id: bird,
+        incarnation: Some(obj.incarnation),
+        lki: obj.snapshot_public_characteristics(),
+        is_token: false,
+        is_commander: false,
+    };
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&bird)
+        .unwrap()
+        .keywords
+        .clear();
+    let state = runner.state();
+    let ctx = FilterContext::from_source(state, bird);
+    let creature_with =
+        |prop: FilterProp| TargetFilter::Typed(TypedFilter::creature().properties(vec![prop]));
+    let reads = |prop: FilterProp| {
+        matches_target_filter_on_attack_declaration_record(
+            state,
+            &record,
+            &creature_with(prop),
+            &ctx,
+        )
+    };
+    assert!(
+        reads(FilterProp::WithKeyword {
+            value: Keyword::Flying
+        }),
+        "positive: the snapshot recorded flying"
+    );
+    assert!(reads(FilterProp::HasKeywordKind {
+        value: KeywordKind::Flying
+    }));
+    assert!(!reads(FilterProp::WithoutKeywordKind {
+        value: KeywordKind::Flying
+    }));
+    assert!(
+        !reads(FilterProp::HasKeywordKind {
+            value: KeywordKind::FirstStrike
+        }),
+        "negative: the attacker never had first strike"
+    );
 }
