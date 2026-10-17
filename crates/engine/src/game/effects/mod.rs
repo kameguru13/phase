@@ -13772,34 +13772,22 @@ fn tail_links_exile(scope: &PendingPlayerScopeTail) -> bool {
 
 /// CR 608.2c: does `tail` read the created referent ("the tokens", "it") that
 /// the preceding player-scope token clause publishes? A node reads it through
-/// its target filter, a `GenericEffect` grant's `affected`, or its condition.
+/// its effect ([`effect_reads_created_referent`]), its condition, or its
+/// `repeat_for` count ([`node_reads_created_referent`]).
 /// The walk stops at the tail's first own created-referent publisher: a later
 /// anaphor names that publisher's product, not the clause's (nearest publisher).
 /// A node that both reads and publishes reads first, so the read check precedes
 /// the publisher stop.
 fn tail_reads_created_referent(tail: &ResolvedAbility) -> bool {
-    let node_reads = |node: &ResolvedAbility| {
-        node.effect
-            .target_filter()
-            .is_some_and(filter_contains_last_created)
-            || matches!(
-                &node.effect,
-                Effect::GenericEffect { static_abilities, .. }
-                    if static_abilities
-                        .iter()
-                        .any(|s| s.affected.as_ref().is_some_and(filter_contains_last_created))
-            )
-            || node
-                .condition
-                .as_ref()
-                .is_some_and(condition_depends_on_last_created)
-    };
     for node in std::iter::successors(Some(tail), |node| node.sub_ability.as_deref()) {
-        if node_reads(node)
-            || node
-                .else_ability
-                .as_deref()
-                .is_some_and(tail_reads_created_referent)
+        if node_reads_created_referent(
+            &node.effect,
+            node.condition.as_ref(),
+            node.repeat_for.as_ref(),
+        ) || node
+            .else_ability
+            .as_deref()
+            .is_some_and(tail_reads_created_referent)
         {
             return true;
         }
@@ -13808,6 +13796,73 @@ fn tail_reads_created_referent(tail: &ResolvedAbility) -> bool {
         }
     }
     false
+}
+
+/// [`tail_reads_created_referent`] over a delayed trigger's payload definition
+/// chain, with the same nearest-publisher stop inside the payload.
+fn definition_reads_created_referent(definition: &AbilityDefinition) -> bool {
+    for node in std::iter::successors(Some(definition), |node| node.sub_ability.as_deref()) {
+        if node_reads_created_referent(
+            &node.effect,
+            node.condition.as_ref(),
+            node.repeat_for.as_ref(),
+        ) || node
+            .else_ability
+            .as_deref()
+            .is_some_and(definition_reads_created_referent)
+        {
+            return true;
+        }
+        if node.effect.publishes_created_referent() {
+            return false;
+        }
+    }
+    false
+}
+
+/// One chain node's reader positions for the created referent: its effect, a
+/// condition over the referent, and a `repeat_for` count over the referent's
+/// population (`quantity_expr_counts_population_matching`).
+fn node_reads_created_referent(
+    effect: &Effect,
+    condition: Option<&AbilityCondition>,
+    repeat_for: Option<&QuantityExpr>,
+) -> bool {
+    effect_reads_created_referent(effect)
+        || condition.is_some_and(condition_depends_on_last_created)
+        || repeat_for.is_some_and(|quantity| {
+            quantity_expr_counts_population_matching(quantity, &filter_contains_last_created)
+        })
+}
+
+/// Whether one effect reads the created referent: through its target filter, a
+/// `GenericEffect` grant's `affected`, a quantity it resolves that counts the
+/// referent's population (`Effect::for_each_quantity_expr`, the exhaustive
+/// quantity authority), or a delayed trigger's payload. CR 603.7c: a delayed
+/// trigger that refers to "those tokens" snapshots them when it is created, in
+/// this resolution, so its payload reads the referent here.
+fn effect_reads_created_referent(effect: &Effect) -> bool {
+    let mut counts_referent = false;
+    effect.for_each_quantity_expr(&mut |quantity| {
+        counts_referent = counts_referent
+            || quantity_expr_counts_population_matching(quantity, &filter_contains_last_created);
+    });
+    counts_referent
+        || effect
+            .target_filter()
+            .is_some_and(filter_contains_last_created)
+        || matches!(
+            effect,
+            Effect::GenericEffect { static_abilities, .. }
+                if static_abilities
+                    .iter()
+                    .any(|s| s.affected.as_ref().is_some_and(filter_contains_last_created))
+        )
+        || matches!(
+            effect,
+            Effect::CreateDelayedTrigger { effect: definition, .. }
+                if definition_reads_created_referent(definition)
+        )
 }
 
 /// CR 400.7 + CR 608.2f: capture only current incarnations exiled by this
@@ -37190,6 +37245,49 @@ mod tests {
             filter: TargetFilter::LastCreated,
         });
         assert!(tail_reads_created_referent(&gated));
+
+        let sacrifice_last_created = || Effect::Sacrifice {
+            target: TargetFilter::LastCreated,
+            count: QuantityExpr::Fixed { value: 1 },
+            min_count: 0,
+        };
+        let delayed = |payload: AbilityDefinition| Effect::CreateDelayedTrigger {
+            condition: DelayedTriggerCondition::AtNextPhase { phase: Phase::End },
+            effect: Box::new(payload),
+            uses_tracked_set: false,
+        };
+        let count_last_created = || QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TargetFilter::LastCreated,
+            },
+        };
+
+        // (vi) "At the beginning of the next end step, sacrifice those tokens":
+        // the delayed trigger snapshots the referent when it is created
+        // (CR 603.7c), so its payload reads it.
+        assert!(tail_reads_created_referent(&node(delayed(
+            AbilityDefinition::new(AbilityKind::Spell, sacrifice_last_created())
+        ))));
+
+        // (vii) Nearest publisher inside the payload: the payload's own creation
+        // names the referent its later anaphor reads.
+        let mut own_payload = AbilityDefinition::new(AbilityKind::Spell, elemental());
+        own_payload.sub_ability = Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            sacrifice_last_created(),
+        )));
+        assert!(!tail_reads_created_referent(&node(delayed(own_payload))));
+
+        // (viii) An effect quantity counting the referent's population reads it.
+        assert!(tail_reads_created_referent(&node(Effect::GainLife {
+            amount: count_last_created(),
+            player: TargetFilter::Controller,
+        })));
+
+        // (ix) A `repeat_for` count over the referent's population reads it.
+        let mut repeated = node(Effect::NoOp);
+        repeated.repeat_for = Some(count_last_created());
+        assert!(tail_reads_created_referent(&repeated));
     }
 
     /// CR 608.2c — a non-choosing per-player reveal introduces no per-iteration

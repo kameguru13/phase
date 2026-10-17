@@ -15,8 +15,9 @@ use engine::game::layers::evaluate_layers;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::zones::{create_object, move_to_zone};
 use engine::types::ability::{
-    ContinuousModification, Duration, Effect, FilterProp, PlayerFilter, PtValue, QuantityExpr,
-    ResolvedAbility, StaticDefinition, TargetFilter, TypedFilter,
+    AbilityDefinition, AbilityKind, ContinuousModification, DelayedTriggerCondition, Duration,
+    Effect, FilterProp, PlayerFilter, PtValue, QuantityExpr, QuantityRef, ResolvedAbility,
+    StaticDefinition, TargetFilter, TargetRef, TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::format::FormatConfig;
@@ -435,6 +436,26 @@ fn war_games_two_pauses_goad_every_seat() {
     assert_eq!(assert_every_token_goaded(state, saga, "Warrior"), 9);
 }
 
+/// A tapped 1/1 white creature token effect named `name` (and of that subtype).
+fn vanilla_token(name: &str, count: i32) -> Effect {
+    Effect::Token {
+        name: name.to_string(),
+        power: PtValue::Fixed(1),
+        toughness: PtValue::Fixed(1),
+        types: vec!["Creature".to_string(), name.to_string()],
+        colors: vec![ManaColor::White],
+        keywords: vec![],
+        tapped: true,
+        count: QuantityExpr::Fixed { value: count },
+        owner: TargetFilter::Controller,
+        attach_to: None,
+        enters_attacking: false,
+        supertypes: vec![],
+        static_abilities: vec![],
+        enter_with_counters: vec![],
+    }
+}
+
 /// V8 — attribution window: a token an EARLIER clause of the same source
 /// created is not one of "the tokens" of the player-scoped clause.
 #[test]
@@ -447,22 +468,7 @@ fn union_excludes_a_prior_clause_of_the_same_source() {
         "Union source".to_string(),
         Zone::Battlefield,
     );
-    let token = |name: &str| Effect::Token {
-        name: name.to_string(),
-        power: PtValue::Fixed(1),
-        toughness: PtValue::Fixed(1),
-        types: vec!["Creature".to_string(), name.to_string()],
-        colors: vec![ManaColor::White],
-        keywords: vec![],
-        tapped: true,
-        count: QuantityExpr::Fixed { value: 1 },
-        owner: TargetFilter::Controller,
-        attach_to: None,
-        enters_attacking: false,
-        supertypes: vec![],
-        static_abilities: vec![],
-        enter_with_counters: vec![],
-    };
+    let token = |name: &str| vanilla_token(name, 1);
     // The War Games tail shape, as the parser lowers "The tokens are goaded …".
     let goad = ResolvedAbility::new(
         Effect::GenericEffect {
@@ -578,4 +584,131 @@ fn tempt_with_vengeance_both_opponents_accept_keeps_its_count() {
 #[test]
 fn tempt_with_vengeance_one_opponent_accepts_keeps_its_count() {
     assert_eq!(tempt_with_vengeance(&|player| player == P1), [4, 2, 0]);
+}
+
+/// V16 / V17 / V18 — the paused route for a tail whose only reader is a
+/// delayed trigger's payload, a counted effect quantity, or a counted
+/// `repeat_for`. "Each player creates three … tokens"
+/// (constructed: no printed card carries these tails) pauses on P1 (Halving
+/// Season and Parallel Lives both apply, CR 616.1); `tail` must still read every
+/// seat's tokens once P1 answers Parallel Lives first (P0 3, P1 3, P2 1).
+fn paused_constructed_fan_out(
+    tail: Effect,
+    repeat_for: Option<QuantityExpr>,
+) -> (GameRunner, ObjectId) {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_enchantment_from_oracle(P0, "Halving Season", HALVING_SEASON);
+    scenario.add_enchantment_from_oracle(P1, "Parallel Lives", PARALLEL_LIVES);
+    let mut runner = scenario.build();
+    let source = create_object(
+        runner.state_mut(),
+        CardId(900),
+        P0,
+        "Union source".to_string(),
+        Zone::Battlefield,
+    );
+    let mut warriors = ResolvedAbility::new(vanilla_token("Warrior", 3), vec![], source, P0);
+    warriors.player_scope = Some(PlayerFilter::All);
+    let mut tail = ResolvedAbility::new(tail, vec![], source, P0);
+    tail.repeat_for = repeat_for;
+    warriors.sub_ability = Some(Box::new(tail));
+
+    resolve_ability_chain(runner.state_mut(), &warriors, &mut Vec::new(), 0)
+        .expect("chain resolves");
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice { player, .. } if player == P1
+        ),
+        "reach guard: the fan-out pauses on P1 (CR 616.1)"
+    );
+    assert_eq!(
+        tokens(runner.state(), P0, "Warrior").len(),
+        3,
+        "reach guard: P0's leg completed before the pause"
+    );
+    let prompted = drive(&mut runner, &mut |_, _| First::ParallelLives, &no_optional);
+    assert_eq!(prompted, vec![P1]);
+    let state = runner.state();
+    assert_eq!(tokens(state, P0, "Warrior").len(), 3);
+    assert_eq!(tokens(state, P1, "Warrior").len(), 3);
+    assert_eq!(tokens(state, P2, "Warrior").len(), 1);
+    (runner, source)
+}
+
+/// V16 — "At the beginning of the next end step, sacrifice those tokens": the
+/// delayed trigger snapshots "those tokens" when it is created (CR 603.7c), so
+/// on the paused route it must snapshot every seat's Warriors, not P2's alone.
+#[test]
+fn paused_fan_out_delayed_trigger_snapshots_every_seats_tokens() {
+    let tail = Effect::CreateDelayedTrigger {
+        condition: DelayedTriggerCondition::AtNextPhase { phase: Phase::End },
+        effect: Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Sacrifice {
+                target: TargetFilter::LastCreated,
+                count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
+            },
+        )),
+        uses_tracked_set: false,
+    };
+    let (runner, source) = paused_constructed_fan_out(tail, None);
+    let state = runner.state();
+    let delayed: Vec<_> = state
+        .delayed_triggers
+        .iter()
+        .filter(|trigger| trigger.source_id == source)
+        .collect();
+    assert_eq!(delayed.len(), 1, "the delayed trigger was created");
+    let snapshot: BTreeSet<ObjectId> = delayed[0]
+        .ability
+        .targets
+        .iter()
+        .filter_map(|target| match target {
+            TargetRef::Object(id) => Some(*id),
+            TargetRef::Player(_) => None,
+        })
+        .collect();
+    let every_warrior: BTreeSet<ObjectId> = all_tokens(state, "Warrior").into_iter().collect();
+    assert_eq!(every_warrior.len(), 7);
+    assert_eq!(snapshot, every_warrior, "\"those tokens\" are every seat's");
+}
+
+/// V17 — "You gain 1 life for each of those tokens": an effect quantity counting
+/// the created referent's population reads every seat's tokens on the paused
+/// route.
+#[test]
+fn paused_fan_out_counted_quantity_reads_every_seats_tokens() {
+    let tail = Effect::GainLife {
+        amount: count_warriors_created(),
+        player: TargetFilter::Controller,
+    };
+    let starting = GameScenario::new_n_player(3, 42).build().state().players[0].life;
+    let (runner, _) = paused_constructed_fan_out(tail, None);
+    assert_eq!(runner.state().players[0].life, starting + 7);
+}
+
+/// V18 — "For each of those tokens, you gain 1 life": a `repeat_for` count over
+/// the created referent's population reads every seat's tokens on the paused
+/// route.
+#[test]
+fn paused_fan_out_repeat_count_reads_every_seats_tokens() {
+    let tail = Effect::GainLife {
+        amount: QuantityExpr::Fixed { value: 1 },
+        player: TargetFilter::Controller,
+    };
+    let starting = GameScenario::new_n_player(3, 42).build().state().players[0].life;
+    let (runner, _) = paused_constructed_fan_out(tail, Some(count_warriors_created()));
+    assert_eq!(runner.state().players[0].life, starting + 7);
+}
+
+/// The number of tokens in the created referent ("those tokens").
+fn count_warriors_created() -> QuantityExpr {
+    QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCount {
+            filter: TargetFilter::LastCreated,
+        },
+    }
 }
