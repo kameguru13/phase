@@ -1012,7 +1012,7 @@ fn pentad_prism_fixed_counter_cost_is_owned_by_its_mana_activation() {
 /// are creatures with a +1/+1 counter, so Experiment Kraj has both of their
 /// counter-cost abilities. Kraj activates Ooze Flux's (3 counters from among
 /// First and Second), then, while paying its {1}{G}, activates Battery's mana
-/// ability (CR 201.5b: "this artifact" is Kraj, which loses 2 charge counters).
+/// ability (CR 201.5b + CR 700.7: "this artifact" is Kraj, which loses 2 charge counters).
 /// Each reads its own count: {B}{B}{B}, then one 3/3 Ooze.
 #[test]
 fn kraj_nested_same_source_counter_cost_mana_payment_keeps_each_count() {
