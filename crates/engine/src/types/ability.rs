@@ -25265,6 +25265,7 @@ impl Effect {
             | Effect::PayCost { .. }
             | Effect::PhaseIn { .. }
             | Effect::PhaseOut { .. }
+            | Effect::PhysicalContest { .. }
             | Effect::Planeswalk
             | Effect::PreventDamage { .. }
             | Effect::ProcessRadCounters
