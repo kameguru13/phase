@@ -13839,8 +13839,10 @@ fn node_reads_created_referent(
 /// `GenericEffect` grant's `affected`, a quantity it resolves that counts the
 /// referent's population (`Effect::for_each_quantity_expr`, the exhaustive
 /// quantity authority), or a delayed trigger's payload. CR 603.7c: a delayed
-/// trigger that refers to "those tokens" snapshots them when it is created, in
-/// this resolution, so its payload reads the referent here.
+/// trigger that refers to "those tokens" affects the objects fixed when it is
+/// created, in this resolution (`delayed_trigger::resolve` snapshots a payload
+/// whose root target is `LastCreated`); a payload that reads the referent
+/// elsewhere is evaluated against the ledger when the trigger resolves.
 fn effect_reads_created_referent(effect: &Effect) -> bool {
     let mut counts_referent = false;
     effect.for_each_quantity_expr(&mut |quantity| {
