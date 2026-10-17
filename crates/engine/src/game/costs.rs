@@ -763,8 +763,9 @@ pub(crate) enum CounterCostRemovalProgress {
 }
 
 /// CR 602.2b + CR 118.11: credit `removed` counters to an activation's own
-/// removed-counter count. A credited zero still reads `Some(0)`, distinct from
-/// "this payment removed no counters as a cost" (`None`, CR 107.1c).
+/// removed-counter count. A credited zero still reads `Some(0)` (a counter cost
+/// that removed none; CR 107.1c lets an "any number" cost choose zero), distinct
+/// from `None` (no counter removal of this payment has completed).
 pub(crate) fn credit_cost_removed_counters(ledger: &mut Option<u32>, removed: u32) {
     let total = ledger.get_or_insert(0);
     *total = total.saturating_add(removed);
@@ -1916,7 +1917,10 @@ fn pay_ability_cost_inner(
                         });
                     }
                     // CR 118.12: a resolution-time payment keeps no root and no
-                    // count; the replacement pipeline owns the paused removal.
+                    // count; the replacement pipeline owns the paused removal, and
+                    // the cost's later planned removals are not made (an accepted
+                    // resolution-scope gap: no printed card has a RemoveCounter
+                    // replacement).
                     PaymentScope::Resolution { .. } => {}
                 },
             }
