@@ -1392,6 +1392,12 @@ pub(crate) struct ConditionContext {
     /// "You"/"your" in that ability mean this player, so the whose-turn leaves
     /// (`DuringYourTurn`, `DuringOpponentsTurn`) and `IsPresent` read it in
     /// preference to the source object's controller. `None` everywhere else.
+    /// The CR 614.12 entry pin (`pin_entry_population_conditions`) binds it to
+    /// the carrier's "you": the source's scratch controller for a printed or
+    /// copied static, and the effect's controller for a transient (CR 109.5).
+    /// For a transient whose source has since changed controllers this
+    /// deliberately differs from the live pass, whose `IsPresent` reads the
+    /// source's current controller through `FilterContext::from_source`.
     pub ability_holder: Option<PlayerId>,
 }
 
@@ -1583,6 +1589,242 @@ fn condition_controller(
             .objects
             .get(&source_id)
             .map_or(controller, |source| source.controller)
+    }
+}
+
+/// The single constructor for a pinned condition leaf: `StaticCondition::None`
+/// (evaluated true) for a true pin, `Not { None }` for a false one. Scratch-local
+/// constant truth, written only into a CR 614.12 projection's scratch state by
+/// [`pin_entry_population_conditions`]; never serialized or observed outside the
+/// projection, so no dedicated variant exists for it.
+fn pinned_static_condition(truth: bool) -> StaticCondition {
+    if truth {
+        StaticCondition::None
+    } else {
+        StaticCondition::Not {
+            condition: Box::new(StaticCondition::None),
+        }
+    }
+}
+
+/// Rewrite every leaf of `condition` that `pin_leaf` pins (`Some(truth)`) into
+/// its constant truth, recursing through `And` / `Or` / `Not`. Copy-on-write:
+/// `None` when no leaf pinned, so the caller leaves the original untouched.
+fn pin_population_leaves(
+    condition: &StaticCondition,
+    pin_leaf: &impl Fn(&StaticCondition) -> Option<bool>,
+) -> Option<StaticCondition> {
+    match condition {
+        StaticCondition::And { conditions } => pin_population_children(conditions, pin_leaf)
+            .map(|conditions| StaticCondition::And { conditions }),
+        StaticCondition::Or { conditions } => pin_population_children(conditions, pin_leaf)
+            .map(|conditions| StaticCondition::Or { conditions }),
+        StaticCondition::Not { condition } => {
+            pin_population_leaves(condition, pin_leaf).map(|condition| StaticCondition::Not {
+                condition: Box::new(condition),
+            })
+        }
+        leaf => pin_leaf(leaf).map(pinned_static_condition),
+    }
+}
+
+/// [`pin_population_leaves`] over a combinator's operands: `None` when no
+/// operand pinned, otherwise every operand with the pinned ones rewritten.
+fn pin_population_children(
+    conditions: &[StaticCondition],
+    pin_leaf: &impl Fn(&StaticCondition) -> Option<bool>,
+) -> Option<Vec<StaticCondition>> {
+    let rewritten: Vec<Option<StaticCondition>> = conditions
+        .iter()
+        .map(|condition| pin_population_leaves(condition, pin_leaf))
+        .collect();
+    if rewritten.iter().all(Option::is_none) {
+        return None;
+    }
+    Some(
+        conditions
+            .iter()
+            .zip(rewritten)
+            .map(|(original, pinned)| pinned.unwrap_or_else(|| original.clone()))
+            .collect(),
+    )
+}
+
+/// The condition rewrites for one static definition list, as
+/// `(index, rewritten condition)`; empty when nothing pins. Every carrier the
+/// CR 614.12 pin covers computes its rewrites here, and writes them only when
+/// the list is non-empty, so an untouched list keeps its shared `Arc`.
+fn pinned_definition_conditions(
+    defs: &[StaticDefinition],
+    pin_leaf: &impl Fn(&StaticCondition) -> Option<bool>,
+) -> Vec<(usize, StaticCondition)> {
+    defs.iter()
+        .enumerate()
+        .filter_map(|(index, def)| {
+            def.condition
+                .as_ref()
+                .and_then(|condition| pin_population_leaves(condition, pin_leaf))
+                .map(|condition| (index, condition))
+        })
+        .collect()
+}
+
+/// Write `rewrites` (from [`pinned_definition_conditions`]) into `defs`.
+fn write_pinned_conditions(defs: &mut [StaticDefinition], rewrites: Vec<(usize, StaticCondition)>) {
+    for (index, condition) in rewrites {
+        if let Some(def) = defs.get_mut(index) {
+            def.condition = Some(condition);
+        }
+    }
+}
+
+/// CR 614.12 + CR 700.5: the pinned truth of one condition leaf, or `None`
+/// when the leaf does not pin. A leaf pins when it counts the battlefield
+/// population, or reads membership of the entrant's origin zone, and does not
+/// read the recipient (a recipient-relative leaf is answered per recipient by
+/// the scratch pass itself). Its truth is read on `pre_entry` with
+/// `controller` as "you" (CR 109.5).
+fn pinned_leaf_truth(
+    pre_entry: &GameState,
+    leaf: &StaticCondition,
+    origin: Option<Zone>,
+    controller: PlayerId,
+    source_id: ObjectId,
+) -> Option<bool> {
+    let pins = !condition_uses_recipient_context(leaf)
+        && (static_condition_uses_object_population(leaf)
+            || origin.is_some_and(|zone| static_condition_reads_zone_membership(leaf, zone)));
+    pins.then(|| {
+        evaluate_condition_with_context(
+            pre_entry,
+            leaf,
+            controller,
+            source_id,
+            ConditionContext::ability_holder(controller),
+        )
+    })
+}
+
+/// CR 614.12 + CR 700.5 + CR 109.5 + CR 613.1a + CR 707.2: pin the
+/// population-reading condition leaves of everything a CR 614.12 projection's
+/// scratch layer pass can apply to their truth in `pre_entry`, the state before
+/// the entry event. CR 614.12 checks the permanent as it would exist on the
+/// battlefield, with its own statics and the continuous effects that already
+/// exist, but the population those conditions count is the one replacement
+/// effects are considered against: before the entrant is on the battlefield
+/// (Heliod, Sun-Crowned ruling 2020-01-24: "the mana symbols in its mana cost
+/// won't be counted"). With `origin`, leaves reading membership of the zone the
+/// entrant leaves pin too.
+///
+/// Carriers, each with the "you" the scratch pass would use for it:
+/// - the static definitions of every object in `scratch.objects`, in both
+///   `base_static_definitions` (what the battlefield reseed copies) and
+///   `static_definitions` (what effect generation reads, including for
+///   command-zone and other off-battlefield sources), with the object's scratch
+///   controller (for the entrant, the controller it enters under, CR 110.2a);
+/// - the static definitions latched in a transient's layer-1
+///   `ContinuousModification::CopyValues` payload, with the copy recipient as
+///   source and its scratch controller as "you": layer 1 installs the payload
+///   as the recipient's statics (CR 707.2 + CR 613.1a); a payload with no single
+///   bound recipient is left unpinned;
+/// - every transient's own condition, with the effect's controller (CR 109.5).
+///
+/// Reads `pre_entry` as-is: it relies on resolution having flushed layers before
+/// each sub-ability, so `pre_entry`'s derived characteristics are current.
+/// Only `scratch` is written; every write is copy-on-write and made only when a
+/// leaf pins.
+pub(crate) fn pin_entry_population_conditions(
+    scratch: &mut GameState,
+    pre_entry: &GameState,
+    origin: Option<Zone>,
+) {
+    type Rewrites = Vec<(usize, StaticCondition)>;
+
+    let object_rewrites: Vec<(ObjectId, Rewrites, Rewrites)> = scratch
+        .objects
+        .iter()
+        .filter_map(|(&id, obj)| {
+            let controller = obj.controller;
+            let pin_leaf =
+                |leaf: &StaticCondition| pinned_leaf_truth(pre_entry, leaf, origin, controller, id);
+            let base = pinned_definition_conditions(&obj.base_static_definitions, &pin_leaf);
+            let live = pinned_definition_conditions(obj.static_definitions.as_slice(), &pin_leaf);
+            (!base.is_empty() || !live.is_empty()).then_some((id, base, live))
+        })
+        .collect();
+    for (id, base, live) in object_rewrites {
+        let Some(obj) = scratch.objects.get_mut(&id) else {
+            continue;
+        };
+        if !base.is_empty() {
+            write_pinned_conditions(
+                Arc::make_mut(&mut obj.base_static_definitions).as_mut_slice(),
+                base,
+            );
+        }
+        for (index, condition) in live {
+            if let Some(def) = obj.static_definitions.get_mut(index) {
+                def.condition = Some(condition);
+            }
+        }
+    }
+
+    let mut condition_rewrites: Vec<(usize, StaticCondition)> = Vec::new();
+    let mut payload_rewrites: Vec<(usize, usize, Rewrites)> = Vec::new();
+    for (tce_index, tce) in scratch.transient_continuous_effects.iter().enumerate() {
+        if let Some(condition) = tce.condition.as_ref().and_then(|condition| {
+            pin_population_leaves(condition, &|leaf: &StaticCondition| {
+                pinned_leaf_truth(pre_entry, leaf, origin, tce.controller, tce.source_id)
+            })
+        }) {
+            condition_rewrites.push((tce_index, condition));
+        }
+        let recipient = tce
+            .affected_recipient
+            .map(|recipient| recipient.object_id)
+            .or(match &tce.affected {
+                TargetFilter::SpecificObject { id } => Some(*id),
+                _ => None,
+            });
+        let Some((recipient, recipient_controller)) = recipient.and_then(|recipient| {
+            scratch
+                .objects
+                .get(&recipient)
+                .map(|obj| (recipient, obj.controller))
+        }) else {
+            continue;
+        };
+        for (modification_index, modification) in tce.modifications.iter().enumerate() {
+            let ContinuousModification::CopyValues { values, .. } = modification else {
+                continue;
+            };
+            let rewrites = pinned_definition_conditions(
+                &values.static_definitions,
+                &|leaf: &StaticCondition| {
+                    pinned_leaf_truth(pre_entry, leaf, origin, recipient_controller, recipient)
+                },
+            );
+            if !rewrites.is_empty() {
+                payload_rewrites.push((tce_index, modification_index, rewrites));
+            }
+        }
+    }
+    for (tce_index, condition) in condition_rewrites {
+        if let Some(tce) = scratch.transient_continuous_effects.get_mut(tce_index) {
+            tce.condition = Some(condition);
+        }
+    }
+    for (tce_index, modification_index, rewrites) in payload_rewrites {
+        if let Some(ContinuousModification::CopyValues { values, .. }) = scratch
+            .transient_continuous_effects
+            .get_mut(tce_index)
+            .and_then(|tce| tce.modifications.get_mut(modification_index))
+        {
+            write_pinned_conditions(
+                Arc::make_mut(&mut values.static_definitions).as_mut_slice(),
+                rewrites,
+            );
+        }
     }
 }
 
@@ -12442,6 +12684,254 @@ mod tests {
         state.active_player = PlayerId(1);
         assert!(eval(&state, &StaticCondition::DuringYourTurn, holder));
         assert!(!eval(&state, &StaticCondition::DuringOpponentsTurn, holder));
+    }
+
+    /// CR 614.12 + CR 700.5 + CR 109.5 + CR 613.1a + CR 707.2: the entry pin
+    /// rewrites population- and origin-zone-reading leaves of every carrier in the
+    /// scratch to their truth in the pre-entry state, with each carrier's "you",
+    /// and leaves everything else (and every untouched `Arc`) alone. The scratch
+    /// differs from the pre-entry state (P0 gains a creature and white devotion),
+    /// so a pin read off the scratch would give the other answer.
+    #[test]
+    fn pin_entry_population_conditions_cases() {
+        fn object(state: &mut GameState, owner: PlayerId, name: &str, zone: Zone) -> ObjectId {
+            create_object(state, CardId(0), owner, name.to_string(), zone)
+        }
+        fn carry(state: &mut GameState, id: ObjectId, defs: Vec<StaticDefinition>) {
+            let obj = state.objects.get_mut(&id).unwrap();
+            for def in &defs {
+                obj.static_definitions.push(def.clone());
+            }
+            obj.base_static_definitions = Arc::new(defs);
+        }
+        fn pinned(truth: bool) -> StaticCondition {
+            pinned_static_condition(truth)
+        }
+        let you_control_a_creature = || StaticCondition::IsPresent {
+            filter: Some(TargetFilter::Typed(
+                TypedFilter::creature().controller(ControllerRef::You),
+            )),
+        };
+        let continuous = |condition: StaticCondition| {
+            StaticDefinition::continuous()
+                .affected(TargetFilter::SelfRef)
+                .condition(condition)
+        };
+        let graveyard_size_at_least_one = StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::GraveyardSize {
+                    player: PlayerScope::Controller,
+                },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        };
+
+        let mut pre_entry = setup();
+        // P0: devotion to white 2, no creature, one graveyard card. P1: a creature.
+        let anchor = object(&mut pre_entry, P0, "WW Anchor", Zone::Battlefield);
+        pre_entry.objects.get_mut(&anchor).unwrap().mana_cost = ManaCost::Cost {
+            generic: 0,
+            shards: vec![ManaCostShard::White; 2],
+        };
+        make_creature(&mut pre_entry, "P1 Bear", 2, 2, P1);
+
+        // (a) Not(DevotionGE) on a battlefield static.
+        let a = object(&mut pre_entry, P0, "Devotion Carrier", Zone::Battlefield);
+        carry(
+            &mut pre_entry,
+            a,
+            vec![continuous(StaticCondition::Not {
+                condition: Box::new(StaticCondition::DevotionGE {
+                    colors: vec![ManaColor::White],
+                    threshold: 5,
+                }),
+            })],
+        );
+        // (b) And[DuringYourTurn, IsPresent]: only the IsPresent child pins.
+        let b = object(&mut pre_entry, P0, "Compound Carrier", Zone::Battlefield);
+        carry(
+            &mut pre_entry,
+            b,
+            vec![continuous(StaticCondition::And {
+                conditions: vec![StaticCondition::DuringYourTurn, you_control_a_creature()],
+            })],
+        );
+        // (c) a recipient-context leaf and a non-population leaf stay untouched.
+        let c = object(&mut pre_entry, P0, "Untouched Carrier", Zone::Battlefield);
+        carry(
+            &mut pre_entry,
+            c,
+            vec![
+                continuous(StaticCondition::RecipientMatchesFilter {
+                    filter: TargetFilter::Typed(TypedFilter::creature()),
+                }),
+                continuous(StaticCondition::SourceIsTapped),
+            ],
+        );
+        // (d) a graveyard-count leaf (not an object census).
+        let d = object(
+            &mut pre_entry,
+            P0,
+            "Graveyard Count Carrier",
+            Zone::Battlefield,
+        );
+        carry(
+            &mut pre_entry,
+            d,
+            vec![continuous(graveyard_size_at_least_one.clone())],
+        );
+        // (f) a command-zone emblem carrier.
+        let emblem = object(&mut pre_entry, P0, "Emblem", Zone::Command);
+        pre_entry.objects.get_mut(&emblem).unwrap().is_emblem = true;
+        carry(
+            &mut pre_entry,
+            emblem,
+            vec![continuous(you_control_a_creature())],
+        );
+        // (g) a graveyard carrier whose static functions there.
+        let graveyard_carrier = object(&mut pre_entry, P0, "Graveyard Carrier", Zone::Graveyard);
+        let mut graveyard_static = continuous(you_control_a_creature());
+        graveyard_static.active_zones = vec![Zone::Graveyard];
+        carry(&mut pre_entry, graveyard_carrier, vec![graveyard_static]);
+        // (e) a transient whose controller (P1) differs from its source's (P0).
+        let transient_condition = pre_entry
+            .add_transient_continuous_effect(
+                a,
+                P1,
+                Duration::Permanent,
+                TargetFilter::Typed(TypedFilter::creature()),
+                vec![ContinuousModification::AddPower { value: 1 }],
+                Some(you_control_a_creature()),
+            )
+            .expect("the transient begins");
+        // (h) a P1-controlled layer-1 copy effect whose recipient P0 controls.
+        let donor = object(&mut pre_entry, P1, "Donor", Zone::Battlefield);
+        carry(
+            &mut pre_entry,
+            donor,
+            vec![continuous(you_control_a_creature())],
+        );
+        let copier = object(&mut pre_entry, P0, "Copier", Zone::Battlefield);
+        let values =
+            crate::game::printed_cards::intrinsic_copiable_values(&pre_entry.objects[&donor]);
+        let transient_copy = pre_entry
+            .add_transient_continuous_effect(
+                donor,
+                P1,
+                Duration::Permanent,
+                TargetFilter::SpecificObject { id: copier },
+                vec![ContinuousModification::CopyValues {
+                    values: Box::new(values),
+                    display_source: crate::game::game_object::DisplaySource::Card,
+                    printed_ref: None,
+                    token_image_ref: None,
+                    token_art: None,
+                }],
+                None,
+            )
+            .expect("the copy effect begins");
+
+        let scratch_of = |pre_entry: &GameState| {
+            let mut scratch = pre_entry.clone();
+            make_creature(&mut scratch, "Scratch Bear", 2, 2, P0);
+            let extra = object(&mut scratch, P0, "Scratch WWWW", Zone::Battlefield);
+            scratch.objects.get_mut(&extra).unwrap().mana_cost = ManaCost::Cost {
+                generic: 0,
+                shards: vec![ManaCostShard::White; 4],
+            };
+            scratch
+        };
+        let mut scratch = scratch_of(&pre_entry);
+        pin_entry_population_conditions(&mut scratch, &pre_entry, Some(Zone::Graveyard));
+
+        let conditions = |state: &GameState, id: ObjectId| {
+            let obj = &state.objects[&id];
+            (
+                obj.base_static_definitions
+                    .iter()
+                    .map(|def| def.condition.clone())
+                    .collect::<Vec<_>>(),
+                obj.static_definitions
+                    .iter_all()
+                    .map(|def| def.condition.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let both =
+            |condition: StaticCondition| (vec![Some(condition.clone())], vec![Some(condition)]);
+
+        // (a) P0's pre-entry devotion is 2: the leaf pins false in both fields.
+        assert_eq!(
+            conditions(&scratch, a),
+            both(StaticCondition::Not {
+                condition: Box::new(pinned(false)),
+            })
+        );
+        // (b) only the population child pins (P0 controlled no creature).
+        assert_eq!(
+            conditions(&scratch, b),
+            both(StaticCondition::And {
+                conditions: vec![StaticCondition::DuringYourTurn, pinned(false)],
+            })
+        );
+        // (c) untouched, and neither list was copied.
+        assert_eq!(conditions(&scratch, c), conditions(&pre_entry, c));
+        assert!(Arc::ptr_eq(
+            &scratch.objects[&c].base_static_definitions,
+            &pre_entry.objects[&c].base_static_definitions
+        ));
+        assert!(Arc::ptr_eq(
+            &scratch.objects[&c].static_definitions.0,
+            &pre_entry.objects[&c].static_definitions.0
+        ));
+        // (d) origin = graveyard: P0's pre-entry graveyard holds one card.
+        assert_eq!(conditions(&scratch, d), both(pinned(true)));
+        // (f) the emblem's condition pins in both fields.
+        assert_eq!(conditions(&scratch, emblem), both(pinned(false)));
+        // (g) the graveyard carrier's live statics pin.
+        assert_eq!(
+            conditions(&scratch, graveyard_carrier).1,
+            vec![Some(pinned(false))]
+        );
+        // (e) the transient's condition pins with its own controller, P1.
+        let transient = |state: &GameState, id: u64| {
+            state
+                .transient_continuous_effects
+                .iter()
+                .find(|tce| tce.id == id)
+                .cloned()
+                .expect("transient present")
+        };
+        assert_eq!(
+            transient(&scratch, transient_condition).condition,
+            Some(pinned(true))
+        );
+        // (h) the copy payload's static pins with the recipient's controller (P0, no
+        // creature before entry), not the copy effect's (P1); the effect's own
+        // absent condition stays absent.
+        let copy = transient(&scratch, transient_copy);
+        assert_eq!(copy.condition, None);
+        match copy.modifications.as_slice() {
+            [ContinuousModification::CopyValues { values, .. }] => assert_eq!(
+                values
+                    .static_definitions
+                    .iter()
+                    .map(|def| def.condition.clone())
+                    .collect::<Vec<_>>(),
+                vec![Some(pinned(false))]
+            ),
+            other => panic!("premise: one CopyValues modification, got {other:?}"),
+        }
+
+        // (d) origin = hand: the graveyard-count leaf does not pin.
+        let mut scratch = scratch_of(&pre_entry);
+        pin_entry_population_conditions(&mut scratch, &pre_entry, Some(Zone::Hand));
+        assert_eq!(conditions(&scratch, d), both(graveyard_size_at_least_one));
+        assert!(Arc::ptr_eq(
+            &scratch.objects[&d].base_static_definitions,
+            &pre_entry.objects[&d].base_static_definitions
+        ));
     }
 
     #[test]

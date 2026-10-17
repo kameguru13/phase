@@ -87779,27 +87779,139 @@ fn put_counter_if_its_a_type_stays_later_instruction() {
     );
 }
 
-/// CR 614.1c (V-L4): a multi-type anaphoric gate ("if it's an artifact or
-/// creature") is not a single-type entry gate the converter represents, so the
-/// rider is not folded into the entry and stays visible.
+/// CR 614.1c + CR 614.12 (V-L4): a multi-type anaphoric gate ("if it's an
+/// artifact or creature") folds into the entry as an any-of type gate, so the
+/// counters are part of the entry and no later instruction survives.
 #[test]
-fn multi_type_entry_rider_is_not_folded() {
+fn multi_type_entry_rider_folds_into_any_of_gate() {
     let def = parse_effect_chain(
         "Return target creature card from your graveyard to the battlefield. \
          It enters with two additional +1/+1 counters on it if it's an artifact or creature.",
         AbilityKind::Spell,
     );
-    assert!(battlefield_move_entry_gate(&def).is_empty(), "{def:#?}");
-    let sub = def
-        .sub_ability
-        .as_ref()
-        .expect("the unconverted rider stays a sub-ability");
+    assert_eq!(
+        battlefield_move_entry_gate(&def),
+        typed_entry_gate(
+            TypeFilter::AnyOf(vec![TypeFilter::Artifact, TypeFilter::Creature]),
+            2
+        )
+        .as_slice(),
+        "{def:#?}"
+    );
     assert!(
-        !matches!(
-            sub.condition,
-            Some(AbilityCondition::ZoneChangedThisWay { .. })
-        ),
-        "{sub:#?}"
+        def.sub_ability.is_none(),
+        "the rider must be folded: {def:#?}"
+    );
+}
+
+/// CR 614.1c + CR 614.12 (V19b): the parse audit treats a folded multi-type
+/// anaphoric rider as represented. Synthetic What Must Be Done with Release Juno's
+/// rider widened to "if it's an artifact or creature" folds the rider into the
+/// battlefield move's any-of entry gate, so no clause is reported swallowed. A
+/// filter-less pronoun rider in the same unit ("If it enters this way, draw a
+/// card.") is not represented and stays reported as `Condition_If`. Verbatim What
+/// Must Be Done (single type) is the positive control.
+#[test]
+fn multi_type_entry_rider_is_represented_not_swallowed() {
+    /// Synthetic: What Must Be Done with Release Juno's rider widened to two types.
+    const MULTI_TYPE_RELEASE_JUNO: &str = "Choose one \u{2014}\n\
+         \u{2022} Let the World Burn \u{2014} Destroy all artifacts and creatures.\n\
+         \u{2022} Release Juno \u{2014} Return target historic permanent card from your graveyard \
+         to the battlefield. It enters with two additional +1/+1 counters on it if it's an artifact \
+         or creature.";
+    /// What Must Be Done {3}{W}{W} Sorcery — verbatim Oracle text.
+    const WHAT_MUST_BE_DONE: &str = "Choose one \u{2014}\n\
+         \u{2022} Let the World Burn \u{2014} Destroy all artifacts and creatures.\n\
+         \u{2022} Release Juno \u{2014} Return target historic permanent card from your graveyard \
+         to the battlefield. It enters with two additional +1/+1 counters on it if it's a creature. \
+         (Artifacts, legendaries, and Sagas are historic.)";
+    let parse = |text: &str| {
+        parse_oracle_text(
+            text,
+            "What Must Be Done",
+            &[],
+            &["Sorcery".to_string()],
+            &[],
+        )
+    };
+    let swallowed = |result: &ParsedAbilities| -> Vec<String> {
+        result
+            .parse_warnings
+            .iter()
+            .filter_map(|warning| match warning {
+                OracleDiagnostic::SwallowedClause { detector, .. } => Some(detector.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let release_juno = |result: &ParsedAbilities| -> AbilityDefinition {
+        result
+            .abilities
+            .iter()
+            .find(|ability| {
+                matches!(
+                    ability.effect.as_ref(),
+                    Effect::ChangeZone {
+                        destination: Zone::Battlefield,
+                        ..
+                    }
+                )
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("Release Juno mode must parse: {:#?}", result.abilities))
+    };
+    let any_of_gate = typed_entry_gate(
+        TypeFilter::AnyOf(vec![TypeFilter::Artifact, TypeFilter::Creature]),
+        2,
+    );
+
+    // (i) The folded multi-type rider is represented: nothing is swallowed.
+    let result = parse(MULTI_TYPE_RELEASE_JUNO);
+    let mode = release_juno(&result);
+    assert_eq!(
+        battlefield_move_entry_gate(&mode),
+        any_of_gate.as_slice(),
+        "reach: the rider opens the entry-gate slot: {mode:#?}"
+    );
+    assert!(
+        mode.sub_ability.is_none(),
+        "the rider must be folded: {mode:#?}"
+    );
+    assert_eq!(
+        swallowed(&result),
+        Vec::<String>::new(),
+        "{:?}",
+        result.parse_warnings
+    );
+
+    // (ii) A pronoun rider sharing the unit stays visible.
+    let result = parse(&format!(
+        "{MULTI_TYPE_RELEASE_JUNO} If it enters this way, draw a card."
+    ));
+    assert_eq!(
+        battlefield_move_entry_gate(&release_juno(&result)),
+        any_of_gate.as_slice(),
+        "reach: the folded rider still opens the slot"
+    );
+    assert!(
+        swallowed(&result)
+            .iter()
+            .any(|detector| detector == "Condition_If"),
+        "the unrepresented pronoun rider must stay reported: {:?}",
+        result.parse_warnings
+    );
+
+    // (iii) Verbatim What Must Be Done: the single-type rider is represented.
+    let result = parse(WHAT_MUST_BE_DONE);
+    assert_eq!(
+        battlefield_move_entry_gate(&release_juno(&result)),
+        typed_entry_gate(TypeFilter::Creature, 2).as_slice()
+    );
+    assert_eq!(
+        swallowed(&result),
+        Vec::<String>::new(),
+        "{:?}",
+        result.parse_warnings
     );
 }
 

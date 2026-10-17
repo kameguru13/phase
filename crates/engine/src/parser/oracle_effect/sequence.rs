@@ -16371,15 +16371,18 @@ mod tests {
         );
     }
 
-    /// CR 614.1c + CR 614.12 (V-L7): the swallow recognizer accepts the two
-    /// anaphoric entry-counter voices the guard conversion represents, keeps the
-    /// existing voices, and rejects the "put" instruction and a multi-type gate
-    /// (neither of which the conversion represents).
+    /// CR 614.1c + CR 614.12 (V-L7): the swallow recognizer accepts the
+    /// anaphoric entry-counter voices the guard conversion represents, a
+    /// multi-type gate among them (an any-of entry gate), keeps the existing
+    /// voices, and rejects the "put" instruction, which the conversion does not
+    /// represent whatever its type list.
     #[test]
     fn entry_counters_clause_recognizes_anaphoric_voices() {
         for represented in [
             "It enters with two additional +1/+1 counters on it if it's a creature.",
             "If it's an artifact, it enters with an additional +1/+1 counter on it.",
+            "It enters with two additional +1/+1 counters on it if it's an artifact or creature.",
+            "If it's an artifact or creature, it enters with two additional +1/+1 counters on it.",
             "If a Hero enters this way, it enters with two additional +1/+1 counters on it.",
             "If you put an artifact onto the battlefield this way, put two +1/+1 counters on it.",
         ] {
@@ -16390,7 +16393,7 @@ mod tests {
         }
         for unrepresented in [
             "Put two +1/+1 counters on it if it's a creature.",
-            "It enters with two additional +1/+1 counters on it if it's an artifact or creature.",
+            "Put two +1/+1 counters on it if it's an artifact or creature.",
         ] {
             assert!(
                 !is_moved_object_entry_this_way_counters_clause(unrepresented),

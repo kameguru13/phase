@@ -16,6 +16,17 @@
 //! * What Must Be Done (mode 2) applies its rider as the entry, under the same
 //!   projected reading.
 //!
+//! CR 614.12 + CR 700.5: the conditions those statics read count the population
+//! as it is before the entry. Heliod, Sun-Crowned ruling (2020-01-24): "Because
+//! replacement effects are considered before the God is on the battlefield, the
+//! mana symbols in its mana cost won't be counted." So Heliod returned with four
+//! other white symbols is not a creature as it would enter (no counter), while an
+//! enters observer still sees it enter as a creature (the ruling's second half):
+//! after entry its own {W} makes devotion five. The same holds for every
+//! population-reading condition (Rusted Relic's metalcraft, Starfield of Nyx's
+//! enchantment count, including a copy of it or a command-zone carrier of its
+//! static) and for the controller the entrant enters under (CR 110.2a + CR 109.5).
+//!
 //! Built via the `/card-test` recipe: `GameScenario` + `GameRunner::cast(..)
 //! .resolve()` + `CastOutcome` deltas, on verbatim Oracle text. Every negative
 //! assertion is paired with a positive reach-guard in the same test.
@@ -24,23 +35,49 @@
 //! * Restore the pre-move `matches_target_filter` read in
 //!   `effects::change_zone::enter_with_counters_for_object` and
 //!   `recommission_reads_march_projection` gets 0 counters (expected 1),
-//!   `recommission_reads_entrants_own_isnt_a_creature_static` gets 1 counter
-//!   (expected 0), and the What Must Be Done March / Opalescence rows get 0
-//!   counters (expected 2).
+//!   `recommission_reads_entrants_own_isnt_a_creature_static` gets 1 counter in
+//!   its (2, 1) case (expected 1 only because devotion is already five before
+//!   entry; its (0, 0) case gets 0), and the What Must Be Done March /
+//!   Opalescence rows get 0 counters (expected 2).
 //! * Revert the anaphoric-rider conversion in
 //!   `parser::oracle_effect::parse_effect_chain_ir_body` and the What Must Be
 //!   Done rows fail their slot premise and their "no later `PutCounter`" check.
+//! * Drop the pre-entry population pin
+//!   (`layers::pin_entry_population_conditions`, called from
+//!   `filter::BattlefieldEntrantProjection::new`) and the projection counts the
+//!   entrant: `recommission_reads_entrants_own_isnt_a_creature_static` and
+//!   `recommission_heliod_four_devotion_still_entered_as_a_creature` get 1
+//!   counter at devotion four (expected 0),
+//!   `release_juno_rusted_relic_counts_pre_entry_artifacts` gets 2 counters with
+//!   two other artifacts (expected 0),
+//!   `release_juno_sanctum_counts_pre_entry_enchantments` gets 2 counters at four
+//!   enchantments (expected 0), and the stolen-entrant rows get 1 counter
+//!   (expected 0). Key the pin's "you" to the owner and the stolen-entrant rows
+//!   also fail.
+//! * Drop the pin's copy-payload carrier and
+//!   `release_juno_sanctum_counts_copied_starfields_pre_entry_enchantments` gets
+//!   2 counters (expected 0); write the pin to `base_static_definitions` only and
+//!   `release_juno_sanctum_counts_command_zone_static_pre_entry` gets 2
+//!   (expected 0).
+//! * Restore the single-type-only slice match in
+//!   `parser::oracle_effect::conditions::card_type_condition_as_entry_this_way`
+//!   and `release_juno_any_of_gate_is_an_entry_replacement` fails: the entry gate
+//!   stays empty and the rider survives as a later `PutCounter`, so Elemental
+//!   Bond draws nothing for Memnite.
 
-use engine::game::scenario::{GameRunner, GameScenario, P0};
+use engine::game::scenario::{CastOutcome, GameRunner, GameScenario, P0, P1};
 use engine::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use engine::parser::parse_oracle_text;
-use engine::types::ability::{Effect, EffectKind, QuantityExpr, TargetFilter, TypeFilter};
+use engine::types::ability::{
+    ContinuousModification, Effect, EffectKind, QuantityExpr, TargetFilter, TypeFilter,
+};
 use engine::types::card_type::CoreType;
 use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
+use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 
 /// Recommission {1}{W} Sorcery — verbatim Oracle text.
@@ -66,6 +103,44 @@ const OPALESCENCE: &str = "Each other non-Aura enchantment is a creature in addi
 
 /// Sol Ring {1} Artifact — verbatim Oracle text.
 const SOL_RING: &str = "{T}: Add {C}{C}.";
+
+/// Rusted Relic {4} Artifact — verbatim Oracle text.
+const RUSTED_RELIC: &str = "Metalcraft \u{2014} This artifact is a 5/5 Golem artifact creature \
+     as long as you control three or more artifacts.";
+
+/// Starfield of Nyx {4}{W} Enchantment — verbatim Oracle text.
+const STARFIELD_OF_NYX: &str = "At the beginning of your upkeep, you may return target \
+     enchantment card from your graveyard to the battlefield.\n\
+     As long as you control five or more enchantments, each other non-Aura enchantment you \
+     control is a creature in addition to its other types and has base power and base toughness \
+     each equal to its mana value.";
+
+/// Copy Enchantment {2}{U} Enchantment — verbatim Oracle text.
+const COPY_ENCHANTMENT: &str =
+    "You may have this enchantment enter as a copy of any enchantment on the battlefield.";
+
+/// Elemental Bond {2}{G} Enchantment — verbatim Oracle text.
+const ELEMENTAL_BOND: &str =
+    "Whenever a creature you control with power 3 or greater enters, draw a card.";
+
+/// Synthetic (no printed card): a gated put from an opponent's graveyard under
+/// the caster's control, so owner and controller differ.
+const STEAL_CREATURE_WITH_GATE: &str = "Put target creature card from an opponent's graveyard \
+     onto the battlefield under your control. If a creature enters this way, it enters with an \
+     additional +1/+1 counter on it.";
+
+/// Synthetic: [`STEAL_CREATURE_WITH_GATE`] naming an artifact card.
+const STEAL_ARTIFACT_WITH_GATE: &str = "Put target artifact card from an opponent's graveyard \
+     onto the battlefield under your control. If a creature enters this way, it enters with an \
+     additional +1/+1 counter on it.";
+
+/// Synthetic: What Must Be Done with Release Juno's rider widened to two types,
+/// so the anaphoric gate names several card types.
+const MULTI_TYPE_RELEASE_JUNO: &str = "Choose one \u{2014}\n\
+     \u{2022} Let the World Burn \u{2014} Destroy all artifacts and creatures.\n\
+     \u{2022} Release Juno \u{2014} Return target historic permanent card from your graveyard \
+     to the battlefield. It enters with two additional +1/+1 counters on it if it's an artifact \
+     or creature.";
 
 /// Sanctum of Tranquil Light {W} Legendary Enchantment — Shrine — verbatim Oracle text.
 const SANCTUM_OF_TRANQUIL_LIGHT: &str = "{5}{W}: Tap target creature. This ability costs {1} \
@@ -242,18 +317,55 @@ fn recommission_reads_march_projection() {
     assert!(!put_counter_resolved(outcome.events()));
 }
 
-fn recommission_on_heliod(
-    devotion_anchors: usize,
-) -> (engine::game::scenario::CastOutcome, ObjectId) {
+/// A main-phase board with a stocked P0 library (draws are counted).
+fn board() -> GameScenario {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P0, &["Card A", "Card B", "Card C", "Card D"]);
+    scenario.with_library_top(P1, &["Card E", "Card F", "Card G", "Card H"]);
+    scenario
+}
+
+/// CR 700.5: permanents `player` controls adding `ww_anchors` × {W}{W} and
+/// `w_anchors` × {W} to that player's devotion to white.
+fn add_devotion_anchors(
+    scenario: &mut GameScenario,
+    player: PlayerId,
+    ww_anchors: usize,
+    w_anchors: usize,
+) {
+    for i in 0..ww_anchors {
+        scenario
+            .add_enchantment_from_oracle(player, &format!("Devotion Anchor WW {i}"), "")
+            .with_mana_cost(generic_and_white(0, 2));
+    }
+    for i in 0..w_anchors {
+        scenario
+            .add_enchantment_from_oracle(player, &format!("Devotion Anchor W {i}"), "")
+            .with_mana_cost(generic_and_white(0, 1));
+    }
+}
+
+fn is_creature(outcome: &CastOutcome, id: ObjectId) -> bool {
+    outcome.state().objects[&id]
+        .card_types
+        .core_types
+        .contains(&CoreType::Creature)
+}
+
+/// Recommission returning Heliod, Sun-Crowned with P0 devotion anchors
+/// (`ww_anchors` × {W}{W}, `w_anchors` × {W}) and, optionally, Elemental Bond.
+fn recommission_on_heliod(
+    ww_anchors: usize,
+    w_anchors: usize,
+    with_bond: bool,
+) -> (CastOutcome, ObjectId) {
+    let mut scenario = board();
     let spell = add_recommission(&mut scenario);
     let heliod = add_graveyard_heliod(&mut scenario);
-    for i in 0..devotion_anchors {
-        // CR 700.5: each {W}{W} permanent adds two to P0's devotion to white.
-        scenario
-            .add_enchantment_from_oracle(P0, &format!("Devotion Anchor {i}"), "")
-            .with_mana_cost(generic_and_white(0, 2));
+    add_devotion_anchors(&mut scenario, P0, ww_anchors, w_anchors);
+    if with_bond {
+        scenario.add_enchantment_from_oracle(P0, "Elemental Bond", ELEMENTAL_BOND);
     }
     let mut runner = scenario.build();
     set_core_types(
@@ -267,30 +379,76 @@ fn recommission_on_heliod(
     (outcome, heliod)
 }
 
-/// V-P2: Recommission returning Heliod, Sun-Crowned. With devotion to white
-/// below five (Heliod's own {W} only), Heliod's own static says it isn't a
-/// creature on the battlefield (CR 614.12 "its own static abilities"), so no
-/// counter. With two {W}{W} permanents, devotion is 1 + 4 = 5 (CR 700.5),
-/// Heliod is a creature there, and it gets the counter (positive control).
+/// V-P2 + B1: Recommission returning Heliod, Sun-Crowned. CR 614.12 checks Heliod
+/// as it would exist on the battlefield, with its own static, and CR 700.5's
+/// devotion is counted before the entry (Heliod ruling 2020-01-24: its own {W}
+/// "won't be counted"). With no anchors (pre-entry devotion 0) and with two
+/// {W}{W} anchors (pre-entry devotion 4) Heliod isn't a creature as it would
+/// enter, so no counter. With one more {W} anchor (pre-entry devotion 5) it is a
+/// creature there and gets the counter (positive control).
 #[test]
 fn recommission_reads_entrants_own_isnt_a_creature_static() {
-    let (outcome, heliod) = recommission_on_heliod(0);
+    let (outcome, heliod) = recommission_on_heliod(0, 0, false);
     outcome.assert_zone(&[heliod], Zone::Battlefield);
     outcome.assert_counters(heliod, CounterType::Plus1Plus1, 0);
+    assert!(
+        !is_creature(&outcome, heliod),
+        "devotion 1 after entry: not a creature"
+    );
 
-    let (outcome, heliod) = recommission_on_heliod(2);
+    // Pre-entry devotion 4: the entrant's own {W} is not counted.
+    let (outcome, heliod) = recommission_on_heliod(2, 0, false);
+    outcome.assert_zone(&[heliod], Zone::Battlefield);
+    outcome.assert_counters(heliod, CounterType::Plus1Plus1, 0);
+    assert!(
+        is_creature(&outcome, heliod),
+        "reach: after entry its own {{W}} makes devotion five, so Heliod is a creature"
+    );
+    assert!(!put_counter_resolved(outcome.events()));
+
+    // Pre-entry devotion 5: a creature as it would enter.
+    let (outcome, heliod) = recommission_on_heliod(2, 1, false);
     outcome.assert_zone(&[heliod], Zone::Battlefield);
     outcome.assert_counters(heliod, CounterType::Plus1Plus1, 1);
+    assert!(is_creature(&outcome, heliod));
+}
+
+/// B1, Heliod ruling (b) (2020-01-24): "When a God enters the battlefield, your
+/// devotion to its color (including the mana symbols in the mana cost of the God
+/// itself) will determine if a creature entered the battlefield or not for
+/// abilities that trigger whenever a creature enters the battlefield." With
+/// pre-entry devotion 4, Recommission's gate sees no creature (no counter), but
+/// Elemental Bond sees a 5/5 creature enter and draws (CR 603.10 + CR 603.6a).
+/// A pre-entry pin leaking into the live game would make Heliod a noncreature
+/// and Bond draw nothing.
+#[test]
+fn recommission_heliod_four_devotion_still_entered_as_a_creature() {
+    let (outcome, heliod) = recommission_on_heliod(2, 0, true);
+    outcome.assert_zone(&[heliod], Zone::Battlefield);
+    outcome.assert_counters(heliod, CounterType::Plus1Plus1, 0);
+    assert!(is_creature(&outcome, heliod));
+    outcome.assert_power_toughness(heliod, 5, 5);
+    outcome.assert_hand_drawn(P0, 1);
 }
 
 /// Cast What Must Be Done choosing Release Juno (mode index 1) on `target`.
 fn cast_release_juno(
-    mut runner: GameRunner,
+    runner: GameRunner,
     spell: ObjectId,
     target: ObjectId,
 ) -> engine::game::scenario::CastOutcome {
+    cast_release_juno_gated(runner, spell, target, creature_gate(2))
+}
+
+/// [`cast_release_juno`] for a Release Juno text whose folded entry gate is `gate`.
+fn cast_release_juno_gated(
+    mut runner: GameRunner,
+    spell: ObjectId,
+    target: ObjectId,
+    gate: Vec<(TargetFilter, CounterType, QuantityExpr)>,
+) -> engine::game::scenario::CastOutcome {
     // Premise: the rider is the effect-carried entry gate, not a later instruction.
-    assert_eq!(conditional_slot(&runner, spell, 1), creature_gate(2));
+    assert_eq!(conditional_slot(&runner, spell, 1), gate);
     assert!(
         runner.state().objects[&spell].abilities[1]
             .sub_ability
@@ -457,4 +615,403 @@ fn what_must_be_done_plain_creature_and_noncreature() {
     let outcome = cast_release_juno(runner, spell, sol_ring);
     outcome.assert_zone(&[sol_ring], Zone::Battlefield);
     outcome.assert_counters(sol_ring, CounterType::Plus1Plus1, 0);
+}
+
+/// `count` mana-value-1 enchantments `player` controls (CR 202.3), named with
+/// `prefix`. Mana value 1 keeps them alive as 1/1s if Starfield of Nyx animates
+/// them.
+fn add_enchantment_anchors(
+    scenario: &mut GameScenario,
+    player: PlayerId,
+    prefix: &str,
+    count: usize,
+) {
+    for i in 0..count {
+        scenario
+            .add_enchantment_from_oracle(player, &format!("{prefix} {i}"), "")
+            .with_mana_cost(ManaCost::Cost {
+                generic: 1,
+                shards: vec![],
+            });
+    }
+}
+
+/// A graveyard Sanctum of Tranquil Light (core types fixed up after `build`).
+fn add_graveyard_sanctum(scenario: &mut GameScenario) -> ObjectId {
+    scenario
+        .add_creature_to_graveyard(P0, "Sanctum of Tranquil Light", 0, 0)
+        .as_legendary()
+        .with_subtypes(vec!["Shrine"])
+        .with_mana_cost(generic_and_white(0, 1))
+        .from_oracle_text(SANCTUM_OF_TRANQUIL_LIGHT)
+        .id()
+}
+
+/// A graveyard Rusted Relic owned by `owner` (core types fixed up after `build`).
+fn add_graveyard_rusted_relic(scenario: &mut GameScenario, owner: PlayerId) -> ObjectId {
+    scenario
+        .add_creature_to_graveyard(owner, "Rusted Relic", 0, 0)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 4,
+            shards: vec![],
+        })
+        .from_oracle_text(RUSTED_RELIC)
+        .id()
+}
+
+/// How many of P0's battlefield anchors named with `prefix` are creatures.
+fn creature_anchors(state: &engine::types::game_state::GameState, prefix: &str) -> usize {
+    state
+        .battlefield
+        .iter()
+        .filter(|id| {
+            let obj = &state.objects[id];
+            obj.name.starts_with(prefix) && obj.card_types.core_types.contains(&CoreType::Creature)
+        })
+        .count()
+}
+
+/// B1 class (own static, `ObjectCount` comparison): Release Juno returning
+/// Rusted Relic. CR 614.12: the condition counts the artifacts P0 controls before
+/// the entry. With two other artifacts, P0 controls two before Rusted Relic
+/// enters, so metalcraft is off as it would enter and the "if it's a creature"
+/// rider adds nothing.
+/// After entry Rusted Relic is the third artifact, so it is a 5/5 creature.
+/// With three other artifacts metalcraft already holds: two counters, 7/7.
+#[test]
+fn release_juno_rusted_relic_counts_pre_entry_artifacts() {
+    for (others, counters, pt) in [(2usize, 0, (5, 5)), (3, 2, (7, 7))] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let spell = add_what_must_be_done(&mut scenario);
+        let relic = add_graveyard_rusted_relic(&mut scenario, P0);
+        for i in 0..others {
+            scenario.add_artifact_from_oracle(P0, &format!("Artifact Anchor {i}"), "");
+        }
+        let mut runner = scenario.build();
+        set_core_types(&mut runner, relic, &[CoreType::Artifact]);
+
+        let outcome = cast_release_juno(runner, spell, relic);
+        outcome.assert_zone(&[relic], Zone::Battlefield);
+        outcome.assert_counters(relic, CounterType::Plus1Plus1, counters);
+        assert!(
+            is_creature(&outcome, relic),
+            "reach ({others} others): metalcraft holds after entry"
+        );
+        outcome.assert_power_toughness(relic, pt.0, pt.1);
+        assert!(!put_counter_resolved(outcome.events()));
+    }
+}
+
+/// B1 class (another object's group static): Release Juno returning Sanctum of
+/// Tranquil Light under Starfield of Nyx. With Starfield and three other
+/// enchantments, P0 controls four enchantments before Sanctum enters, so
+/// Starfield's static is off as Sanctum would enter: no counters. After entry
+/// Sanctum is the fifth enchantment, so it is a 1/1 creature (mana value 1).
+/// With four other enchantments the condition already holds: two counters, 3/3.
+#[test]
+fn release_juno_sanctum_counts_pre_entry_enchantments() {
+    for (others, counters, pt) in [(3usize, 0, (1, 1)), (4, 2, (3, 3))] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let spell = add_what_must_be_done(&mut scenario);
+        let sanctum = add_graveyard_sanctum(&mut scenario);
+        scenario
+            .add_enchantment_from_oracle(P0, "Starfield of Nyx", STARFIELD_OF_NYX)
+            .with_mana_cost(generic_and_white(4, 1));
+        add_enchantment_anchors(&mut scenario, P0, "Enchantment Anchor", others);
+        let mut runner = scenario.build();
+        set_core_types(&mut runner, sanctum, &[CoreType::Enchantment]);
+
+        let outcome = cast_release_juno(runner, spell, sanctum);
+        outcome.assert_zone(&[sanctum], Zone::Battlefield);
+        outcome.assert_counters(sanctum, CounterType::Plus1Plus1, counters);
+        assert!(
+            is_creature(&outcome, sanctum),
+            "reach ({others} others): five enchantments after entry"
+        );
+        outcome.assert_power_toughness(sanctum, pt.0, pt.1);
+        assert!(!put_counter_resolved(outcome.events()));
+    }
+}
+
+/// B1 class, a copied group static (CR 707.2 + CR 613.1a + CR 109.5): P0's Copy
+/// Enchantment enters as a copy of P1's Starfield of Nyx, so the copy's static is
+/// P0's ("you" is the copy's controller). With the copy and three other P0
+/// enchantments, P0 controls four before Sanctum enters: no counters, and Sanctum
+/// is a 1/1 creature after entry (five). With four others: two counters, 3/3.
+/// The original Starfield is P1's, so only the copy can animate P0's Sanctum.
+#[test]
+fn release_juno_sanctum_counts_copied_starfields_pre_entry_enchantments() {
+    for (others, counters, pt) in [(3usize, 0, (1, 1)), (4, 2, (3, 3))] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let spell = add_what_must_be_done(&mut scenario);
+        let copier = scenario
+            .add_spell_to_hand_from_oracle(P0, "Copy Enchantment", false, COPY_ENCHANTMENT)
+            .as_enchantment()
+            .id();
+        let sanctum = add_graveyard_sanctum(&mut scenario);
+        let starfield = scenario
+            .add_enchantment_from_oracle(P1, "Starfield of Nyx", STARFIELD_OF_NYX)
+            .with_mana_cost(generic_and_white(4, 1))
+            .id();
+        add_enchantment_anchors(&mut scenario, P0, "Enchantment Anchor", others);
+        let mut runner = scenario.build();
+        set_core_types(&mut runner, sanctum, &[CoreType::Enchantment]);
+
+        let copied = runner
+            .cast(copier)
+            .accept_optional()
+            .replacement_choice(0)
+            .copy_target(starfield)
+            .resolve();
+        let copy = &copied.state().objects[&copier];
+        assert_eq!(copy.zone, Zone::Battlefield, "reach: the copy entered");
+        assert_eq!(copy.name, "Starfield of Nyx", "reach: it copied Starfield");
+        assert_eq!(copy.controller, P0);
+        assert!(
+            copied
+                .state()
+                .transient_continuous_effects
+                .iter()
+                .any(|tce| tce
+                    .modifications
+                    .iter()
+                    .any(|m| matches!(m, ContinuousModification::CopyValues { .. }))),
+            "reach: the copy is a layer-1 copy effect"
+        );
+        assert_eq!(
+            creature_anchors(copied.state(), "Enchantment Anchor"),
+            if others + 1 >= 5 { others } else { 0 },
+            "reach: the copy's static counts P0's enchantments"
+        );
+
+        let outcome = cast_release_juno(runner, spell, sanctum);
+        outcome.assert_zone(&[sanctum], Zone::Battlefield);
+        outcome.assert_counters(sanctum, CounterType::Plus1Plus1, counters);
+        assert!(
+            is_creature(&outcome, sanctum),
+            "reach ({others} others): five P0 enchantments after entry"
+        );
+        outcome.assert_power_toughness(sanctum, pt.0, pt.1);
+    }
+}
+
+/// B1 class, a command-zone carrier. Labelled synthetic: a P0 emblem (CR 113.6 +
+/// CR 114.4: an emblem's static functions in the command zone) carrying Starfield
+/// of Nyx's parsed static, cloned from a P1 donor. With four P0 enchantments
+/// before Sanctum enters: no counters, and Sanctum is a 1/1 creature after entry
+/// (five). With five: two counters, 3/3.
+#[test]
+fn release_juno_sanctum_counts_command_zone_static_pre_entry() {
+    for (anchors, counters, pt) in [(4usize, 0, (1, 1)), (5, 2, (3, 3))] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let spell = add_what_must_be_done(&mut scenario);
+        let sanctum = add_graveyard_sanctum(&mut scenario);
+        let donor = scenario
+            .add_enchantment_from_oracle(P1, "Starfield of Nyx", STARFIELD_OF_NYX)
+            .with_mana_cost(generic_and_white(4, 1))
+            .id();
+        add_enchantment_anchors(&mut scenario, P0, "Enchantment Anchor", anchors);
+        let mut runner = scenario.build();
+        set_core_types(&mut runner, sanctum, &[CoreType::Enchantment]);
+        {
+            let state = runner.state_mut();
+            let statics = state.objects[&donor].static_definitions.clone();
+            let base_statics = state.objects[&donor].base_static_definitions.clone();
+            let emblem = engine::game::zones::create_object(
+                state,
+                engine::types::identifiers::CardId(9_001),
+                P0,
+                "Starfield Emblem".to_string(),
+                Zone::Command,
+            );
+            let obj = state.objects.get_mut(&emblem).expect("emblem created");
+            obj.is_emblem = true;
+            obj.static_definitions = statics;
+            obj.base_static_definitions = base_statics;
+            engine::game::layers::mark_layers_full(state);
+            engine::game::layers::flush_layers(state);
+            assert!(
+                state.command_zone.contains(&emblem),
+                "reach: the emblem is in the command zone"
+            );
+            assert_eq!(
+                creature_anchors(state, "Enchantment Anchor"),
+                if anchors >= 5 { anchors } else { 0 },
+                "reach: the emblem's static functions and counts P0's enchantments"
+            );
+        }
+
+        let outcome = cast_release_juno(runner, spell, sanctum);
+        outcome.assert_zone(&[sanctum], Zone::Battlefield);
+        outcome.assert_counters(sanctum, CounterType::Plus1Plus1, counters);
+        assert!(
+            is_creature(&outcome, sanctum),
+            "reach ({anchors} anchors): five P0 enchantments after entry"
+        );
+        outcome.assert_power_toughness(sanctum, pt.0, pt.1);
+    }
+}
+
+/// B1 + CR 110.2a + CR 109.5: Heliod owned by P1 enters under P0's control, so
+/// "your devotion" is P0's, counted before entry. P0 has devotion 4 (two {W}{W}
+/// permanents) and P1 has 6: the projection counts P0's 4, so Heliod isn't a
+/// creature as it would enter and gets no counter. After entry its {W} makes P0's
+/// devotion five, so it is a creature. A pin keyed to the owner (P1, 6) would
+/// give the counter.
+#[test]
+fn stolen_heliod_counts_new_controllers_pre_entry_devotion() {
+    let mut scenario = board();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Steal Gate", false, STEAL_CREATURE_WITH_GATE)
+        .id();
+    let heliod = scenario
+        .add_creature_to_graveyard(P1, "Heliod, Sun-Crowned", 5, 5)
+        .as_legendary()
+        .with_subtypes(vec!["God"])
+        .with_mana_cost(generic_and_white(2, 1))
+        .from_oracle_text(HELIOD_SUN_CROWNED)
+        .id();
+    add_devotion_anchors(&mut scenario, P0, 2, 0);
+    add_devotion_anchors(&mut scenario, P1, 3, 0);
+    let mut runner = scenario.build();
+    set_core_types(
+        &mut runner,
+        heliod,
+        &[CoreType::Enchantment, CoreType::Creature],
+    );
+    // Premise: the synthetic text carries the gate and the controller override.
+    assert_eq!(conditional_slot(&runner, spell, 0), creature_gate(1));
+    assert!(matches!(
+        runner.state().objects[&spell].abilities[0].effect.as_ref(),
+        Effect::ChangeZone {
+            enters_under: Some(_),
+            ..
+        }
+    ));
+
+    let outcome = runner.cast(spell).target_objects(&[heliod]).resolve();
+    outcome.assert_zone(&[heliod], Zone::Battlefield);
+    assert_eq!(outcome.state().objects[&heliod].controller, P0);
+    outcome.assert_counters(heliod, CounterType::Plus1Plus1, 0);
+    assert!(
+        is_creature(&outcome, heliod),
+        "reach: P0's devotion is five after entry"
+    );
+}
+
+/// B1 + CR 110.2a + CR 109.5: Rusted Relic owned by P1 enters under P0's control;
+/// P0 controls two artifacts before entry and P1 three. Metalcraft counts P0's
+/// two, so it is not a creature as it would enter: no counter. After entry it is
+/// P0's third artifact, a 5/5 creature.
+#[test]
+fn stolen_rusted_relic_counts_new_controllers_pre_entry_artifacts() {
+    let mut scenario = board();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Steal Gate", false, STEAL_ARTIFACT_WITH_GATE)
+        .id();
+    let relic = add_graveyard_rusted_relic(&mut scenario, P1);
+    for i in 0..2 {
+        scenario.add_artifact_from_oracle(P0, &format!("P0 Artifact {i}"), "");
+    }
+    for i in 0..3 {
+        scenario.add_artifact_from_oracle(P1, &format!("P1 Artifact {i}"), "");
+    }
+    let mut runner = scenario.build();
+    set_core_types(&mut runner, relic, &[CoreType::Artifact]);
+    assert_eq!(conditional_slot(&runner, spell, 0), creature_gate(1));
+
+    let outcome = runner.cast(spell).target_objects(&[relic]).resolve();
+    outcome.assert_zone(&[relic], Zone::Battlefield);
+    assert_eq!(outcome.state().objects[&relic].controller, P0);
+    outcome.assert_counters(relic, CounterType::Plus1Plus1, 0);
+    assert!(
+        is_creature(&outcome, relic),
+        "reach: P0 controls three artifacts after entry"
+    );
+    outcome.assert_power_toughness(relic, 5, 5);
+}
+
+/// C4 (CR 614.1c + CR 614.12): a multi-type anaphoric rider ("if it's an
+/// artifact or creature") folds into an any-of entry gate, so the counters are
+/// part of the entry. Memnite enters as a 3/3, so Elemental Bond draws, and no
+/// later `PutCounter` resolves; Sol Ring (an artifact) also enters with two;
+/// Sanctum of Tranquil Light (neither) gets none and still enters.
+#[test]
+fn release_juno_any_of_gate_is_an_entry_replacement() {
+    let any_of_gate = || {
+        vec![(
+            TargetFilter::Typed(engine::types::ability::TypedFilter::new(TypeFilter::AnyOf(
+                vec![TypeFilter::Artifact, TypeFilter::Creature],
+            ))),
+            CounterType::Plus1Plus1,
+            QuantityExpr::Fixed { value: 2 },
+        )]
+    };
+    let release = |scenario: &mut GameScenario| {
+        let spell = scenario
+            .add_spell_to_hand_from_oracle(
+                P0,
+                "Multi-Type Release Juno",
+                false,
+                MULTI_TYPE_RELEASE_JUNO,
+            )
+            .with_mana_cost(generic_and_white(3, 2))
+            .id();
+        scenario.with_mana_pool(P0, {
+            let mut pool = mana(ManaType::White, 2);
+            pool.extend(mana(ManaType::Colorless, 3));
+            pool
+        });
+        spell
+    };
+
+    // Case 1: Memnite, a 1/1 artifact creature, with Elemental Bond.
+    let mut scenario = board();
+    scenario.add_enchantment_from_oracle(P0, "Elemental Bond", ELEMENTAL_BOND);
+    let spell = release(&mut scenario);
+    let memnite = scenario
+        .add_creature_to_graveyard(P0, "Memnite", 1, 1)
+        .as_artifact_creature()
+        .with_subtypes(vec!["Construct"])
+        .with_mana_cost(ManaCost::Cost {
+            generic: 0,
+            shards: vec![],
+        })
+        .id();
+    let runner = scenario.build();
+    let outcome = cast_release_juno_gated(runner, spell, memnite, any_of_gate());
+    outcome.assert_zone(&[memnite], Zone::Battlefield);
+    outcome.assert_counters(memnite, CounterType::Plus1Plus1, 2);
+    outcome.assert_power_toughness(memnite, 3, 3);
+    assert!(
+        !put_counter_resolved(outcome.events()),
+        "the counters ride the entry: {:?}",
+        outcome.events()
+    );
+    outcome.assert_hand_drawn(P0, 1);
+
+    // Case 2: Sol Ring, a noncreature artifact.
+    let mut scenario = board();
+    let spell = release(&mut scenario);
+    let sol_ring = add_graveyard_sol_ring(&mut scenario);
+    let mut runner = scenario.build();
+    set_core_types(&mut runner, sol_ring, &[CoreType::Artifact]);
+    let outcome = cast_release_juno_gated(runner, spell, sol_ring, any_of_gate());
+    outcome.assert_zone(&[sol_ring], Zone::Battlefield);
+    outcome.assert_counters(sol_ring, CounterType::Plus1Plus1, 2);
+    assert!(!put_counter_resolved(outcome.events()));
+
+    // Case 3: Sanctum of Tranquil Light, neither an artifact nor a creature.
+    let mut scenario = board();
+    let spell = release(&mut scenario);
+    let sanctum = add_graveyard_sanctum(&mut scenario);
+    let mut runner = scenario.build();
+    set_core_types(&mut runner, sanctum, &[CoreType::Enchantment]);
+    let outcome = cast_release_juno_gated(runner, spell, sanctum, any_of_gate());
+    outcome.assert_zone(&[sanctum], Zone::Battlefield);
+    outcome.assert_counters(sanctum, CounterType::Plus1Plus1, 0);
 }
