@@ -369,8 +369,8 @@ pub fn cast_facts_for_object(object: &GameObject) -> CastFacts<'_> {
     .collect();
 
     // CR 115.10a: being affected is not being targeted. A created-token
-    // placement (`PutCounter { LastCreated }` after a `Token` in the same
-    // chain) puts counters on the token its own ability created, so it declares
+    // placement (`PutCounter { LastCreated }` whose nearest preceding publisher in the
+    // same chain is a `Token`) puts counters on the token its own ability created, so it declares
     // no target; both flags read the walk without those placements.
     let requires_targets_in_spell_text = primary_effects
         .iter()

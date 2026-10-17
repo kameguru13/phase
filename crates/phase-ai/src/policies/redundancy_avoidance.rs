@@ -215,7 +215,7 @@ impl TacticalPolicy for RedundancyAvoidancePolicy {
         // without bloating `PolicyReason` with per-arm arrays.
         //
         // CR 608.2c + CR 608.2h: a created-token placement (`PutCounter {
-        // LastCreated }` after a `Token` in the same chain) is part of that
+        // LastCreated }` whose nearest preceding publisher in the same chain is a `Token`) is part of that
         // token's creation; its count is read when the placement resolves, after
         // the token exists, not at decision time. Both loops therefore read the
         // walks without those placements, matching the no-redundancy reading of

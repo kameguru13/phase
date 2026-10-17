@@ -380,7 +380,7 @@ fn score_pre_cast(ctx: &PolicyContext<'_>) -> f64 {
     // search-and-put chain, and reanimation-shaped puts alike.
     //
     // CR 608.2c + CR 111.1: a created-token placement (`PutCounter { LastCreated }`
-    // after a `Token` in the same chain) is the second member of that category.
+    // whose nearest preceding publisher in the same chain is a `Token`) is the second member of that category.
     // Its recipient is the token this same resolution creates, so it does not
     // need a creature of ours; this check reads the walk without those
     // placements. Every other check below keeps the full `effects`.

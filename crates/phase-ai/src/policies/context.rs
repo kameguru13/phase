@@ -172,8 +172,8 @@ impl<'a> PolicyContext<'a> {
     }
 
     /// [`Self::effects`] without its created-token placements (CR 608.2c +
-    /// CR 111.1: a `PutCounter { LastCreated }` after a `Token` in the same
-    /// chain lands on the token that chain created). Each ability's walk is
+    /// CR 111.1: a `PutCounter { LastCreated }` whose nearest preceding publisher
+    /// in the same chain is a `Token` lands on that token). Each ability's walk is
     /// filtered against its own unconditional chain, so a `Token` in one
     /// ability never pairs with a placement in another.
     pub(crate) fn effects_without_created_token_placements(&self) -> Vec<&'a Effect> {

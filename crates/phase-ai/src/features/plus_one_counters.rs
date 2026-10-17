@@ -14,8 +14,8 @@
 //!   `crates/engine/src/types/keywords.rs:358-361`. CR 122.6a: ETB-with-counters keyword.
 //! - `Effect::Token { enter_with_counters: Vec<(CounterType, QuantityExpr)>, .. }` at
 //!   `ability.rs:2167`. CR 122.6a: tokens that enter with counters.
-//! - Created-token placement: `Effect::Token` followed in the same unconditional
-//!   chain by `Effect::PutCounter { target: TargetFilter::LastCreated, .. }`
+//! - Created-token placement: `Effect::PutCounter { target: TargetFilter::LastCreated, .. }`
+//!   whose nearest preceding created-referent publisher in the same unconditional chain is an `Effect::Token`
 //!   (`ability_chain::created_token_placement_source`). CR 122.6 + CR 122.6a: a
 //!   token given counters by the ability that creates it is a token with
 //!   counters, in either representation, not a generator onto existing creatures.
@@ -217,7 +217,7 @@ pub(crate) fn ability_places_plus_one_counter(ability: &AbilityDefinition) -> bo
 
 /// True if this ability creates a token that gets +1/+1 counters, either as it
 /// enters (`Token { enter_with_counters }`) or from a created-token placement
-/// later in the same unconditional chain (`Token` → `PutCounter { LastCreated }`).
+/// later in the same unconditional chain whose nearest preceding publisher is that `Token` (`Token` → `PutCounter { LastCreated }`).
 /// CR 122.6 + CR 122.6a: both are "counters put on" the created token.
 pub(crate) fn ability_creates_token_with_plus_one_counters(ability: &AbilityDefinition) -> bool {
     let chain = collect_chain_effects(ability);

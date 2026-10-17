@@ -25350,7 +25350,9 @@ impl Effect {
     /// Consumers: the parser's anaphor passes (through
     /// `oracle_effect::lower::publishes_chain_created_referent`), the declined
     /// "if you do" walk (`game::effects::declined_gate_surviving_instructions`),
-    /// and phase-ai's created-token pairing.
+    /// the player-scope tail's created-referent reader walk
+    /// (`game::effects::tail_reads_created_referent`, which stops at the tail's
+    /// nearest own publisher), and phase-ai's created-token pairing.
     pub fn publishes_created_referent(&self) -> bool {
         crate::types::ability_visit::visit_effect_scoped(
             self,
