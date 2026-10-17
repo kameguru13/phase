@@ -35197,6 +35197,161 @@ pub mod tests {
         assert_eq!(end_step_quality_trigger_stack_len(prime(), 5, 0), 1);
     }
 
+    /// The one intervening-if trigger `oracle` parses to (verbatim Oracle text),
+    /// asserting its condition reads `qref` through a `QuantityComparison`.
+    fn parsed_quantity_gated_trigger(
+        name: &str,
+        oracle: &str,
+        keywords: &[&str],
+        qref: &QuantityRef,
+    ) -> TriggerDefinition {
+        let keywords: Vec<String> = keywords.iter().map(|k| k.to_string()).collect();
+        let parsed = crate::parser::parse_oracle_text(
+            oracle,
+            name,
+            &keywords,
+            &["Creature".to_string()],
+            &[],
+        );
+        let trigger = parsed
+            .triggers
+            .into_iter()
+            .find(|trigger| trigger.condition.is_some())
+            .unwrap_or_else(|| panic!("{name} parses an intervening-if trigger"));
+        assert!(
+            matches!(
+                &trigger.condition,
+                Some(TriggerCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref { qty },
+                    ..
+                }) if qty == qref
+            ),
+            "{name}: {:?}",
+            trigger.condition
+        );
+        trigger
+    }
+
+    /// Gatstaf Shepherd's parsed upkeep trigger on a P0 creature, after a turn
+    /// in which `spells_cast` spells were cast; returns the stack length after
+    /// the next upkeep begins.
+    fn gatstaf_shepherd_upkeep_stack_len(spells_cast: u8) -> usize {
+        let trigger = parsed_quantity_gated_trigger(
+            "Gatstaf Shepherd",
+            "At the beginning of each upkeep, if no spells were cast last turn, transform this creature.",
+            &["Intimidate", "Transform"],
+            &QuantityRef::SpellsCastLastTurn,
+        );
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+        let source = create_object(
+            &mut state,
+            CardId(0x09F10),
+            PlayerId(0),
+            "Gatstaf Shepherd".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&source).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.trigger_definitions.push(trigger);
+        }
+        state.spells_cast_this_turn = spells_cast;
+        let mut events = Vec::new();
+        crate::game::turns::start_next_turn(&mut state, &mut events);
+        // Reach: the production turn-boundary snapshot ran.
+        assert_eq!(state.spells_cast_last_turn, Some(spells_cast));
+        state.phase = Phase::Upkeep;
+        process_triggers(
+            &mut state,
+            &[GameEvent::PhaseChanged {
+                phase: Phase::Upkeep,
+            }],
+        );
+        state.stack.len()
+    }
+
+    /// R1. CR 603.4 + CR 601.2i: "if no spells were cast last turn" reads the
+    /// table-wide count of spells cast during the previous turn, snapshotted by
+    /// `turns::start_next_turn`. Runtime evidence for coverage classifying
+    /// `QuantityRef::SpellsCastLastTurn` as `Handled`.
+    /// REVERT-PROBE: resolve the ref as a constant 0 → the n = 1 case fires.
+    #[test]
+    fn spells_cast_last_turn_gates_parsed_werewolf_upkeep_trigger() {
+        assert_eq!(
+            gatstaf_shepherd_upkeep_stack_len(0),
+            1,
+            "no spells were cast last turn: the trigger must fire"
+        );
+        for spells_cast in [1, 2] {
+            assert_eq!(
+                gatstaf_shepherd_upkeep_stack_len(spells_cast),
+                0,
+                "{spells_cast} spell(s) were cast last turn: the trigger must not fire"
+            );
+        }
+    }
+
+    /// Child of the Volcano's parsed end-step trigger on a P0 creature; `dies`
+    /// optionally moves a P0 creature (token or card) from the battlefield to
+    /// the graveyard first. Returns (descended flag, stack length).
+    fn child_of_the_volcano_end_step(dies: Option<bool>) -> (bool, usize) {
+        let trigger = parsed_quantity_gated_trigger(
+            "Child of the Volcano",
+            "Trample\nAt the beginning of your end step, if you descended this turn, put a +1/+1 counter on this creature. (You descended if a permanent card was put into your graveyard from anywhere.)",
+            &["Trample"],
+            &QuantityRef::DescendedThisTurn,
+        );
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+        let source = create_object(
+            &mut state,
+            CardId(0x09F20),
+            PlayerId(0),
+            "Child of the Volcano".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&source).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.trigger_definitions.push(trigger);
+        }
+        if let Some(is_token) = dies {
+            let victim = create_object(
+                &mut state,
+                CardId(0x09F21),
+                PlayerId(0),
+                "Descend Fodder".to_string(),
+                Zone::Battlefield,
+            );
+            {
+                let obj = state.objects.get_mut(&victim).unwrap();
+                obj.card_types.core_types.push(CoreType::Creature);
+                obj.is_token = is_token;
+            }
+            let mut events = Vec::new();
+            move_to_zone(&mut state, victim, Zone::Graveyard, &mut events);
+        }
+        let descended = state.players[0].descended_this_turn;
+        process_triggers(&mut state, &[GameEvent::PhaseChanged { phase: Phase::End }]);
+        (descended, state.stack.len())
+    }
+
+    /// R2. CR 700.11: "descended this turn" means a permanent card was put into
+    /// the player's graveyard from anywhere this turn; tokens are not cards.
+    /// Runtime evidence for coverage classifying `QuantityRef::DescendedThisTurn`
+    /// as `Handled`.
+    /// REVERT-PROBE: resolve the ref as a constant → case (a) or (b) flips.
+    #[test]
+    fn descended_this_turn_gates_parsed_end_step_trigger() {
+        // (a) A creature card went to P0's graveyard: P0 descended.
+        assert_eq!(child_of_the_volcano_end_step(Some(false)), (true, 1));
+        // (b) Nothing went to the graveyard.
+        assert_eq!(child_of_the_volcano_end_step(None), (false, 0));
+        // (c) A creature token is not a card (CR 700.11).
+        assert_eq!(child_of_the_volcano_end_step(Some(true)), (false, 0));
+    }
+
     /// Exercises `stack::bind_triggered_resolution_scope` with a constructed
     /// scope: the bind function re-evaluates a `QuantityQuality` condition
     /// against the live board. The production coverage of a stacked trigger's

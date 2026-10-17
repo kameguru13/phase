@@ -3087,6 +3087,8 @@ fn positive_count_gate_qty(condition: &TriggerCondition) -> Option<QuantityRef> 
         // intervening "if". It is not a positive resolution-recheck count gate, so it names
         // no antecedent for the body's count anaphor — binding one would read the count at
         // resolution, not the count the event measured. Deliberately no descent.
+        // Coverage's `extract_trigger_condition_features` does descend here; it asks a
+        // different question (whether the quantity resolves at all).
         TriggerCondition::EventTime { .. } => None,
         _ => None,
     }
