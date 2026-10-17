@@ -35,13 +35,15 @@ use engine::types::ability::{
 use engine::types::actions::GameAction;
 use engine::types::counter::{parse_counter_type, CounterType};
 use engine::types::game_state::{
-    CounterCostChoice, GameState, ManaAbilityCostCursor, ManaChoice, ManaChoiceContext,
-    PausedCounterCostRemoval, PayCostKind, PendingCast, PendingCostMoveCompletion,
-    PendingCostMoveResume, ReplacementChoiceKind, StackEntryKind, WaitingFor,
+    CastPaymentMode, CounterCostChoice, GameState, ManaAbilityCostCursor, ManaChoice,
+    ManaChoiceContext, PausedCounterCostRemoval, PayCostKind, PendingCast,
+    PendingCostMoveCompletion, PendingCostMoveResume, ReplacementChoiceKind, StackEntryKind,
+    WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
+use engine::types::proposed_event::{ProposedEvent, ReplacementId};
 use engine::types::replacements::ReplacementEvent;
 use engine::types::zones::Zone;
 
@@ -69,6 +71,7 @@ const EXPERIMENT_KRAJ: &str = "Experiment Kraj has all activated abilities of ea
 const MARCH_OF_THE_MACHINES: &str = "Each noncreature artifact is an artifact creature with power and toughness each equal to its mana value. (Equipment that's a creature can't equip a creature.)";
 const PENTAD_PRISM: &str = "Sunburst (This artifact enters with a charge counter on it for each color of mana spent to cast it.)\nRemove a charge counter from this artifact: Add one mana of any color.";
 const MAGOSI: &str = "This land enters tapped.\n{T}: Add {U}.\n{U}, {T}: Put an eon counter on this land. Skip your next turn.\n{T}, Remove an eon counter from this land and return it to its owner's hand: Take an extra turn after this one.";
+const EMBER_SHOT: &str = "Ember Shot deals 3 damage to any target.\nDraw a card.";
 /// C5a: the effect-path control — counters removed by an EFFECT, not a cost.
 const EFFECT_PATH_CONTROL: &str = "{T}: Remove all charge counters from this artifact. You gain 1 life for each charge counter removed this way.";
 /// C7d: a reader of X itself (not of the counters removed).
@@ -1511,6 +1514,9 @@ fn geometric_nexus_deferred_residual_counter_leg_counts_after_the_choice() {
 /// selected self-return; the removal waits on the choice, so the root carries
 /// the selected return. After the choice the removal is settled first, then
 /// Magosi returns to hand, and the activation reads its 1 counter removed.
+/// Magosi starts with 2 eon counters so the order is observable: settling after
+/// the return would also count the eon counter that ceased to exist when Magosi
+/// left the battlefield (CR 122.2) and read 2, not the 1 the cost removed.
 /// Unreplaced control first: the return completes in the same action.
 #[test]
 fn magosi_deferred_counter_leg_completes_its_selected_return_after_the_choice() {
@@ -1519,7 +1525,7 @@ fn magosi_deferred_counter_leg_completes_its_selected_return_after_the_choice() 
         let magosi = scenario
             .add_land_from_oracle(P0, "Magosi, the Waterveil", MAGOSI)
             .id();
-        scenario.with_counter(magosi, counter("eon"), 1);
+        scenario.with_counter(magosi, counter("eon"), 2);
         let mut runner = scenario.build();
         runner.state_mut().objects.get_mut(&magosi).unwrap().tapped = false;
         if replaced {
@@ -1556,7 +1562,7 @@ fn magosi_deferred_counter_leg_completes_its_selected_return_after_the_choice() 
             assert_optional_replacement_prompt(&runner);
             assert!(runner.state().stack.is_empty());
             assert_eq!(runner.state().objects[&magosi].zone, Zone::Battlefield);
-            assert_eq!(counters_on(&runner, magosi, &counter("eon")), 1);
+            assert_eq!(counters_on(&runner, magosi, &counter("eon")), 2);
             let (pending, _, completion) = parked_counter_cost_root(&runner);
             assert_eq!(pending.ability.context.cost_removed_counter_amount, None);
             assert!(
@@ -1578,6 +1584,150 @@ fn magosi_deferred_counter_leg_completes_its_selected_return_after_the_choice() 
         assert_eq!(runner.state().extra_turns.len(), 1, "replaced {replaced}");
         assert!(payment_ownership_is_clear(&runner), "replaced {replaced}");
     }
+}
+
+/// Stage a full prevention of the parked counter removal. No RemoveCounter
+/// applier yields `Prevented` today (`remove_counter_applier` always modifies
+/// the event), so the parked choice is re-pointed at a skip-turn definition on
+/// the same holder, whose applier prevents its event outright. This mirrors the
+/// staged regeneration-shield producer of the CR 608.3e prevented-entry test in
+/// `engine_replacement.rs`. The parked event is still the RemoveCounter, and the
+/// resume runs through the real `GameAction::ChooseReplacement` entry.
+fn stage_prevented_counter_removal(runner: &mut GameRunner) {
+    let holder = runner
+        .state()
+        .battlefield
+        .iter()
+        .copied()
+        .find(|id| runner.state().objects[id].name == "Steward")
+        .expect("the board has the replacement's holder");
+    let prevention = ReplacementDefinition::new(ReplacementEvent::BeginTurn);
+    let obj = runner.state_mut().objects.get_mut(&holder).unwrap();
+    let index = obj.replacement_definitions.len();
+    Arc::make_mut(&mut obj.base_replacement_definitions).push(prevention.clone());
+    obj.replacement_definitions.push(prevention);
+    let pending = runner
+        .state_mut()
+        .pending_replacement
+        .as_mut()
+        .expect("a counter removal waits on its replacement choice");
+    assert!(
+        matches!(pending.proposed, ProposedEvent::RemoveCounter { .. }),
+        "reach: the parked event is the counter removal: {:?}",
+        pending.proposed
+    );
+    pending.candidates = vec![ReplacementId {
+        source: holder,
+        index,
+    }];
+    pending.is_optional = false;
+}
+
+/// Prevented boundary, a removal no cost owns (CR 616.1): Ember Shot's 3 damage
+/// to a planeswalker removes loyalty counters (CR 120.3c), and that removal
+/// waits on the choice with the spell's "Draw a card." still to resolve. When
+/// the removal is prevented outright, no loyalty is removed (CR 614.6) and the
+/// spell resumes: its controller draws the card and the spell finishes. Only a
+/// cost-move root's removal may leave this drain for the cost-move resume.
+#[test]
+fn a_prevented_damage_counter_removal_resumes_the_resolving_spell() {
+    let mut scenario = replacement_board();
+    let walker = scenario
+        .add_planeswalker_from_oracle(P1, "Walker", "Gideon", 5, "+1: You gain 1 life.")
+        .id();
+    let shot = scenario
+        .add_spell_to_hand_from_oracle(P0, "Ember Shot", true, EMBER_SHOT)
+        .id();
+    let mut mana = colorless(6);
+    mana.push(ManaType::Red);
+    add_mana(&mut scenario, &mana);
+    let mut runner = scenario.build();
+    install_optional_counter_removal_replacement(&mut runner);
+
+    let card_id = runner.state().objects[&shot].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: shot,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .unwrap_or_else(|err| panic!("Ember Shot is cast: {err:?}"));
+    drive(
+        &mut runner,
+        |state| matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }),
+        &mut Answers::default().object(walker),
+    );
+    assert_optional_replacement_prompt(&runner);
+    assert!(
+        runner.state().active_ability_continuation().is_some(),
+        "reach: the spell's draw waits behind the removal"
+    );
+    assert!(runner.state().pending_cost_move_resume.is_none());
+    assert_eq!(counters_on(&runner, walker, &CounterType::Loyalty), 5);
+    let hand_at_choice = runner.state().players[0].hand.len();
+    stage_prevented_counter_removal(&mut runner);
+
+    choose_replacement(&mut runner, 0);
+    drive(
+        &mut runner,
+        priority_with_empty_stack,
+        &mut Answers::default(),
+    );
+    assert_eq!(
+        counters_on(&runner, walker, &CounterType::Loyalty),
+        5,
+        "the prevented removal removed nothing"
+    );
+    assert_eq!(
+        runner.state().players[0].hand.len(),
+        hand_at_choice + 1,
+        "the spell's draw still resolves"
+    );
+    assert_eq!(runner.state().objects[&shot].zone, Zone::Graveyard);
+    assert!(runner.state().active_ability_continuation().is_none());
+    assert!(payment_ownership_is_clear(&runner));
+}
+
+/// Prevented boundary, a cost-move root's removal: Essence Bottle's "Remove all
+/// elixir counters" waits on the choice with the activation parked. When the
+/// removal is prevented outright, the cost is still paid (CR 118.11) and no
+/// counter was removed (CR 614.6), so the parked root resumes: the ability goes
+/// on the stack reading 0 counters removed and gains no life.
+#[test]
+fn a_prevented_cost_counter_removal_resumes_its_cost_root() {
+    let mut scenario = replacement_board();
+    let bottle = scenario
+        .add_artifact_from_oracle(P0, "Essence Bottle", ESSENCE_BOTTLE)
+        .id();
+    scenario.with_counter(bottle, counter("elixir"), 3);
+    let mut runner = scenario.build();
+    install_optional_counter_removal_replacement(&mut runner);
+    let life_before = runner.life(P0);
+
+    let index = counter_cost_ability(&runner, bottle, 0);
+    activate(&mut runner, bottle, index);
+    assert_optional_replacement_prompt(&runner);
+    let (pending, _, _) = parked_counter_cost_root(&runner);
+    assert_eq!(pending.ability.context.cost_removed_counter_amount, None);
+    stage_prevented_counter_removal(&mut runner);
+
+    choose_replacement(&mut runner, 0);
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "the parked activation is placed"
+    );
+    assert_eq!(top_stack_count(&runner), Some(0));
+    assert_eq!(counters_on(&runner, bottle, &counter("elixir")), 3);
+
+    drive(
+        &mut runner,
+        priority_with_empty_stack,
+        &mut Answers::default(),
+    );
+    assert_eq!(runner.life(P0), life_before);
+    assert!(payment_ownership_is_clear(&runner));
 }
 
 // ---------------------------------------------------------------------------

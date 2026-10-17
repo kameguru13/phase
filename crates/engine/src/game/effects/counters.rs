@@ -3405,6 +3405,21 @@ pub(crate) fn validate_and_queue_counter_removal(
     Ok(())
 }
 
+/// CR 614.6 + CR 118.11: the in-flight record of a removal about to be handed
+/// to the replacement pipeline: the object's count of that counter type before
+/// the removal is proposed. The single "before" measure for every owner (the
+/// effect queue and the cost payer); `settled_in_flight_counter_removal` takes
+/// the "after" measure with the same count.
+pub(crate) fn begin_in_flight_counter_removal(
+    state: &GameState,
+    removal: PendingCounterRemoval,
+) -> PendingCounterRemovalInFlight {
+    PendingCounterRemovalInFlight {
+        counter_count_before: counter_count(state, removal.object_id, &removal.counter_type),
+        removal,
+    }
+}
+
 /// CR 614.6 + CR 118.11: the number of counters a removal handed to the
 /// replacement pipeline actually removed, measured as the drop in that
 /// object's count of that counter type since the removal was proposed. A
@@ -3460,14 +3475,14 @@ pub(crate) fn drain_pending_counter_removals(state: &mut GameState, events: &mut
             continue;
         };
         queue.remaining.remove(0);
-        queue.in_flight = Some(PendingCounterRemovalInFlight {
-            counter_count_before: counter_count(state, object_id, &counter_type),
-            removal: PendingCounterRemoval {
+        queue.in_flight = Some(begin_in_flight_counter_removal(
+            state,
+            PendingCounterRemoval {
                 object_id,
                 counter_type: counter_type.clone(),
                 count,
             },
-        });
+        ));
         state
             .replace_active_counter_removals(queue)
             .expect("re-parked counter-removals queue must own the active frame");

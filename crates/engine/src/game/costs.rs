@@ -49,8 +49,7 @@ use crate::types::ability::{
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
     CostResume, GameState, ManaAbilityResume, PausedCounterCostRemoval, PayCostKind,
-    PendingCostMoveCompletion, PendingCostMoveResume, PendingCounterRemoval,
-    PendingCounterRemovalInFlight, WaitingFor,
+    PendingCostMoveCompletion, PendingCostMoveResume, PendingCounterRemoval, WaitingFor,
 };
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::player::PlayerId;
@@ -787,18 +786,14 @@ pub(crate) fn pay_counter_cost_removals(
     mut cost_removed_counters: Option<&mut Option<u32>>,
     events: &mut Vec<GameEvent>,
 ) -> CounterCostRemovalProgress {
-    for (index, removal) in removals.iter().enumerate() {
-        let counter_count_before = state
-            .objects
-            .get(&removal.object_id)
-            .and_then(|obj| obj.counters.get(&removal.counter_type))
-            .copied()
-            .unwrap_or(0);
+    let mut removals = removals.into_iter();
+    while let Some(removal) = removals.next() {
+        let in_flight = super::effects::counters::begin_in_flight_counter_removal(state, removal);
         match super::effects::counters::remove_counter_with_replacement(
             state,
-            removal.object_id,
-            removal.counter_type.clone(),
-            removal.count,
+            in_flight.removal.object_id,
+            in_flight.removal.counter_type.clone(),
+            in_flight.removal.count,
             events,
         ) {
             super::effects::counters::CounterRemovalOutcome::Removed(removed) => {
@@ -809,11 +804,8 @@ pub(crate) fn pay_counter_cost_removals(
             super::effects::counters::CounterRemovalOutcome::AwaitingReplacementChoice => {
                 return CounterCostRemovalProgress::AwaitingReplacementChoice(
                     PausedCounterCostRemoval {
-                        in_flight: PendingCounterRemovalInFlight {
-                            removal: removal.clone(),
-                            counter_count_before,
-                        },
-                        remaining: removals[index + 1..].to_vec(),
+                        in_flight,
+                        remaining: removals.collect(),
                     },
                 );
             }

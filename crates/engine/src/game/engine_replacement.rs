@@ -1616,9 +1616,10 @@ fn handle_replacement_choice_inner(
                 }
                 return Ok(state.waiting_for.clone());
             }
-            // CR 616.1: only the effect queue owns this drain; a cost removal
-            // falls through to the typed cost-move drain below.
-            if pending_was_counter_removal && state.active_counter_removals().is_some() {
+            // CR 616.1: a removal whose cost-move root owns it (stack or mana
+            // route) falls through to the typed cost-move drain below; every other
+            // removal (the effect queue, damage, resolution-time costs) resumes here.
+            if pending_was_counter_removal && state.pending_cost_move_resume.is_none() {
                 state.waiting_for = WaitingFor::Priority {
                     player: state.active_player,
                 };
