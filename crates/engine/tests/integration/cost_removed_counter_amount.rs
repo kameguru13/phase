@@ -29,19 +29,22 @@ use engine::game::effects::attach::attach_to;
 use engine::game::perf_counters;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
-    AbilityCost, AbilityDefinition, AggregateFunction, DamageChannel, Effect, QuantityExpr,
-    QuantityRef, ReplacementDefinition, ReplacementMode, RoundingMode, TargetFilter, TargetRef,
+    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
+    ChosenAttribute, Comparator, ControllerRef, CounterCostSelection, DamageChannel, Effect,
+    ManaContribution, ManaProduction, QuantityExpr, QuantityRef, ReplacementDefinition,
+    ReplacementMode, RoundingMode, TargetFilter, TargetRef, TypedFilter, REMOVE_COUNTER_COST_ALL,
 };
 use engine::types::actions::GameAction;
-use engine::types::counter::{parse_counter_type, CounterType};
+use engine::types::counter::{parse_counter_type, CounterMatch, CounterType};
+use engine::types::events::GameEvent;
 use engine::types::game_state::{
     CastPaymentMode, CounterCostChoice, GameState, ManaAbilityCostCursor, ManaChoice,
-    ManaChoiceContext, PausedCounterCostRemoval, PayCostKind, PendingCast,
+    ManaChoiceContext, ManaChoicePrompt, PausedCounterCostRemoval, PayCostKind, PendingCast,
     PendingCostMoveCompletion, PendingCostMoveResume, ReplacementChoiceKind, StackEntryKind,
     WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
-use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
+use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::proposed_event::{ProposedEvent, ReplacementId};
 use engine::types::replacements::ReplacementEvent;
@@ -778,7 +781,16 @@ fn black_mana_battery_adds_an_additional_black_per_counter_removed() {
 /// Rite, First and Second are tapped). Its counter cost removes 3 +1/+1 counters
 /// from among First (2) and Second (1).
 fn ooze_flux_with_granted_mana(pool: &[ManaType]) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    ooze_flux_with_granted_mana_and(pool, |_| {})
+}
+
+/// The C3c board, with `extra` seating more permanents before it is built.
+fn ooze_flux_with_granted_mana_and(
+    pool: &[ManaType],
+    extra: impl FnOnce(&mut GameScenario),
+) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
     let mut scenario = main_phase();
+    extra(&mut scenario);
     scenario.add_enchantment_from_oracle(P0, "Opalescence", OPALESCENCE);
     let rite = scenario
         .add_enchantment_from_oracle(P0, "Cryptolith Rite", CRYPTOLITH_RITE)
@@ -2103,6 +2115,559 @@ fn bracers_copy_of_an_x_reader_keeps_x() {
     assert_eq!(power(&runner, baku), 3, "the copy gives +X/+0");
     drive(&mut runner, priority_with_empty_stack, &mut answers);
     assert_eq!(power(&runner, baku), 5);
+}
+
+// ---------------------------------------------------------------------------
+// C8 — the colour prompt reads the paid count (CR 605.3b + CR 608.2d)
+// ---------------------------------------------------------------------------
+//
+// The rows below use a synthetic typed witness derived from Pentad Prism. It is
+// NOT printed text: no printed card pairs a counter-removal mana cost with a
+// colour prompt whose size or gate reads the counters removed, but the class
+// is reachable by data. The witness is an artifact whose one activated mana
+// ability removes its own charge counters and adds mana counted by
+// `PreviousEffectAmount`, the "counters removed this way" / "that much" amount.
+//
+// CR 605.3b + CR 602.2b + CR 608.2h: the mana ability resolves immediately, so
+// the colour prompt it offers (CR 608.2d) is sized by this activation's own
+// paid count, exactly as its production is. The enclosing "this way" amount
+// (`last_effect_amount`) neither sizes the prompt nor is changed by it.
+
+/// Pentad Prism's self counter cost ("Remove a charge counter from this
+/// artifact"), with `count` charge counters, or `REMOVE_COUNTER_COST_ALL` for
+/// "Remove all charge counters from this artifact".
+fn remove_charge_counters(count: u32) -> AbilityCost {
+    AbilityCost::RemoveCounter {
+        count,
+        counter_type: CounterMatch::OfType(counter("charge")),
+        target: None,
+        selection: CounterCostSelection::SingleObject,
+    }
+}
+
+fn mana_effect(produced: ManaProduction) -> Effect {
+    Effect::Mana {
+        produced,
+        restrictions: vec![],
+        grants: vec![],
+        expiry: None,
+        target: None,
+    }
+}
+
+/// "Add that much mana in any combination of {R} and/or {G}."
+fn red_green_combination() -> ManaProduction {
+    ManaProduction::AnyCombination {
+        count: previous_effect_amount(),
+        color_options: vec![ManaColor::Red, ManaColor::Green],
+    }
+}
+
+/// The synthetic witness: an artifact with `charge` charge counters whose only
+/// ability is the activated mana ability `cost: <ability>`.
+fn add_charge_font(
+    scenario: &mut GameScenario,
+    cost: AbilityCost,
+    ability: AbilityDefinition,
+    charge: u32,
+) -> ObjectId {
+    let font = scenario
+        .add_artifact_from_oracle(P0, "Charge Font", "")
+        .with_ability_definition(ability.cost(cost))
+        .id();
+    scenario.with_counter(font, counter("charge"), charge);
+    font
+}
+
+fn mana_ability(produced: ManaProduction) -> AbilityDefinition {
+    AbilityDefinition::new(AbilityKind::Activated, mana_effect(produced))
+}
+
+/// Seeds `outer` as the enclosing "this way" amount, activates `source`'s mana
+/// ability, and returns the colour prompt it surfaced, if any.
+fn activate_with_outer_amount(
+    runner: &mut GameRunner,
+    source: ObjectId,
+    outer: Option<i32>,
+) -> Option<ManaChoicePrompt> {
+    runner.state_mut().last_effect_amount = outer;
+    activate(runner, source, 0);
+    assert_eq!(
+        runner.state().last_effect_amount,
+        outer,
+        "the enclosing amount is unchanged when the activation returns"
+    );
+    match &runner.state().waiting_for {
+        WaitingFor::ChooseManaColor { choice, .. } => Some(choice.clone()),
+        _ => None,
+    }
+}
+
+/// The prompt offers `answer`'s shape: a single colour among its options, or a
+/// combination of `paid` units.
+fn assert_prompt_offers(
+    prompt: &Option<ManaChoicePrompt>,
+    answer: &ManaChoice,
+    paid: usize,
+    row: &str,
+) {
+    match (prompt, answer) {
+        (Some(ManaChoicePrompt::SingleColor { options }), ManaChoice::SingleColor(color)) => {
+            assert!(
+                options.contains(color),
+                "{row}: {color:?} is among the offered colours {options:?}"
+            );
+        }
+        (
+            Some(ManaChoicePrompt::AnyCombination { count, options }),
+            ManaChoice::Combination(combination),
+        ) => {
+            assert_eq!(
+                *count, paid,
+                "{row}: the combination is sized by the {paid} counters removed"
+            );
+            assert!(
+                combination.iter().all(|unit| options.contains(unit)),
+                "{row}: {combination:?} is drawn from {options:?}"
+            );
+        }
+        (other, _) => panic!(
+            "{row}: a prompt for {answer:?}, sized by the {paid} counters removed, \
+             is surfaced; got {other:?}"
+        ),
+    }
+}
+
+fn choose_mana(runner: &mut GameRunner, choice: ManaChoice, row: &str) {
+    runner
+        .act(GameAction::ChooseManaColor { choice, count: 1 })
+        .unwrap_or_else(|err| panic!("{row}: the answer is legal: {err:?}"));
+}
+
+/// Exactly `paid` mana reached the pool, as `answer` chose it.
+fn assert_pool_holds(runner: &GameRunner, answer: &ManaChoice, paid: usize, row: &str) {
+    let chosen = match answer {
+        ManaChoice::SingleColor(color) => vec![*color; paid],
+        ManaChoice::Combination(combination) => combination.clone(),
+    };
+    assert_eq!(
+        runner.state().players[0].mana_pool.total(),
+        paid,
+        "{row}: exactly the {paid} paid units are added"
+    );
+    for color in &chosen {
+        let expected = chosen.iter().filter(|unit| *unit == color).count();
+        assert_eq!(
+            pool(runner, *color),
+            expected,
+            "{row}: the pool holds the chosen {color:?}"
+        );
+    }
+}
+
+/// One count-sensitive `mana_choice_prompt` arm: its production, the board its
+/// options read, and the answer the row gives.
+struct PromptSibling {
+    name: &'static str,
+    produced: ManaProduction,
+    /// Seats the permanents the production's options read.
+    board: fn(&mut GameScenario),
+    /// Gives the built source the state its options read.
+    source: fn(&mut GameRunner, ObjectId),
+    answer: ManaChoice,
+}
+
+fn no_board(_: &mut GameScenario) {}
+
+fn no_source_state(_: &mut GameRunner, _: ObjectId) {}
+
+fn add_colored_creature(scenario: &mut GameScenario, name: &str, color: ManaColor) {
+    scenario
+        .add_creature(P0, name, 1, 1)
+        .with_color(vec![color]);
+}
+
+/// Every arm of `mana_choice_prompt` that reads the count through
+/// `resolve_mana_types_for_ability`: the count-sized combination and the
+/// single-colour arms whose prompt is gated on the production adding mana
+/// (CR 106.5).
+///
+/// `AnyCombinationOfObjectColors` has no row: its options come from
+/// `object_colors_for_scope`, which binds only an object TARGET, and a mana
+/// ability requires no target (CR 605.1a), so the arm returns no prompt before
+/// it reads the count — it cannot be reached from a mana ability's prompt.
+fn prompt_siblings() -> Vec<PromptSibling> {
+    let you_control =
+        |filter: TypedFilter| TargetFilter::Typed(filter.controller(ControllerRef::You));
+    vec![
+        PromptSibling {
+            name: "AnyCombination",
+            produced: red_green_combination(),
+            board: no_board,
+            source: no_source_state,
+            answer: ManaChoice::Combination(vec![ManaType::Red, ManaType::Green]),
+        },
+        PromptSibling {
+            name: "AnyOneColor",
+            produced: ManaProduction::AnyOneColor {
+                count: previous_effect_amount(),
+                color_options: vec![ManaColor::Red, ManaColor::Green],
+                contribution: ManaContribution::Base,
+            },
+            board: no_board,
+            source: no_source_state,
+            answer: ManaChoice::SingleColor(ManaType::Green),
+        },
+        PromptSibling {
+            name: "AnyOneColorAmongPermanents",
+            produced: ManaProduction::AnyOneColorAmongPermanents {
+                count: previous_effect_amount(),
+                filter: you_control(TypedFilter::creature()),
+                contribution: ManaContribution::Base,
+            },
+            board: |scenario| {
+                add_colored_creature(scenario, "Red Creature", ManaColor::Red);
+                add_colored_creature(scenario, "Green Creature", ManaColor::Green);
+            },
+            source: no_source_state,
+            answer: ManaChoice::SingleColor(ManaType::Green),
+        },
+        PromptSibling {
+            name: "ChosenColor with a fixed alternative",
+            produced: ManaProduction::ChosenColor {
+                count: previous_effect_amount(),
+                contribution: ManaContribution::Base,
+                fixed_alternative: Some(ManaColor::White),
+            },
+            board: no_board,
+            source: |runner, font| {
+                runner
+                    .state_mut()
+                    .objects
+                    .get_mut(&font)
+                    .unwrap()
+                    .chosen_attributes
+                    .push(ChosenAttribute::Color(ManaColor::Green));
+            },
+            answer: ManaChoice::SingleColor(ManaType::Green),
+        },
+        PromptSibling {
+            name: "AnyTypeProduceableBy",
+            produced: ManaProduction::AnyTypeProduceableBy {
+                count: previous_effect_amount(),
+                land_filter: you_control(TypedFilter::land()),
+            },
+            board: |scenario| {
+                scenario.add_basic_land(P0, ManaColor::Blue);
+                scenario.add_basic_land(P0, ManaColor::Green);
+            },
+            source: no_source_state,
+            answer: ManaChoice::SingleColor(ManaType::Green),
+        },
+        PromptSibling {
+            name: "OpponentLandColors",
+            produced: ManaProduction::OpponentLandColors {
+                count: previous_effect_amount(),
+            },
+            board: |scenario| {
+                scenario.add_basic_land(P1, ManaColor::Red);
+                scenario.add_basic_land(P1, ManaColor::Green);
+            },
+            source: no_source_state,
+            answer: ManaChoice::SingleColor(ManaType::Green),
+        },
+        PromptSibling {
+            name: "AnyInCommandersColorIdentity",
+            produced: ManaProduction::AnyInCommandersColorIdentity {
+                count: previous_effect_amount(),
+                contribution: ManaContribution::Base,
+            },
+            board: |scenario| {
+                scenario
+                    .add_creature(P0, "Red-Green Commander", 2, 2)
+                    .with_color(vec![ManaColor::Red, ManaColor::Green])
+                    .commander();
+            },
+            source: no_source_state,
+            answer: ManaChoice::SingleColor(ManaType::Green),
+        },
+    ]
+}
+
+/// R4 (B2): every count-sensitive colour prompt reads this activation's own
+/// 2 counters removed. With no enclosing amount (or 0) the prompt is still
+/// surfaced and sized by 2, and exactly the 2 chosen units reach the pool.
+#[test]
+fn count_sensitive_mana_prompts_read_the_paid_count() {
+    for row in prompt_siblings() {
+        for outer in [None, Some(0)] {
+            let name = format!("{} (outer {outer:?})", row.name);
+            let mut scenario = main_phase();
+            (row.board)(&mut scenario);
+            let font = add_charge_font(
+                &mut scenario,
+                remove_charge_counters(REMOVE_COUNTER_COST_ALL),
+                mana_ability(row.produced.clone()),
+                2,
+            );
+            let mut runner = scenario.build();
+            (row.source)(&mut runner, font);
+
+            let prompt = activate_with_outer_amount(&mut runner, font, outer);
+            assert_eq!(
+                counters_on(&runner, font, &counter("charge")),
+                0,
+                "{name}: reach: the cost removed both charge counters"
+            );
+            assert_prompt_offers(&prompt, &row.answer, 2, &name);
+
+            choose_mana(&mut runner, row.answer.clone(), &name);
+            assert_pool_holds(&runner, &row.answer, 2, &name);
+            assert_eq!(
+                runner.state().last_effect_amount,
+                outer,
+                "{name}: the enclosing amount is restored after production"
+            );
+            assert!(payment_ownership_is_clear(&runner), "{name}");
+        }
+    }
+}
+
+/// R4: Pentad Prism's one-counter cost with a combination production. Whatever
+/// the enclosing amount — none, 0, or a stale 3 — the prompt asks for the 1
+/// counter removed: a 3-unit answer is rejected and the 1-unit answer adds
+/// exactly 1 mana.
+#[test]
+fn a_stale_enclosing_amount_does_not_size_the_combination_prompt() {
+    let mut scenario = main_phase();
+    let prism = scenario
+        .add_artifact_from_oracle(P0, "Pentad Prism", PENTAD_PRISM)
+        .id();
+    let runner = scenario.build();
+    let index = counter_cost_ability(&runner, prism, 0);
+    assert_eq!(
+        runner.state().objects[&prism].abilities[index].cost,
+        Some(remove_charge_counters(1)),
+        "structural guard: the witness cost is the cost Pentad Prism parses to"
+    );
+
+    for outer in [None, Some(0), Some(3)] {
+        let name = format!("AnyCombination, paid 1 (outer {outer:?})");
+        let mut scenario = main_phase();
+        let font = add_charge_font(
+            &mut scenario,
+            remove_charge_counters(1),
+            mana_ability(red_green_combination()),
+            2,
+        );
+        let mut runner = scenario.build();
+
+        let prompt = activate_with_outer_amount(&mut runner, font, outer);
+        assert_eq!(
+            counters_on(&runner, font, &counter("charge")),
+            1,
+            "{name}: reach: the cost removed one charge counter"
+        );
+        let answer = ManaChoice::Combination(vec![ManaType::Green]);
+        assert_prompt_offers(&prompt, &answer, 1, &name);
+
+        assert!(
+            runner
+                .act(GameAction::ChooseManaColor {
+                    choice: ManaChoice::Combination(vec![ManaType::Red; 3]),
+                    count: 1,
+                })
+                .is_err(),
+            "{name}: three units are not legal for one counter removed"
+        );
+        assert!(
+            matches!(
+                runner.state().waiting_for,
+                WaitingFor::ChooseManaColor { .. }
+            ),
+            "{name}: the rejected answer leaves the prompt pending"
+        );
+
+        choose_mana(&mut runner, answer.clone(), &name);
+        assert_pool_holds(&runner, &answer, 1, &name);
+        assert_eq!(
+            runner.state().last_effect_amount,
+            outer,
+            "{name}: the enclosing amount is restored after production"
+        );
+    }
+}
+
+/// R4 (B1): the head adds {C}; "instead", if 2 or more counters were removed
+/// this way, it adds that much mana in any combination of {R} and/or {G}. The
+/// instead condition reads this activation's own paid count (CR 608.2c), as the
+/// stack route's resolution does — not the enclosing amount.
+#[test]
+fn an_instead_condition_reads_the_paid_count() {
+    let instead_ability = || {
+        let combination =
+            mana_ability(red_green_combination()).condition(AbilityCondition::ConditionInstead {
+                inner: Box::new(AbilityCondition::PreviousEffectAmount {
+                    comparator: Comparator::GE,
+                    rhs: QuantityExpr::Fixed { value: 2 },
+                    channel: DamageChannel::Total,
+                }),
+            });
+        mana_ability(ManaProduction::Colorless {
+            count: QuantityExpr::Fixed { value: 1 },
+        })
+        .sub_ability(combination)
+    };
+
+    // Paid 2, no enclosing amount: the instead production applies and asks for
+    // 2 units.
+    let name = "instead, paid 2 (outer None)";
+    let mut scenario = main_phase();
+    let font = add_charge_font(
+        &mut scenario,
+        remove_charge_counters(REMOVE_COUNTER_COST_ALL),
+        instead_ability(),
+        2,
+    );
+    let mut runner = scenario.build();
+    let prompt = activate_with_outer_amount(&mut runner, font, None);
+    assert_eq!(
+        counters_on(&runner, font, &counter("charge")),
+        0,
+        "{name}: reach: the cost removed both charge counters"
+    );
+    let answer = ManaChoice::Combination(vec![ManaType::Red, ManaType::Green]);
+    assert_prompt_offers(&prompt, &answer, 2, name);
+    choose_mana(&mut runner, answer.clone(), name);
+    assert_pool_holds(&runner, &answer, 2, name);
+    assert_eq!(runner.state().last_effect_amount, None, "{name}");
+
+    // Paid 1 against a stale enclosing 3: the condition is false, so {C} with
+    // no prompt.
+    let name = "instead, paid 1 (outer Some(3))";
+    let mut scenario = main_phase();
+    let font = add_charge_font(
+        &mut scenario,
+        remove_charge_counters(REMOVE_COUNTER_COST_ALL),
+        instead_ability(),
+        1,
+    );
+    let mut runner = scenario.build();
+    let prompt = activate_with_outer_amount(&mut runner, font, Some(3));
+    assert_eq!(
+        counters_on(&runner, font, &counter("charge")),
+        0,
+        "{name}: reach: the cost removed the charge counter"
+    );
+    assert_eq!(prompt, None, "{name}: the head {{C}} needs no choice");
+    assert_eq!(pool(&runner, ManaType::Colorless), 1, "{name}");
+    assert_eq!(runner.state().players[0].mana_pool.total(), 1, "{name}");
+    assert_eq!(runner.state().last_effect_amount, Some(3), "{name}");
+}
+
+/// R4 (B3): while Ooze Flux waits for its {1}{G} with its own 3 counters
+/// removed (CR 601.2g + CR 605.3a), a counter-cost mana ability removing 1
+/// counter asks for 1 unit, not the enclosing 3, and leaves both the enclosing
+/// amount and Ooze Flux's pending count untouched.
+#[test]
+fn a_nested_mana_prompt_reads_its_own_paid_count() {
+    let mut font = None;
+    let (mut runner, flux, first, second) = ooze_flux_with_granted_mana_and(&[], |scenario| {
+        font = Some(add_charge_font(
+            scenario,
+            remove_charge_counters(1),
+            mana_ability(red_green_combination()),
+            2,
+        ));
+    });
+    let font = font.expect("the board seats the font");
+    let mut answers = ooze_flux_answers(first, second);
+
+    let index = counter_cost_ability(&runner, flux, 0);
+    activate(&mut runner, flux, index);
+    drive(&mut runner, is_mana_payment, &mut answers);
+    assert_eq!(pending_activation_count(&runner), Some(3));
+
+    let name = "nested AnyCombination, paid 1 (outer Some(3))";
+    let prompt = activate_with_outer_amount(&mut runner, font, Some(3));
+    assert_eq!(
+        counters_on(&runner, font, &counter("charge")),
+        1,
+        "{name}: reach: the cost removed one charge counter"
+    );
+    let answer = ManaChoice::Combination(vec![ManaType::Green]);
+    assert_prompt_offers(&prompt, &answer, 1, name);
+
+    choose_mana(&mut runner, answer.clone(), name);
+    assert_pool_holds(&runner, &answer, 1, name);
+    assert_eq!(runner.state().last_effect_amount, Some(3), "{name}");
+    assert!(
+        is_mana_payment(runner.state()),
+        "{name}: the enclosing payment resumes: {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(
+        pending_activation_count(&runner),
+        Some(3),
+        "{name}: Ooze Flux's pending count is unchanged"
+    );
+
+    // The rest of {1}{G}.
+    let _ = runner.state_mut().add_mana_to_pool(
+        P0,
+        ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]),
+    );
+    drive(&mut runner, priority_with_stack(1), &mut answers);
+    assert_eq!(top_stack_count(&runner), Some(3));
+    drive(&mut runner, priority_with_empty_stack, &mut answers);
+    assert_one_three_three_ooze(&runner, first, second);
+}
+
+/// R4 (B4): "{T}, Remove all charge counters" with none on it removes 0, and a
+/// paid 0 is this activation's count, not an absent one. Against a stale
+/// enclosing 3 the combination is sized by 0: no prompt and no mana.
+#[test]
+fn removing_zero_counters_adds_no_mana_against_a_stale_amount() {
+    let mut scenario = main_phase();
+    let font = add_charge_font(
+        &mut scenario,
+        AbilityCost::Composite {
+            costs: vec![
+                AbilityCost::Tap,
+                remove_charge_counters(REMOVE_COUNTER_COST_ALL),
+            ],
+        },
+        mana_ability(red_green_combination()),
+        0,
+    );
+    let mut runner = scenario.build();
+    runner.state_mut().last_effect_amount = Some(3);
+
+    let result = runner
+        .act(GameAction::ActivateAbility {
+            source_id: font,
+            ability_index: 0,
+        })
+        .unwrap_or_else(|err| panic!("the ability activates: {err:?}"));
+
+    assert!(
+        runner.state().objects[&font].tapped,
+        "reach: the {{T}} cost was paid"
+    );
+    assert!(
+        result.events.iter().any(|event| matches!(
+            event,
+            GameEvent::AbilityActivated { source_id, .. } if *source_id == font
+        )),
+        "reach: the mana ability was activated"
+    );
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "no colour prompt for 0 counters removed: {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(runner.state().players[0].mana_pool.total(), 0);
+    assert_eq!(runner.state().last_effect_amount, Some(3));
 }
 
 // ---------------------------------------------------------------------------

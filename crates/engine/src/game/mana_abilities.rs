@@ -734,11 +734,61 @@ fn produce_mana_from_ability(
     cost_paid_object: Option<CostPaidObjectSnapshot>,
     cost_removed_counters: Option<u32>,
 ) {
+    with_bound_mana_activation(
+        state,
+        source_id,
+        player,
+        ability_def,
+        chosen_x,
+        cost_paid_object,
+        cost_removed_counters,
+        |state, resolved_for_quantity| {
+            produce_mana_from_bound_ability(
+                state,
+                source_id,
+                player,
+                ability_def,
+                events,
+                color_override,
+                resolved_for_quantity,
+            );
+        },
+    );
+}
+
+/// CR 605.3b + CR 602.2b + CR 608.2h: run `body` against this activation's
+/// resolved mana ability with its own paid removed-counter count bound — the
+/// context field and the "this way" scalar — then restore the outer
+/// `last_effect_amount` (a mana ability can resolve inside another payment).
+/// The single binding authority for the colour prompt and production.
+#[allow(clippy::too_many_arguments)]
+fn with_bound_mana_activation<R>(
+    state: &mut GameState,
+    source_id: ObjectId,
+    player: PlayerId,
+    ability_def: &AbilityDefinition,
+    chosen_x: Option<u32>,
+    cost_paid_object: Option<CostPaidObjectSnapshot>,
+    cost_removed_counters: Option<u32>,
+    body: impl FnOnce(&mut GameState, &ResolvedAbility) -> R,
+) -> R {
+    // CR 605.3b + CR 602.2b + CR 608.2h: a mana ability resolves immediately, so
+    // its own payment's count binds here; another activation's payment cannot
+    // reach it. The count is the preceding "this way" amount for the head
+    // production and the sub-chain. It binds BEFORE the ability is built: an
+    // "instead" condition (`apply_condition_instead_mana_swap`) reads the "this
+    // way" amount when it picks the production (CR 608.2c), as the stack route's
+    // resolution does.
+    let outer_last_effect_amount = cost_removed_counters.map(|n| {
+        state
+            .last_effect_amount
+            .replace(super::arithmetic::u32_to_i32_saturating(n))
+    });
     // CR 117.1 + CR 202.3: Build a transient `ResolvedAbility` carrying the
     // cost-paid object snapshot so quantity resolution sees it. Reused for
     // both production-count and sub-chain resolution paths so the same
     // snapshot is visible end-to-end.
-    let mut resolved_for_quantity = resolved_mana_ability_for_current_state(
+    let mut resolved = resolved_mana_ability_for_current_state(
         state,
         source_id,
         player,
@@ -746,19 +796,25 @@ fn produce_mana_from_ability(
         chosen_x,
         cost_paid_object,
     );
-    // CR 605.3b + CR 602.2b + CR 608.2h: a mana ability resolves immediately, so
-    // its own payment's count binds here; another activation's payment cannot
-    // reach it. The count is the preceding "this way" amount for the head
-    // production and the sub-chain. A mana ability can resolve inside another
-    // resolution's payment, so the outer `last_effect_amount` is restored
-    // afterwards.
-    resolved_for_quantity.context.cost_removed_counter_amount = cost_removed_counters;
-    let outer_last_effect_amount = cost_removed_counters.map(|n| {
-        state
-            .last_effect_amount
-            .replace(super::arithmetic::u32_to_i32_saturating(n))
-    });
+    resolved.context.cost_removed_counter_amount = cost_removed_counters;
+    let result = body(state, &resolved);
+    if let Some(outer) = outer_last_effect_amount {
+        state.last_effect_amount = outer;
+    }
+    result
+}
 
+/// Produce mana from `resolved_for_quantity`, this activation's resolved mana
+/// ability with its paid count already bound (`with_bound_mana_activation`).
+fn produce_mana_from_bound_ability(
+    state: &mut GameState,
+    source_id: ObjectId,
+    player: PlayerId,
+    ability_def: &AbilityDefinition,
+    events: &mut Vec<GameEvent>,
+    color_override: Option<ProductionOverride>,
+    resolved_for_quantity: &ResolvedAbility,
+) {
     // CR 106.12: a permanent is "tapped for mana" when the activated mana
     // ability's cost includes the `{T}` symbol.
     let tapped = mana_sources::has_tap_component(&ability_def.cost);
@@ -858,7 +914,7 @@ fn produce_mana_from_ability(
     // on the chain actually carrying an `AddChosenColor`, so ordinary producers
     // are untouched. Placed above the `TappedForMana` push below, which MOVES
     // `produced_mana`.
-    if chain_references_chosen_color(&resolved_for_quantity) {
+    if chain_references_chosen_color(resolved_for_quantity) {
         if let Some(color) = sole_produced_color(&produced_for_tap_event) {
             if let Some(obj) = state.objects.get_mut(&source_id) {
                 // CR 400.7: `chosen_attributes` persist on the permanent until it
@@ -903,10 +959,7 @@ fn produce_mana_from_ability(
     // effect chain (e.g. painlands' "This land deals 1 damage to you.")
     // resolves that chain inline — mana abilities don't use the stack, so
     // the sub-ability runs as part of the same atomic resolution.
-    resolve_mana_ability_sub_chain(state, &resolved_for_quantity, events);
-    if let Some(outer) = outer_last_effect_amount {
-        state.last_effect_amount = outer;
-    }
+    resolve_mana_ability_sub_chain(state, resolved_for_quantity, events);
 }
 
 fn resolved_mana_ability_for_current_state(
@@ -3431,21 +3484,30 @@ fn finish_mana_ability_cost_payment(
     super::triggers::collect_activation_event_at_boundary(state, events, activation_event)
         .map_err(|error| EngineError::InvalidAction(error.to_string()))?;
     if !resolves_automatically && pending.color_override.is_none() {
-        let resolved_for_prompt = resolved_mana_ability_for_current_state(
+        // CR 605.3b + CR 608.2d: the colour choice this ability offers is sized
+        // and gated by this activation's own paid count, under the same binding
+        // its production uses; the outer "this way" amount is restored before
+        // the prompt is returned.
+        let source_id = pending.source_id;
+        let prompt = with_bound_mana_activation(
             state,
-            pending.source_id,
+            source_id,
             pending.player,
             &ability_def,
             pending.chosen_x,
             pending.cost_paid_object.clone(),
+            pending.cost_removed_counters,
+            |state, resolved_for_prompt| {
+                mana_choice_prompt(
+                    &resolved_for_prompt.effect,
+                    state,
+                    source_id,
+                    Some(resolved_for_prompt),
+                    Some(resolved_for_prompt),
+                )
+            },
         );
-        if let Some(choice) = mana_choice_prompt(
-            &resolved_for_prompt.effect,
-            state,
-            pending.source_id,
-            Some(&resolved_for_prompt),
-            Some(&resolved_for_prompt),
-        ) {
+        if let Some(choice) = prompt {
             if matches!(choice, ManaChoicePrompt::SingleColor { .. })
                 && cost_resolves_without_choice(&ability_def.cost)
             {
