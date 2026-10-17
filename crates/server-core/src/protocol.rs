@@ -3346,17 +3346,25 @@ mod tests {
         }
     }
 
-    /// v145: `StaticCondition`, `TriggerCondition` and `AbilityCondition` gain
+    /// v147: `StaticCondition`, `TriggerCondition` and `AbilityCondition` gain
     /// `QuantityQuality { quantity, quality }` with the new `NumberQuality`
-    /// (CR 107.1, CR 603.4), carried in `GameState` ability definitions; a v144
+    /// (CR 107.1, CR 603.4), carried in `GameState` ability definitions; a v146
     /// peer cannot decode the new tag, so it must be refused before it receives
-    /// v145 state.
+    /// v147 state.
     /// The same bump adds the optional `created_tokens` channel to the private
     /// player-scope tail sidecar that `PendingContinuation` carries under its
     /// existing `player_scope_linked_exile` key (CR 608.2c + CR 608.2f: the
     /// tokens every seat created, for a paused "each player creates … The
     /// tokens …" tail); it is serde-defaulted, so a sidecar without it decodes
     /// as the linked-exile-only sidecar.
+    ///
+    /// v146: `ConfirmedPeriod` gains `counted_by` (CR 732.2a counted loop offers) and `performance`,
+    /// and a loop offer's `win_kind` becomes optional; a v145 peer drops the field
+    /// or cannot parse the offer, so it must be refused before it receives v146 state.
+    /// v145: `ParentTargetMissingReason` gains `SearchLibrary` (CR 701.23b),
+    /// serialized on `ResolvedAbility.parent_target_missing_reason`; a v144
+    /// peer cannot parse the tag. P2P moves in lockstep (wire 127); lobby
+    /// messages unchanged.
     ///
     /// v144: one-time boons (#7495) add `Effect::CreateBoon`, `Effect::NoteNumber`,
     /// the `HasBoon` conditions, and `WaitingFor::ChooseTokenHost` tags, and
@@ -3576,8 +3584,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_145_for_number_quality_conditions() {
-        assert_eq!(PROTOCOL_VERSION, 145);
+    fn protocol_version_is_147_for_number_quality_conditions() {
+        assert_eq!(PROTOCOL_VERSION, 147);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3588,7 +3596,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_145_for_number_quality_conditions` stays
+    /// `protocol_version_is_147_for_number_quality_conditions` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
