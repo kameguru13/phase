@@ -7693,7 +7693,8 @@ fn parse_spell_history_condition(input: &str) -> OracleResult<'_, StaticConditio
             make_quantity_comparison(QuantityRef::SpellsCastLastTurn, Comparator::EQ, 0),
             tag("no spells were cast last turn"),
         ),
-        // "two or more spells were cast last turn" / "a player cast two or more spells last turn"
+        // "two or more spells were cast last turn" (table-wide only; the
+        // per-player "a player cast N or more spells last turn" is declined)
         parse_spells_cast_last_turn,
         parse_you_cast_both_spell_kinds_this_turn,
         // CR 702.185c: "a spell was warped this turn" — any player cast a spell
@@ -9251,20 +9252,21 @@ fn strip_spell_history_noun(type_text: &str) -> &str {
     type_text
 }
 
-/// Parse "two or more spells were cast last turn" / "a player cast two or more spells last turn".
+/// CR 603.4: "two or more spells were cast last turn" — the table-wide count
+/// of spells cast during the previous turn (`QuantityRef::SpellsCastLastTurn`).
+///
+/// The per-player wording "a player cast two or more spells last turn" is
+/// deliberately NOT recognized here: it is true only when a single player cast
+/// that many spells, which a table-wide total cannot express (two players
+/// casting one spell each would wrongly satisfy it). Declining leaves that
+/// guard unparsed, so the trigger fails closed as an `unparsed_condition` gap
+/// instead of lowering to the wrong count.
 fn parse_spells_cast_last_turn(input: &str) -> OracleResult<'_, StaticCondition> {
-    // "two or more spells were cast last turn"
-    if let Ok((rest, _)) =
-        tag::<_, _, OracleError<'_>>("two or more spells were cast last turn").parse(input)
-    {
-        return Ok((rest, make_quantity_ge(QuantityRef::SpellsCastLastTurn, 2)));
-    }
-    // "a player cast two or more spells last turn"
-    let (rest, _) = tag("a player cast ").parse(input)?;
-    let (rest, n) = parse_number(rest)?;
-    let rest = rest.trim_start();
-    let (rest, _) = tag("or more spells last turn").parse(rest)?;
-    Ok((rest, make_quantity_ge(QuantityRef::SpellsCastLastTurn, n)))
+    value(
+        make_quantity_ge(QuantityRef::SpellsCastLastTurn, 2),
+        tag("two or more spells were cast last turn"),
+    )
+    .parse(input)
 }
 
 /// Parse "you [put/ve put] [a counter/one or more counters] on a

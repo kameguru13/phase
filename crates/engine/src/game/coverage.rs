@@ -10808,8 +10808,10 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ("LoyaltyAbilitiesActivatedThisTurn", Handled)
         }
         // CR 601.2i: the table-wide count of spells that became cast during the previous turn
-        // (`turns::start_next_turn`'s snapshot). Table-wide by construction; a per-player
-        // 'a player cast …' reading is not this ref.
+        // (`turns::start_next_turn`'s snapshot). Only table-wide guards ('no spells were cast
+        // last turn', 'two or more spells were cast last turn') lower to it. The per-player
+        // 'a player cast N or more spells last turn' is declined by the condition parser and
+        // fails closed as an `unparsed_condition` gap, so those faces never reach this arm.
         QuantityRef::SpellsCastLastTurn => ("SpellsCastLastTurn", Handled),
         QuantityRef::SpellsCastThisGame { .. } => ("SpellsCastThisGame", Handled),
         QuantityRef::CounterAddedThisTurn { .. } => ("CounterAddedThisTurn", Handled),
@@ -21160,6 +21162,59 @@ have been revealed, Aggressive Detective deals 2 damage to each opponent.";
             let result = coverage_result_for_face(face);
             assert!(result.supported, "{name}: {:?}", gap_handlers(&result));
         }
+    }
+
+    /// CR 603.4: Gatstaf Howler's per-player "a player cast two or more spells
+    /// last turn" guard is not expressible by the table-wide
+    /// `SpellsCastLastTurn` count, so the face must be an honest unsupported
+    /// gap through production `analyze_coverage` — never a supported upkeep
+    /// transform with the guard dropped. Gatstaf Shepherd's table-wide "no
+    /// spells" face (the same card's other side) stays supported.
+    /// REVERT-PROBE: restore the per-player arm in `parse_spells_cast_last_turn`
+    /// → Howler hoists `SpellsCastLastTurn >= 2` and reports supported.
+    #[test]
+    fn per_player_spells_cast_last_turn_face_is_unsupported() {
+        const GATSTAF_HOWLER_ORACLE: &str = "Intimidate (This creature can't be blocked except by artifact creatures and/or creatures that share a color with it.)\nAt the beginning of each upkeep, if a player cast two or more spells last turn, transform this creature.";
+        let howler = counter_rider_face(
+            "Gatstaf Howler",
+            GATSTAF_HOWLER_ORACLE,
+            &["Intimidate", "Transform"],
+            &["Creature"],
+        );
+        // Reach guard: the upkeep trigger itself parsed (the face is not red
+        // merely because the line was dropped), with no hoisted condition.
+        assert_eq!(howler.triggers.len(), 1, "{:?}", howler.triggers);
+        assert_eq!(howler.triggers[0].phase, Some(Phase::Upkeep));
+        let condition = howler.triggers[0].condition.clone();
+        let result = coverage_result_for_face(howler);
+        assert!(
+            !result.supported,
+            "the per-player guard must leave the face unsupported (condition: {condition:?})"
+        );
+        assert_eq!(
+            condition, None,
+            "nothing may hoist from the per-player guard"
+        );
+        assert!(
+            gap_handlers(&result)
+                .iter()
+                .any(|handler| handler.contains("unparsed_condition")),
+            "the gap must be the dropped condition: {:?}",
+            gap_handlers(&result)
+        );
+
+        let shepherd = counter_rider_face(
+            "Gatstaf Shepherd",
+            GATSTAF_SHEPHERD_ORACLE,
+            &["Intimidate", "Transform"],
+            &["Creature"],
+        );
+        let result = coverage_result_for_face(shepherd);
+        assert!(
+            result.supported,
+            "Gatstaf Shepherd: {:?}",
+            gap_handlers(&result)
+        );
     }
 
     // -----------------------------------------------------------------------
