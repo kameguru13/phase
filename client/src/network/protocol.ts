@@ -108,7 +108,9 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * Bumps to date:
  *  127 — game_setup and state_update carry GameState whose ability conditions
  *       may carry QuantityQuality/NumberQuality. Bumped in lockstep with
- *       full-game protocol 145.
+ *       full-game protocol 145, which also adds the optional created_tokens
+ *       channel on the player-scope tail sidecar inside paused resolution
+ *       frames.
  *  126 — game_setup and state_update carry GameState, whose one-time boons
  *       (#7495) add Effect.CreateBoon / Effect.NoteNumber, the HasBoon
  *       conditions, and WaitingFor.ChooseTokenHost, and whose perpetual P/T

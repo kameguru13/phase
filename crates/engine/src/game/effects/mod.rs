@@ -30,9 +30,9 @@ use crate::types::format::ZoneScope;
 use crate::types::game_state::{
     AutoMayChoice, CastOfferKind, ClauseMinimumSnapshot, DayNight, DiscardBatchCursor, GameState,
     LKISnapshot, ManaAbilityResume, MayTriggerAutoChoiceKey, PendingContinuation,
-    PendingCostMoveResume, PendingDiscardBatchCompletion, PendingPlayerScopeLinkedExile,
-    PendingPlayerScopeSacrificeChoice, PendingPlayerScopeSacrificeCompletion,
-    PendingPlayerScopeSacrificeFollowUp, RepeatUntilStopWitness, ResolutionOptionalPaymentOption,
+    PendingCostMoveResume, PendingDiscardBatchCompletion, PendingPlayerScopeSacrificeChoice,
+    PendingPlayerScopeSacrificeCompletion, PendingPlayerScopeSacrificeFollowUp,
+    PendingPlayerScopeTail, RepeatUntilStopWitness, ResolutionOptionalPaymentOption,
     ReturnResultOccurrenceId, WaitingFor, ZoneChangeRecord, ZoneOpponentChooserPurpose,
 };
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef, TrackedSetId};
@@ -1249,17 +1249,54 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
     if !waits_for_resolution_choice(&state.waiting_for)
         && state.active_ability_continuation().is_some()
     {
-        let scoped_source = state
+        // Each sidecar channel is extended only when it is live: the linked
+        // batch when the detached tail holds a linked-exile consumer, the
+        // created-token union when the driver opened it.
+        //
+        // Bound of the created-token read: `events` is the action-local buffer
+        // (`apply_action` builds one per action), and this drain returned above
+        // while the clause's own choice was still pending
+        // (`waits_for_resolution_choice` includes `ReplacementChoice`). The
+        // clause's frame is taken by the first drain that passes that guard, so
+        // on that frame this read covers exactly the action that answered the
+        // clause's pause — the paused seat's resumed creation and any
+        // replacement-made tokens of that same event (CR 614.1a). An id already
+        // present is not re-added. A later drain in the same action (the
+        // recursive drain after `finish_active_paused_post_replacement_dispatch`)
+        // reaches a created-channel frame only while that clause is still in
+        // progress: the channel is set only by the driver on the clause's own
+        // frame or cloned into frames created while its sidecar resolves, and
+        // the clause's generated legs never re-enter the driver, so at most one
+        // created-channel sidecar is live at a time.
+        let scoped_channels = state
             .active_ability_continuation()
-            .and_then(|pending| pending.player_scope_linked_exile.as_ref())
-            .map(|scope| scope.source_id);
-        if let Some(source_id) = scoped_source {
-            let additions = linked_exile_batch_from_events(state, source_id, events);
+            .and_then(|pending| pending.player_scope_tail.as_ref())
+            .map(|scope| {
+                (
+                    scope.source_id,
+                    tail_links_exile(scope),
+                    scope.created_tokens.is_some(),
+                )
+            });
+        if let Some((source_id, links, collects)) = scoped_channels {
+            let linked_additions = if links {
+                linked_exile_batch_from_events(state, source_id, events)
+            } else {
+                Vec::new()
+            };
+            let created_additions = if collects {
+                created_token_union_from_events(state, events)
+            } else {
+                Vec::new()
+            };
             if let Some(scope) = state
                 .active_ability_continuation_frame_mut()
-                .and_then(|frame| frame.pending.player_scope_linked_exile.as_mut())
+                .and_then(|frame| frame.pending.player_scope_tail.as_mut())
             {
-                extend_linked_exile_batch(&mut scope.batch, additions);
+                extend_pinned_batch(&mut scope.linked_exile_batch, linked_additions);
+                if let Some(created) = scope.created_tokens.as_mut() {
+                    extend_pinned_batch(created, created_additions);
+                }
             }
         }
         let discard_frame = state
@@ -1297,7 +1334,7 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
             trigger_firing,
             attachment_choice,
             attachment_remainder: _,
-            player_scope_linked_exile,
+            player_scope_tail,
             player_scope_queue_end,
         } = cont;
         debug_assert!(
@@ -1310,10 +1347,8 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
         );
         restore_continuation_trigger_firing(state, trigger_firing);
         state.resolving_continuation_attach_host = search_attach_host;
-        let previous_scope = std::mem::replace(
-            &mut state.resolving_player_scope_linked_exile,
-            player_scope_linked_exile,
-        );
+        let previous_scope =
+            std::mem::replace(&mut state.resolving_player_scope_tail, player_scope_tail);
         let source_id = chain.source_id;
         let prior_occurrence = std::mem::replace(
             &mut state.active_return_result_occurrence,
@@ -1349,20 +1384,35 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
                 let _ = resolve_ability_chain(state, &chain, events, 1);
             }
         }
-        if let Some(scope) = state.resolving_player_scope_linked_exile.as_ref() {
-            mark_exile_choice_tracks_by_source(state, scope.source_id);
+        if let Some(source_id) = state
+            .resolving_player_scope_tail
+            .as_ref()
+            .filter(|scope| tail_links_exile(scope))
+            .map(|scope| scope.source_id)
+        {
+            mark_exile_choice_tracks_by_source(state, source_id);
         }
         if let Some(snapshot) = trigger_snapshot {
             super::triggers::restore_trigger_event_context(state, snapshot);
         }
-        let completed_scope = std::mem::take(&mut state.resolving_player_scope_linked_exile);
-        state.resolving_player_scope_linked_exile = previous_scope;
+        let completed_scope = std::mem::take(&mut state.resolving_player_scope_tail);
+        state.resolving_player_scope_tail = previous_scope;
         state.resolving_continuation_attach_host = None;
         if !waits_for_resolution_choice(&state.waiting_for)
             && state.active_ability_continuation().is_none()
         {
             if let Some(mut scope) = completed_scope {
-                bind_resolution_exile_batch_paths(&mut scope.after_scope, &scope.batch);
+                if tail_links_exile(&scope) {
+                    bind_resolution_exile_batch_paths(
+                        &mut scope.after_scope,
+                        &scope.linked_exile_batch,
+                    );
+                }
+                // CR 608.2c + CR 608.2f: the paused clause has completed, so its
+                // one action's created referent is every token it made.
+                if let Some(union) = scope.created_tokens.as_deref() {
+                    publish_created_token_union(state, union);
+                }
                 let _ = resolve_ability_chain(state, &scope.after_scope, events, 1);
             }
         }
@@ -2897,7 +2947,7 @@ fn prepend_to_pending_continuation_with_producer(
             trigger_firing,
             attachment_choice,
             attachment_remainder,
-            player_scope_linked_exile,
+            player_scope_tail,
             player_scope_queue_end,
         } = existing;
         assert!(
@@ -2920,7 +2970,7 @@ fn prepend_to_pending_continuation_with_producer(
                 trigger_firing,
                 attachment_choice,
                 attachment_remainder,
-                player_scope_linked_exile,
+                player_scope_tail,
                 player_scope_queue_end,
             },
             choose_zone_trigger_context: frame.choose_zone_trigger_context,
@@ -13565,6 +13615,11 @@ fn install_previous_effect_counts_by_player(
 /// `scoped_events` is the clause's full event span. The driver passes its live
 /// slice; a resumed batch passes its pre-pause span reunited with the resumed
 /// action's buffer.
+///
+/// It also returns the clause's created-token union (CR 608.2c + CR 608.2f) for
+/// a token-creation clause — every token created inside `scoped_events`, which
+/// is the clause's own window; the caller publishes it when the clause has
+/// completed (`publish_created_token_union`), never mid-fan-out.
 fn publish_player_scope_clause_results(
     state: &mut GameState,
     outer: &ResolvedAbility,
@@ -13572,7 +13627,7 @@ fn publish_player_scope_clause_results(
     zero_fill_domain: &[PlayerId],
     after_scope_needs_linked_exile: bool,
     scoped_events: &[GameEvent],
-) -> Vec<ObjectIncarnationRef> {
+) -> PlayerScopeClauseBatches {
     let counts_by_player = previous_effect_counts_by_player_from_events(
         EffectKind::from(&scoped_template.effect),
         scoped_template.source_id,
@@ -13646,7 +13701,113 @@ fn publish_player_scope_clause_results(
             },
         );
     }
-    linked_exile_batch_from_events(state, outer.source_id, scoped_events)
+    let linked_exile = linked_exile_batch_from_events(state, outer.source_id, scoped_events);
+    let created_tokens = if scoped_template.effect.is_token_creator() {
+        created_token_union_from_events(state, scoped_events)
+    } else {
+        Vec::new()
+    };
+    PlayerScopeClauseBatches {
+        linked_exile,
+        created_tokens,
+    }
+}
+
+/// The pinned batches one completed (or paused) `player_scope` clause span
+/// yields for its detached tail: the linked-exile batch and the created-token
+/// union.
+struct PlayerScopeClauseBatches {
+    linked_exile: Vec<ObjectIncarnationRef>,
+    created_tokens: Vec<ObjectIncarnationRef>,
+}
+
+/// CR 111.1 + CR 400.7 + CR 608.2f + CR 614.1a: the tokens created inside one
+/// observation window of a multi-player token-creation instruction, in event
+/// order, each pinned to the incarnation it has while it is on the battlefield.
+/// Membership is the window, not the event's `source_id`: a replacement that
+/// substitutes or appends tokens (CR 614.1a) stamps its own source on them, yet
+/// they are created by this action. Callers pass only the clause's own windows.
+fn created_token_union_from_events(
+    state: &GameState,
+    events: &[GameEvent],
+) -> Vec<ObjectIncarnationRef> {
+    let mut union: Vec<ObjectIncarnationRef> = Vec::new();
+    for id in events.iter().filter_map(|event| match event {
+        GameEvent::TokenCreated { object_id, .. } => Some(*object_id),
+        _ => None,
+    }) {
+        if union.iter().any(|pin| pin.object_id == id) {
+            continue;
+        }
+        if let Some(object) = state
+            .objects
+            .get(&id)
+            .filter(|object| object.zone == Zone::Battlefield)
+        {
+            union.push(ObjectIncarnationRef::from_object(object));
+        }
+    }
+    union
+}
+
+/// CR 608.2c + CR 608.2f + CR 609.3: publish a completed player-scope token
+/// clause's created referent — every token its one action created — keeping
+/// only members that are still the object they were when created (CR 400.7).
+/// Called only at clause completion: a paused copy-token creation resumes from
+/// the ledger, so it must never be overwritten mid-fan-out.
+fn publish_created_token_union(state: &mut GameState, union: &[ObjectIncarnationRef]) {
+    state.last_created_token_ids = union
+        .iter()
+        .filter(|pin| pin.is_current(state))
+        .map(|pin| pin.object_id)
+        .collect();
+}
+
+/// CR 607.2a: the linked-exile channel is live exactly when the detached tail
+/// holds a linked-exile consumer — the predicate that opened every linked
+/// sidecar, legacy saves included.
+fn tail_links_exile(scope: &PendingPlayerScopeTail) -> bool {
+    crate::game::exile_links::ability_contains_linked_exile_consumer(&scope.after_scope)
+}
+
+/// CR 608.2c: does `tail` read the created referent ("the tokens", "it") that
+/// the preceding player-scope token clause publishes? A node reads it through
+/// its target filter, a `GenericEffect` grant's `affected`, or its condition.
+/// The walk stops at the tail's first own created-referent publisher: a later
+/// anaphor names that publisher's product, not the clause's (nearest publisher).
+/// A node that both reads and publishes reads first, so the read check precedes
+/// the publisher stop.
+fn tail_reads_created_referent(tail: &ResolvedAbility) -> bool {
+    let node_reads = |node: &ResolvedAbility| {
+        node.effect
+            .target_filter()
+            .is_some_and(filter_contains_last_created)
+            || matches!(
+                &node.effect,
+                Effect::GenericEffect { static_abilities, .. }
+                    if static_abilities
+                        .iter()
+                        .any(|s| s.affected.as_ref().is_some_and(filter_contains_last_created))
+            )
+            || node
+                .condition
+                .as_ref()
+                .is_some_and(condition_depends_on_last_created)
+    };
+    for node in std::iter::successors(Some(tail), |node| node.sub_ability.as_deref()) {
+        if node_reads(node)
+            || node
+                .else_ability
+                .as_deref()
+                .is_some_and(tail_reads_created_referent)
+        {
+            return true;
+        }
+        if node.effect.publishes_created_referent() {
+            return false;
+        }
+    }
+    false
 }
 
 /// CR 400.7 + CR 608.2f: capture only current incarnations exiled by this
@@ -13676,7 +13837,7 @@ pub(super) fn linked_exile_batch_from_events(
     batch
 }
 
-fn extend_linked_exile_batch(
+fn extend_pinned_batch(
     batch: &mut Vec<ObjectIncarnationRef>,
     additions: impl IntoIterator<Item = ObjectIncarnationRef>,
 ) {
@@ -16018,6 +16179,16 @@ fn resolve_chain_body(
         let after_scope_needs_linked_exile = after_scope.as_ref().is_some_and(|tail| {
             crate::game::exile_links::ability_contains_linked_exile_consumer(tail)
         });
+        // CR 608.2c + CR 608.2f: "Each player creates … The tokens …" — a detached
+        // tail that reads the created referent must see every token this one action
+        // created, so a paused fan-out keeps that tail on the sidecar until the last
+        // seat leg drains. A tail that does not read it keeps the linearized route.
+        let after_scope_needs_created_union = scoped_template.effect.is_token_creator()
+            && after_scope
+                .as_deref()
+                .is_some_and(tail_reads_created_referent);
+        let after_scope_owned_by_sidecar =
+            after_scope_needs_linked_exile || after_scope_needs_created_union;
 
         if should_collect_player_scope_sacrifice_choices(&scoped_template) {
             start_player_scope_sacrifice_choices(
@@ -16153,10 +16324,10 @@ fn resolve_chain_body(
         // choice and the seats that complete after it. This is a known gap,
         // filed separately.
         //
-        // A tail that needs linked exile is not linearized: it rides the
-        // frame's `player_scope_linked_exile` sidecar, which that predicate
-        // does not read, so on that branch neither the legs nor the paused
-        // seat publish.
+        // A tail that needs linked exile or reads the created referent is not
+        // linearized: it rides the frame's `player_scope_tail` sidecar, which
+        // that predicate does not read, so on that branch neither the legs nor
+        // the paused seat publish.
         let mut applied_domain_end = matching_players.len();
         // CR 608.2e: each clause's equalization minimum is fixed when that
         // clause begins; the snapshot is per `player_scope` link, captured
@@ -16240,7 +16411,7 @@ fn resolve_chain_body(
                 // The unscoped tail is owned explicitly by the continuation
                 // sidecar below. Only generated per-seat nodes are linearized
                 // here, so no ordinary scoped sibling can impersonate them.
-                let mut tail = if after_scope_needs_linked_exile {
+                let mut tail = if after_scope_owned_by_sidecar {
                     None
                 } else {
                     after_scope.clone()
@@ -16284,7 +16455,7 @@ fn resolve_chain_body(
                 break;
             }
         }
-        let linked_batch = publish_player_scope_clause_results(
+        let batches = publish_player_scope_clause_results(
             state,
             ability,
             &scoped_template,
@@ -16298,11 +16469,16 @@ fn resolve_chain_body(
             // tail is another `player_scope` clause, that recursive entry will
             // capture its own fresh snapshot against the post-this-clause board.
             state.clause_minimum_snapshot = None;
+            // CR 608.2c + CR 608.2f: one action ⇒ one created referent — every
+            // token this clause created, for every seat.
+            if scoped_template.effect.is_token_creator() {
+                publish_created_token_union(state, &batches.created_tokens);
+            }
             if let Some(mut after_scope) = after_scope {
-                bind_resolution_exile_batch_paths(&mut after_scope, &linked_batch);
+                bind_resolution_exile_batch_paths(&mut after_scope, &batches.linked_exile);
                 resolve_ability_chain(state, &after_scope, events, depth + 1)?;
             }
-        } else if after_scope_needs_linked_exile {
+        } else if after_scope_owned_by_sidecar {
             if let Some(after_scope) = after_scope {
                 if state.active_ability_continuation().is_none() {
                     park_player_scope_queue_end(state, after_scope.as_ref().clone());
@@ -16311,10 +16487,12 @@ fn resolve_chain_body(
                     // CR 608.2f: generated APNAP nodes and their exact union are
                     // explicit pause authority. The detached tail resolves once only
                     // after every generated seat has drained.
-                    frame.pending.player_scope_linked_exile = Some(PendingPlayerScopeLinkedExile {
+                    frame.pending.player_scope_tail = Some(PendingPlayerScopeTail {
                         source_id: ability.source_id,
                         after_scope,
-                        batch: linked_batch,
+                        linked_exile_batch: batches.linked_exile,
+                        created_tokens: after_scope_needs_created_union
+                            .then_some(batches.created_tokens),
                     });
                 }
             }
@@ -17664,8 +17842,28 @@ fn resolve_chain_body(
     }
     let linked_batch =
         linked_exile_batch_from_events(state, ability.source_id, &events[events_before..]);
-    if let Some(scope) = state.resolving_player_scope_linked_exile.as_mut() {
-        extend_linked_exile_batch(&mut scope.batch, linked_batch.iter().copied());
+    // A node resolving under a player-scope sidecar is a generated leg of the
+    // clause in progress (the detached tail runs only after the sidecar is
+    // restored), so its own events extend each live channel: the linked batch
+    // when the tail links exile, the created-token union (CR 608.2f) when open.
+    let scope_channels = state
+        .resolving_player_scope_tail
+        .as_ref()
+        .map(|scope| (tail_links_exile(scope), scope.created_tokens.is_some()));
+    if let Some((links, collects)) = scope_channels {
+        let created_additions = if collects {
+            created_token_union_from_events(state, &events[events_before..])
+        } else {
+            Vec::new()
+        };
+        if let Some(scope) = state.resolving_player_scope_tail.as_mut() {
+            if links {
+                extend_pinned_batch(&mut scope.linked_exile_batch, linked_batch.iter().copied());
+            }
+            if let Some(created) = scope.created_tokens.as_mut() {
+                extend_pinned_batch(created, created_additions);
+            }
+        }
     }
     let linked_batch_owned;
     let ability = if linked_batch.is_empty() || ability.sub_ability.is_none() {
@@ -18071,7 +18269,7 @@ fn resolve_chain_body(
 
     if ability.sub_ability.is_none()
         && waits_for_resolution_choice(&state.waiting_for)
-        && state.resolving_player_scope_linked_exile.is_some()
+        && state.resolving_player_scope_tail.is_some()
         && state.active_ability_continuation().is_none()
     {
         park_player_scope_queue_end(state, ability.clone());
@@ -36922,6 +37120,76 @@ mod tests {
             assert!(scoped.sub_ability.is_none(), "{label}: detaches");
             assert!(tail.is_some(), "{label}: runs as the unscoped tail");
         }
+    }
+
+    /// CR 608.2c — the created-token channel of a paused player-scope token
+    /// fan-out opens only for a detached tail that reads the created referent
+    /// ("The tokens are goaded …"), and the walk stops at the tail's own
+    /// nearest publisher. Tempting-offer tails (a controller-only `Token` per
+    /// accepting opponent) read nothing and keep the linearized route.
+    #[test]
+    fn tail_reads_created_referent_keys_on_a_last_created_reader() {
+        let node = |effect: Effect| ResolvedAbility::new(effect, vec![], ObjectId(1), PlayerId(0));
+        let goad_last_created = || Effect::GenericEffect {
+            static_abilities: vec![
+                StaticDefinition::new(StaticMode::Continuous).affected(TargetFilter::LastCreated)
+            ],
+            duration: None,
+            target: None,
+            end_cost: None,
+        };
+        let elemental = || Effect::Token {
+            name: "Elemental".to_string(),
+            power: PtValue::Fixed(1),
+            toughness: PtValue::Fixed(1),
+            types: vec!["Creature".to_string(), "Elemental".to_string()],
+            colors: vec![ManaColor::Red],
+            keywords: vec![],
+            tapped: false,
+            count: QuantityExpr::Fixed { value: 2 },
+            owner: TargetFilter::Controller,
+            attach_to: None,
+            enters_attacking: false,
+            supertypes: vec![],
+            static_abilities: vec![],
+            enter_with_counters: vec![],
+        };
+
+        // (i) War Games tail shape: a goad grant whose `affected` is the referent.
+        assert!(tail_reads_created_referent(&node(goad_last_created())));
+
+        // (ii) Tempt with Vengeance tail shape: the controller's own creation,
+        // repeated per accepting opponent, reads no created referent.
+        let mut tempt_tail = node(elemental());
+        tempt_tail.repeat_for = Some(QuantityExpr::Ref {
+            qty: QuantityRef::PlayerCount {
+                filter: PlayerFilter::PerformedActionThisWay {
+                    relation: PlayerRelation::Opponent,
+                    action: PlayerActionKind::AcceptedOptionalEffect,
+                },
+            },
+        });
+        assert!(!tail_reads_created_referent(&tempt_tail));
+
+        // (iii) Nearest publisher: a reader after the tail's own creation names
+        // that creation's product, not the clause's.
+        let mut own_creation = node(elemental());
+        own_creation.sub_ability = Some(Box::new(node(goad_last_created())));
+        assert!(!tail_reads_created_referent(&own_creation));
+
+        // (iv) A counter placement on the referent reads it.
+        assert!(tail_reads_created_referent(&node(Effect::PutCounter {
+            counter_type: CounterType::Plus1Plus1,
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::LastCreated,
+        })));
+
+        // (v) A condition over the referent reads it.
+        let mut gated = node(Effect::NoOp);
+        gated.condition = Some(AbilityCondition::ControllerControlsMatching {
+            filter: TargetFilter::LastCreated,
+        });
+        assert!(tail_reads_created_referent(&gated));
     }
 
     /// CR 608.2c — a non-choosing per-player reveal introduces no per-iteration

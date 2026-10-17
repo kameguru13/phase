@@ -66,6 +66,12 @@ pub struct TournamentRequestId(pub u64);
 ///      in ability definitions inside `GameState` (CR 107.1, CR 603.4). A v144
 ///      peer cannot parse the tag. Full-game peers and P2P move in lockstep
 ///      (wire 127); no lobby carrier names it.
+///      The same bump adds the optional `created_tokens` channel to the private
+///      player-scope tail sidecar that `PendingContinuation` carries under its
+///      existing `player_scope_linked_exile` key (CR 608.2c + CR 608.2f: the
+///      tokens every seat created, for a paused "each player creates … The
+///      tokens …" tail); it is serde-defaulted, so a sidecar without it decodes
+///      as the linked-exile-only sidecar.
 ///
 /// 144 — One-time boons (#7495) add serialized `GameState` tags, and the
 ///      perpetual P/T edit is retyped. `Effect::CreateBoon` (with its granted

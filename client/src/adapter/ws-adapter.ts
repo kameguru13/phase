@@ -218,6 +218,12 @@ export class NativeEngineVersionMismatchError extends Error {
  *      PROTOCOL_VERSION's own `/// 145` entry in
  *      crates/lobby-broker/src/protocol.rs. A v144 peer cannot parse the
  *      tag; the exact-match version check at connect refuses the pairing.
+ *      The same bump adds the optional `created_tokens` channel to the private
+ *      player-scope tail sidecar that `PendingContinuation` carries under its
+ *      existing `player_scope_linked_exile` key (CR 608.2c + CR 608.2f: the
+ *      tokens every seat created, for a paused "each player creates … The
+ *      tokens …" tail); it is serde-defaulted, so a sidecar without it decodes
+ *      as the linked-exile-only sidecar.
  *      Wire 127 moves with it.
  * 144 — One-time boons (#7495): new Effect.CreateBoon / Effect.NoteNumber tags,
  *       HasBoon conditions, and WaitingFor.ChooseTokenHost; the perpetual P/T

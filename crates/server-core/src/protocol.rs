@@ -3351,6 +3351,12 @@ mod tests {
     /// (CR 107.1, CR 603.4), carried in `GameState` ability definitions; a v144
     /// peer cannot decode the new tag, so it must be refused before it receives
     /// v145 state.
+    /// The same bump adds the optional `created_tokens` channel to the private
+    /// player-scope tail sidecar that `PendingContinuation` carries under its
+    /// existing `player_scope_linked_exile` key (CR 608.2c + CR 608.2f: the
+    /// tokens every seat created, for a paused "each player creates … The
+    /// tokens …" tail); it is serde-defaulted, so a sidecar without it decodes
+    /// as the linked-exile-only sidecar.
     ///
     /// v144: one-time boons (#7495) add `Effect::CreateBoon`, `Effect::NoteNumber`,
     /// the `HasBoon` conditions, and `WaitingFor::ChooseTokenHost` tags, and
