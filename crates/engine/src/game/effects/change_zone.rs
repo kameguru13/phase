@@ -5281,7 +5281,7 @@ mod tests {
                 .state()
                 .resolution_stack
                 .iter()
-                .map(ResolutionFrame::kind)
+                .map(crate::types::resolution::ResolutionFrame::kind)
                 .collect::<Vec<_>>(),
             vec![crate::types::resolution::FrameKind::ChangeZone],
             "premise: the parked ChangeZone owns the only resolution frame"
