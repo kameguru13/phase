@@ -815,3 +815,294 @@ Revert-check: `EnclosingPostReplacementFrame::is_retired` with `Some(id)` routed
   - T4 red at 59247b7 and green with D7(a);
   - T4b red at 59247b7 and green with D7(b);
   - U3b red under the positional mutation.
+
+---
+
+## Phase D impl-review r1 fixes
+
+Sequenced **on top of** the amendment as revised by A1/A2 (the kg-dev executor's next commit). Anchors are cited at 59247b7; the amendment touches only `engine_replacement.rs` 1187–1194 and 1658–1662 plus tests, so these anchors carry over unchanged. Read-only planning, no builds.
+
+### F1. The subtree drain does not stop at the root's boundary
+
+**Confirmed at 59247b7.** The reviewer's three traces hold. The mechanism is that nothing that drains frames knows that a parked counter-cost root became due mid-drain:
+- `drain_pending_continuation` (`effects/mod.rs` 1209–1436):
+  - its leading counter drains (1210–1212);
+  - its post-chain retire of the active paused dispatch (1386–1390), which retires an **outer** paused dispatch when the child's drain is already gone;
+  - its cascade into the exposed continuation (1394–1399);
+  - its later vote, repeat-for, choose-one-of and repeat-until steps (1404–1430).
+- `resume_resolution_frames` (1655): the `PostReplacement` arm retires the top `Paused` dispatch (1782–1792) and drains an exposed continuation (1816–1827).
+- The common-boundary pass (`engine.rs` 8939): it runs `drain_pending_continuation` and then `resume_resolution_frames` before its cost-move drain.
+
+The `DeferredLifeCostResume` seam guards only the *entry* of the first two steps (`len > boundary`, `engine.rs` 8953–8961). Its own mid-cascade gap is pre-existing and unchanged here.
+
+**Rule (CR 601.2h + CR 602.2b + CR 605.3b + CR 608.2c, verified):** a cost being paid is the innermost unfinished work. A mana ability "resolves immediately after it is activated" (CR 605.3b), and the paid activation or outer payment resumes before any later instruction is followed (CR 608.2c). So once the root's replacement subtree has retired, **no** further resolution work may run before the root resumes.
+
+**One predicate, three stops, one resume:**
+
+1. `crates/engine/src/types/game_state.rs`, next to `counter_cost_root_subtree` (8436):
+   ```rust
+   /// CR 601.2h + CR 605.3b + CR 616.1: a parked counter-cost root whose
+   /// replacement subtree has retired is due: it is the innermost unfinished
+   /// work and resumes before any other resolution work.
+   pub(crate) fn counter_cost_root_is_due(&self) -> bool {
+       self.counter_cost_root_subtree() == CounterCostRootSubtree::Retired
+   }
+   ```
+
+2. `crates/engine/src/game/effects/mod.rs::drain_pending_continuation` (1209), three gates with one shared comment:
+   ```rust
+   // CR 601.2h + CR 605.3b + CR 608.2c: a parked counter-cost root whose
+   // replacement subtree has retired resumes before any further resolution
+   // work; every frame left on top of it is outer work.
+   ```
+   - (a) The first statement of the body, before the leading counter drains: `if state.counter_cost_root_is_due() { return; }`.
+   - (b) The post-chain block at 1386 becomes `if !waits_for_resolution_choice(&state.waiting_for) && !state.counter_cost_root_is_due() {`. If the subtree retired with the continuation that just ran, the top paused dispatch belongs to an outer owner and must stay paused. While the subtree is unfinished, the paused dispatch on top is the child's own: either its own frame above the depth, or nested in the enclosing frame and raising that frame's count.
+   - (c) Directly after that `if` block closes (before the vote-ballot step at ~1404): `if state.counter_cost_root_is_due() { return; }`. The child's dispatch retiring at (b) is exactly when the root becomes due. This stops the cascade at 1394–1399, whose recursive call would also stop at (a), and the later loop steps.
+
+   The skipped tail cleanups (`clear_post_replacement_token_choice_seed_if_resolution_drained`, `clear_return_result_frames_if_idle`) are idle-guarded. The next boundary pass runs them once the root has resumed.
+
+3. `crates/engine/src/game/effects/mod.rs::resume_resolution_frames` (1655): directly after the `if !matches!(state.waiting_for, WaitingFor::Priority { .. }) { .. return; }` block, add `if state.counter_cost_root_is_due() { return; }` with the same comment. This covers the `PostReplacement` arm retiring P's outer dispatch (trace 2) and every other frame arm, for every caller.
+
+4. `crates/engine/src/game/engine.rs`, next to `resume_pending_continuation_pass` (8939):
+   ```rust
+   /// CR 601.2h + CR 605.3b + CR 608.2c + CR 616.1: once a parked counter-cost
+   /// root's replacement subtree has retired, resume that root at this boundary
+   /// before any further frame, liminal-entry or phase-transition work.
+   fn resume_due_counter_cost_root(
+       state: &mut GameState,
+       events: &mut Vec<GameEvent>,
+   ) -> Result<(), EngineError> {
+       if matches!(state.waiting_for, WaitingFor::Priority { .. })
+           && state.counter_cost_root_is_due()
+       {
+           super::life_safety::observe_boundary_carrier(state);
+           let _ = drain_pending_cost_move_resume(
+               state,
+               events,
+               CostMoveDrainBoundary::PriorityBoundary,
+           )?;
+       }
+       Ok(())
+   }
+   ```
+   Call it twice inside `resume_pending_continuation_pass`:
+   - right after the first `drain_pending_continuation` block (8953–8956);
+   - right after the `resume_resolution_frames` block (8957–8961).
+
+   The existing PriorityBoundary cost drain later in the pass is unchanged and still serves the other admitted roots. After a resumed mana root, `waiting_for` is the outer prompt, so every later step of the pass and the D5 loop's first exit condition stop. After a resumed stack root, `waiting_for` is Priority with the root gone, so the remaining outer work runs after it, as CR 608.2c orders.
+
+**Why this is sufficient:**
+- **Trace 1** (Execute/DECLINE, `[P, C]`, nested):
+  1. 1153 finishes the queue.
+  2. 1345: `Unfinished` → skip.
+  3. 1360 `drain_pending_continuation` runs R. Gate (b) passes (the child's drain is still nested in P), so the child's paused dispatch retires and the root becomes due. Gate (c) returns before the cascade.
+  4. D6(a) resumes the Cove at `ReplacementDelivered`, which re-offers `UnlessPayment`. C and P's outer `Paused` drain remain.
+- **Trace 2** (last entry prevented, `[P]`):
+  1. D4(b) `Unfinished`: queue → common boundary.
+  2. In the pass, `drain_pending_continuation` runs R and retires the child's dispatch; gate (c) returns.
+  3. `resume_due_counter_cost_root` resumes the Cove, which returns `UnlessPayment`.
+  4. `resume_resolution_frames` is never reached in this pass. The `Priority` guard also blocks its own entry, and gate 3 would too. P's outer dispatch stays `Paused`.
+- **Non-nested outer tail below the boundary** (a resolving ability's `sub_ability` parked under its `UnlessPayment`): the child's frames sit above the depth. When they retire, gates (a)–(c) and 3 stop, and the pass helper resumes the root.
+- **Recursion:** the `Queued` re-drain at 1381–1384 calls `drain_pending_continuation`/`resume_resolution_frames` recursively. Both stop at their entry gates, and control unwinds to a site that resumes the root.
+
+**Is the same stop needed at the Execute arm's 1360 drain and in D4(b)'s `Unfinished` arm?** Yes, and both get it from the gates above with no new code at those sites:
+- **1360** is a `drain_pending_continuation` call, stopped by (b)/(c). D6(a), which follows it, is the resume.
+- **D4(b) `Unfinished`** reaches the boundary only through `resume_pending_continuation_if_priority` → the pass, which stops at (a)–(c)/3 and resumes through `resume_due_counter_cost_root`. Its direct `drain_pending_counter_removals` drains only the child's own queue: the subtree is `Unfinished` there by construction, and the queue finalization runs no outer work.
+- **D4(c)** is the same as D4(b).
+- **The Execute arm's 1276–1296 pre-delivery drain** now stops at (a) when the root is due at entry. That happens for a stack-route root whose own removal was just delivered, so its continuation now drains at 1360 after 1345 resumes the root. That is root-first, matching the mana route's existing skip there. It is inert for every existing row, which activate at depth 0 with nothing parked.
+
+**Why this is minimal:**
+- The stops sit in the two functions every frame drain goes through, so no caller list has to be audited or kept in sync.
+- The resume sits only in the common-boundary pass, plus D6(a), which exists already.
+- With no counter-cost root, or an `Unfinished` one, every gate is inert. The predicate is one comparison on the existing typed seam.
+- A single check between the two pass steps (the reviewer's first suggestion) would not stop the cascade *inside* `drain_pending_continuation` (traces 1 and 2), so gates (b)/(c) are required. Gate 3 is what keeps a non-pass caller of `resume_resolution_frames` from doing the same.
+
+**Comment fixes:**
+- **D6(a)** (`engine_replacement.rs` 1374–1379): "resumes as soon as the child's rider has retired that subtree" becomes "the continuation drain above stops at the moment the subtree retires (`counter_cost_root_is_due`), and the root resumes here, before any outer frame work and before any outer cast or activation it is paying for".
+- **D5's doc** (`engine.rs` 8890): add "a due root resumes mid-pass through `resume_due_counter_cost_root`".
+
+~~New residual 9~~: deleted (fix-design review FD1). Its claim that "every site where a subtree can retire is followed by a resume" is false:
+- the resolution `PayCost{TapCreatures}` handler (`engine.rs` 12996–13006);
+- the ChooseMana `ResolvingEffect` handler (`engine.rs` 13175 → `effects/mana.rs` 431–432);
+- the Prevented counter-move block (`engine_replacement.rs` 1640–1648) and residual 2's other blocks.
+
+All of these drain directly and never reach the common boundary. Replaced by the action-boundary authority below.
+
+### F1, part 2 (FD1): one resume authority at the action boundary
+
+**Problem.** A handler that drains directly and returns `Priority` leaves a due root parked. Under the new gates (a) and 3, every later `drain_pending_continuation`/`resume_resolution_frames` is then inert until something resumes the root. That includes the next action's stack resolution, because `pass_priority_once_with_pipeline` runs `handle_priority_pass` (`engine.rs` 9461) before its boundary (9506).
+
+**Authority.** In `crates/engine/src/game/engine.rs`, next to `owed_spell_final_part_is_due` (1704):
+```rust
+/// CR 601.2h + CR 602.2b + CR 605.3b + CR 608.2c: the action-boundary resume
+/// authority for a parked counter-cost root whose replacement subtree retired
+/// during this action. A handler may finish the subtree by draining directly
+/// (a resolution-time cost choice, a mana-colour choice, a Prevented-arm child
+/// block) without reaching the common boundary; the root is still the innermost
+/// unfinished work and resumes before the action returns. Inert unless a root is
+/// due under a Priority result.
+fn resume_due_counter_cost_root_at_action_boundary(
+    state: &mut GameState,
+    waiting_for: &WaitingFor,
+    events: &mut Vec<GameEvent>,
+) -> Result<Option<WaitingFor>, EngineError> {
+    if !matches!(waiting_for, WaitingFor::Priority { .. }) || !state.counter_cost_root_is_due() {
+        return Ok(None);
+    }
+    sync_waiting_for(state, waiting_for);
+    resume_pending_continuation_if_priority(state, events)?;
+    Ok(Some(state.waiting_for.clone()))
+}
+```
+It enters the common boundary, so the root itself resumes through the pass's `resume_due_counter_cost_root`, and the outer work after it runs in CR 608.2c order. One function, one gate, and two call sites. That follows the precedent of `realize_settled_token_battlefield_entry`, which is called both before the shared pipeline and at the core convergence ("Same gate as that boundary call, one authority", `engine.rs` 16331–16338; `sync_waiting_for` is `public_state.rs` 83). No individual handler is patched.
+
+- **Site 1, the shared tail of `apply_non_priority_pass_action`** (`engine.rs` ~16326). This is the route of every handler that falls through to the shared post-action pipeline, including the TapCreatures, ChooseMana and replacement-choice arms. Immediately before `if matches!(waiting_for, WaitingFor::Priority { .. }) {`, rebind:
+  ```rust
+  let waiting_for =
+      resume_due_counter_cost_root_at_action_boundary(state, &waiting_for, &mut events)?
+          .unwrap_or(waiting_for);
+  ```
+  It must run **before** that pipeline ("SBAs, triggers, layers", 16323). Otherwise triggers raised during the payment are collected while the activation is still unplaced. CR 603.3 (verified) puts them on the stack the next time a player would receive priority, which is after the activation completes (CR 602.2b + 601.2h).
+  - A resumed stack root returns `Priority` with the activation placed, and the pipeline then collects its triggers.
+  - A resumed mana root returns the outer prompt, and the pipeline is skipped, as for any non-Priority result.
+- **Site 2, `apply_action_boundary_core`** (`engine.rs` 1658–1673), for handlers that return their `ActionResult` directly and the `PassPriority` route (`engine.rs` 11549–11559). Move `let scan_from = result.events.len();` above a new first step:
+  ```rust
+  let resumed_due_root = match resume_due_counter_cost_root_at_action_boundary(
+      state, &result.waiting_for, &mut result.events,
+  ) {
+      Ok(Some(waiting_for)) => { result.waiting_for = waiting_for; true }
+      Ok(None) => false,
+      Err(err) => { *state = boundary_snapshot; return Err(err); }
+  };
+  ```
+  Then widen the existing convergence condition to `(resumed_due_root && matches!(result.waiting_for, WaitingFor::Priority { .. })) || realized_token_entry || owed_spell_final_part_is_due`. `run_boundary_convergence_pipeline(.., scan_from)` then collects the resumed root's events, and `owed_spell_final_part_is_due` is evaluated **after** the resume. That also narrows T-F: a final part is never run under a root that this action made due.
+
+**Runs after every action.** `apply`, `apply_as_current` and `apply_as_current_for_simulation` all go through `apply_action_boundary_core` (`engine.rs` 1306/1335/1398/8648). That calls `apply_action` (11072), which ends in either `pass_priority_once_with_pipeline` (11551) or `apply_non_priority_pass_action` (11562). Site 1 covers the second route's shared tail; site 2 covers everything else before the core returns. A due root therefore never outlives the action that made it due.
+
+**Why the ordering at 9461 vs 9506 is safe.** `handle_priority_pass` (9461) can only meet a due root left by an earlier action, and site 2 has resumed that root before the earlier action returned. Within a `PassPriority` action, no root becomes due before 9461, because roots park only during payments, which end at prompts that are answered by non-pass actions.
+
+**Residual 2, narrowed.** Its Prevented-arm blocks, and any other direct-drain handler, now resume a **due** root in the same action, at site 1 or site 2. What remains of residual 2 is a block that returns while the subtree is still `Unfinished`, which surfaces Priority mid-activation (unchanged, follow-up).
+
+**No new residual 9.** There is no remaining caller-coverage gap: the authority sits on the two routes every action takes.
+
+### F2. A row for the D4(c) tail guard
+
+**T11** `a_prevented_non_counter_child_event_finishes_its_rider_before_the_cost_root`:
+- **Board:** Essence Bottle with 3 elixir (stack-route root, depth 0).
+- **Steward replacements:**
+  - an optional RemoveCounter replacement with `execute = GainLife { Fixed 2, Controller }.sub_ability(LoseLife { amount: Fixed 1, target: None })`;
+  - an optional `GainLife` replacement with no execute.
+- **Harness:** generalize `stage_prevented_counter_removal` (1637) into `stage_prevented_pending_event(runner, expected: fn(&ProposedEvent) -> bool)`. Its body is unchanged except for the asserted predicate. Keep `stage_prevented_counter_removal` as a one-line wrapper so existing rows don't change.
+- **Flow:** activate → `ChooseReplacement(ACCEPT)` → the GainLife prompt → `stage_prevented_pending_event(.., |p| matches!(p, ProposedEvent::LifeGain { .. }))` → choose 0.
+- **Assertions:**
+  - Reach at the GainLife prompt: the root is `CounterCostRemovalPayment`, `parked_child_rider` is true, the stack is empty, and `pending_replacement.proposed` is `LifeGain`.
+  - After: life −1 (the gain was prevented; the rider ran). In that action's events, the P0 `LifeLost` comes before `AbilityActivated{bottle}`. Stack 1 with `top_stack_count == Some(3)`, no rider frame, ownership clear.
+  - Resolve: +6.
+- **Expected:**
+  - **(unprobed)** green at 59247b7.
+  - **Revert-check:** delete the D4(c) block (`engine_replacement.rs` 1714–1723). The CR 608.3e teardown (1746–1750) then clears the rider, so life is 0 → red.
+- **P7 (unprobed):** the `BeginTurn` staging candidate prevents a `LifeGain` as it does a `RemoveCounter`. If it does not, stage with a GainLife-scoped prevention definition from the same helper.
+
+### New rows for F1, on the A2 re-flowed T10
+
+All three use A2's T10 board: Gainer (`GAIN_CONTROL`), the Steward `GainLife` replacement with the `LoseLife { 1 }.unless_pay({2}, Controller)` post-effect, the Cove with 3 storage, the Battery, and the RemoveCounter replacement with A2's child execute (whatever non-GainLife rider the executor chose; call it `t10_child_execute`). Every new life-moving effect in these rows is a life **loss**, so the GainLife replacement cannot re-apply (A2).
+
+- **T10a** `an_outer_tail_waits_for_the_mana_root_paying_its_unless_cost` (trace 1). The outer post-effect is `LoseLife { 1 }.unless_pay({2}, Controller).sub_ability(LoseLife { Fixed 3 })`. Flow: activate Gainer → resolve → ACCEPT → `UnlessPayment` → activate the Cove → ACCEPT → entry 1 → DECLINE → entry 2 → DECLINE.
+  - Reach at `UnlessPayment`, before the Cove: both P6 reaches, and an `AbilityContinuation` frame is parked (the outer tail C, via `parked_child_rider`).
+  - Reach at each child prompt: `parked_mana_cursor(..).counter_removal` has `enclosing.frame.is_some()`.
+  - After entry 2's DECLINE:
+    - `waiting_for` is `UnlessPayment`;
+    - life equals `life_at_unless` plus the child rider's own delta, and **not** −3 (the tail has not run);
+    - the outer drain is still resident and `Paused` in the active frame;
+    - an `AbilityContinuation` (C) is still parked;
+    - in events, `EffectResolved{RemoveCounter}` < first `ManaAdded{cove}`.
+  - Then `PayUnlessCost { pay: true }`: life −3 (the tail ran and the unless loss did not), `resolution_stack.is_empty()`, ownership clear.
+  - Expected: **red** at 59247b7 (the cascade runs C before the re-offer) and green with F1. Revert-check: drop gate (a). The cascade's recursive `drain_pending_continuation` (`effects/mod.rs` 1397–1399) then runs C → red. Corrected by FD2: T10a does not discriminate (b) or (c). At the post-chain block the child is still nested in P, so the root is not yet due there, and T10a has no outer vote, repeat or choose-one-of frame for (c) to guard. T10d and T10e carry those gates.
+- **T10b** `a_prevented_last_child_entry_leaves_the_outer_unless_post_effect_paused` (trace 2). The A2 T10 flow, but entry 1 is DECLINEd (removes one, so the count-driven rider sees 1) and entry 2 is prevented (`stage_prevented_counter_removal`, choose 0).
+  - Reach at entry 2: the queue's `in_flight` is set, and the enclosing frame reach is as in T10a.
+  - After the prevention:
+    - `waiting_for` is `UnlessPayment`;
+    - `active_post_replacement_or_paired_parent().and_then(resident)` is `DrainStatus::Paused` (the outer dispatch was not retired);
+    - `EffectResolved{RemoveCounter}` < first `ManaAdded{cove}`;
+    - storage 1, queue none.
+  - After paying: no unless loss, and `resolution_stack.is_empty()`.
+  - Expected: **red** at 59247b7 (`resume_resolution_frames` retires the outer dispatch first) and green with F1. Revert-check: drop gate 3 **and** `resume_due_counter_cost_root` → red.
+- **T10c** `an_outer_tail_below_the_boundary_waits_for_the_mana_root` (the non-nested case, no replacement on the outer effect). Artifact "Taxer" gets a typed activated ability `{T}: LoseLife{1}.unless_pay({2}, Controller).sub_ability(LoseLife{3})`. Push it onto the object's ability definitions through `runner.state_mut()`, the way `install_replacement_on_steward` (1185) pushes a replacement. Flow: activate Taxer → resolve → `UnlessPayment` → the Cove → T3-shaped child → entry 1 DECLINE → entry 2 DECLINE.
+  - Reach at the child prompts: `enclosing.is_none()` (the root parked with no PostReplacement frame among the top two), and C parked below.
+  - After the second DECLINE: `waiting_for` is `UnlessPayment`, the tail has not run, and C is still parked. After paying: −3.
+  - Expected: **red** at 59247b7 and green with F1.
+- **T10d** `a_queued_child_rider_leaves_the_outer_unless_post_effect_paused` (FD2, discriminates gate (b)). The A2 T10 flow, but the child's rider is `Effect::Clash` with `.sub_ability(LoseLife { Fixed 1 })` in place of the A2 rider. Both players' libraries are empty, so Clash queues its tail without a placement prompt (P10). That is the `Queued` shape pinned by `step_distinguishes_complete_queued_waiting_and_keeps_outer_authority` (`effects/mod.rs` ~46610–46640). Entry 1 and entry 2 are both DECLINEd.
+  - Reach: both libraries are empty at the Cove activation; the enclosing frame reach is as in T10a; no Clash placement prompt is ever raised.
+  - After entry 2's DECLINE:
+    - `waiting_for` is `UnlessPayment`;
+    - the queued tail ran: P0 lost 1 in that action;
+    - `active_post_replacement_or_paired_parent().and_then(resident)` is `DrainStatus::Paused` (P's outer dispatch survived);
+    - `EffectResolved{RemoveCounter}` < first `ManaAdded{cove}`.
+  - After paying: no unless loss, `resolution_stack.is_empty()`.
+  - **Trace with (b) deleted:**
+    1. In `drain_pending_continuation`, R's `Queued` branch (`effects/mod.rs` 1381–1384) runs the tail recursively. The recursive post-chain block retires the child's paused dispatch, so the root becomes due.
+    2. Back in the outer call, the post-chain block's `finish_active_paused_post_replacement_dispatch` retires **P's outer** dispatch → red.
+  - Expected: **red** at 59247b7, green with F1, red with gate (b) deleted.
+  - **If P10 fails** (Clash prompts, or returns `Complete`), or the A2 flow cannot reach: **delete gate (b) and T10d**, and record "a `Queued` child rider under a nested mana root retires the outer paused dispatch" as residual 9 (a remaining defect with a follow-up), not an unexercised gate.
+- **T10e** `an_outer_repeat_waits_for_the_mana_root_paying_its_unless_cost` (FD2, discriminates gate (c); non-nested, needs no outer replacement). Taxer's typed ability (as T10c) is `{T}: LoseLife{1}.unless_pay({2}, Controller)` with `repeat_for = Some(QuantityExpr::Fixed { value: 2 })` (`AbilityDefinition::repeat_for`, CR 608.2c) and no `sub_ability`. Flow:
+  1. activate Taxer → resolve → `UnlessPayment` (iteration 1);
+  2. snapshot `let repeat = runner.state().resolution_stack.iter().find(|f| matches!(f, ResolutionFrame::RepeatFor(_))).cloned()`;
+  3. the Cove → T3-shaped child → entry 1 DECLINE → entry 2 DECLINE.
+  - Reach: `repeat.is_some()`, and the child prompts' cursor has `enclosing.is_none()`.
+  - After entry 2's DECLINE:
+    - `waiting_for` is `UnlessPayment`;
+    - the `RepeatFor` frame is still present and **equal to `repeat`** (iteration 2 has not started);
+    - `ManaAdded{cove}` is in that action's events; storage 1.
+  - Then `PayUnlessCost { pay: true }` (iteration 1 paid) → `UnlessPayment` again (iteration 2) → `PayUnlessCost { pay: false }`: P0 lost exactly 1 overall, and `resolution_stack.is_empty()`.
+  - **Trace with (c) deleted:** after R retires the child's own dispatch frame, the post-block `drain_active_repeat_for` (`effects/mod.rs` ~1415) starts iteration 2, which raises a fresh `UnlessPayment`. D6(a) never runs (`waiting_for` is not Priority), so the Cove root stays parked → red. The `RepeatFor` frame differs from `repeat`, and there is no `ManaAdded`.
+  - Expected: **red** at 59247b7, green with F1, red with gate (c) deleted.
+  - **P9 (unprobed):** `repeat_for` with `unless_pay` on a resolving activated ability parks a `RepeatFor` frame under iteration 1's `UnlessPayment`. If it does not (for example, the unless prompt owns the whole repeat), use the Oracle form "{T}: Repeat the following process twice. You lose 1 life unless you pay {2}." if it parses; otherwise use `RepeatUntil` / `VoteBallot` / `ChooseOneOf` shapes, whichever reaches first. If none reaches, **delete gate (c)** and record its shape as a residual, as for (b).
+- **T12** `a_mana_choice_child_finishes_and_places_the_activation_in_the_same_action` (FD1). Essence Bottle with 3 elixir. A Steward optional RemoveCounter replacement with `execute = Mana(AnyOneColor, count 1).sub_ability(LoseLife { Fixed 1 })`: the typed `Effect::Mana` whose production is `ManaProduction::AnyOneColor { count: Fixed 1, .. }` (`types/ability.rs` 3442). Flow: activate → ACCEPT → `WaitingFor::ChooseManaColor { context: ManaChoiceContext::ResolvingEffect(_), .. }` → `GameAction::ChooseManaColor { choice: ManaChoice::SingleColor(ManaType::Green), count: 1 }` (the answer shape used by `triggered_ability_mana_ledger.rs` 228–235).
+  - Reach at the prompt: the root is `CounterCostRemovalPayment`, `parked_child_rider`, stack empty.
+  - After the answer, **in that same action**:
+    - green 1 in P0's pool and life −1;
+    - `LifeLost` < `AbilityActivated{bottle}` in the action's events;
+    - stack 1 with `top_stack_count == Some(3)`, no rider frame, ownership clear.
+  - Resolve: +6.
+  - Expected:
+    - **red** at 59247b7: the handler (`effects/mana.rs` 431–432) drains and returns, so nothing resumes the root in this action;
+    - **red** with F1 part 1 alone: the gates stop and nothing resumes;
+    - **green** with the authority.
+  - Revert-check: remove both authority call sites → red. Remove only site 1 → still green (site 2 catches it), which is why T12b exists.
+- **T12b** `a_trigger_from_the_childs_payment_goes_on_the_stack_above_the_activation` (discriminates site 1). T12's board plus a P0 artifact "Witness" with the labelled synthetic Oracle text `"Whenever you lose life, you gain 1 life."` (reach: Witness has one trigger definition). Same flow.
+  - After the answer: stack 2, the **top** entry is Witness's trigger, the entry below it is the Bottle activation with count 3.
+  - Expected: green with site 1. With site 1 removed (site 2 alone), the shared pipeline collects Witness's trigger before the activation exists, so the activation lands above it → red. **(unprobed)**
+  - If T12b is green with site 1 removed (the pipeline does not place triggers while a root is parked), **delete site 1 and T12b** and keep site 2 as the only call site.
+
+**If the A2 flow cannot reach** (P6 fails, or the public-action validator rejects the nested shape): keep T10a/T10b `#[ignore]`d, with the reason quoting the failed reach. T10c (which needs no outer replacement) and T11 then carry F1's and F2's evidence, and the nested-configuration gate stays covered by U2/U3/U3b. If T10c's typed ability cannot be installed through `state_mut()`, express it in Oracle text instead ("{T}: You lose 1 life unless you pay {2}. You lose 3 life.") and assert the parsed shape (`unless_pay.is_some()`, a `sub_ability` present) as its first reach. If that does not parse either, record T10c as blocked; F1 then rests on T10a/T10b alone.
+
+### Scope, sizing and verification
+
+- **Production paths:** `types/game_state.rs`, `game/effects/mod.rs` (**new path**), `game/engine.rs` (the pass helper and the action-boundary authority with its two call sites) and `game/engine_replacement.rs` (comment only).
+- **Tests:** T10a–T10e, T11, T12, T12b, and the staging generalization in `cost_removed_counter_amount.rs`.
+- **Gate ↔ row map** (every gate has a discriminating row, or it is deleted):
+
+  | Gate | Row | If the row cannot reach |
+  |---|---|---|
+  | (a) | T10a | — |
+  | (b) | T10d | delete (b) and T10d, residual 9 |
+  | (c) | T10e | delete (c), residual |
+  | 3 + `resume_due_counter_cost_root` | T10b (paired) | — |
+  | Authority, site 2 | T12 | — |
+  | Authority, site 1 | T12b | delete site 1 |
+  | D4(c) | T11 | — |
+- Paths go from 9 to 10, still 1 unit (the same rule, now enforced where frames drain). This does not trip the phase-fit gate, so no second unit is needed.
+- **Verification:**
+  1. `cargo fmt --all`.
+  2. Full `test-engine` (the gates sit in the shared drains) and `clippy`.
+  3. Red evidence at 59247b7 plus the amendment commit for T10a–T10e and T12, then green after.
+  4. Run each gate's revert-check from the table above, and record the deletions the table prescribes if a row cannot reach.
+  5. T11 green, with its D4(c) revert-check red.
+  6. All earlier rows (T1–T9, T4b, U1–U3b) stay green. T3 and T9 are the closest regressions: their R runs and then the child retires, after which the stop is a no-op, because no outer work exists at depth 0.
+
+### Fix-design review dispositions
+
+| Finding | Resolution |
+|---|---|
+| **FD1** (residual 9 false; direct-drain handlers leave a due root parked behind the gates) | Residual 9 deleted. One authority, `resume_due_counter_cost_root_at_action_boundary`, sits next to `owed_spell_final_part_is_due`. It is called at the core (site 2, every action) and before the shared post-action pipeline (site 1, trigger order, CR 603.3), following the token-realization precedent; no handler is patched. Verified that it runs after every action (all entry points → `apply_action_boundary_core`), and that 9461 cannot meet a due root. Residual 2 is narrowed to `Unfinished` exits. Rows **T12** (ChooseMana child, same-action placement) and **T12b** (site 1, trigger above the activation, with a delete-if-undiscriminated fallback). |
+| **FD2** (gates (b)/(c) undiscriminated; T10a revert-checks wrong) | T10a's revert-check corrected to gate (a). **T10e** (outer `RepeatFor` under the unless prompt) discriminates (c). **T10d** (a `Queued` Clash rider) discriminates (b). Each comes with an explicit "delete the gate and record a residual" fallback if its fixture cannot reach, so no gate ships undiscriminated. |
