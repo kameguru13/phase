@@ -9278,6 +9278,6 @@ mod tests {
         let error = serde_json::from_value::<ResolutionStateWire>(future)
             .expect_err("an unknown version is refused")
             .to_string();
-        assert!(error.contains("1, 2, 3, 4, 5, or 6"), "{error}");
+        assert!(error.contains("1, 2, 3, 4, 5, 6, or 7"), "{error}");
     }
 }
