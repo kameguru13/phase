@@ -3473,10 +3473,20 @@ mod tests {
         }
     }
 
-    /// v148: `PendingChangeZoneIteration.remaining` carries each member's
+    /// v150: `PendingChangeZoneIteration.remaining` carries each member's
     /// pre-event entry modifications (`ChangeZoneMemberEntry`, CR 603.6a +
-    /// CR 614.12) and drops the raw gate fields; a v147 peer cannot parse a parked
-    /// ChangeZone frame, so it must be refused before it receives v148 state.
+    /// CR 614.12) and drops the raw gate fields, and the persisted resolution
+    /// state moves from version 6 to 7; a v149 peer cannot parse a parked
+    /// ChangeZone frame, so it must be refused before it receives v150 state.
+    /// v149: `GameState::deferred_spell_delivery` is gone and
+    /// `GameState::resolving_spell_final_part` marks the CR 608.2n final part a
+    /// paused instant or sorcery still owes; a v148 peer drops the key and would
+    /// move the spell before its paused instructions finish, so it must be refused
+    /// before it receives v149 state.
+    /// v148: Timesifter's top-card exile contest — `Effect::ExileTopCardContest`
+    /// in serialized ability definitions and the parked
+    /// `BatchCompletion::TopCardContestRoundComplete`; a v147 peer cannot parse
+    /// either tag, so it must be refused before it receives v148 state.
     /// v147: online physical contests (Eye to Eye, Mouth to Mouth) —
     /// `WaitingFor::PhysicalContest`, `Effect::PhysicalContest`, the two
     /// `PhysicalContest*` `GameEvent`s, `ClientMessage::ContestClick` and
@@ -3708,8 +3718,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_148_for_pre_event_change_zone_entries() {
-        assert_eq!(PROTOCOL_VERSION, 148);
+    fn protocol_version_is_150_for_pre_event_change_zone_entries() {
+        assert_eq!(PROTOCOL_VERSION, 150);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3720,7 +3730,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_148_for_pre_event_change_zone_entries` stays
+    /// `protocol_version_is_150_for_pre_event_change_zone_entries` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
