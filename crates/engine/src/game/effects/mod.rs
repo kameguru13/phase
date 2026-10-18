@@ -6494,6 +6494,885 @@ fn condition_reads_filter_population(
     }
 }
 
+/// Whether any filter, player population or counted population that `effect`
+/// carries in its OWN fields satisfies `leaf` — the effect-level twin of
+/// [`condition_reads_filter_population`].
+///
+/// Boundary (the reader predicate): a position is read when it carries a
+/// `TargetFilter`, `PlayerFilter`, `StaticCondition` or `QuantityExpr` that
+/// this resolution evaluates while applying the effect, after which the answer
+/// is fixed — CR 608.2c (instructions in the order written), CR 608.2d (choices
+/// made on resolution), CR 608.2h (information determined once, when the effect
+/// is applied), CR 611.2b (a "for as long as" duration that never starts does
+/// nothing), CR 118.12 (a cost paid during resolution). An affected object
+/// need not be a target (CR 115.10a), so every population the effect names is a
+/// reader, whatever its role. Positions evaluated only later, when an event
+/// fires or a layer pass runs (trigger and replacement matchers, `StaticMode`
+/// filters, keyword payloads, a permission's or spend-grant's later cost), are
+/// not read here; filter-free types carry nothing to read.
+///
+/// The walk is one level deep: nested definitions belong to
+/// [`nested_payload_reads_created_referent`], quantities to
+/// `Effect::for_each_quantity_expr` (the exhaustive quantity authority), and
+/// every slot `Effect::target_filter()` surfaces is read through that
+/// compiler-checked accessor as well as through its arm here.
+///
+/// EXHAUSTIVE on `Effect`, no `_` arm, like `target_filter()` and
+/// `for_each_quantity_expr`: a new variant must be classified here. This is a
+/// read-only classification; it feeds no parent-ref or mass-population
+/// rewriting helper (`effect_parent_ref_slots`, `mass_population_target`),
+/// whose narrower binding semantics are deliberate.
+fn effect_reads_filter_population(effect: &Effect, leaf: &dyn Fn(&TargetFilter) -> bool) -> bool {
+    let mut counts_population = false;
+    effect.for_each_quantity_expr(&mut |quantity| {
+        counts_population =
+            counts_population || quantity_expr_counts_population_matching(quantity, leaf);
+    });
+    counts_population
+        || effect
+            .target_filter()
+            .is_some_and(|filter| filter::filter_contains(filter, leaf))
+        || effect_fields_read_filter_population(effect, leaf)
+}
+
+/// The own-field arms of [`effect_reads_filter_population`]: every filter,
+/// player population, duration, cost and choice the effect carries in its own
+/// fields, including each slot `target_filter()` surfaces (read by both).
+/// EXHAUSTIVE on `Effect`, no `_` arm.
+fn effect_fields_read_filter_population(
+    effect: &Effect,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    use crate::types::ability::{
+        CastingPermission, ChoiceType, ConjureSource, CopyRecipient, CounterSourceRider,
+        ExiledSpellRider, GameRestriction, GuessSubject, ManaTargetRole, SearchSelectionConstraint,
+        UntilCondition, VoteSubject,
+    };
+    use crate::types::mana::ManaSpellGrant;
+
+    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    let has_player = |player: &PlayerFilter| filter::player_filter_contains(player, leaf);
+    let has_duration = |duration: &Duration| duration_reads_filter_population(duration, leaf);
+    let has_cost = |cost: &AbilityCost| ability_cost_reads_filter_population(cost, leaf);
+    let has_choice = |choice: &ChoiceType| choice_type_reads_filter_population(choice, leaf);
+    match effect {
+        // Populations `target_filter()` hides for an `EffectScope::All`
+        // scope: CR 701.26a/b (tap/untap), CR 701.27a (transform), CR 615.1
+        // (prevention), CR 508.1d (attack requirements), CR 701.60a
+        // (suspect), CR 722.3a (prepared).
+        Effect::SetTapState { target, .. }
+        | Effect::Transform { target, .. }
+        | Effect::Suspect { target, .. }
+        | Effect::Unsuspect { target, .. }
+        | Effect::BecomePrepared { target, .. }
+        | Effect::BecomeUnprepared { target, .. } => has_filter(target),
+        Effect::PreventDamage {
+            target,
+            damage_source_filter,
+            prevention_duration,
+            ..
+        } => {
+            has_filter(target)
+                || damage_source_filter.as_ref().is_some_and(has_filter)
+                || prevention_duration.as_ref().is_some_and(has_duration)
+        }
+        Effect::ForceAttack {
+            target,
+            required_defender,
+            duration,
+            ..
+        } => has_filter(target) || has_filter(required_defender) || has_duration(duration),
+        // `*All` populations outside `mass_population_target`: CR 701.15a
+        // (goad) and CR 701.44a (explore).
+        Effect::GoadAll { target } => has_filter(target),
+        Effect::ExploreAll { filter } => has_filter(filter),
+        // Player populations.
+        Effect::StartYourEngines { player_scope } | Effect::ChangeSpeed { player_scope, .. } => {
+            has_player(player_scope)
+        }
+        Effect::DamageAll {
+            target,
+            player_filter,
+            ..
+        } => has_filter(target) || player_filter.as_ref().is_some_and(has_player),
+        Effect::DamageEachPlayer { player_filter, .. } => has_player(player_filter),
+        Effect::RevealChosenNumbers { players } => has_player(players),
+        Effect::ChooseOneOf { chooser, .. } => has_player(chooser),
+        // CR 608.2d: a choice made while this effect resolves.
+        Effect::Choose { choice_type, .. } => has_choice(choice_type),
+        Effect::OpponentGuess { subject, .. } => match subject.as_ref() {
+            GuessSubject::CommittedChoice { choice_type } => has_choice(choice_type),
+            // Its operands are quantities, read above.
+            GuessSubject::Proposition { .. } => false,
+        },
+        // CR 118.12: a cost paid while this effect resolves.
+        Effect::PayCost { cost, payer, .. } => has_cost(cost) || has_filter(payer),
+        Effect::CastFromZone {
+            target,
+            alt_ability_cost,
+            duration,
+            ..
+        } => {
+            has_filter(target)
+                || alt_ability_cost.as_ref().is_some_and(has_cost)
+                || duration.as_ref().is_some_and(has_duration)
+        }
+        // Inline operand carriers.
+        Effect::EachSourceDealsDamage {
+            sources, recipient, ..
+        } => {
+            has_filter(sources)
+                || match recipient {
+                    EachDamageRecipient::Shared(filter) => has_filter(filter),
+                    EachDamageRecipient::OtherBatchSource { source_filters } => {
+                        source_filters.iter().any(|filter| has_filter(filter))
+                    }
+                    EachDamageRecipient::EachController => false,
+                }
+        }
+        Effect::Counter {
+            target,
+            source_rider,
+            ..
+        } => {
+            has_filter(target)
+                || match source_rider {
+                    // Its `static_def` is the nested walk's.
+                    Some(CounterSourceRider::LosesAbilities {
+                        source_filter,
+                        duration,
+                        static_def: _,
+                    }) => {
+                        source_filter.as_deref().is_some_and(has_filter) || has_duration(duration)
+                    }
+                    Some(CounterSourceRider::Destroy) | None => false,
+                }
+        }
+        Effect::Vote { subject, .. } => match subject {
+            // Its `outcome_template` is the nested walk's.
+            VoteSubject::Objects {
+                candidate_filter,
+                outcome_template: _,
+            } => has_filter(candidate_filter),
+            VoteSubject::Named => false,
+        },
+        Effect::BecomeCopy {
+            target,
+            recipient,
+            duration,
+            ..
+        } => {
+            has_filter(target)
+                || match recipient {
+                    CopyRecipient::Target(filter) | CopyRecipient::Untargeted(filter) => {
+                        has_filter(filter)
+                    }
+                    CopyRecipient::Source => false,
+                }
+                || duration.as_ref().is_some_and(has_duration)
+        }
+        Effect::Mana {
+            produced,
+            grants,
+            target,
+            ..
+        } => {
+            let produced_reads = match produced {
+                ManaProduction::AnyTypeProduceableBy { land_filter, .. } => has_filter(land_filter),
+                ManaProduction::DistinctColorsAmongPermanents { filter }
+                | ManaProduction::AnyOneColorAmongPermanents { filter, .. } => has_filter(filter),
+                ManaProduction::Fixed { .. }
+                | ManaProduction::Colorless { .. }
+                | ManaProduction::Mixed { .. }
+                | ManaProduction::AnyOneColor { .. }
+                | ManaProduction::AnyCombination { .. }
+                | ManaProduction::ChosenColor { .. }
+                | ManaProduction::NotedType { .. }
+                | ManaProduction::OpponentLandColors { .. }
+                | ManaProduction::AnyCombinationOfObjectColors { .. }
+                | ManaProduction::ChoiceAmongExiledColors { .. }
+                | ManaProduction::ChoiceAmongCombinations { .. }
+                | ManaProduction::AnyInCommandersColorIdentity { .. }
+                | ManaProduction::TriggerEventManaType => false,
+            };
+            produced_reads
+                || grants.iter().any(|grant| match grant {
+                    ManaSpellGrant::CantBeCountered { filter }
+                    | ManaSpellGrant::EntersWithCounters { filter, .. }
+                    | ManaSpellGrant::TriggerOnSpend { filter, .. } => has_filter(filter),
+                    // Applied when the mana is spent, later: not read here.
+                    ManaSpellGrant::AddKeywordUntilEndOfTurn { .. } => false,
+                })
+                || target.as_ref().is_some_and(|role| match role {
+                    ManaTargetRole::Recipient { recipient } => has_filter(recipient),
+                    ManaTargetRole::CountSource { count_source } => has_filter(count_source),
+                    ManaTargetRole::Both {
+                        recipient,
+                        count_source,
+                    } => has_filter(recipient) || has_filter(count_source),
+                })
+        }
+        Effect::SearchLibrary {
+            filter,
+            target_player,
+            selection_constraint,
+            ..
+        } => {
+            has_filter(filter)
+                || target_player.as_ref().is_some_and(has_filter)
+                || match selection_constraint {
+                    SearchSelectionConstraint::MatchEachFilter { filters } => {
+                        filters.iter().any(has_filter)
+                    }
+                    SearchSelectionConstraint::None
+                    | SearchSelectionConstraint::DistinctQualities { .. }
+                    | SearchSelectionConstraint::TotalManaValue { .. } => false,
+                }
+        }
+        Effect::CreateDelayedTrigger { condition, .. } => {
+            delayed_trigger_condition_reads_filter_population(condition, leaf)
+        }
+        Effect::ExileResolvingSpellInsteadOfGraveyard { on_exile } => match on_exile {
+            Some(ExiledSpellRider::ReturnTo { timing, .. }) => {
+                delayed_trigger_condition_reads_filter_population(timing, leaf)
+            }
+            Some(ExiledSpellRider::BecomePlotted) | None => false,
+        },
+        Effect::AddRestriction { restriction } => match restriction {
+            GameRestriction::CantEnterBattlefieldFrom { filter, .. } => has_filter(filter),
+            GameRestriction::DamagePreventionDisabled { .. }
+            | GameRestriction::ProhibitActivity { .. } => false,
+        },
+        // A permission granted now: its card filter and its duration. Its
+        // alternative cost is paid when the card is cast later.
+        Effect::GrantCastingPermission {
+            permission, target, ..
+        } => {
+            has_filter(target)
+                || match permission {
+                    CastingPermission::PlayFromExile {
+                        card_filter,
+                        duration,
+                        ..
+                    } => card_filter.as_ref().is_some_and(has_filter) || has_duration(duration),
+                    CastingPermission::ExileWithAltCost { duration, .. }
+                    | CastingPermission::ExileWithAltAbilityCost { duration, .. } => {
+                        duration.as_ref().is_some_and(has_duration)
+                    }
+                    CastingPermission::AdventureCreature
+                    | CastingPermission::ExileWithEnergyCost
+                    | CastingPermission::WarpExile { .. }
+                    | CastingPermission::Plotted { .. }
+                    | CastingPermission::Foretold { .. } => false,
+                }
+        }
+        Effect::ForEachCategory { action, .. } => match action {
+            ForEachCategoryAction::PutCounter { target, .. } => has_filter(target),
+            ForEachCategoryAction::ExileFromPool { .. } => false,
+        },
+        Effect::ExileFromTopUntil { player, until } => {
+            has_filter(player)
+                || match until {
+                    UntilCondition::NextMatches { filter, .. } => has_filter(filter),
+                    UntilCondition::CumulativeThreshold { .. } => false,
+                }
+        }
+        Effect::AdditionalPhase {
+            recipient,
+            attacker_restriction,
+            ..
+        } => {
+            let recipient_reads = match recipient {
+                ExtraPhaseRecipient::TargetedPlayer(filter) => has_filter(filter),
+                ExtraPhaseRecipient::NoPlayer
+                | ExtraPhaseRecipient::Controller
+                | ExtraPhaseRecipient::TriggeringPlayer => false,
+            };
+            recipient_reads || attacker_restriction.as_ref().is_some_and(has_filter)
+        }
+        Effect::Conjure {
+            cards,
+            library_players,
+            ..
+        } => {
+            cards.iter().any(|card| match &card.source {
+                ConjureSource::Duplicate { duplicate_of } => has_filter(duplicate_of),
+                ConjureSource::Named { .. } => false,
+            }) || library_players.as_ref().is_some_and(has_player)
+        }
+        // Every other filter the effect carries in its own fields.
+        Effect::DealDamage { target, .. } => has_filter(target),
+        Effect::EachDealsDamageEqualToPower {
+            sources,
+            recipient,
+            extra_source,
+        } => {
+            has_filter(sources)
+                || has_filter(recipient)
+                || extra_source.as_ref().is_some_and(has_filter)
+        }
+        Effect::Draw { target, .. } => has_filter(target),
+        Effect::Pump { target, .. } => has_filter(target),
+        Effect::PairWith { target } => has_filter(target),
+        Effect::Destroy { target, .. } => has_filter(target),
+        Effect::Regenerate { target } => has_filter(target),
+        Effect::RemoveAllDamage { target } => has_filter(target),
+        Effect::CounterAll { target } => has_filter(target),
+        Effect::Token {
+            owner, attach_to, ..
+        } => has_filter(owner) || attach_to.as_ref().is_some_and(has_filter),
+        Effect::GainLife { player, .. } => has_filter(player),
+        Effect::LoseLife { target, .. } => target.as_ref().is_some_and(has_filter),
+        Effect::RemoveCounter { target, .. } => has_filter(target),
+        Effect::Sacrifice { target, .. } => has_filter(target),
+        Effect::DiscardCard { target, .. } => has_filter(target),
+        Effect::Mill { target, .. } => has_filter(target),
+        Effect::Scry { target, .. } => has_filter(target),
+        Effect::PumpAll { target, .. } => has_filter(target),
+        Effect::DestroyAll { target, .. } => has_filter(target),
+        Effect::ChangeZone {
+            target,
+            conditional_enter_with_counters,
+            enters_modified_if,
+            ..
+        } => {
+            has_filter(target)
+                || conditional_enter_with_counters
+                    .iter()
+                    .any(|(filter, _, _)| has_filter(filter))
+                || enters_modified_if.as_ref().is_some_and(has_filter)
+        }
+        Effect::ChangeZoneAll { target, .. } => has_filter(target),
+        Effect::Dig { player, filter, .. } => has_filter(player) || has_filter(filter),
+        Effect::GainControl { target } => has_filter(target),
+        Effect::GainControlAll { target } => has_filter(target),
+        Effect::ControlNextTurn { target, .. } => has_filter(target),
+        Effect::Attach {
+            attachment, target, ..
+        } => has_filter(attachment) || has_filter(target),
+        Effect::UnattachAll { attachment, target } => has_filter(attachment) || has_filter(target),
+        Effect::Surveil { target, .. } => has_filter(target),
+        Effect::Fight { target, subject } => has_filter(target) || has_filter(subject),
+        Effect::Bounce { target, .. } => has_filter(target),
+        Effect::BounceAll { target, .. } => has_filter(target),
+        Effect::BecomeMonarch { target } => has_filter(target),
+        Effect::ProliferateTarget { target } => has_filter(target),
+        Effect::Behold { filter } => has_filter(filter),
+        Effect::SeparateIntoPiles { object_filter, .. } => has_filter(object_filter),
+        Effect::SwitchPT { target } => has_filter(target),
+        Effect::CopySpell { target, .. } => has_filter(target),
+        Effect::CastCopyOfCard { target, .. } => has_filter(target),
+        Effect::CopyTokenOf {
+            target,
+            owner,
+            source_filter,
+            ..
+        } => {
+            has_filter(target)
+                || has_filter(owner)
+                || source_filter.as_ref().is_some_and(has_filter)
+        }
+        Effect::CreateTokenCopyFromPool {
+            owner, type_filter, ..
+        } => has_filter(owner) || has_filter(type_filter),
+        Effect::CombineHost { host, .. } => has_filter(host),
+        Effect::ChooseAugmentAndCombineWithHost { filter, host, .. } => {
+            has_filter(filter) || has_filter(host)
+        }
+        Effect::Meld {
+            source_filter,
+            partner_filter,
+            ..
+        } => has_filter(source_filter) || has_filter(partner_filter),
+        Effect::ExileHaunting { target } => has_filter(target),
+        Effect::HideawayConceal { target, .. } => has_filter(target),
+        Effect::CopyTokenBlockingAttacker {
+            source_filter,
+            owner,
+        } => has_filter(source_filter) || has_filter(owner),
+        Effect::ChoosePermanent { filter } => has_filter(filter),
+        Effect::GainActivatedAbilitiesOfTarget {
+            target,
+            recipient,
+            duration,
+            ..
+        } => {
+            has_filter(target)
+                || has_filter(recipient)
+                || duration.as_ref().is_some_and(has_duration)
+        }
+        Effect::ChooseCard { target, .. } => has_filter(target),
+        Effect::PutCounter { target, .. } => has_filter(target),
+        Effect::ChooseCounterKind { target, .. } => has_filter(target),
+        Effect::PutChosenCounter { target, .. } => has_filter(target),
+        Effect::PutCounterAll { target, .. } => has_filter(target),
+        Effect::MultiplyCounter { target, .. } => has_filter(target),
+        Effect::DoublePT { target, .. } => has_filter(target),
+        Effect::DoublePTAll { target, .. } => has_filter(target),
+        Effect::MoveCounters { source, target, .. } => has_filter(source) || has_filter(target),
+        Effect::ReproduceEventCounters { target, .. } => has_filter(target),
+        Effect::Animate { target, .. } => has_filter(target),
+        Effect::ReturnAsAura { enchant_filter, .. } => has_filter(enchant_filter),
+        Effect::GenericEffect {
+            duration, target, ..
+        } => duration.as_ref().is_some_and(has_duration) || target.as_ref().is_some_and(has_filter),
+        Effect::Discard {
+            target,
+            unless_filter,
+            filter,
+            ..
+        } => {
+            has_filter(target)
+                || unless_filter.as_ref().is_some_and(has_filter)
+                || filter.as_ref().is_some_and(has_filter)
+        }
+        Effect::Shuffle { target } => has_filter(target),
+        Effect::FlipPermanent { target } => has_filter(target),
+        Effect::SearchOutsideGame { filter, .. } => has_filter(filter),
+        Effect::OpenBoosterPack { filter, .. } => has_filter(filter),
+        Effect::RevealHand {
+            target,
+            card_filter,
+            ..
+        } => has_filter(target) || has_filter(card_filter),
+        Effect::RevealFromHand { filter, .. } => has_filter(filter),
+        Effect::Reveal { target } => has_filter(target),
+        Effect::RevealTop { player, .. } => has_filter(player),
+        Effect::ExileTop { player, .. } => has_filter(player),
+        Effect::ExileFaceDownPile { object, player, .. } => {
+            has_filter(object) || has_filter(player)
+        }
+        Effect::TargetOnly { target } => has_filter(target),
+        Effect::ChooseDamageSource { source_filter } => has_filter(source_filter),
+        Effect::Connive { target, .. } => has_filter(target),
+        Effect::PhaseOut { target } => has_filter(target),
+        Effect::PhaseIn { target } => has_filter(target),
+        Effect::ForceBlock {
+            target, duration, ..
+        } => has_filter(target) || has_duration(duration),
+        Effect::BecomeSaddled { target } => has_filter(target),
+        Effect::AddTargetReplacement { target, .. } => has_filter(target),
+        Effect::ReduceNextSpellCost { spell_filter, .. } => {
+            spell_filter.as_ref().is_some_and(has_filter)
+        }
+        Effect::GrantNextSpellAbility { spell_filter, .. } => {
+            spell_filter.as_ref().is_some_and(has_filter)
+        }
+        Effect::CreateBoon { recipient, .. } => has_filter(recipient),
+        Effect::FreeCastFromZones { filter, .. } => has_filter(filter),
+        Effect::CreateDamageReplacement {
+            source_filter,
+            redirect_object_filter,
+            recipient_object_filter,
+            ..
+        } => {
+            source_filter.as_ref().is_some_and(has_filter)
+                || redirect_object_filter.as_ref().is_some_and(has_filter)
+                || recipient_object_filter.as_ref().is_some_and(has_filter)
+        }
+        Effect::LoseTheGame { target } => target.as_ref().is_some_and(has_filter),
+        Effect::WinTheGame { target } => target.as_ref().is_some_and(has_filter),
+        Effect::FlipCoin { flipper, .. } => has_filter(flipper),
+        Effect::FlipCoins { flipper, .. } => has_filter(flipper),
+        Effect::CrankContraptions { target } => has_filter(target),
+        Effect::ReassembleContraption { target, .. } => has_filter(target),
+        Effect::AssembleContraptionOnSprocket { target, .. } => has_filter(target),
+        Effect::ReassembleContraptionOnSprocket { target, .. } => has_filter(target),
+        Effect::PutSticker { target, .. } => has_filter(target),
+        Effect::ApplySticker { target, .. } => has_filter(target),
+        Effect::ChooseFromZone { filter, .. } => filter.as_ref().is_some_and(has_filter),
+        Effect::RememberCard { target } => has_filter(target),
+        Effect::ChooseObjectsIntoTrackedSet {
+            chooser, filter, ..
+        } => has_filter(chooser) || has_filter(filter),
+        Effect::ChooseAndSacrificeRest {
+            choose_filter,
+            sacrifice_filter,
+            ..
+        } => has_filter(choose_filter) || has_filter(sacrifice_filter),
+        Effect::EachPlayerCopyChosen { choose_filter, .. } => has_filter(choose_filter),
+        Effect::Exploit { target } => has_filter(target),
+        Effect::GivePlayerCounter { target, .. } => has_filter(target),
+        Effect::LoseAllPlayerCounters { target } => has_filter(target),
+        Effect::RevealUntil {
+            player,
+            filter,
+            kept_destination_if,
+            ..
+        } => {
+            has_filter(player)
+                || has_filter(filter)
+                || kept_destination_if
+                    .as_ref()
+                    .is_some_and(|(filter, _)| has_filter(filter))
+        }
+        Effect::Discover { player, .. } => has_filter(player),
+        Effect::PhysicalContest { contestant, .. } => has_filter(contestant),
+        Effect::Heist { target, .. } => has_filter(target),
+        Effect::PutAtLibraryPosition { target, .. } => has_filter(target),
+        Effect::ChooseDrawnThisTurnPayOrTopdeck { player, .. } => has_filter(player),
+        Effect::PutOnTopOrBottom { target, chooser } => has_filter(target) || has_filter(chooser),
+        Effect::Goad { target } => has_filter(target),
+        Effect::Detain { target } => has_filter(target),
+        Effect::SetRoomDoorLock { target, .. } => has_filter(target),
+        Effect::ExchangeControl { target_a, target_b } => {
+            has_filter(target_a) || has_filter(target_b)
+        }
+        Effect::ChangeTargets {
+            target, forced_to, ..
+        } => has_filter(target) || forced_to.as_ref().is_some_and(has_filter),
+        Effect::Manifest {
+            target,
+            object_source,
+            ..
+        } => has_filter(target) || object_source.as_ref().is_some_and(has_filter),
+        Effect::Cloak {
+            target,
+            object_source,
+            ..
+        } => has_filter(target) || object_source.as_ref().is_some_and(has_filter),
+        Effect::TurnFaceUp { target } => has_filter(target),
+        Effect::TurnFaceDown { target, .. } => has_filter(target),
+        Effect::ExtraTurn { target, .. } => has_filter(target),
+        Effect::GrantExtraLoyaltyActivations { target, .. } => has_filter(target),
+        Effect::SkipNextTurn { target, .. } => has_filter(target),
+        Effect::SkipNextStep { target, .. } => has_filter(target),
+        Effect::Double { target, .. } => has_filter(target),
+        Effect::Amass { player, .. } => has_filter(player),
+        Effect::Endure { subject, .. } => has_filter(subject),
+        Effect::BlightEffect { player, .. } => has_filter(player),
+        Effect::Seek { filter, .. } => has_filter(filter),
+        Effect::SetLifeTotal { target, .. } => has_filter(target),
+        Effect::ExchangeLifeWithStat { player, .. } => has_filter(player),
+        Effect::ExchangeLifeTotals { player_a, player_b } => {
+            has_filter(player_a) || has_filter(player_b)
+        }
+        Effect::GiveControl { target, recipient } => has_filter(target) || has_filter(recipient),
+        Effect::RemoveFromCombat { target } => has_filter(target),
+        Effect::BecomeBlocked { target } => has_filter(target),
+        Effect::ApplyPerpetual { target, .. } => has_filter(target),
+        // Effects whose own fields carry no filter, player population,
+        // duration, cost or choice: only their quantities (read above) and
+        // nested definitions (the nested walk's) can read.
+        Effect::ApplyPostReplacementDamage { .. }
+        | Effect::Explore
+        | Effect::Investigate
+        | Effect::Tribute { .. }
+        | Effect::TimeTravel
+        | Effect::NoOp
+        | Effect::Proliferate
+        | Effect::Populate
+        | Effect::Clash
+        | Effect::ExileTopCardContest { .. }
+        | Effect::EndTheTurn
+        | Effect::EndCombatPhase
+        | Effect::EpicCopy { .. }
+        | Effect::Myriad
+        | Effect::Encore
+        | Effect::ChooseCounterAdjustment { .. }
+        | Effect::RegisterBending { .. }
+        | Effect::Cleanup { .. }
+        | Effect::SwapChosenLabels { .. }
+        | Effect::SolveCase
+        | Effect::SetClassLevel { .. }
+        | Effect::AddPendingETBCounters { .. }
+        | Effect::AddPendingEntersModifications { .. }
+        | Effect::CreateEmblem { .. }
+        | Effect::NoteNumber { .. }
+        | Effect::CreateDrawReplacement { .. }
+        | Effect::CreatePlaneswalkReplacement { .. }
+        | Effect::RollDie { .. }
+        | Effect::FlipCoinUntilLose { .. }
+        | Effect::RingTemptsYou
+        | Effect::VentureIntoDungeon
+        | Effect::VentureInto { .. }
+        | Effect::TakeTheInitiative
+        | Effect::ArrangePlanarDeckTop { .. }
+        | Effect::Planeswalk
+        | Effect::ChaosEnsues
+        | Effect::ReverseTurnOrder
+        | Effect::RedistributeLifeTotals
+        | Effect::OpenAttractions { .. }
+        | Effect::RollToVisitAttractions
+        | Effect::AssembleContraptions { .. }
+        | Effect::AssembleContraptionsFromRollDifference
+        | Effect::ProcessRadCounters
+        | Effect::NoteManaSpent
+        | Effect::GainEnergy { .. }
+        | Effect::HeistExile
+        | Effect::Cascade
+        | Effect::Ripple { .. }
+        | Effect::MiracleCast { .. }
+        | Effect::MadnessCast { .. }
+        | Effect::GiftDelivery { .. }
+        | Effect::ManifestDread
+        | Effect::RuntimeHandled { .. }
+        | Effect::Incubate { .. }
+        | Effect::EmpowerJace { .. }
+        | Effect::Monstrosity { .. }
+        | Effect::Specialize
+        | Effect::Renown { .. }
+        | Effect::Bolster { .. }
+        | Effect::Adapt { .. }
+        | Effect::Learn
+        | Effect::Forage
+        | Effect::CompletePlayerAction { .. }
+        | Effect::Harness
+        | Effect::CollectEvidence { .. }
+        | Effect::SetDayNight { .. }
+        | Effect::Intensify { .. }
+        | Effect::DraftFromSpellbook { .. }
+        | Effect::Unimplemented { .. } => false,
+    }
+}
+
+/// CR 611.2b: a "for as long as" duration is tested once, when the effect
+/// would begin (`GameState::transient_duration_begins` →
+/// `layers::resolved_duration_begins`); if it never starts, the effect does
+/// nothing, so its condition is read on resolution. An `UntilEvent` deadline is
+/// a trigger matcher evaluated when a later event fires, and the remaining
+/// durations carry no filter. Exhaustive, no `_` arm.
+fn duration_reads_filter_population(
+    duration: &Duration,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    match duration {
+        Duration::ForAsLongAs { condition } => {
+            static_condition_reads_filter_population(condition, leaf)
+        }
+        Duration::UntilEvent { .. }
+        | Duration::UntilEndOfTurn
+        | Duration::UntilEndOfCombat
+        | Duration::UntilNextTurnOf { .. }
+        | Duration::UntilEndOfNextTurnOf { .. }
+        | Duration::UntilHostLeavesPlay
+        | Duration::WhileHostOnBattlefield
+        | Duration::WhileControllingHost
+        | Duration::UntilNextStepOf { .. }
+        | Duration::UntilSourceExilesAnotherCard
+        | Duration::UntilOpponentBecomesMonarch
+        | Duration::Permanent => false,
+    }
+}
+
+/// CR 118.12 + CR 608.2c: whether a cost paid while this resolution applies
+/// its instructions names a population satisfying `leaf` — through a filter it
+/// selects from, a quantity it counts (`AbilityCost::for_each_quantity_expr`,
+/// the exhaustive cost-quantity authority), a choice it asks for, or an effect
+/// paid as the cost. Exhaustive, no `_` arm.
+fn ability_cost_reads_filter_population(
+    cost: &AbilityCost,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    let recurse = |inner: &AbilityCost| ability_cost_reads_filter_population(inner, leaf);
+    let mut counts_population = false;
+    cost.for_each_quantity_expr(&mut |quantity| {
+        counts_population =
+            counts_population || quantity_expr_counts_population_matching(quantity, leaf);
+    });
+    counts_population
+        || match cost {
+            AbilityCost::Sacrifice(SacrificeCost {
+                target,
+                requirement: _,
+            }) => has_filter(target),
+            AbilityCost::Discard { filter, .. }
+            | AbilityCost::Exile { filter, .. }
+            | AbilityCost::ReturnToHand { filter, .. }
+            | AbilityCost::Reveal { filter, .. } => filter.as_ref().is_some_and(has_filter),
+            AbilityCost::RemoveCounter { target, .. } => target.as_ref().is_some_and(has_filter),
+            AbilityCost::ExileMaterials { materials, .. } => has_filter(materials),
+            AbilityCost::ExileWithAggregate { filter, .. }
+            | AbilityCost::TapCreatures { filter, .. }
+            | AbilityCost::UnattachFrom { filter, .. } => has_filter(filter),
+            AbilityCost::Behold {
+                filter,
+                type_choice,
+                ..
+            } => {
+                has_filter(filter)
+                    || type_choice
+                        .as_ref()
+                        .is_some_and(|choice| choice_type_reads_filter_population(choice, leaf))
+            }
+            AbilityCost::Composite { costs } | AbilityCost::OneOf { costs } => {
+                costs.iter().any(recurse)
+            }
+            AbilityCost::PerCounter { target, base, .. } => has_filter(target) || recurse(base),
+            // An effect paid as the cost is performed now.
+            AbilityCost::EffectCost { effect } => effect_reads_filter_population(effect, leaf),
+            AbilityCost::Mana { .. }
+            | AbilityCost::ManaDynamic { .. }
+            | AbilityCost::Tap
+            | AbilityCost::Untap
+            | AbilityCost::Loyalty { .. }
+            | AbilityCost::PayLife { .. }
+            | AbilityCost::CollectEvidence { .. }
+            | AbilityCost::PayEnergy { .. }
+            | AbilityCost::PaySpeed { .. }
+            | AbilityCost::Unattach
+            | AbilityCost::Mill { .. }
+            | AbilityCost::Exert
+            | AbilityCost::Blight { .. }
+            | AbilityCost::Waterbend { .. }
+            | AbilityCost::NinjutsuFamily { .. }
+            | AbilityCost::KeywordCostOfCastSpell { .. }
+            | AbilityCost::GetPlayerCounters { .. }
+            | AbilityCost::Unimplemented { .. } => false,
+        }
+}
+
+/// CR 608.2d: whether a choice made while this resolution applies its
+/// instructions restricts its options by a player population satisfying
+/// `leaf`. Only an opponent choice carries a `PlayerFilter`; every other kind
+/// offers a fixed vocabulary. Exhaustive, no `_` arm.
+fn choice_type_reads_filter_population(
+    choice: &crate::types::ability::ChoiceType,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    use crate::types::ability::ChoiceType;
+    match choice {
+        ChoiceType::Opponent { restriction, .. } => restriction
+            .as_deref()
+            .is_some_and(|player| filter::player_filter_contains(player, leaf)),
+        ChoiceType::CreatureType { .. }
+        | ChoiceType::Color { .. }
+        | ChoiceType::OddOrEven
+        | ChoiceType::BasicLandType
+        | ChoiceType::CardType { .. }
+        | ChoiceType::CardName
+        | ChoiceType::NumberRange { .. }
+        | ChoiceType::Labeled { .. }
+        | ChoiceType::LandType
+        | ChoiceType::CardPredicate { .. }
+        | ChoiceType::CardPredicateGuess { .. }
+        | ChoiceType::Player { .. }
+        | ChoiceType::TwoColors
+        | ChoiceType::Word
+        | ChoiceType::Artist
+        | ChoiceType::Keyword { .. }
+        | ChoiceType::CounterKind { .. } => false,
+    }
+}
+
+/// The filters a delayed trigger's condition carries. CR 603.7c: a delayed
+/// trigger created by this resolution refers to the objects fixed when it is
+/// created, so its own filter arms are read. The embedded triggers of
+/// `WheneverEvent` / `WhenNextEvent` are matchers evaluated when a later event
+/// fires, and are not read here. Exhaustive, no `_` arm.
+fn delayed_trigger_condition_reads_filter_population(
+    condition: &crate::types::ability::DelayedTriggerCondition,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    use crate::types::ability::DelayedTriggerCondition;
+    match condition {
+        DelayedTriggerCondition::WhenDies { filter }
+        | DelayedTriggerCondition::WhenLeavesPlayFiltered { filter }
+        | DelayedTriggerCondition::WhenEntersBattlefield { filter }
+        | DelayedTriggerCondition::WhenDiesOrExiled { filter } => {
+            filter::filter_contains(filter, leaf)
+        }
+        DelayedTriggerCondition::AtNextPhase { .. }
+        | DelayedTriggerCondition::AtNextPhaseForPlayer { .. }
+        | DelayedTriggerCondition::AtBeginningOfAddedPhase { .. }
+        | DelayedTriggerCondition::WhenLeavesPlay { .. }
+        | DelayedTriggerCondition::WheneverEvent { .. }
+        | DelayedTriggerCondition::WhenNextEvent { .. } => false,
+    }
+}
+
+/// Whether any filter or counted population inside a static's enabling
+/// `condition` satisfies `leaf` — the `StaticCondition` twin of
+/// [`condition_reads_filter_population`]. A resolving effect evaluates its
+/// static's condition once, when it is applied (CR 608.2h + CR 611.2d), and a
+/// "for as long as" duration tests its condition when it would begin
+/// (CR 611.2b). Compound operands (`And` / `Or` / `Not`) are read.
+///
+/// EXHAUSTIVE on `StaticCondition`, no `_` arm. The leaves listed as `false`
+/// carry no `TargetFilter` and no `QuantityExpr`.
+fn static_condition_reads_filter_population(
+    condition: &crate::types::ability::StaticCondition,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    use crate::types::ability::StaticCondition;
+    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    let has_quantity =
+        |quantity: &QuantityExpr| quantity_expr_counts_population_matching(quantity, leaf);
+    let recurse = |inner: &StaticCondition| static_condition_reads_filter_population(inner, leaf);
+    match condition {
+        StaticCondition::And { conditions } | StaticCondition::Or { conditions } => {
+            conditions.iter().any(recurse)
+        }
+        StaticCondition::Not { condition } => recurse(condition),
+        StaticCondition::QuantityComparison { lhs, rhs, .. } => {
+            has_quantity(lhs) || has_quantity(rhs)
+        }
+        StaticCondition::QuantityQuality {
+            quantity,
+            quality: _,
+        } => has_quantity(quantity),
+        StaticCondition::IsPresent { filter } => filter.as_ref().is_some_and(has_filter),
+        StaticCondition::DefendingPlayerControls { filter }
+        | StaticCondition::SourceMatchesFilter { filter }
+        | StaticCondition::TopOfLibraryMatches { filter }
+        | StaticCondition::RecipientMatchesFilter { filter } => has_filter(filter),
+        StaticCondition::DevotionGE { .. }
+        | StaticCondition::ChosenColorIs { .. }
+        | StaticCondition::ChosenLabelIs { .. }
+        | StaticCondition::HasMaxSpeed
+        | StaticCondition::SpeedGE { .. }
+        | StaticCondition::DayNightIs { .. }
+        | StaticCondition::HasCounters { .. }
+        | StaticCondition::CastVariantPaid { .. }
+        | StaticCondition::RecipientHasCounters { .. }
+        | StaticCondition::ClassLevelGE { .. }
+        | StaticCondition::SourceAttackingAlone
+        | StaticCondition::SourceIsAttacking
+        | StaticCondition::SourceIsBlocking
+        | StaticCondition::SourceIsBlocked
+        | StaticCondition::IsMonarch { .. }
+        | StaticCondition::HasBoon { .. }
+        | StaticCondition::IsInitiative
+        | StaticCondition::NoMonarch
+        | StaticCondition::HasCityBlessing
+        | StaticCondition::HasEnduringStory
+        | StaticCondition::CompletedADungeon
+        | StaticCondition::WasStartingPlayer { .. }
+        | StaticCondition::SpellCastWithVariantThisTurn { .. }
+        | StaticCondition::AnyPlayerAttackedYouLastTurn { .. }
+        | StaticCondition::OpponentPoisonAtLeast { .. }
+        | StaticCondition::UnlessPay { .. }
+        | StaticCondition::Unrecognized { .. }
+        | StaticCondition::DuringYourTurn
+        | StaticCondition::DuringOpponentsTurn
+        | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
+        | StaticCondition::SourceEnteredThisTurn
+        | StaticCondition::SourceHasDealtDamage
+        | StaticCondition::WasCast { .. }
+        | StaticCondition::IsRingBearer
+        | StaticCondition::RingLevelAtLeast { .. }
+        | StaticCondition::ControlsCommander { .. }
+        | StaticCondition::SourceIsTapped
+        | StaticCondition::IsTapped { .. }
+        | StaticCondition::SourceIsFaceUp
+        | StaticCondition::SourceIsSaddled
+        | StaticCondition::SourceControllerEquals { .. }
+        | StaticCondition::SourceIsEquipped
+        | StaticCondition::SourceIsEnchanted
+        | StaticCondition::SourceIsMonstrous
+        | StaticCondition::SourceIsHarnessed
+        | StaticCondition::SourceAttachedToCreature
+        | StaticCondition::RecipientAttackingOwnerTarget { .. }
+        | StaticCondition::SourceIsPaired
+        | StaticCondition::SourceInZone { .. }
+        | StaticCondition::EnchantedIsFaceDown
+        | StaticCondition::AdditionalCostPaid
+        | StaticCondition::CastingAsVariant { .. }
+        | StaticCondition::None => false,
+    }
+}
+
 /// CR 608.2c + CR 400.7j: Whether a condition reads the parent's *suspended-
 /// selection result object* — the found/revealed card that a `SearchLibrary`
 /// injects as the continuation target only after the player responds
@@ -14019,8 +14898,10 @@ fn tail_links_exile(scope: &PendingPlayerScopeTail) -> bool {
 
 /// CR 608.2c: does `tail` read the created referent ("the tokens", "it") that
 /// the preceding player-scope token clause publishes? A node reads it through
-/// its effect ([`effect_reads_created_referent`]), its condition, or its
-/// `repeat_for` count ([`node_reads_created_referent`]), or through a nested
+/// its effect ([`effect_reads_created_referent`]), its condition, its
+/// `repeat_for` count, its `player_scope` population, its duration, its
+/// `unless_pay` cost or its `optional_player` ([`node_reads_created_referent`]),
+/// or through a nested
 /// branch: its `else_ability` chain (CR 608.2c) or a `mode_abilities` chain
 /// (CR 700.2: each mode is an alternative chain; CR 700.2b + CR 603.12 for a
 /// reflexive modal trigger), each walked as its own chain.
@@ -14034,6 +14915,10 @@ fn tail_reads_created_referent(tail: &ResolvedAbility) -> bool {
             &node.effect,
             node.condition.as_ref(),
             node.repeat_for.as_ref(),
+            node.player_scope.as_ref(),
+            node.duration.as_ref(),
+            node.unless_pay.as_ref(),
+            node.optional_player.as_ref(),
         ) || node
             .else_ability
             .as_deref()
@@ -14061,6 +14946,10 @@ fn definition_reads_created_referent(definition: &AbilityDefinition) -> bool {
             &node.effect,
             node.condition.as_ref(),
             node.repeat_for.as_ref(),
+            node.player_scope.as_ref(),
+            node.duration.as_ref(),
+            node.unless_pay.as_ref(),
+            node.optional_player.as_ref(),
         ) || node
             .else_ability
             .as_deref()
@@ -14080,43 +14969,58 @@ fn definition_reads_created_referent(definition: &AbilityDefinition) -> bool {
 }
 
 /// One chain node's reader positions for the created referent: its effect, a
-/// condition over the referent, and a `repeat_for` count over the referent's
-/// population (`quantity_expr_counts_population_matching`).
+/// condition over the referent, a `repeat_for` count over the referent's
+/// population (`quantity_expr_counts_population_matching`), and the node
+/// positions this resolution evaluates once while applying the node:
+/// - its `player_scope` population, which its own player-scope driver
+///   evaluates to pick its seats (CR 608.2c);
+/// - its duration, whose "for as long as" condition is tested when the effect
+///   would begin (CR 611.2b);
+/// - its `unless_pay` cost and payer, paid during this resolution
+///   (CR 118.12a);
+/// - its `optional_player`, the player who makes the choice (CR 608.2d).
 fn node_reads_created_referent(
     effect: &Effect,
     condition: Option<&AbilityCondition>,
     repeat_for: Option<&QuantityExpr>,
+    player_scope: Option<&PlayerFilter>,
+    duration: Option<&Duration>,
+    unless_pay: Option<&crate::types::ability::UnlessPayModifier>,
+    optional_player: Option<&TargetFilter>,
 ) -> bool {
     effect_reads_created_referent(effect)
         || condition.is_some_and(condition_depends_on_last_created)
         || repeat_for.is_some_and(|quantity| {
             quantity_expr_counts_population_matching(quantity, &filter_contains_last_created)
         })
+        || player_scope.is_some_and(|players| {
+            filter::player_filter_contains(players, &filter_contains_last_created)
+        })
+        || duration.is_some_and(|duration| {
+            duration_reads_filter_population(duration, &filter_contains_last_created)
+        })
+        || unless_pay.is_some_and(|unless_pay| {
+            ability_cost_reads_filter_population(&unless_pay.cost, &filter_contains_last_created)
+                || filter_contains_last_created(&unless_pay.payer)
+        })
+        || optional_player.is_some_and(filter_contains_last_created)
 }
 
-/// Whether one effect reads the created referent. Readers are the hidden and
-/// mass slots (`effect_parent_ref_slots`, which includes the target filter, and
-/// `mass_population_target`), the quantities (`Effect::for_each_quantity_expr`,
-/// the exhaustive quantity authority), and every nested carrier of the scoped
-/// traversal (`nested_payload_reads_created_referent`), including the statics,
-/// granted abilities and token/emblem abilities this resolution creates;
-/// publishers stop at `publishes_created_referent` (`OwnResolutionOnly`).
+/// Whether one effect reads the created referent. Readers are every filter and
+/// counted population in the effect's own fields
+/// ([`effect_reads_filter_population`]: its `target_filter()` slot, its hidden
+/// population, operand, player, duration, cost and choice positions, and its
+/// quantities) and every nested carrier of the scoped traversal
+/// (`nested_payload_reads_created_referent`), including the statics, granted
+/// abilities and token/emblem abilities this resolution creates; publishers
+/// stop at `publishes_created_referent` (`OwnResolutionOnly`).
 /// CR 603.7c: a delayed trigger that refers to "those tokens" affects the
 /// objects fixed when it is created, in this resolution
 /// (`delayed_trigger::resolve` snapshots a payload whose root target is
 /// `LastCreated`); a payload that reads the referent elsewhere is evaluated
 /// against the ledger when the trigger resolves.
 fn effect_reads_created_referent(effect: &Effect) -> bool {
-    let mut counts_referent = false;
-    effect.for_each_quantity_expr(&mut |quantity| {
-        counts_referent = counts_referent
-            || quantity_expr_counts_population_matching(quantity, &filter_contains_last_created);
-    });
-    counts_referent
-        || effect_parent_ref_slots(effect)
-            .into_iter()
-            .chain(mass_population_target(effect))
-            .any(filter_contains_last_created)
+    effect_reads_filter_population(effect, &filter_contains_last_created)
         || nested_payload_reads_created_referent(effect)
 }
 
@@ -14216,19 +15120,27 @@ fn replacement_reads_created_referent(
 
 /// Mirrors `ability_visit::visit_static_scoped`. A static definition this
 /// resolution creates (CR 611.2c; CR 611.3a: its effect applies to whatever its
-/// text indicates at each moment) reads the created referent through three
+/// text indicates at each moment) reads the created referent through four
 /// positions: its `affected` set, each modification's dynamic magnitude
 /// (`quantity::continuous_modification_dynamic_quantity`, the exhaustive
-/// magnitude authority), and the definitions its modifications carry
+/// magnitude authority), the definitions its modifications carry
 /// (CR 113.1a: an ability an effect grants is defined by that effect's text) —
-/// exactly the descending arms of `visit_continuous_mod_scoped`. The
-/// modification match's `_ => false` defers to those two wildcard-free
-/// authorities; a new descending modification must add a census fixture.
+/// exactly the descending arms of `visit_continuous_mod_scoped` — and its
+/// enabling condition, compound operands included
+/// ([`static_condition_reads_filter_population`]), which a resolving effect
+/// evaluates once when it is applied (CR 608.2h + CR 611.2d; `effects/effect.rs`
+/// registers only a satisfied definition and drops the condition), and which a
+/// token's or emblem's static evaluates live (CR 611.3a). The modification
+/// match's `_ => false` defers to those two wildcard-free authorities; a new
+/// descending modification must add a census fixture.
 fn static_reads_created_referent(static_def: &StaticDefinition) -> bool {
     static_def
         .affected
         .as_ref()
         .is_some_and(filter_contains_last_created)
+        || static_def.condition.as_ref().is_some_and(|condition| {
+            static_condition_reads_filter_population(condition, &filter_contains_last_created)
+        })
         || static_def.modifications.iter().any(|modification| {
             crate::game::quantity::continuous_modification_dynamic_quantity(modification)
                 .is_some_and(|quantity| {
@@ -39085,6 +39997,20 @@ mod tests {
         });
         outer_creation.sub_ability = Some(Box::new(node(put_counter(TargetFilter::LastCreated))));
         assert!(!tail_reads_created_referent(&outer_creation));
+
+        // (xvi) U-R4-publisher: a hidden `EffectScope::All` population after the
+        // tail's own creation names that creation's product (nearest
+        // publisher); before it, it reads the clause's referent.
+        let suspect_all = || Effect::Suspect {
+            target: TargetFilter::LastCreated,
+            scope: EffectScope::All,
+        };
+        let mut creation_then_suspect = node(elemental());
+        creation_then_suspect.sub_ability = Some(Box::new(node(suspect_all())));
+        assert!(!tail_reads_created_referent(&creation_then_suspect));
+        let mut suspect_then_creation = node(suspect_all());
+        suspect_then_creation.sub_ability = Some(Box::new(node(elemental())));
+        assert!(tail_reads_created_referent(&suspect_then_creation));
     }
 
     /// CR 608.2c + CR 611.2c + CR 113.1a: every carrier that the scoped
@@ -39556,6 +40482,642 @@ mod tests {
         assert!(!tail_reads_created_referent(&node(generic(affected(
             TargetFilter::SelfRef
         )))));
+
+        // U-R4-static: the enabling condition, evaluated once when the effect
+        // is applied (CR 608.2h + CR 611.2d), and a "for as long as" duration's
+        // condition, tested when the effect would begin (CR 611.2b), read the
+        // referent through every leaf and compound operand.
+        use crate::types::ability::{Comparator, NumberQuality, StaticCondition};
+        let count_of = |filter: TargetFilter| QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount { filter },
+        };
+        let prime = |filter: TargetFilter| StaticCondition::QuantityQuality {
+            quantity: count_of(filter),
+            quality: NumberQuality::Prime,
+        };
+        let at_least_two = || StaticCondition::QuantityComparison {
+            lhs: count_of(TargetFilter::LastCreated),
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 2 },
+        };
+        let your_creatures =
+            || TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You));
+        // A fixed grant to an ordinary population, so a reader verdict can only
+        // come from the condition or the duration.
+        let fixed_grant = || {
+            StaticDefinition::continuous()
+                .affected(your_creatures())
+                .modifications(vec![ContinuousModification::AddPower { value: 1 }])
+        };
+        let gated = |condition: StaticCondition| fixed_grant().condition(condition);
+        let reading_conditions = vec![
+            ("Prime(LastCreated)", prime(TargetFilter::LastCreated)),
+            (
+                "And[DuringYourTurn, Prime]",
+                StaticCondition::And {
+                    conditions: vec![
+                        StaticCondition::DuringYourTurn,
+                        prime(TargetFilter::LastCreated),
+                    ],
+                },
+            ),
+            (
+                "Or[DuringOpponentsTurn, Prime]",
+                StaticCondition::Or {
+                    conditions: vec![
+                        StaticCondition::DuringOpponentsTurn,
+                        prime(TargetFilter::LastCreated),
+                    ],
+                },
+            ),
+            (
+                "Not(Prime)",
+                StaticCondition::Not {
+                    condition: Box::new(prime(TargetFilter::LastCreated)),
+                },
+            ),
+            (
+                "Not(And[DuringYourTurn, Prime])",
+                StaticCondition::Not {
+                    condition: Box::new(StaticCondition::And {
+                        conditions: vec![
+                            StaticCondition::DuringYourTurn,
+                            prime(TargetFilter::LastCreated),
+                        ],
+                    }),
+                },
+            ),
+            ("QuantityComparison(LastCreated >= 2)", at_least_two()),
+            (
+                "IsPresent(LastCreated)",
+                StaticCondition::IsPresent {
+                    filter: Some(TargetFilter::LastCreated),
+                },
+            ),
+            (
+                "SourceMatchesFilter(LastCreated)",
+                StaticCondition::SourceMatchesFilter {
+                    filter: TargetFilter::LastCreated,
+                },
+            ),
+            (
+                "RecipientMatchesFilter(LastCreated)",
+                StaticCondition::RecipientMatchesFilter {
+                    filter: TargetFilter::LastCreated,
+                },
+            ),
+        ];
+        for (label, condition) in reading_conditions {
+            assert!(
+                tail_reads_created_referent(&node(generic(gated(condition.clone())))),
+                "GenericEffect static condition {label} reads the referent"
+            );
+            assert!(
+                tail_reads_created_referent(&node(token(gated(condition.clone())))),
+                "token static condition {label} reads the referent"
+            );
+            assert!(
+                tail_reads_created_referent(&node(Effect::CreateEmblem {
+                    statics: vec![gated(condition)],
+                    triggers: vec![],
+                })),
+                "emblem static condition {label} reads the referent"
+            );
+        }
+        // Negatives: an otherwise identical static whose condition names no
+        // referent; and the positive reach for the same grant above.
+        assert!(!tail_reads_created_referent(&node(generic(gated(
+            StaticCondition::DuringYourTurn
+        )))));
+        assert!(!tail_reads_created_referent(&node(generic(gated(prime(
+            TargetFilter::Typed(TypedFilter::creature())
+        ))))));
+        assert!(!tail_reads_created_referent(&node(generic(fixed_grant()))));
+
+        // B1: "for as long as" durations, on the effect and on the node.
+        let for_as_long_as = |condition: StaticCondition| Duration::ForAsLongAs { condition };
+        let effect_duration = |duration: Duration| Effect::GenericEffect {
+            static_abilities: vec![fixed_grant()],
+            duration: Some(duration),
+            target: None,
+            end_cost: None,
+        };
+        let node_duration = |duration: Duration| {
+            let mut ability = node(generic(fixed_grant()));
+            ability.duration = Some(duration);
+            ability
+        };
+        let compound = || StaticCondition::And {
+            conditions: vec![StaticCondition::DuringYourTurn, at_least_two()],
+        };
+        for (label, condition) in [("leaf", at_least_two()), ("compound", compound())] {
+            assert!(
+                tail_reads_created_referent(&node(effect_duration(for_as_long_as(
+                    condition.clone()
+                )))),
+                "effect ForAsLongAs {label} reads the referent"
+            );
+            assert!(
+                tail_reads_created_referent(&node_duration(for_as_long_as(condition))),
+                "node ForAsLongAs {label} reads the referent"
+            );
+        }
+        assert!(!tail_reads_created_referent(&node(effect_duration(
+            for_as_long_as(StaticCondition::DuringYourTurn)
+        ))));
+        assert!(!tail_reads_created_referent(&node_duration(
+            for_as_long_as(StaticCondition::DuringYourTurn)
+        )));
+    }
+
+    /// CR 608.2c + CR 608.2h + CR 115.10a: every filter, player population,
+    /// duration, cost and choice an effect or a chain node carries in its own
+    /// positions is a reader of the created referent, including every
+    /// population `Effect::target_filter()` hides. Each fixture is built twice
+    /// from one constructor: (i) with `LastCreated` (and with the compound
+    /// `And[LastCreated, Typed creature]`) in the position, it reads; (ii) with
+    /// `Typed creature` in the same position, it does not — so the verdict
+    /// comes from that position alone.
+    #[test]
+    fn created_referent_hidden_filter_positions_read() {
+        use crate::types::ability::ChoiceType;
+        use crate::types::ability::{
+            AbilityCost, Comparator, ConjureCard, ConjureSource, CopyRecipient,
+            CounterMoveSelection, CounterTransferMode, DigRestOrder, DigSource, ManaContribution,
+            PerpetualModification, PileSource, PlayerChoiceDistinctness, PreventionAmount,
+            PreventionScope, TargetSelectionMode, UnlessPayModifier, VoteSubject, VoteTally,
+            VoteVisibility, VoterScope,
+        };
+        let node = |effect: Effect| ResolvedAbility::new(effect, vec![], ObjectId(1), PlayerId(0));
+        let typed_creature = || TargetFilter::Typed(TypedFilter::creature());
+        let compound = || TargetFilter::And {
+            filters: vec![TargetFilter::LastCreated, typed_creature()],
+        };
+        let one = || QuantityExpr::Fixed { value: 1 };
+        let controls = |filter: TargetFilter| PlayerFilter::ControlsCount {
+            relation: PlayerRelation::All,
+            filter,
+            comparator: Comparator::GE,
+            count: Box::new(QuantityExpr::Fixed { value: 1 }),
+        };
+        let sacrifice_cost = |filter: TargetFilter| {
+            AbilityCost::Sacrifice(SacrificeCost::new(
+                filter,
+                SacrificeRequirement::Count { count: 1 },
+            ))
+        };
+        let effect_row = |build: fn(TargetFilter) -> Effect| {
+            Box::new(move |filter: TargetFilter| {
+                ResolvedAbility::new(build(filter), vec![], ObjectId(1), PlayerId(0))
+            }) as Box<dyn Fn(TargetFilter) -> ResolvedAbility>
+        };
+
+        type Row = (&'static str, Box<dyn Fn(TargetFilter) -> ResolvedAbility>);
+        let rows: Vec<Row> = vec![
+            // §9a: populations `target_filter()` hides for `EffectScope::All`.
+            (
+                "SetTapState All",
+                effect_row(|target| Effect::SetTapState {
+                    target,
+                    scope: EffectScope::All,
+                    state: TapStateChange::Tap,
+                }),
+            ),
+            (
+                "Transform All",
+                effect_row(|target| Effect::Transform {
+                    target,
+                    scope: EffectScope::All,
+                }),
+            ),
+            (
+                "PreventDamage All",
+                effect_row(|target| Effect::PreventDamage {
+                    amount: PreventionAmount::All,
+                    amount_dynamic: None,
+                    target,
+                    recipient_scope: EffectScope::All,
+                    scope: PreventionScope::AllDamage,
+                    damage_source_filter: None,
+                    prevention_duration: None,
+                }),
+            ),
+            (
+                "ForceAttack All",
+                effect_row(|target| Effect::ForceAttack {
+                    target,
+                    required_defender: TargetFilter::Any,
+                    duration: Duration::UntilEndOfTurn,
+                    scope: EffectScope::All,
+                }),
+            ),
+            (
+                "Suspect All",
+                effect_row(|target| Effect::Suspect {
+                    target,
+                    scope: EffectScope::All,
+                }),
+            ),
+            (
+                "Unsuspect All",
+                effect_row(|target| Effect::Unsuspect {
+                    target,
+                    scope: EffectScope::All,
+                }),
+            ),
+            (
+                "BecomePrepared All",
+                effect_row(|target| Effect::BecomePrepared {
+                    target,
+                    scope: EffectScope::All,
+                }),
+            ),
+            (
+                "BecomeUnprepared All",
+                effect_row(|target| Effect::BecomeUnprepared {
+                    target,
+                    scope: EffectScope::All,
+                }),
+            ),
+            // §9b: `*All` variants outside `mass_population_target`.
+            ("GoadAll", effect_row(|target| Effect::GoadAll { target })),
+            (
+                "ExploreAll",
+                effect_row(|filter| Effect::ExploreAll { filter }),
+            ),
+            // §9c / §9d / §9e: populations, second operands and inline carriers.
+            (
+                "EachSourceDealsDamage.sources",
+                effect_row(|sources| Effect::EachSourceDealsDamage {
+                    sources,
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    recipient: EachDamageRecipient::EachController,
+                }),
+            ),
+            (
+                "EachSourceDealsDamage.recipient OtherBatchSource",
+                effect_row(|filter| Effect::EachSourceDealsDamage {
+                    sources: TargetFilter::Any,
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    recipient: EachDamageRecipient::OtherBatchSource {
+                        source_filters: [Box::new(TargetFilter::Any), Box::new(filter)],
+                    },
+                }),
+            ),
+            (
+                "SeparateIntoPiles.object_filter",
+                effect_row(|object_filter| Effect::SeparateIntoPiles {
+                    partition_subject: VoterScope::EachOpponent,
+                    object_filter,
+                    chooser: PlayerScope::Controller,
+                    chosen_pile_effect: Box::new(AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::NoOp,
+                    )),
+                    pile_source: PileSource::Battlefield,
+                    unchosen_pile_effect: None,
+                }),
+            ),
+            (
+                "ChoosePermanent.filter",
+                effect_row(|filter| Effect::ChoosePermanent { filter }),
+            ),
+            (
+                "Dig.filter",
+                effect_row(|filter| Effect::Dig {
+                    player: TargetFilter::Controller,
+                    count: QuantityExpr::Fixed { value: 3 },
+                    destination: Some(Zone::Hand),
+                    keep_count: Some(1),
+                    keep_count_expr: None,
+                    up_to: false,
+                    filter,
+                    rest_destination: Some(Zone::Graveyard),
+                    rest_split_top_count: None,
+                    rest_order: DigRestOrder::Preserve,
+                    reveal: false,
+                    enter_tapped: false,
+                    enters_attacking: false,
+                    source: DigSource::Library,
+                }),
+            ),
+            (
+                "Fight.subject",
+                effect_row(|subject| Effect::Fight {
+                    target: TargetFilter::Any,
+                    subject,
+                }),
+            ),
+            (
+                "MoveCounters.source",
+                effect_row(|source| Effect::MoveCounters {
+                    source,
+                    counter_type: None,
+                    count: None,
+                    mode: CounterTransferMode::Move,
+                    selection: CounterMoveSelection::StackTarget,
+                    target: TargetFilter::Any,
+                }),
+            ),
+            (
+                "Attach.attachment",
+                effect_row(|attachment| Effect::Attach {
+                    attachment,
+                    target: TargetFilter::Any,
+                    selection: Default::default(),
+                }),
+            ),
+            (
+                "BecomeCopy CopyRecipient::Untargeted",
+                effect_row(|filter| Effect::BecomeCopy {
+                    target: TargetFilter::Any,
+                    recipient: CopyRecipient::Untargeted(filter),
+                    duration: None,
+                    mana_value_limit: None,
+                    additional_modifications: vec![],
+                }),
+            ),
+            (
+                "Vote VoteSubject::Objects.candidate_filter",
+                effect_row(|candidate_filter| Effect::Vote {
+                    choices: vec![],
+                    per_choice_effect: vec![],
+                    starting_with: ControllerRef::You,
+                    voter_scope: VoterScope::AllPlayers,
+                    tally_mode: VoteTally::PerVote,
+                    subject: VoteSubject::Objects {
+                        candidate_filter,
+                        outcome_template: Box::new(AbilityDefinition::new(
+                            AbilityKind::Spell,
+                            Effect::NoOp,
+                        )),
+                    },
+                    visibility: VoteVisibility::Open,
+                }),
+            ),
+            (
+                "CreateDelayedTrigger WhenDies.filter",
+                effect_row(|filter| Effect::CreateDelayedTrigger {
+                    condition: DelayedTriggerCondition::WhenDies { filter },
+                    effect: Box::new(AbilityDefinition::new(AbilityKind::Spell, Effect::NoOp)),
+                    uses_tracked_set: false,
+                }),
+            ),
+            (
+                "Mana AnyOneColorAmongPermanents.filter",
+                effect_row(|filter| Effect::Mana {
+                    produced: ManaProduction::AnyOneColorAmongPermanents {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        filter,
+                        contribution: ManaContribution::Base,
+                    },
+                    restrictions: vec![],
+                    grants: vec![],
+                    expiry: None,
+                    target: None,
+                }),
+            ),
+            (
+                "Conjure ConjureSource::Duplicate",
+                effect_row(|duplicate_of| Effect::Conjure {
+                    cards: vec![ConjureCard {
+                        source: ConjureSource::Duplicate { duplicate_of },
+                        count: QuantityExpr::Fixed { value: 1 },
+                    }],
+                    destination: Zone::Hand,
+                    tapped: false,
+                    library_position: None,
+                    library_players: None,
+                }),
+            ),
+            // §9f: player populations.
+            (
+                "DamageAll.player_filter ControlsCount",
+                effect_row(|filter| Effect::DamageAll {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::None,
+                    player_filter: Some(PlayerFilter::ControlsCount {
+                        relation: PlayerRelation::All,
+                        filter,
+                        comparator: Comparator::GE,
+                        count: Box::new(QuantityExpr::Fixed { value: 1 }),
+                    }),
+                    damage_source: None,
+                }),
+            ),
+            (
+                "node player_scope ControlsCount",
+                Box::new(move |filter: TargetFilter| {
+                    let mut ability =
+                        ResolvedAbility::new(Effect::NoOp, vec![], ObjectId(1), PlayerId(0));
+                    ability.player_scope = Some(controls(filter));
+                    ability
+                }),
+            ),
+            // B1: positions this resolution evaluates once and then fixes.
+            (
+                "PayCost Sacrifice cost",
+                Box::new(move |filter: TargetFilter| {
+                    ResolvedAbility::new(
+                        Effect::PayCost {
+                            cost: sacrifice_cost(filter),
+                            scale: None,
+                            payer: TargetFilter::Controller,
+                        },
+                        vec![],
+                        ObjectId(1),
+                        PlayerId(0),
+                    )
+                }),
+            ),
+            (
+                "node unless_pay Sacrifice cost",
+                Box::new(move |filter: TargetFilter| {
+                    let mut ability =
+                        ResolvedAbility::new(Effect::NoOp, vec![], ObjectId(1), PlayerId(0));
+                    ability.unless_pay = Some(UnlessPayModifier {
+                        cost: sacrifice_cost(filter),
+                        payer: TargetFilter::Controller,
+                    });
+                    ability
+                }),
+            ),
+            (
+                "node optional_player",
+                Box::new(move |filter: TargetFilter| {
+                    let mut ability =
+                        ResolvedAbility::new(Effect::NoOp, vec![], ObjectId(1), PlayerId(0));
+                    ability.optional_player = Some(filter);
+                    ability
+                }),
+            ),
+            (
+                "Choose Opponent restriction ControlsCount",
+                Box::new(move |filter: TargetFilter| {
+                    ResolvedAbility::new(
+                        Effect::Choose {
+                            choice_type: ChoiceType::Opponent {
+                                restriction: Some(Box::new(controls(filter))),
+                                distinctness: PlayerChoiceDistinctness::Independent,
+                            },
+                            persist: false,
+                            selection: TargetSelectionMode::Chosen,
+                        },
+                        vec![],
+                        ObjectId(1),
+                        PlayerId(0),
+                    )
+                }),
+            ),
+        ];
+        for (label, build) in &rows {
+            assert!(
+                tail_reads_created_referent(&build(TargetFilter::LastCreated)),
+                "{label}: LastCreated in the position reads the referent"
+            );
+            assert!(
+                tail_reads_created_referent(&build(compound())),
+                "{label}: And[LastCreated, Typed creature] in the position reads the referent"
+            );
+            assert!(
+                !tail_reads_created_referent(&build(typed_creature())),
+                "{label}: Typed creature in the same position reads nothing"
+            );
+        }
+
+        // B2: every printed `LastCreated` position `target_filter()` surfaces is
+        // read both by that compiler-checked accessor and by its own-field arm.
+        type Surfaced = (&'static str, fn(TargetFilter) -> Effect);
+        let surfaced: Vec<Surfaced> = vec![
+            ("Attach.target", |target| Effect::Attach {
+                attachment: TargetFilter::SelfRef,
+                target,
+                selection: Default::default(),
+            }),
+            ("Sacrifice.target", |target| Effect::Sacrifice {
+                target,
+                count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
+            }),
+            ("ChangeZone.target", |target| Effect::ChangeZone {
+                origin: None,
+                destination: Zone::Exile,
+                target,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
+            }),
+            ("ApplyPerpetual.target", |target| Effect::ApplyPerpetual {
+                target,
+                modification: PerpetualModification::SetBasePowerToughness {
+                    power: 1,
+                    toughness: 1,
+                },
+            }),
+            ("Destroy.target", |target| Effect::Destroy {
+                target,
+                cant_regenerate: false,
+            }),
+            ("TargetOnly.target", |target| Effect::TargetOnly { target }),
+            ("MoveCounters.target", |target| Effect::MoveCounters {
+                source: TargetFilter::SelfRef,
+                counter_type: None,
+                count: None,
+                mode: CounterTransferMode::Move,
+                selection: CounterMoveSelection::StackTarget,
+                target,
+            }),
+            ("Pump.target", |target| Effect::Pump {
+                power: PtValue::Fixed(1),
+                toughness: PtValue::Fixed(0),
+                target,
+            }),
+        ];
+        let last_created: &dyn Fn(&TargetFilter) -> bool = &filter_contains_last_created;
+        for (label, build) in &surfaced {
+            let reading = build(TargetFilter::LastCreated);
+            assert!(
+                reading
+                    .target_filter()
+                    .is_some_and(filter_contains_last_created),
+                "{label}: target_filter() surfaces the referent"
+            );
+            assert!(
+                effect_fields_read_filter_population(&reading, last_created),
+                "{label}: its own-field arm reads the referent"
+            );
+            assert!(tail_reads_created_referent(&ResolvedAbility::new(
+                reading,
+                vec![],
+                ObjectId(1),
+                PlayerId(0),
+            )));
+            let typed = build(typed_creature());
+            assert!(!typed
+                .target_filter()
+                .is_some_and(filter_contains_last_created));
+            assert!(!effect_fields_read_filter_population(&typed, last_created));
+            assert!(!tail_reads_created_referent(&ResolvedAbility::new(
+                typed,
+                vec![],
+                ObjectId(1),
+                PlayerId(0),
+            )));
+        }
+
+        // Regression set, read before and after this change; and a negative.
+        let put_counter_all = Effect::PutCounterAll {
+            counter_type: CounterType::Plus1Plus1,
+            count: one(),
+            target: TargetFilter::LastCreated,
+        };
+        let token_attached = Effect::Token {
+            name: "Aura".to_string(),
+            power: PtValue::Fixed(0),
+            toughness: PtValue::Fixed(0),
+            types: vec!["Enchantment".to_string(), "Aura".to_string()],
+            colors: vec![],
+            keywords: vec![],
+            tapped: false,
+            count: one(),
+            owner: TargetFilter::Controller,
+            attach_to: Some(TargetFilter::LastCreated),
+            enters_attacking: false,
+            supertypes: vec![],
+            static_abilities: vec![],
+            enter_with_counters: vec![],
+        };
+        let suspect_single = Effect::Suspect {
+            target: TargetFilter::LastCreated,
+            scope: EffectScope::Single,
+        };
+        let gain_per_created = Effect::GainLife {
+            amount: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: TargetFilter::LastCreated,
+                },
+            },
+            player: TargetFilter::Controller,
+        };
+        for effect in [
+            put_counter_all,
+            token_attached,
+            suspect_single,
+            gain_per_created,
+        ] {
+            assert!(tail_reads_created_referent(&node(effect)));
+        }
+        assert!(!tail_reads_created_referent(&node(Effect::GainLife {
+            amount: one(),
+            player: TargetFilter::Controller,
+        })));
     }
 
     /// CR 608.2c — a non-choosing per-player reveal introduces no per-iteration

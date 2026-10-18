@@ -15,9 +15,10 @@ use engine::game::layers::evaluate_layers;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::zones::{create_object, move_to_zone};
 use engine::types::ability::{
-    AbilityDefinition, AbilityKind, ContinuousModification, DelayedTriggerCondition,
-    DieResultBranch, Duration, Effect, FilterProp, PlayerFilter, PtValue, QuantityExpr,
-    QuantityRef, ResolvedAbility, StaticDefinition, TargetFilter, TargetRef, TypedFilter,
+    AbilityDefinition, AbilityKind, Comparator, ContinuousModification, ControllerRef,
+    DelayedTriggerCondition, DieResultBranch, Duration, Effect, EffectScope, FilterProp,
+    NumberQuality, PlayerFilter, PtValue, QuantityExpr, QuantityRef, ResolvedAbility,
+    StaticCondition, StaticDefinition, TapStateChange, TargetFilter, TargetRef, TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
@@ -909,4 +910,369 @@ fn sync_fan_out_emblem_static_reads_every_seats_tokens() {
     assert!(all_tokens(state, "Warrior")
         .iter()
         .all(|id| state.objects[id].power == Some(2)));
+}
+
+// ---------------------------------------------------------------------------
+// Hidden population filters and static-definition conditions as readers of the
+// created referent (CR 608.2e + CR 608.2h): the real cast of "Each player
+// creates a 1/1 Fractal" followed by a typed tail, in a two-player game. Paused
+// route: P0 controls Parallel Lives and P1 controls Halving Season, so at P0's
+// creation both apply and P0 orders them (CR 616.1); P0 applies doubling first
+// (1 -> 2 -> 1). P1's creation is untouched (1). The clause's union is both
+// seats' Fractals. Synchronous route: no replacements, the same final
+// population, no prompt.
+// ---------------------------------------------------------------------------
+
+/// An untapped 1/1 green creature token effect named `name` (and of that subtype).
+fn untapped_token(name: &str) -> Effect {
+    Effect::Token {
+        name: name.to_string(),
+        power: PtValue::Fixed(1),
+        toughness: PtValue::Fixed(1),
+        types: vec!["Creature".to_string(), name.to_string()],
+        colors: vec![ManaColor::Green],
+        keywords: vec![],
+        tapped: false,
+        count: QuantityExpr::Fixed { value: 1 },
+        owner: TargetFilter::Controller,
+        attach_to: None,
+        enters_attacking: false,
+        supertypes: vec![],
+        static_abilities: vec![],
+        enter_with_counters: vec![],
+    }
+}
+
+/// What a union cast observed: who was prompted, and at each prompt the
+/// paused sidecar's created-token channel (`Some` exactly when the tail was
+/// classified as a created-referent reader).
+struct UnionCast {
+    runner: GameRunner,
+    prompted: Vec<PlayerId>,
+    channels_at_prompts: Vec<Option<usize>>,
+}
+
+/// P0 casts a spell whose typed definition is "Each player creates a 1/1
+/// Fractal" followed by `tail`, then the cast is driven through each real
+/// `ReplacementChoice` prompt with the public `GameAction::ChooseReplacement`
+/// (doubling first) to Priority with an empty stack.
+fn cast_union_fan_out(tail: AbilityDefinition, paused: bool) -> UnionCast {
+    let mut scenario = GameScenario::new_n_player(2, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    if paused {
+        scenario.add_enchantment_from_oracle(P0, "Parallel Lives", PARALLEL_LIVES);
+        scenario.add_enchantment_from_oracle(P1, "Halving Season", HALVING_SEASON);
+    }
+    let mut definition = AbilityDefinition::new(AbilityKind::Spell, untapped_token("Fractal"));
+    definition.player_scope = Some(PlayerFilter::All);
+    definition.sub_ability = Some(Box::new(tail));
+    let spell = scenario
+        .add_spell_to_hand(P0, "Union probe", false)
+        .with_ability_definition(definition)
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(spell).commit();
+
+    let mut channels_at_prompts = Vec::new();
+    let mut at_prompt = |runner: &mut GameRunner, player: PlayerId| {
+        let state = runner.state();
+        let WaitingFor::ReplacementChoice { candidates, .. } = &state.waiting_for else {
+            panic!("the prompt is a replacement choice");
+        };
+        // CR 616.1: the affected player orders the replacements; both apply.
+        assert_eq!(player, P0, "P0 is the affected player");
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.description.contains("twice")));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.description.contains("half")));
+        if channels_at_prompts.is_empty() {
+            assert!(
+                all_tokens(state, "Fractal").is_empty(),
+                "reach guard: the first prompt is P0's creation, before any Fractal"
+            );
+        }
+        let wire = serde_json::to_value(state).expect("paused state serializes");
+        channels_at_prompts.push(serialized_created_channel_len(&wire));
+        First::ParallelLives
+    };
+    let prompted = drive(&mut runner, &mut at_prompt, &no_optional);
+    let state = runner.state();
+    assert_eq!(
+        tokens(state, P0, "Fractal").len(),
+        1,
+        "P0 ends with one Fractal"
+    );
+    assert_eq!(
+        tokens(state, P1, "Fractal").len(),
+        1,
+        "P1 ends with one Fractal"
+    );
+    assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+    assert!(state.stack.is_empty());
+    assert!(
+        state.active_ability_continuation().is_none(),
+        "no stranded continuation"
+    );
+    if !paused {
+        assert!(prompted.is_empty(), "the synchronous route never prompts");
+    }
+    UnionCast {
+        runner,
+        prompted,
+        channels_at_prompts,
+    }
+}
+
+/// Reach guard of a paused row whose tail reads the referent: P0 alone was
+/// prompted once, and the paused sidecar opened the created-token channel
+/// (empty: P0's creation is the one paused).
+fn assert_paused_reader_reach(cast: &UnionCast) {
+    assert_eq!(cast.prompted, vec![P0]);
+    assert_eq!(cast.channels_at_prompts, vec![Some(0)]);
+}
+
+fn tail_definition(effect: Effect) -> AbilityDefinition {
+    AbilityDefinition::new(AbilityKind::Spell, effect)
+}
+
+fn suspect_all_created() -> AbilityDefinition {
+    tail_definition(Effect::Suspect {
+        target: TargetFilter::LastCreated,
+        scope: EffectScope::All,
+    })
+}
+
+fn suspected_fractals(state: &GameState) -> usize {
+    all_tokens(state, "Fractal")
+        .iter()
+        .filter(|id| state.objects[*id].is_suspected)
+        .count()
+}
+
+/// PR-1 — "Suspect those tokens" (`Suspect { All, LastCreated }`, CR 701.60a):
+/// the hidden `EffectScope::All` population reads the clause's union.
+#[test]
+fn paused_cast_suspect_all_reads_both_seats_tokens() {
+    let cast = cast_union_fan_out(suspect_all_created(), true);
+    assert_paused_reader_reach(&cast);
+    assert_eq!(suspected_fractals(cast.runner.state()), 2);
+}
+
+#[test]
+fn sync_cast_suspect_all_reads_both_seats_tokens() {
+    let cast = cast_union_fan_out(suspect_all_created(), false);
+    assert_eq!(suspected_fractals(cast.runner.state()), 2);
+}
+
+fn tap_all_created() -> AbilityDefinition {
+    tail_definition(Effect::SetTapState {
+        target: TargetFilter::LastCreated,
+        scope: EffectScope::All,
+        state: TapStateChange::Tap,
+    })
+}
+
+fn tapped_fractals(state: &GameState) -> usize {
+    all_tokens(state, "Fractal")
+        .iter()
+        .filter(|id| state.objects[*id].tapped)
+        .count()
+}
+
+/// PR-3 — "Tap those tokens" (`SetTapState { All, LastCreated }`,
+/// CR 701.26a).
+#[test]
+fn paused_cast_tap_all_reads_both_seats_tokens() {
+    let cast = cast_union_fan_out(tap_all_created(), true);
+    assert_paused_reader_reach(&cast);
+    assert_eq!(tapped_fractals(cast.runner.state()), 2);
+}
+
+#[test]
+fn sync_cast_tap_all_reads_both_seats_tokens() {
+    let cast = cast_union_fan_out(tap_all_created(), false);
+    assert_eq!(tapped_fractals(cast.runner.state()), 2);
+}
+
+/// The number of objects in the created referent.
+fn created_count() -> QuantityExpr {
+    QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCount {
+            filter: TargetFilter::LastCreated,
+        },
+    }
+}
+
+fn created_count_is_prime() -> StaticCondition {
+    StaticCondition::QuantityQuality {
+        quantity: created_count(),
+        quality: NumberQuality::Prime,
+    }
+}
+
+/// A fixed "+1/+0 to creatures you control" grant, so only its condition or
+/// duration can read the referent.
+fn fixed_grant() -> StaticDefinition {
+    StaticDefinition::continuous()
+        .affected(TargetFilter::Typed(
+            TypedFilter::creature().controller(ControllerRef::You),
+        ))
+        .modifications(vec![ContinuousModification::AddPower { value: 1 }])
+}
+
+fn grant_tail(static_def: StaticDefinition, duration: Duration) -> AbilityDefinition {
+    tail_definition(Effect::GenericEffect {
+        static_abilities: vec![static_def],
+        duration: Some(duration),
+        target: None,
+        end_cost: None,
+    })
+}
+
+fn conditional_grant(condition: StaticCondition) -> AbilityDefinition {
+    grant_tail(fixed_grant().condition(condition), Duration::UntilEndOfTurn)
+}
+
+/// After layers: P0's Fractal's power and how many fixed `+1/+0` grants exist.
+fn p0_fractal_power_and_grants(cast: &mut UnionCast) -> (Option<i32>, usize) {
+    evaluate_layers(cast.runner.state_mut());
+    let state = cast.runner.state();
+    let fractal = tokens(state, P0, "Fractal");
+    let grants = state
+        .transient_continuous_effects
+        .iter()
+        .filter(|effect| {
+            effect
+                .modifications
+                .contains(&ContinuousModification::AddPower { value: 1 })
+        })
+        .count();
+    (state.objects[&fractal[0]].power, grants)
+}
+
+/// PR-2 — a fixed grant gated by "the number of those tokens is prime": the
+/// condition is evaluated once, when the effect is applied (CR 608.2h +
+/// CR 611.2d), so it must see the union (2, prime) and install the grant.
+#[test]
+fn paused_cast_prime_static_condition_sees_both_seats_tokens() {
+    let mut cast = cast_union_fan_out(conditional_grant(created_count_is_prime()), true);
+    assert_paused_reader_reach(&cast);
+    assert_eq!(p0_fractal_power_and_grants(&mut cast), (Some(2), 1));
+}
+
+#[test]
+fn sync_cast_prime_static_condition_sees_both_seats_tokens() {
+    let mut cast = cast_union_fan_out(conditional_grant(created_count_is_prime()), false);
+    assert_eq!(p0_fractal_power_and_grants(&mut cast), (Some(2), 1));
+}
+
+fn not_prime() -> StaticCondition {
+    StaticCondition::Not {
+        condition: Box::new(created_count_is_prime()),
+    }
+}
+
+/// PR-4 — hostile compound: `Not(Prime)` over the union (2) is false, so no
+/// grant. PR-2 is its paired positive in the same harness.
+#[test]
+fn paused_cast_not_prime_static_condition_sees_both_seats_tokens() {
+    let mut cast = cast_union_fan_out(conditional_grant(not_prime()), true);
+    assert_paused_reader_reach(&cast);
+    assert_eq!(p0_fractal_power_and_grants(&mut cast), (Some(1), 0));
+}
+
+#[test]
+fn sync_cast_not_prime_static_condition_sees_both_seats_tokens() {
+    let mut cast = cast_union_fan_out(conditional_grant(not_prime()), false);
+    assert_eq!(p0_fractal_power_and_grants(&mut cast), (Some(1), 0));
+}
+
+fn during_your_turn_and_prime() -> StaticCondition {
+    StaticCondition::And {
+        conditions: vec![StaticCondition::DuringYourTurn, created_count_is_prime()],
+    }
+}
+
+/// PR-5 — compound `And[DuringYourTurn, Prime]`: the referent operand is read.
+#[test]
+fn paused_cast_and_prime_static_condition_sees_both_seats_tokens() {
+    let mut cast = cast_union_fan_out(conditional_grant(during_your_turn_and_prime()), true);
+    assert_paused_reader_reach(&cast);
+    assert_eq!(p0_fractal_power_and_grants(&mut cast), (Some(2), 1));
+}
+
+#[test]
+fn sync_cast_and_prime_static_condition_sees_both_seats_tokens() {
+    let mut cast = cast_union_fan_out(conditional_grant(during_your_turn_and_prime()), false);
+    assert_eq!(p0_fractal_power_and_grants(&mut cast), (Some(2), 1));
+}
+
+/// "Create a 1/1 Soldier. Suspect those tokens.": the tail's own creation is
+/// the nearest publisher of the anaphor after it.
+fn soldier_then_suspect_all() -> AbilityDefinition {
+    let mut soldier = tail_definition(untapped_token("Soldier"));
+    soldier.sub_ability = Some(Box::new(suspect_all_created()));
+    soldier
+}
+
+fn assert_only_the_soldier_is_suspected(state: &GameState) {
+    let soldiers = tokens(state, P0, "Soldier");
+    assert_eq!(
+        soldiers.len(),
+        1,
+        "reach guard: the tail created its Soldier"
+    );
+    assert!(state.objects[&soldiers[0]].is_suspected);
+    assert_eq!(suspected_fractals(state), 0);
+}
+
+/// PR-6 — nearest publisher: the Soldier is suspected, no Fractal is. The
+/// tail is not a reader of the clause's referent, so no channel opens; P0 is
+/// prompted for the Fractal and again for the Soldier.
+#[test]
+fn paused_cast_suspect_all_after_own_token_reads_its_own_token() {
+    let cast = cast_union_fan_out(soldier_then_suspect_all(), true);
+    assert_eq!(cast.prompted, vec![P0, P0]);
+    assert_eq!(cast.channels_at_prompts[0], None);
+    assert_only_the_soldier_is_suspected(cast.runner.state());
+}
+
+#[test]
+fn sync_cast_suspect_all_after_own_token_reads_its_own_token() {
+    let cast = cast_union_fan_out(soldier_then_suspect_all(), false);
+    assert_only_the_soldier_is_suspected(cast.runner.state());
+}
+
+/// "... for as long as there are two or more of those tokens": a fixed grant
+/// whose duration starts only if its condition holds when the effect would
+/// begin (CR 611.2b).
+fn for_as_long_as_two_created() -> AbilityDefinition {
+    grant_tail(
+        fixed_grant(),
+        Duration::ForAsLongAs {
+            condition: StaticCondition::QuantityComparison {
+                lhs: created_count(),
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 2 },
+            },
+        },
+    )
+}
+
+/// PR-7 — the union holds two tokens, 2 >= 2, so the duration starts and the
+/// grant is installed (CR 611.2b).
+#[test]
+fn paused_cast_for_as_long_as_duration_sees_both_seats_tokens() {
+    let mut cast = cast_union_fan_out(for_as_long_as_two_created(), true);
+    assert_paused_reader_reach(&cast);
+    assert_eq!(p0_fractal_power_and_grants(&mut cast), (Some(2), 1));
+}
+
+/// PR-7 sync twin and reach guard: the duration path installs the grant.
+#[test]
+fn sync_cast_for_as_long_as_duration_sees_both_seats_tokens() {
+    let mut cast = cast_union_fan_out(for_as_long_as_two_created(), false);
+    assert_eq!(p0_fractal_power_and_grants(&mut cast), (Some(2), 1));
 }
