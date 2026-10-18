@@ -1889,7 +1889,7 @@ fn pinned_leaf_truth(
 ///   recipient's scratch controller as "you" (CR 109.5: the controller of the
 ///   object the granted static is on), encoded per recipient because one grant
 ///   fans out over recipients with different controllers. Pinned before the
-///   flush because the gather runs after the CR 613.1 Step 1 controller reset
+///   flush because the gather runs after the `evaluate_layers` Step 1 controller reset
 ///   and before layer 2 (CR 613.1b), so an expansion-time pin would read the
 ///   base controller.
 ///
