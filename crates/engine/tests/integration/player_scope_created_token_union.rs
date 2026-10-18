@@ -952,8 +952,8 @@ struct UnionCast {
     runner: GameRunner,
     prompted: Vec<PlayerId>,
     channels_at_prompts: Vec<Option<usize>>,
-    /// P0's follow-up "Destroy all creatures you control" sorcery, still in hand.
-    sweep: ObjectId,
+    /// P0's follow-up "Tap all creatures you control" sorcery, still in hand.
+    tap_follow_up: ObjectId,
 }
 
 /// P0 casts a spell whose typed definition is "Each player creates a 1/1
@@ -974,13 +974,14 @@ fn cast_union_fan_out(tail: AbilityDefinition, paused: bool) -> UnionCast {
         .add_spell_to_hand(P0, "Union probe", false)
         .with_ability_definition(definition)
         .id();
-    let sweep = scenario
-        .add_spell_to_hand(P0, "Sweep probe", false)
+    let tap_follow_up = scenario
+        .add_spell_to_hand(P0, "Tap probe", false)
         .with_ability_definition(AbilityDefinition::new(
             AbilityKind::Spell,
-            Effect::DestroyAll {
+            Effect::SetTapState {
                 target: TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
-                cant_regenerate: false,
+                scope: EffectScope::All,
+                state: TapStateChange::Tap,
             },
         ))
         .id();
@@ -1036,7 +1037,7 @@ fn cast_union_fan_out(tail: AbilityDefinition, paused: bool) -> UnionCast {
         runner,
         prompted,
         channels_at_prompts,
-        sweep,
+        tap_follow_up,
     }
 }
 
@@ -1292,18 +1293,18 @@ fn sync_cast_for_as_long_as_duration_sees_both_seats_tokens() {
     assert_eq!(p0_fractal_power_and_grants(&mut cast), (Some(2), 1));
 }
 
-/// "When the next of those tokens dies this turn, you gain 1 life": a delayed
-/// trigger whose embedded `WhenNextEvent` matcher names the created referent.
-/// Creation snapshots only payload targets (CR 603.7c); the matcher is matched
-/// against the live ledger when the event fires, so it must see the union.
-fn when_next_created_token_dies_gain_life() -> AbilityDefinition {
-    let dies = TriggerDefinition::new(TriggerMode::ChangesZone)
-        .origin(Zone::Battlefield)
-        .destination(Zone::Graveyard)
-        .valid_card(TargetFilter::LastCreated);
+/// "When one of those tokens next becomes tapped this turn, you gain 1 life": a
+/// delayed trigger whose embedded `WhenNextEvent` matcher names the created
+/// referent. Creation snapshots only payload targets (CR 603.7c); the
+/// `valid_card` matcher is matched against the live ledger when the tap event
+/// fires (CR 603.2, `trigger_matchers::match_taps` → `matches_target_filter`),
+/// so it must see the union.
+fn when_next_created_token_taps_gain_life() -> AbilityDefinition {
+    let mut taps = TriggerDefinition::new(TriggerMode::Taps);
+    taps.valid_card = Some(TargetFilter::LastCreated);
     tail_definition(Effect::CreateDelayedTrigger {
         condition: DelayedTriggerCondition::WhenNextEvent {
-            trigger: Box::new(dies),
+            trigger: Box::new(taps),
             or_trigger: None,
             lifetime: DelayedTriggerLifetime::ThisTurn,
         },
@@ -1318,10 +1319,11 @@ fn when_next_created_token_dies_gain_life() -> AbilityDefinition {
     })
 }
 
-/// After the union cast settles, P0 casts the harness's "Destroy all creatures
-/// you control" sorcery through the public cast, so P0's Fractal (one of "those
-/// tokens") dies. Returns P0's life gain from that point.
-fn destroy_p0_fractal_and_measure_life_gain(cast: &mut UnionCast) -> i32 {
+/// After the union cast settles, P0 casts the harness's "Tap all creatures you
+/// control" sorcery through the public cast, so P0's Fractal (one of "those
+/// tokens") becomes tapped and P1's does not. Returns P0's life gain from that
+/// point.
+fn tap_p0_fractal_and_measure_life_gain(cast: &mut UnionCast) -> i32 {
     let state = cast.runner.state();
     assert_eq!(
         state.delayed_triggers.len(),
@@ -1329,34 +1331,36 @@ fn destroy_p0_fractal_and_measure_life_gain(cast: &mut UnionCast) -> i32 {
         "reach guard: the tail created its delayed trigger"
     );
     let life_before = state.players[0].life;
-    let sweep = cast.sweep;
-    cast.runner.cast(sweep).commit();
+    let follow_up = cast.tap_follow_up;
+    cast.runner.cast(follow_up).commit();
     let prompted = drive(&mut cast.runner, &mut no_replacement, &no_optional);
     assert!(prompted.is_empty());
     let state = cast.runner.state();
+    let p0_fractal = tokens(state, P0, "Fractal");
     assert!(
-        tokens(state, P0, "Fractal").is_empty(),
-        "reach guard: P0's Fractal died"
+        state.objects[&p0_fractal[0]].tapped,
+        "reach guard: P0's Fractal became tapped"
     );
-    assert_eq!(tokens(state, P1, "Fractal").len(), 1);
+    let p1_fractal = tokens(state, P1, "Fractal");
+    assert!(!state.objects[&p1_fractal[0]].tapped);
     assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
     assert!(state.stack.is_empty());
     assert!(state.active_ability_continuation().is_none());
     state.players[0].life - life_before
 }
 
-/// PR-8 — the review's counterexample: P0's Fractal is one of "those tokens",
-/// so its death fires the `WhenNextEvent` trigger on the paused route as on the
-/// synchronous one.
+/// PR-8 — a later-evaluated matcher: P0's Fractal is one of "those tokens",
+/// so its tapping fires the `WhenNextEvent` trigger on the paused route as on
+/// the synchronous one.
 #[test]
 fn paused_cast_when_next_event_matcher_sees_both_seats_tokens() {
-    let mut cast = cast_union_fan_out(when_next_created_token_dies_gain_life(), true);
+    let mut cast = cast_union_fan_out(when_next_created_token_taps_gain_life(), true);
     assert_paused_reader_reach(&cast);
-    assert_eq!(destroy_p0_fractal_and_measure_life_gain(&mut cast), 1);
+    assert_eq!(tap_p0_fractal_and_measure_life_gain(&mut cast), 1);
 }
 
 #[test]
 fn sync_cast_when_next_event_matcher_sees_both_seats_tokens() {
-    let mut cast = cast_union_fan_out(when_next_created_token_dies_gain_life(), false);
-    assert_eq!(destroy_p0_fractal_and_measure_life_gain(&mut cast), 1);
+    let mut cast = cast_union_fan_out(when_next_created_token_taps_gain_life(), false);
+    assert_eq!(tap_p0_fractal_and_measure_life_gain(&mut cast), 1);
 }

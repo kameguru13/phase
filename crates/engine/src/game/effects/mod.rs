@@ -6569,6 +6569,14 @@ fn effect_fields_read_filter_population(
     let has_modification = |modification: &ContinuousModification| {
         continuous_modification_reads_filter_population(modification, leaf)
     };
+    // The mana-value bound a later cast is checked against (CR 601.2c).
+    let has_cast_constraint =
+        |constraint: &crate::types::ability::CastPermissionConstraint| match constraint {
+            crate::types::ability::CastPermissionConstraint::ManaValue {
+                comparator: _,
+                value,
+            } => quantity_expr_counts_population_matching(value, leaf),
+        };
     let has_face_down = |profile: &crate::types::ability::FaceDownProfile| {
         profile
             .ward
@@ -6631,11 +6639,13 @@ fn effect_fields_read_filter_population(
             target,
             alt_ability_cost,
             duration,
+            constraint,
             ..
         } => {
             has_filter(target)
                 || alt_ability_cost.as_ref().is_some_and(has_cost)
                 || duration.as_ref().is_some_and(has_duration)
+                || constraint.as_ref().is_some_and(has_cast_constraint)
         }
         // Inline operand carriers.
         Effect::EachSourceDealsDamage {
@@ -6777,26 +6787,60 @@ fn effect_fields_read_filter_population(
         } => {
             has_filter(target)
                 || match permission {
+                    // Destructured without `..`: a new permission field is a
+                    // compile error here until it is classified.
                     CastingPermission::PlayFromExile {
-                        card_filter,
                         duration,
+                        granted_to: _,
+                        mode: _,
+                        frequency: _,
+                        source_id: _,
+                        exiled_by_ability_controller: _,
+                        mana_spend_permission: _,
+                        card_filter,
+                        single_use_group: _,
+                        single_use: _,
+                        cast_cost_modifier: _,
                         alt_ability_cost,
-                        ..
+                        without_paying_mana_cost: _,
+                        land_enter_tapped: _,
+                        invalidation: _,
+                        provenance: _,
                     } => {
                         card_filter.as_ref().is_some_and(has_filter)
                             || has_duration(duration)
                             || alt_ability_cost.as_ref().is_some_and(has_cost)
                     }
                     CastingPermission::ExileWithAltCost {
+                        cost: _,
+                        cost_provenance: _,
+                        cast_transformed: _,
+                        constraint,
+                        granted_to: _,
+                        resolution_cleanup: _,
                         duration,
+                        source_id: _,
+                        graveyard_replacement: _,
+                        enters_with_counter: _,
                         enters_with_modifications,
-                        ..
+                        mana_spend_permission: _,
+                        cast_cost_modifier: _,
                     } => {
-                        duration.as_ref().is_some_and(has_duration)
+                        constraint.as_ref().is_some_and(has_cast_constraint)
+                            || duration.as_ref().is_some_and(has_duration)
                             || enters_with_modifications.iter().any(has_modification)
                     }
-                    CastingPermission::ExileWithAltAbilityCost { cost, duration, .. } => {
-                        has_cost(cost) || duration.as_ref().is_some_and(has_duration)
+                    CastingPermission::ExileWithAltAbilityCost {
+                        cost,
+                        constraint,
+                        granted_to: _,
+                        duration,
+                        source_id: _,
+                        cast_cost_modifier: _,
+                    } => {
+                        has_cost(cost)
+                            || constraint.as_ref().is_some_and(has_cast_constraint)
+                            || duration.as_ref().is_some_and(has_duration)
                     }
                     CastingPermission::AdventureCreature
                     | CastingPermission::ExileWithEnergyCost
@@ -6895,7 +6939,18 @@ fn effect_fields_read_filter_population(
             face_down_profile,
             ..
         } => has_filter(target) || face_down_profile.as_ref().is_some_and(has_face_down),
-        Effect::Dig { player, filter, .. } => has_filter(player) || has_filter(filter),
+        Effect::Dig {
+            player,
+            filter,
+            rest_split_top_count,
+            ..
+        } => {
+            has_filter(player)
+                || has_filter(filter)
+                || rest_split_top_count.as_ref().is_some_and(|quantity| {
+                    quantity_expr_counts_population_matching(quantity, leaf)
+                })
+        }
         Effect::GainControl { target } => has_filter(target),
         Effect::GainControlAll { target } => has_filter(target),
         Effect::ControlNextTurn { target, .. } => has_filter(target),
@@ -7035,17 +7090,25 @@ fn effect_fields_read_filter_population(
                     | crate::types::game_state::NextSpellModifier::WithoutPayingManaCost => false,
                 }
         }
-        Effect::CreateBoon { recipient, .. } => has_filter(recipient),
+        // The boon's trigger matchers are matched when its event fires; its
+        // `execute` chain is the nested walk's.
+        Effect::CreateBoon { recipient, trigger } => {
+            has_filter(recipient) || trigger_matchers_read_filter_population(trigger, leaf)
+        }
         Effect::FreeCastFromZones { filter, .. } => has_filter(filter),
         Effect::CreateDamageReplacement {
             source_filter,
             redirect_object_filter,
             recipient_object_filter,
+            modification,
             ..
         } => {
             source_filter.as_ref().is_some_and(has_filter)
                 || redirect_object_filter.as_ref().is_some_and(has_filter)
                 || recipient_object_filter.as_ref().is_some_and(has_filter)
+                || modification.as_ref().is_some_and(|modification| {
+                    damage_modification_reads_filter_population(modification, leaf)
+                })
         }
         Effect::LoseTheGame { target } => target.as_ref().is_some_and(has_filter),
         Effect::WinTheGame { target } => target.as_ref().is_some_and(has_filter),
@@ -7611,7 +7674,7 @@ fn replacement_matchers_read_filter_population(
     replacement: &crate::types::ability::ReplacementDefinition,
     leaf: &dyn Fn(&TargetFilter) -> bool,
 ) -> bool {
-    use crate::types::ability::{DamageModification, ReplacementMode};
+    use crate::types::ability::ReplacementMode;
     let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
     let crate::types::ability::ReplacementDefinition {
         event: _,
@@ -7679,25 +7742,39 @@ fn replacement_matchers_read_filter_population(
             }
             ReplacementMode::Mandatory | ReplacementMode::Optional { decline: _ } => false,
         }
-        || match damage_modification {
-            Some(DamageModification::Plus { value }) => {
-                quantity_expr_counts_population_matching(value, leaf)
-            }
-            Some(
-                DamageModification::Double
-                | DamageModification::Triple
-                | DamageModification::Minus { .. }
-                | DamageModification::PreventionMinus { .. }
-                | DamageModification::SetToSourcePower
-                | DamageModification::SetTo { .. }
-                | DamageModification::LifeFloor { .. },
-            )
-            | None => false,
-        }
+        || damage_modification.as_ref().is_some_and(|modification| {
+            damage_modification_reads_filter_population(modification, leaf)
+        })
         || additional_token_spec
             .as_deref()
             .is_some_and(token_spec_reads)
         || ensure_token_specs.iter().flatten().any(token_spec_reads)
+}
+
+/// Whether a damage modification's magnitude counts a population satisfying
+/// `leaf`: an added amount, or a prevention amount given as a quantity, each
+/// resolved every time the modified damage would be dealt or prevented
+/// (CR 614.1). Exhaustive, no `_` arm.
+fn damage_modification_reads_filter_population(
+    modification: &crate::types::ability::DamageModification,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    use crate::types::ability::{DamageModification, PreventionFormula};
+    match modification {
+        DamageModification::Plus { value }
+        | DamageModification::PreventionMinus {
+            value: PreventionFormula::Quantity { quantity: value },
+        } => quantity_expr_counts_population_matching(value, leaf),
+        DamageModification::PreventionMinus {
+            value: PreventionFormula::Fixed(_) | PreventionFormula::Fraction { .. },
+        }
+        | DamageModification::Double
+        | DamageModification::Triple
+        | DamageModification::Minus { .. }
+        | DamageModification::SetToSourcePower
+        | DamageModification::SetTo { .. }
+        | DamageModification::LifeFloor { .. } => false,
+    }
 }
 
 /// Whether a static definition's OWN positions name a population satisfying
@@ -16205,7 +16282,9 @@ fn tail_links_exile(scope: &PendingPlayerScopeTail) -> bool {
 /// its effect ([`effect_reads_created_referent`]), its condition, its
 /// `repeat_for` count, its `player_scope` population, its duration, its
 /// `unless_pay` cost or its `optional_player` ([`node_reads_created_referent`]),
-/// its `repeat_until` condition, a nested definition's activation positions
+/// its `repeat_until` condition, its target positions when they are chosen
+/// during this resolution (`TargetChoiceTiming::Resolution`), a nested
+/// definition's activation and target-choice positions
 /// ([`definition_activation_reads_created_referent`]), or through a nested
 /// branch: its `else_ability` chain (CR 608.2c) or a `mode_abilities` chain
 /// (CR 700.2: each mode is an alternative chain; CR 700.2b + CR 603.12 for a
@@ -16228,6 +16307,14 @@ fn tail_reads_created_referent(tail: &ResolvedAbility) -> bool {
             .repeat_until
             .as_ref()
             .is_some_and(repeat_continuation_reads_created_referent)
+            || (matches!(node.target_choice_timing, TargetChoiceTiming::Resolution)
+                && target_choice_positions_read_created_referent(
+                    node.multi_target.as_ref(),
+                    &node.target_constraints,
+                    node.target_chooser.as_ref(),
+                    node.announced_x.as_ref(),
+                    node.modal.as_ref(),
+                ))
             || node
                 .else_ability
                 .as_deref()
@@ -16301,17 +16388,33 @@ fn repeat_continuation_reads_created_referent(
 }
 
 /// The activation positions of a nested definition (a granted or copied
-/// ability): its activation cost (CR 602.2), its activator filter and its
-/// activation restrictions (CR 602.5, CR 602.5b), each evaluated against the
-/// live ledger whenever the ability is activated. The positions a definition
-/// fixes as it is put on the stack — targets, target constraints and their
-/// counts (CR 601.2c) — precede this resolution's tokens and are not read.
+/// ability, a delayed or granted trigger's payload): its activation cost
+/// (CR 602.2) and its cost reduction (CR 601.2f, via CR 602.2b), its activator
+/// filter and its activation restrictions (CR 602.5, CR 602.5b), each
+/// evaluated against the live ledger whenever the ability is activated. Its
+/// target, target-count, chooser, X and mode positions are chosen when the
+/// definition is later activated (CR 602.2b) or put on the stack (CR 603.3d),
+/// against the live ledger, and are read too
+/// ([`target_choice_positions_read_created_referent`]).
 fn definition_activation_reads_created_referent(definition: &AbilityDefinition) -> bool {
     let leaf: &dyn Fn(&TargetFilter) -> bool = &filter_contains_last_created;
     definition
         .cost
         .as_ref()
         .is_some_and(|cost| ability_cost_reads_filter_population(cost, leaf))
+        || definition.cost_reduction.as_ref().is_some_and(|reduction| {
+            quantity_expr_counts_population_matching(&reduction.count, leaf)
+                || reduction.condition.as_ref().is_some_and(|condition| {
+                    parsed_condition_reads_filter_population(condition, leaf)
+                })
+        })
+        || target_choice_positions_read_created_referent(
+            definition.multi_target.as_ref(),
+            &definition.target_constraints,
+            definition.target_chooser.as_ref(),
+            definition.announced_x.as_ref(),
+            definition.modal.as_ref(),
+        )
         || definition
             .activator_filter
             .as_ref()
@@ -16320,6 +16423,85 @@ fn definition_activation_reads_created_referent(definition: &AbilityDefinition) 
             .activation_restrictions
             .iter()
             .any(|restriction| activation_restriction_reads_filter_population(restriction, leaf))
+}
+
+/// CR 601.2b + CR 601.2c: the positions read when a spell or ability's modes,
+/// targets, target counts, X and target chooser are chosen — the multi-target
+/// bounds, a total-mana-value target constraint, the target chooser, the
+/// announced X, and the mode chooser, dynamic maximum and conditional maximum.
+/// Read for a nested definition, whose choices are made when it is later
+/// activated (CR 602.2b) or put on the stack (CR 603.3d), and for a tail node
+/// whose targets are chosen during this resolution
+/// (`TargetChoiceTiming::Resolution`). Exhaustive destructures and matches, no
+/// `_` arm.
+fn target_choice_positions_read_created_referent(
+    multi_target: Option<&crate::types::ability::MultiTargetSpec>,
+    target_constraints: &[crate::types::game_state::TargetSelectionConstraint],
+    target_chooser: Option<&TargetFilter>,
+    announced_x: Option<&QuantityExpr>,
+    modal: Option<&crate::types::ability::ModalChoice>,
+) -> bool {
+    use crate::types::ability::{
+        ModalChoice, ModalSelectionCondition, ModalSelectionConstraint, MultiTargetSpec,
+    };
+    use crate::types::game_state::TargetSelectionConstraint;
+    let leaf: &dyn Fn(&TargetFilter) -> bool = &filter_contains_last_created;
+    let has_quantity =
+        |quantity: &QuantityExpr| quantity_expr_counts_population_matching(quantity, leaf);
+    let multi_target_reads = multi_target.is_some_and(|MultiTargetSpec { min, max }| {
+        has_quantity(min) || max.as_ref().is_some_and(has_quantity)
+    });
+    let constraint_reads = target_constraints
+        .iter()
+        .any(|constraint| match constraint {
+            TargetSelectionConstraint::TotalManaValue {
+                comparator: _,
+                value,
+            } => has_quantity(value),
+            TargetSelectionConstraint::DifferentTargetPlayers
+            | TargetSelectionConstraint::DifferentObjectControllers
+            | TargetSelectionConstraint::SameZoneOwner { zone: _ } => false,
+        });
+    let modal_reads = modal.is_some_and(
+        |ModalChoice {
+             min_choices: _,
+             max_choices: _,
+             mode_count: _,
+             mode_descriptions: _,
+             allow_repeat_modes: _,
+             constraints,
+             mode_costs: _,
+             mode_pawprints: _,
+             entwine_cost: _,
+             chooser,
+             selection: _,
+             dynamic_max_choices,
+         }| {
+            filter::player_filter_contains(chooser, leaf)
+                || dynamic_max_choices.as_ref().is_some_and(has_quantity)
+                || constraints.iter().any(|constraint| match constraint {
+                    ModalSelectionConstraint::ConditionalMaxChoices {
+                        condition: ModalSelectionCondition::Static { condition },
+                        max_choices: _,
+                        otherwise_max_choices: _,
+                    } => static_condition_reads_filter_population(condition, leaf),
+                    // Its additional-cost reading carries no filter.
+                    ModalSelectionConstraint::ConditionalMaxChoices {
+                        condition: ModalSelectionCondition::AdditionalCostPaid { .. },
+                        max_choices: _,
+                        otherwise_max_choices: _,
+                    }
+                    | ModalSelectionConstraint::DifferentTargetPlayers
+                    | ModalSelectionConstraint::NoRepeatThisTurn
+                    | ModalSelectionConstraint::NoRepeatThisGame => false,
+                })
+        },
+    );
+    multi_target_reads
+        || constraint_reads
+        || target_chooser.is_some_and(|chooser| filter::filter_contains(chooser, leaf))
+        || announced_x.is_some_and(has_quantity)
+        || modal_reads
 }
 
 /// One chain node's reader positions for the created referent: its effect, a
@@ -42893,6 +43075,340 @@ mod tests {
                 "{label}: Typed creature in the same position reads nothing"
             );
         }
+    }
+
+    /// Implementation review r2 (MED): the remaining positions the engine
+    /// evaluates against the live ledger now or later — a prevention quantity,
+    /// a cast-permission mana-value constraint, an activation cost reduction,
+    /// the target, count, chooser, X and mode positions a nested definition
+    /// chooses when it is later activated or put on the stack (CR 602.2b,
+    /// CR 603.3d), and the same positions on a tail node that chooses its
+    /// targets during this resolution. Same three-way construction as
+    /// `created_referent_later_evaluated_positions_read`.
+    #[test]
+    fn created_referent_later_chosen_positions_read() {
+        use crate::types::ability::{
+            AbilityCost, CastFromZoneDriver, CastPermissionConstraint, CastingPermission,
+            Comparator, CostReduction, DamageModification, ModalChoice, ModalSelectionCondition,
+            ModalSelectionConstraint, MultiTargetSpec, ParsedCondition, PreventionFormula,
+            RedirectionLifetime, ReplacementDefinition, TriggerDefinition,
+        };
+        use crate::types::game_state::TargetSelectionConstraint;
+        use crate::types::replacements::ReplacementEvent;
+        use crate::types::triggers::TriggerMode;
+
+        let typed_creature = || TargetFilter::Typed(TypedFilter::creature());
+        let compound = || TargetFilter::And {
+            filters: vec![TargetFilter::LastCreated, typed_creature()],
+        };
+        let count_of = |filter: TargetFilter| QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount { filter },
+        };
+        let mana_value_at_most = move |filter: TargetFilter| CastPermissionConstraint::ManaValue {
+            comparator: Comparator::LE,
+            value: count_of(filter),
+        };
+        // A granted activated ability whose own positions are under test.
+        let granting = |granted: AbilityDefinition| Effect::GenericEffect {
+            static_abilities: vec![StaticDefinition::continuous()
+                .affected(TargetFilter::SelfRef)
+                .modifications(vec![ContinuousModification::GrantAbility {
+                    definition: Box::new(granted),
+                }])],
+            duration: None,
+            target: None,
+            end_cost: None,
+        };
+        let granted = || AbilityDefinition::new(AbilityKind::Activated, Effect::NoOp);
+        let effect_row = |build: Box<dyn Fn(TargetFilter) -> Effect>| {
+            Box::new(move |filter: TargetFilter| {
+                ResolvedAbility::new(build(filter), vec![], ObjectId(1), PlayerId(0))
+            }) as Box<dyn Fn(TargetFilter) -> ResolvedAbility>
+        };
+
+        type Row = (&'static str, Box<dyn Fn(TargetFilter) -> ResolvedAbility>);
+        let rows: Vec<Row> = vec![
+            (
+                "replacement PreventionMinus Quantity",
+                effect_row(Box::new(move |filter| {
+                    let mut replacement = ReplacementDefinition::new(ReplacementEvent::DamageDone);
+                    replacement.damage_modification = Some(DamageModification::PreventionMinus {
+                        value: PreventionFormula::Quantity {
+                            quantity: count_of(filter),
+                        },
+                    });
+                    Effect::AddTargetReplacement {
+                        replacement: Box::new(replacement),
+                        target: TargetFilter::Any,
+                    }
+                })),
+            ),
+            (
+                "CreateDamageReplacement modification Plus",
+                effect_row(Box::new(move |filter| Effect::CreateDamageReplacement {
+                    source_filter: None,
+                    combat_scope: None,
+                    target_filter: None,
+                    modification: Some(DamageModification::Plus {
+                        value: count_of(filter),
+                    }),
+                    redirect_to: None,
+                    redirect_amount: None,
+                    redirect_object_filter: None,
+                    recipient_object_filter: None,
+                    redirect_lifetime: RedirectionLifetime::OneOpportunity,
+                })),
+            ),
+            (
+                "CastingPermission::ExileWithAltCost constraint",
+                effect_row(Box::new(move |filter| Effect::GrantCastingPermission {
+                    permission: CastingPermission::ExileWithAltCost {
+                        cost: crate::types::mana::ManaCost::NoCost,
+                        cost_provenance: Default::default(),
+                        cast_transformed: false,
+                        constraint: Some(mana_value_at_most(filter)),
+                        granted_to: None,
+                        resolution_cleanup: None,
+                        duration: None,
+                        source_id: None,
+                        graveyard_replacement: None,
+                        enters_with_counter: None,
+                        enters_with_modifications: vec![],
+                        mana_spend_permission: None,
+                        cast_cost_modifier: None,
+                    },
+                    target: TargetFilter::Any,
+                    grantee: Default::default(),
+                })),
+            ),
+            (
+                "CastingPermission::ExileWithAltAbilityCost constraint",
+                effect_row(Box::new(move |filter| Effect::GrantCastingPermission {
+                    permission: CastingPermission::ExileWithAltAbilityCost {
+                        cost: AbilityCost::Tap,
+                        constraint: Some(mana_value_at_most(filter)),
+                        granted_to: None,
+                        duration: None,
+                        source_id: None,
+                        cast_cost_modifier: None,
+                    },
+                    target: TargetFilter::Any,
+                    grantee: Default::default(),
+                })),
+            ),
+            (
+                "CastFromZone constraint",
+                effect_row(Box::new(move |filter| Effect::CastFromZone {
+                    target: TargetFilter::Any,
+                    without_paying_mana_cost: true,
+                    mode: CardPlayMode::Cast,
+                    cast_transformed: false,
+                    alt_ability_cost: None,
+                    constraint: Some(mana_value_at_most(filter)),
+                    duration: None,
+                    driver: CastFromZoneDriver::DuringResolution,
+                    mana_spend_permission: None,
+                    additional_cost: None,
+                    cast_cost_modifier: None,
+                })),
+            ),
+            (
+                "Dig rest_split_top_count",
+                effect_row(Box::new(move |filter| Effect::Dig {
+                    player: TargetFilter::Controller,
+                    count: QuantityExpr::Fixed { value: 3 },
+                    destination: Some(Zone::Hand),
+                    keep_count: Some(1),
+                    keep_count_expr: None,
+                    up_to: false,
+                    filter: TargetFilter::Any,
+                    rest_destination: Some(Zone::Library),
+                    rest_split_top_count: Some(count_of(filter)),
+                    rest_order: crate::types::ability::DigRestOrder::Preserve,
+                    reveal: false,
+                    enter_tapped: false,
+                    enters_attacking: false,
+                    source: crate::types::ability::DigSource::Library,
+                })),
+            ),
+            (
+                "CreateBoon trigger valid_card",
+                effect_row(Box::new(move |filter| Effect::CreateBoon {
+                    recipient: TargetFilter::Controller,
+                    trigger: Box::new(
+                        TriggerDefinition::new(TriggerMode::ChangesZone).valid_card(filter),
+                    ),
+                })),
+            ),
+            (
+                "granted ability cost_reduction count",
+                effect_row(Box::new(move |filter| {
+                    let mut ability = granted();
+                    ability.cost_reduction = Some(CostReduction {
+                        mode: Default::default(),
+                        amount_per: 1,
+                        count: count_of(filter),
+                        condition: None,
+                    });
+                    granting(ability)
+                })),
+            ),
+            (
+                "granted ability cost_reduction condition",
+                effect_row(Box::new(move |filter| {
+                    let mut ability = granted();
+                    ability.cost_reduction = Some(CostReduction {
+                        mode: Default::default(),
+                        amount_per: 1,
+                        count: QuantityExpr::Fixed { value: 1 },
+                        condition: Some(ParsedCondition::YouCastSpellThisTurn {
+                            filter: Some(filter),
+                        }),
+                    });
+                    granting(ability)
+                })),
+            ),
+            (
+                "granted ability multi_target min",
+                effect_row(Box::new(move |filter| {
+                    let mut ability = granted();
+                    ability.multi_target = Some(MultiTargetSpec {
+                        min: count_of(filter),
+                        max: None,
+                    });
+                    granting(ability)
+                })),
+            ),
+            (
+                "granted ability multi_target max",
+                effect_row(Box::new(move |filter| {
+                    let mut ability = granted();
+                    ability.multi_target = Some(MultiTargetSpec {
+                        min: QuantityExpr::Fixed { value: 0 },
+                        max: Some(count_of(filter)),
+                    });
+                    granting(ability)
+                })),
+            ),
+            (
+                "granted ability target_constraints TotalManaValue",
+                effect_row(Box::new(move |filter| {
+                    let mut ability = granted();
+                    ability.target_constraints = vec![TargetSelectionConstraint::TotalManaValue {
+                        comparator: Comparator::LE,
+                        value: count_of(filter),
+                    }];
+                    granting(ability)
+                })),
+            ),
+            (
+                "granted ability target_chooser",
+                effect_row(Box::new(move |filter| {
+                    let mut ability = granted();
+                    ability.target_chooser = Some(filter);
+                    granting(ability)
+                })),
+            ),
+            (
+                "granted ability announced_x",
+                effect_row(Box::new(move |filter| {
+                    let mut ability = granted();
+                    ability.announced_x = Some(count_of(filter));
+                    granting(ability)
+                })),
+            ),
+            (
+                "granted ability modal chooser",
+                effect_row(Box::new(move |filter| {
+                    let mut ability = granted();
+                    ability.modal = Some(ModalChoice {
+                        chooser: PlayerFilter::ControlsCount {
+                            relation: PlayerRelation::All,
+                            filter,
+                            comparator: Comparator::GE,
+                            count: Box::new(QuantityExpr::Fixed { value: 1 }),
+                        },
+                        ..ModalChoice::default()
+                    });
+                    granting(ability)
+                })),
+            ),
+            (
+                "granted ability modal dynamic_max_choices",
+                effect_row(Box::new(move |filter| {
+                    let mut ability = granted();
+                    ability.modal = Some(ModalChoice {
+                        dynamic_max_choices: Some(count_of(filter)),
+                        ..ModalChoice::default()
+                    });
+                    granting(ability)
+                })),
+            ),
+            (
+                "granted ability modal ConditionalMaxChoices",
+                effect_row(Box::new(move |filter| {
+                    let mut ability = granted();
+                    ability.modal = Some(ModalChoice {
+                        constraints: vec![ModalSelectionConstraint::ConditionalMaxChoices {
+                            condition: ModalSelectionCondition::Static {
+                                condition: crate::types::ability::StaticCondition::IsPresent {
+                                    filter: Some(filter),
+                                },
+                            },
+                            max_choices: 2,
+                            otherwise_max_choices: 1,
+                        }],
+                        ..ModalChoice::default()
+                    });
+                    granting(ability)
+                })),
+            ),
+            (
+                "tail node target_chooser, chosen during this resolution",
+                Box::new(move |filter: TargetFilter| {
+                    let mut ability =
+                        ResolvedAbility::new(Effect::NoOp, vec![], ObjectId(1), PlayerId(0));
+                    ability.target_choice_timing = TargetChoiceTiming::Resolution;
+                    ability.target_chooser = Some(filter);
+                    ability
+                }),
+            ),
+            (
+                "tail node multi_target min, chosen during this resolution",
+                Box::new(move |filter: TargetFilter| {
+                    let mut ability =
+                        ResolvedAbility::new(Effect::NoOp, vec![], ObjectId(1), PlayerId(0));
+                    ability.target_choice_timing = TargetChoiceTiming::Resolution;
+                    ability.multi_target = Some(MultiTargetSpec {
+                        min: count_of(filter),
+                        max: None,
+                    });
+                    ability
+                }),
+            ),
+        ];
+        for (label, build) in &rows {
+            assert!(
+                tail_reads_created_referent(&build(TargetFilter::LastCreated)),
+                "{label}: LastCreated in the position reads the referent"
+            );
+            assert!(
+                tail_reads_created_referent(&build(compound())),
+                "{label}: And[LastCreated, Typed creature] in the position reads the referent"
+            );
+            assert!(
+                !tail_reads_created_referent(&build(typed_creature())),
+                "{label}: Typed creature in the same position reads nothing"
+            );
+        }
+
+        // CR 601.2c: a tail node whose targets were chosen at cast, before this
+        // resolution's tokens existed, does not read through those positions.
+        let mut chosen_at_cast =
+            ResolvedAbility::new(Effect::NoOp, vec![], ObjectId(1), PlayerId(0));
+        chosen_at_cast.target_choice_timing = TargetChoiceTiming::Stack;
+        chosen_at_cast.target_chooser = Some(TargetFilter::LastCreated);
+        assert!(!tail_reads_created_referent(&chosen_at_cast));
     }
 
     /// CR 608.2c — a non-choosing per-player reveal introduces no per-iteration
