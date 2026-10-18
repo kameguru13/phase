@@ -6569,7 +6569,7 @@ fn effect_fields_read_filter_population(
     let has_modification = |modification: &ContinuousModification| {
         continuous_modification_reads_filter_population(modification, leaf)
     };
-    // The mana-value bound a later cast is checked against (CR 601.2c).
+    // CR 202.3 + CR 601.2e: the mana-value bound a later cast is checked against.
     let has_cast_constraint =
         |constraint: &crate::types::ability::CastPermissionConstraint| match constraint {
             crate::types::ability::CastPermissionConstraint::ManaValue {
@@ -7754,7 +7754,7 @@ fn replacement_matchers_read_filter_population(
 /// Whether a damage modification's magnitude counts a population satisfying
 /// `leaf`: an added amount, or a prevention amount given as a quantity, each
 /// resolved every time the modified damage would be dealt or prevented
-/// (CR 614.1). Exhaustive, no `_` arm.
+/// (CR 614.1 / CR 615.1). Exhaustive, no `_` arm.
 fn damage_modification_reads_filter_population(
     modification: &crate::types::ability::DamageModification,
     leaf: &dyn Fn(&TargetFilter) -> bool,
