@@ -215,15 +215,26 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
- * 151 — PendingCostMoveResume gains CounterCostRemovalPayment (a counter-removal
+ * 153 — PendingCostMoveResume gains CounterCostRemovalPayment (a counter-removal
  *       cost paused on a CR 616.1 replacement choice; the activation reads the
  *       settled count, CR 118.11) and ManaAbilityCostCursor gains
  *       counter_removal, carried in GameState.pending_cost_move_resume — see
- *       PROTOCOL_VERSION's own `/// 151` entry in
- *       crates/lobby-broker/src/protocol.rs. A v150 peer cannot parse the tag;
- *       the exact-match version check at connect refuses the pairing. Wire 133
- *       moves with it. Follows #10004's 150; PausedCounterCostRemoval carries
- *       its replacement_subtree boundary.
+ *       PROTOCOL_VERSION's own `/// 153` entry in
+ *       crates/lobby-broker/src/protocol.rs. A v152 peer cannot parse the tag;
+ *       the exact-match version check at connect refuses the pairing. Wire 135
+ *       moves with it. PausedCounterCostRemoval carries its replacement_subtree
+ *       boundary. (152 is reserved for the Zimone PR, #10004.)
+ * 151: Populated GameObject.bestow_form carries the removed creature subtypes
+ *      as an object instead of a boolean. Old native readers cannot decode it.
+ *      Wire 133 moves with it.
+ * 150 — The cast-this-way gains rider's serialized payload is reshaped: the
+ *      ExileWithAltCost permission's enters_with_modifications becomes a
+ *      PendingEntersModifications object (was a ContinuousModification array) and
+ *      Effect.AddPendingEntersModifications carries its rider object in place of
+ *      the required modifications array — a v149 server or client cannot parse
+ *      either new shape. Full-game peers and P2P move in lockstep (wire 132); see
+ *      PROTOCOL_VERSION's own `/// 150` entry in
+ *      crates/lobby-broker/src/protocol.rs.
  * 149 — The CR 608.2n final part of a spell's resolution is owed on the
  *      resolution carrier: `GameState::deferred_spell_delivery` (v110) is removed
  *      and `GameState::resolving_spell_final_part` (`{ spell }`) marks an instant
@@ -917,7 +928,8 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 151;
+export const PROTOCOL_VERSION = 153;
+
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
