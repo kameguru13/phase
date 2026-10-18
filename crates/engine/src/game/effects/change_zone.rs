@@ -5198,6 +5198,545 @@ mod tests {
         }
     }
 
+    /// Synthetic (no printed card): a multi-target graveyard return cast through
+    /// the real stack, so a paused carrier has a resolving spell entry.
+    const MASS_RETURN: &str =
+        "Return up to three target permanent cards from your graveyard to the battlefield.";
+
+    /// Gives the committed Mass Return move ungated, non-default entry
+    /// modifications: it enters attacking with two +1/+1 counters.
+    fn attacking_with_two_counters(effect: &mut Effect) {
+        let Effect::ChangeZone {
+            enters_attacking,
+            enter_with_counters,
+            ..
+        } = effect
+        else {
+            panic!("premise: Mass Return resolves a ChangeZone, got {effect:?}");
+        };
+        *enters_attacking = true;
+        *enter_with_counters = vec![(CounterType::Plus1Plus1, QuantityExpr::Fixed { value: 2 })];
+    }
+
+    /// Casts [`MASS_RETURN`] on a shock-style land, a Rusted Relic and an
+    /// Ornithopter from P0's graveyard, applies `mods` to the committed move,
+    /// and passes priority until the shock member parks the loop on its
+    /// `ReplacementChoice`. With `shock_first` the Relic and the Ornithopter are
+    /// the parked carrier's unprocessed members; otherwise the shock is the last
+    /// member and the carrier's `remaining` is empty. Returns the paused state
+    /// and `(shock, relic, orni)`.
+    fn paused_mass_return(
+        mods: impl FnOnce(&mut Effect),
+        shock_first: bool,
+    ) -> (GameState, ObjectId, ObjectId, ObjectId) {
+        let mut scenario = crate::game::scenario::GameScenario::new();
+        scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
+        let spell = scenario
+            .add_spell_to_hand_from_oracle(PlayerId(0), "Mass Return", false, MASS_RETURN)
+            .id();
+        let relic = add_graveyard_rusted_relic(&mut scenario);
+        let orni = add_graveyard_ornithopter(&mut scenario);
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        set_core_types(state, relic, &[CoreType::Artifact]);
+        set_core_types(state, orni, &[CoreType::Artifact, CoreType::Creature]);
+        let shock = add_shock_in_graveyard_for_test(state, 701, PlayerId(0), &[CoreType::Land]);
+        let targets = if shock_first {
+            [shock, relic, orni]
+        } else {
+            [relic, orni, shock]
+        };
+
+        let mut commit = runner.cast(spell).target_objects(&targets).commit();
+        {
+            let stack = &mut commit.state_mut().stack;
+            let top = stack.len() - 1;
+            let ability = stack
+                .get_mut(top)
+                .and_then(StackEntry::ability_mut)
+                .expect("premise: the committed spell carries its ability");
+            mods(&mut ability.effect);
+        }
+        for _ in 0..6 {
+            if matches!(
+                commit.state().waiting_for,
+                WaitingFor::ReplacementChoice { .. }
+            ) {
+                break;
+            }
+            commit
+                .act(GameAction::PassPriority)
+                .expect("priority passes while Mass Return resolves");
+        }
+        assert!(
+            matches!(
+                commit.state().waiting_for,
+                WaitingFor::ReplacementChoice { .. }
+            ),
+            "premise: the shock member parks the loop, got {:?}",
+            commit.state().waiting_for
+        );
+        assert_eq!(
+            commit
+                .state()
+                .resolution_stack
+                .iter()
+                .map(crate::types::resolution::ResolutionFrame::kind)
+                .collect::<Vec<_>>(),
+            vec![crate::types::resolution::FrameKind::ChangeZone],
+            "premise: the parked ChangeZone owns the only resolution frame"
+        );
+        (commit.state().clone(), shock, relic, orni)
+    }
+
+    /// Restores `wire` through the public persisted-state reader exactly as a
+    /// production loader does: decode, checked preparation, finalization.
+    fn restore_persisted(wire: serde_json::Value) -> Result<GameState, String> {
+        serde_json::from_value::<crate::types::game_state::PersistedGameState>(wire)
+            .map_err(|error| error.to_string())?
+            .prepare_for_restore(crate::types::game_state::PersistedRestoreFinalization::Immediate)
+            .map_err(|error| error.to_string())?
+            .finalize_immediately()
+            .map_err(|error| error.to_string())
+    }
+
+    /// `state` written by both public persisted-state envelopes: the raw wire
+    /// and the trusted envelope.
+    fn both_wires(state: &GameState) -> [(&'static str, serde_json::Value); 2] {
+        use crate::types::game_state::PersistedGameState;
+        [
+            (
+                "raw",
+                serde_json::to_value(PersistedGameState::Raw(Box::new(state.clone())))
+                    .expect("the raw wire serializes"),
+            ),
+            (
+                "trusted",
+                serde_json::to_value(PersistedGameState::capture(state.clone()))
+                    .expect("the trusted envelope serializes"),
+            ),
+        ]
+    }
+
+    /// The serialized `GameState` inside a persisted wire (the trusted envelope
+    /// nests it under `state`).
+    fn wire_state(wire: &serde_json::Value) -> &serde_json::Value {
+        wire.get("state").unwrap_or(wire)
+    }
+
+    fn wire_state_mut(wire: &mut serde_json::Value) -> &mut serde_json::Value {
+        if wire.get("state").is_some() {
+            wire.get_mut("state")
+                .expect("the trusted envelope has an inner state")
+        } else {
+            wire
+        }
+    }
+
+    /// The parked ChangeZone carrier in the serialized frame stack under `key`
+    /// (`resolution_frames` on a versioned wire, `resolution_stack` on an
+    /// unversioned raw payload).
+    fn change_zone_carrier_mut<'a>(
+        state: &'a mut serde_json::Value,
+        key: &str,
+    ) -> &'a mut serde_json::Value {
+        state[key]["frames"]
+            .as_array_mut()
+            .expect("premise: the payload carries a frame stack")
+            .iter_mut()
+            .find(|frame| frame["type"] == "ChangeZone")
+            .map(|frame| &mut frame["data"]["pending"])
+            .expect("premise: a parked ChangeZone carrier")
+    }
+
+    /// Rewrites a current carrier into what the v1–v6 writer wrote: bare member
+    /// ids, plus the carrier-level entry fields in `legacy` (`enter_tapped` as a
+    /// bool, `enters_attacking` always present, the other entry fields only when
+    /// non-default).
+    fn legacy_change_zone_carrier(carrier: &mut serde_json::Value, legacy: &serde_json::Value) {
+        let ids = carrier["remaining"]
+            .as_array()
+            .expect("premise: the carrier lists its members")
+            .iter()
+            .map(|member| member["object_id"].clone())
+            .collect::<Vec<_>>();
+        carrier["remaining"] = serde_json::Value::Array(ids);
+        for (key, value) in legacy.as_object().expect("legacy fields are an object") {
+            carrier[key.as_str()] = value.clone();
+        }
+    }
+
+    /// Projects a current persisted wire onto the wire a v`version` writer
+    /// produced for the same pause: the carrier in its legacy shape, the
+    /// declared version, and for v1 the carrier at the top-level
+    /// `pending_change_zone_iteration` slot with no typed frame stack.
+    fn downgrade_change_zone_carrier(
+        wire: &serde_json::Value,
+        version: u64,
+        legacy: &serde_json::Value,
+    ) -> serde_json::Value {
+        let mut wire = wire.clone();
+        {
+            let state = wire_state_mut(&mut wire);
+            legacy_change_zone_carrier(change_zone_carrier_mut(state, "resolution_frames"), legacy);
+            state["resolution_state_version"] = serde_json::Value::from(version);
+            if version == 1 {
+                let object = state.as_object_mut().expect("the state is an object");
+                let frames = object
+                    .remove("resolution_frames")
+                    .expect("premise: a typed frame stack");
+                let carrier = frames["frames"]
+                    .as_array()
+                    .expect("premise: frames")
+                    .iter()
+                    .find(|frame| frame["type"] == "ChangeZone")
+                    .map(|frame| frame["data"]["pending"].clone())
+                    .expect("premise: a parked ChangeZone carrier");
+                object.insert("pending_change_zone_iteration".to_string(), carrier);
+            }
+        }
+        wire
+    }
+
+    /// CR 603.6a + CR 614.12 (persisted-version boundary): a v1–v6 save paused
+    /// inside a multi-object ChangeZone wrote bare member ids with carrier-level
+    /// entry modifications. With no gate, every member's pre-event entry is
+    /// exactly those carrier fields (as `resolve_change_zone_member_entry`
+    /// resolves them and the old drain applied them), so the reader migrates it
+    /// and the restored game equals the current-wire restore of the same pause,
+    /// through both the raw and the trusted envelope. The current writer declares
+    /// `RESOLUTION_STATE_WIRE_VERSION` and round-trips the member records.
+    /// REVERT: removing the `migrate_legacy_change_zone_member_entries` call in
+    /// `ResolutionStateWire::from_value` makes every legacy row fail with serde
+    /// `invalid type: integer`; keeping the writer at 6 makes the migration read
+    /// the current member records as bare ids and the current round-trip fails.
+    #[test]
+    fn legacy_ungated_parked_change_zone_migrates_through_both_readers() {
+        use crate::types::resolution::RESOLUTION_STATE_WIRE_VERSION;
+        use crate::types::zones::EtbTapState;
+
+        let (mut paused, shock, relic, orni) =
+            paused_mass_return(attacking_with_two_counters, true);
+        // Labelled synthetic: with Tapped on the move itself the shock decline is
+        // moot and no pause occurs, so Tapped is set on the parked members. This
+        // models an ungated v6 carrier written with `enter_tapped: true`.
+        let mut pending = parked_change_zone_iteration(&paused)
+            .cloned()
+            .expect("premise: a parked carrier");
+        for member in &mut pending.remaining {
+            member.enter_tapped = EtbTapState::Tapped;
+        }
+        paused.replace_active_change_zone_iteration(pending);
+        let member = |object_id| ChangeZoneMemberEntry {
+            object_id,
+            enter_with_counters: vec![(CounterType::Plus1Plus1, 2)],
+            enter_tapped: EtbTapState::Tapped,
+            enters_attacking: true,
+        };
+        let expected_members = vec![member(relic), member(orni)];
+        let legacy = serde_json::json!({
+            "enter_tapped": true,
+            "enters_attacking": true,
+            "enter_with_counters": [["P1P1", 2]],
+        });
+
+        let mut post_decline = None;
+        for (label, current) in both_wires(&paused) {
+            let state = wire_state(&current);
+            assert_eq!(
+                state["resolution_state_version"],
+                serde_json::Value::from(RESOLUTION_STATE_WIRE_VERSION),
+                "{label}: the current writer declares the current version"
+            );
+            let carrier = state["resolution_frames"]["frames"]
+                .as_array()
+                .and_then(|frames| frames.iter().find(|frame| frame["type"] == "ChangeZone"))
+                .map(|frame| &frame["data"]["pending"])
+                .expect("premise: a parked carrier");
+            assert!(
+                carrier["remaining"]
+                    .as_array()
+                    .is_some_and(|members| !members.is_empty()
+                        && members.iter().all(serde_json::Value::is_object)),
+                "{label}: the current carrier writes member records"
+            );
+
+            let expected = restore_persisted(current.clone())
+                .unwrap_or_else(|error| panic!("{label}: current round-trip: {error}"));
+            assert_eq!(
+                parked_change_zone_iteration(&expected).map(|pending| pending.remaining.clone()),
+                Some(expected_members.clone()),
+                "{label}: the current round-trip keeps each member's entry"
+            );
+
+            for version in 1..=6 {
+                let migrated =
+                    restore_persisted(downgrade_change_zone_carrier(&current, version, &legacy))
+                        .unwrap_or_else(|error| {
+                            panic!("{label} v{version}: legacy restore: {error}")
+                        });
+                assert_eq!(
+                    migrated, expected,
+                    "{label} v{version}: the migrated save equals the current restore"
+                );
+                if version != 1 && version != 6 {
+                    continue;
+                }
+                let mut resumed = migrated;
+                apply_as_current(&mut resumed, GameAction::ChooseReplacement { index: 1 })
+                    .expect("decline the shock payment");
+                assert_eq!(resumed.objects[&shock].zone, Zone::Battlefield);
+                assert!(
+                    resumed.objects[&shock].tapped,
+                    "reach ({label} v{version}): the declined shock enters tapped"
+                );
+                for id in [relic, orni] {
+                    assert_eq!(resumed.objects[&id].zone, Zone::Battlefield);
+                    assert!(
+                        resumed.objects[&id].tapped,
+                        "{label} v{version}: the migrated member enters tapped"
+                    );
+                    assert_eq!(
+                        plus_one_counters(&resumed, id),
+                        2,
+                        "{label} v{version}: the migrated member enters with its counters"
+                    );
+                }
+                assert!(
+                    parked_change_zone_iteration(&resumed).is_none(),
+                    "{label} v{version}: the drained iteration retires its frame"
+                );
+                if version == 6 {
+                    post_decline = Some(resumed);
+                }
+            }
+        }
+
+        // Unaffected old state: with no parked carrier, a v6 declaration restores
+        // exactly as the current one does.
+        let post_decline = post_decline.expect("the v6 row resumed");
+        for (label, current) in both_wires(&post_decline) {
+            let mut old = current.clone();
+            wire_state_mut(&mut old)["resolution_state_version"] = serde_json::Value::from(6_u64);
+            assert_eq!(
+                restore_persisted(old)
+                    .unwrap_or_else(|error| panic!("{label}: v6 restore: {error}")),
+                restore_persisted(current)
+                    .unwrap_or_else(|error| panic!("{label}: current restore: {error}")),
+                "{label}: a v6 save with no parked carrier restores unchanged"
+            );
+        }
+    }
+
+    /// CR 603.6a + CR 614.12 (persisted-version boundary): when a v1–v6
+    /// carrier's unprocessed members' entries depend on a gate (conditional
+    /// counters, or a tapped/attacking rider gate), each member's entry is a
+    /// verdict against the board before the event's first member moved, which
+    /// the save does not hold. Both readers refuse it with the exact
+    /// `LEGACY_GATED_CHANGE_ZONE_ENTRY_RESTORE_ERROR`; the same row without the
+    /// gate key restores (reach). A gate over default riders cannot change any
+    /// member, and gate fields on an empty `remaining` drove no member, so both
+    /// migrate and equal the current restore.
+    /// REVERT: without `entry_depends_on_gate` the refused rows migrate (Ok);
+    /// without the migration the error is the serde message, not the constant;
+    /// dropping the rider-default clause of `entry_depends_on_gate` refuses the
+    /// inert-gate row.
+    #[test]
+    fn legacy_gated_parked_change_zone_refuses_with_the_exact_diagnostic() {
+        use crate::types::resolution::LEGACY_GATED_CHANGE_ZONE_ENTRY_RESTORE_ERROR;
+
+        let creature =
+            serde_json::to_value(typed(TypeFilter::Creature)).expect("gate filter serializes");
+        let conditional = serde_json::json!([[
+            creature,
+            "P1P1",
+            serde_json::to_value(QuantityExpr::Fixed { value: 1 }).expect("quantity serializes"),
+        ]]);
+        let refused_rows = [
+            (
+                "conditional counters",
+                serde_json::json!({
+                    "enters_attacking": false,
+                    "conditional_enter_with_counters": conditional,
+                }),
+                "conditional_enter_with_counters",
+            ),
+            (
+                "tapped rider gate",
+                serde_json::json!({
+                    "enters_attacking": false,
+                    "enter_tapped": true,
+                    "enters_modified_if": creature,
+                }),
+                "enters_modified_if",
+            ),
+            (
+                "attacking rider gate",
+                serde_json::json!({
+                    "enters_attacking": true,
+                    "enters_modified_if": creature,
+                }),
+                "enters_modified_if",
+            ),
+        ];
+        let inert_gate = serde_json::json!({
+            "enters_attacking": false,
+            "enters_modified_if": creature,
+        });
+
+        let (paused, ..) = paused_mass_return(|_| {}, true);
+        assert!(
+            parked_change_zone_iteration(&paused)
+                .is_some_and(|pending| !pending.remaining.is_empty()),
+            "premise: the carrier has unprocessed members"
+        );
+        for (label, current) in both_wires(&paused) {
+            let expected = restore_persisted(current.clone())
+                .unwrap_or_else(|error| panic!("{label}: current round-trip: {error}"));
+            for version in [1, 3, 6] {
+                for (row, legacy, gate_key) in &refused_rows {
+                    let error =
+                        restore_persisted(downgrade_change_zone_carrier(&current, version, legacy))
+                            .expect_err("a gated legacy carrier must be refused");
+                    assert_eq!(
+                        error, LEGACY_GATED_CHANGE_ZONE_ENTRY_RESTORE_ERROR,
+                        "{label} v{version} {row}: the exact diagnostic"
+                    );
+                    assert!(error.starts_with("RESTORE_INCOMPATIBLE_GATED_CHANGE_ZONE_ENTRY:"));
+
+                    let mut ungated = legacy.clone();
+                    ungated
+                        .as_object_mut()
+                        .expect("legacy fields are an object")
+                        .remove(*gate_key);
+                    restore_persisted(downgrade_change_zone_carrier(&current, version, &ungated))
+                        .unwrap_or_else(|error| {
+                            panic!("reach ({label} v{version} {row}): ungated restores: {error}")
+                        });
+                }
+                let inert = restore_persisted(downgrade_change_zone_carrier(
+                    &current,
+                    version,
+                    &inert_gate,
+                ))
+                .unwrap_or_else(|error| panic!("{label} v{version}: inert gate: {error}"));
+                assert_eq!(
+                    inert, expected,
+                    "{label} v{version}: a gate over default riders migrates exactly"
+                );
+            }
+        }
+
+        // Gate fields on an empty `remaining` drove no member.
+        let (drained, ..) = paused_mass_return(|_| {}, false);
+        assert!(
+            parked_change_zone_iteration(&drained)
+                .is_some_and(|pending| pending.remaining.is_empty()),
+            "premise: the shock is the last member, so nothing remains"
+        );
+        let every_gate = serde_json::json!({
+            "enters_attacking": false,
+            "conditional_enter_with_counters": conditional,
+            "enters_modified_if": creature,
+            "enter_tapped": true,
+        });
+        for (label, current) in both_wires(&drained) {
+            let expected = restore_persisted(current.clone())
+                .unwrap_or_else(|error| panic!("{label}: current round-trip: {error}"));
+            for version in [1, 6] {
+                let migrated = restore_persisted(downgrade_change_zone_carrier(
+                    &current,
+                    version,
+                    &every_gate,
+                ))
+                .unwrap_or_else(|error| panic!("{label} v{version}: empty remaining: {error}"));
+                assert_eq!(
+                    migrated, expected,
+                    "{label} v{version}: gate fields with nothing remaining are dropped"
+                );
+            }
+        }
+    }
+
+    /// CR 603.6a + CR 614.12 (unversioned raw ingress): a derived `GameState`
+    /// payload (phase-ai saved state, a bare-object WASM restore) has no
+    /// declared version. A current writer's member records date it to
+    /// `RESOLUTION_STATE_WIRE_VERSION`, so it decodes directly; a legacy
+    /// bare-id payload is still read as v3 and migrated, or refused when gated.
+    /// REVERT: removing the member-record inference in
+    /// `declare_raw_resolution_wire` declares v3, the migration rejects the
+    /// member records, and the current unversioned restore fails.
+    #[test]
+    fn unversioned_raw_parked_change_zone_declares_its_member_shape() {
+        use crate::types::resolution::{
+            declare_raw_resolution_wire, LEGACY_GATED_CHANGE_ZONE_ENTRY_RESTORE_ERROR,
+            RESOLUTION_STATE_WIRE_VERSION,
+        };
+
+        let (paused, ..) = paused_mass_return(attacking_with_two_counters, true);
+        let paused_remaining =
+            parked_change_zone_iteration(&paused).map(|pending| pending.remaining.clone());
+        assert!(
+            paused_remaining
+                .as_ref()
+                .is_some_and(|remaining| !remaining.is_empty()),
+            "premise: the carrier has unprocessed members"
+        );
+        let raw = serde_json::to_value(&paused).expect("derived state serializes");
+        assert!(
+            raw.get("resolution_state_version").is_none() && raw.get("resolution_stack").is_some(),
+            "premise: an unversioned derived payload carrying the frame stack"
+        );
+        let declared_version = |payload: &serde_json::Value| {
+            let mut payload = payload.clone();
+            declare_raw_resolution_wire(&mut payload).expect("the payload declares a version");
+            payload["resolution_state_version"].clone()
+        };
+
+        assert_eq!(
+            declared_version(&raw),
+            serde_json::Value::from(RESOLUTION_STATE_WIRE_VERSION),
+            "member records date the payload to the current version"
+        );
+        let restored = restore_persisted(raw.clone())
+            .unwrap_or_else(|error| panic!("current unversioned restore: {error}"));
+        assert_eq!(
+            parked_change_zone_iteration(&restored).map(|pending| pending.remaining.clone()),
+            paused_remaining
+        );
+
+        let mut legacy = raw.clone();
+        legacy_change_zone_carrier(
+            change_zone_carrier_mut(&mut legacy, "resolution_stack"),
+            &serde_json::json!({
+                "enters_attacking": true,
+                "enter_with_counters": [["P1P1", 2]],
+            }),
+        );
+        // `LEGACY_RESULT_OWNERSHIP_RESOLUTION_STATE_WIRE_VERSION`: a bare-id
+        // typed stack with no draw `delivery_owner`.
+        assert_eq!(declared_version(&legacy), serde_json::Value::from(3_u64));
+        let migrated = restore_persisted(legacy.clone())
+            .unwrap_or_else(|error| panic!("legacy unversioned restore: {error}"));
+        assert_eq!(
+            parked_change_zone_iteration(&migrated).map(|pending| pending.remaining.clone()),
+            paused_remaining,
+            "the legacy bare-id payload migrates to the same member entries"
+        );
+
+        let mut gated = legacy;
+        change_zone_carrier_mut(&mut gated, "resolution_stack")
+            ["conditional_enter_with_counters"] = serde_json::json!([[
+            serde_json::to_value(typed(TypeFilter::Creature)).expect("gate filter serializes"),
+            "P1P1",
+            serde_json::to_value(QuantityExpr::Fixed { value: 1 }).expect("quantity serializes"),
+        ]]);
+        assert_eq!(
+            restore_persisted(gated).expect_err("a gated legacy payload must be refused"),
+            LEGACY_GATED_CHANGE_ZONE_ENTRY_RESTORE_ERROR
+        );
+    }
+
     /// CR 614.12 (V-P7): the `enters_modified_if` gate reads the projected
     /// entrant. Under Enchanted Evening a plain creature card in hand would be an
     /// enchantment on the battlefield, so the tapped/attacking riders apply.

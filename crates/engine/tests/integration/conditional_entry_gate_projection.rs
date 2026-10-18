@@ -71,7 +71,10 @@
 //!   its P1-Shrine-only and no-Shrine rows (expected 0). Pin the granted inner
 //!   with the host's controller instead of each recipient's and the
 //!   P1-Shrine-only row gets 2 (expected 0) and the P0-Shrine-only row gets 0
-//!   (expected 2).
+//!   (expected 2). `release_juno_granted_starfield_condition_counts_pre_entry_enchantments`
+//!   and `release_juno_granted_starfield_condition_binds_the_recipients_controller`
+//!   fail too: their zero-counter rows get 2, and with a host-keyed pin the
+//!   opposite-controller rows flip.
 
 use engine::game::scenario::{CastOutcome, GameRunner, GameScenario, P0, P1};
 use engine::parser::oracle_ir::diagnostic::OracleDiagnostic;
@@ -1071,7 +1074,7 @@ fn release_juno_under_shrine_grant(
     (outcome, sanctum, host)
 }
 
-/// CR 614.12 + CR 700.5 + CR 109.5: a granted static's population condition is
+/// CR 614.12 + CR 109.5: a granted static's population condition is
 /// read before the entry, with the recipient's controller as "you". P0's host
 /// grants every enchantment "As long as you control a Shrine, this enchantment
 /// is a 1/1 creature". With Sanctum as P0's only Shrine, P0 controls no Shrine
@@ -1121,6 +1124,106 @@ fn release_juno_granted_condition_binds_each_recipients_controller() {
             is_creature(&outcome, sanctum),
             "reach (P0 Shrine: {p0_shrine}, P1 Shrine: {p1_shrine}): \
              P0 controls a Shrine after entry"
+        );
+        outcome.assert_power_toughness(sanctum, pt.0, pt.1);
+        assert!(!put_counter_resolved(outcome.events()));
+    }
+}
+
+/// Synthetic (no printed card): a host granting every enchantment Starfield of
+/// Nyx's animation static, scoped to its recipient. Starfield's own text grants
+/// nothing ("each other non-Aura enchantment you control"); this carrier gives the
+/// same population condition and characteristics to each enchantment through
+/// `GrantStaticAbility`, so the pin's grant arm reads it.
+const STARFIELD_GRANT_HOST: &str = "Each enchantment has \"As long as you control five or more \
+     enchantments, this enchantment is a creature in addition to its other types and has base \
+     power and base toughness each equal to its mana value.\"";
+
+/// Release Juno returning P0's Sanctum of Tranquil Light with
+/// [`STARFIELD_GRANT_HOST`] under `host_controller`, plus `p0_anchors` P0 and
+/// `p1_anchors` P1 mana-value-1 enchantments. The host's mana value 5 keeps it
+/// alive as a 5/5 if its own grant animates it.
+fn release_juno_under_starfield_grant(
+    host_controller: PlayerId,
+    p0_anchors: usize,
+    p1_anchors: usize,
+) -> (CastOutcome, ObjectId, ObjectId) {
+    let mut scenario = board();
+    let spell = add_what_must_be_done(&mut scenario);
+    let sanctum = add_graveyard_sanctum(&mut scenario);
+    let host = scenario
+        .add_enchantment_from_oracle(
+            host_controller,
+            "Starfield Grant Host",
+            STARFIELD_GRANT_HOST,
+        )
+        .with_mana_cost(generic_and_white(4, 1))
+        .id();
+    add_enchantment_anchors(&mut scenario, P0, "Enchantment Anchor", p0_anchors);
+    add_enchantment_anchors(&mut scenario, P1, "P1 Anchor", p1_anchors);
+    let mut runner = scenario.build();
+    set_core_types(&mut runner, sanctum, &[CoreType::Enchantment]);
+    // Premise: the host grants a static whose inner condition is population-reading.
+    assert!(
+        runner.state().objects[&host]
+            .static_definitions
+            .as_slice()
+            .iter()
+            .any(|def| def.modifications.iter().any(|m| matches!(
+                m,
+                ContinuousModification::GrantStaticAbility { definition }
+                    if definition.condition.is_some()
+            ))),
+        "premise: the host carries a conditioned GrantStaticAbility"
+    );
+
+    let outcome = cast_release_juno(runner, spell, sanctum);
+    (outcome, sanctum, host)
+}
+
+/// CR 614.12 + CR 109.5: a granted Starfield-shaped static's enchantment count is
+/// read before the entry, with the recipient's controller as "you". With P0's
+/// host and three P0 anchors, P0 controls four enchantments before Sanctum enters
+/// as the fifth, so Sanctum is not a creature as it would enter: no counters.
+/// After entry P0 controls five, so Sanctum is a creature with base power and
+/// toughness equal to its mana value, 1/1. With four anchors the condition
+/// already holds before entry: two counters, 3/3.
+#[test]
+fn release_juno_granted_starfield_condition_counts_pre_entry_enchantments() {
+    for (p0_anchors, counters, pt) in [(3usize, 0, (1, 1)), (4, 2, (3, 3))] {
+        let (outcome, sanctum, _host) = release_juno_under_starfield_grant(P0, p0_anchors, 0);
+        outcome.assert_zone(&[sanctum], Zone::Battlefield);
+        outcome.assert_counters(sanctum, CounterType::Plus1Plus1, counters);
+        assert!(
+            is_creature(&outcome, sanctum),
+            "reach ({p0_anchors} anchors): P0 controls five enchantments after entry"
+        );
+        outcome.assert_power_toughness(sanctum, pt.0, pt.1);
+        assert!(!put_counter_resolved(outcome.events()));
+    }
+}
+
+/// CR 614.12 + CR 109.5: "you" in the granted Starfield-shaped static is the
+/// controller of the object it is on, not the granting host's. P1's host grants
+/// it to P0's Sanctum, so Sanctum's condition counts P0's enchantments before
+/// entry:
+/// * P0 controls four and P1 five (host plus four) → no counters (a pin keyed to
+///   the host's controller would read five and give two), and Sanctum is a 1/1
+///   creature after entry;
+/// * P0 controls five and P1 one (the host) → two counters, 3/3 (a host-keyed
+///   pin would read one and give none).
+#[test]
+fn release_juno_granted_starfield_condition_binds_the_recipients_controller() {
+    for (p0_anchors, p1_anchors, counters, pt) in [(4usize, 4usize, 0, (1, 1)), (5, 0, 2, (3, 3))] {
+        let (outcome, sanctum, _host) =
+            release_juno_under_starfield_grant(P1, p0_anchors, p1_anchors);
+        outcome.assert_zone(&[sanctum], Zone::Battlefield);
+        assert_eq!(outcome.state().objects[&sanctum].controller, P0);
+        outcome.assert_counters(sanctum, CounterType::Plus1Plus1, counters);
+        assert!(
+            is_creature(&outcome, sanctum),
+            "reach (P0 {p0_anchors}, P1 {p1_anchors}): P0 controls five enchantments \
+             after entry"
         );
         outcome.assert_power_toughness(sanctum, pt.0, pt.1);
         assert!(!put_counter_resolved(outcome.events()));
