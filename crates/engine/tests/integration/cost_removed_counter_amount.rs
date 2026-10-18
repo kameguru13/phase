@@ -30,10 +30,10 @@ use engine::game::perf_counters;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
-    ChosenAttribute, Comparator, ControllerRef, CounterCostSelection, DamageChannel,
-    DrawReplacementScope, Effect, EffectKind, ManaContribution, ManaProduction, QuantityExpr,
-    QuantityRef, ReplacementDefinition, ReplacementMode, RoundingMode, TargetFilter, TargetRef,
-    TypedFilter, UnlessPayModifier, REMOVE_COUNTER_COST_ALL,
+    ChosenAttribute, Comparator, ControllerRef, CounterCostSelection, DamageChannel, Effect,
+    EffectKind, ManaContribution, ManaProduction, QuantityExpr, QuantityRef, ReplacementDefinition,
+    ReplacementMode, RoundingMode, TargetFilter, TargetRef, TypedFilter, UnlessPayModifier,
+    REMOVE_COUNTER_COST_ALL,
 };
 use engine::types::actions::GameAction;
 use engine::types::counter::{parse_counter_type, CounterMatch, CounterType};
@@ -1774,8 +1774,8 @@ fn a_prevented_cost_counter_removal_resumes_its_cost_root() {
 
 /// Synthetic control: a mill cost with no other cost leg (CR 701.17a).
 const MILL_COST_CONTROL: &str = "{T}, Mill a card: You gain 1 life.";
-/// Synthetic control: a draw the Draw replacement can act on.
-const DRAW_CONTROL: &str = "{T}: Draw a card.";
+/// Synthetic control: a life gain the GainLife replacement can act on.
+const GAIN_CONTROL: &str = "{T}: You gain 1 life.";
 const DIVINATION: &str = "Draw two cards.";
 
 /// The index of the first event matching `pred`. The panic is the reach of
@@ -1831,6 +1831,29 @@ fn t3_child_execute(battery: ObjectId) -> AbilityDefinition {
                 qty: QuantityRef::PreviousEffectCount,
             },
             player: TargetFilter::Controller,
+        },
+    ))
+}
+
+/// T10's child: the same queue as `t3_child_execute`, with a rider that draws
+/// one card per counter that removal actually removed. It is not a life gain, so
+/// it cannot match T10's GainLife replacement.
+fn t10_child_execute(battery: ObjectId) -> AbilityDefinition {
+    AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::RemoveCounter {
+            counter_type: None,
+            count: QuantityExpr::Fixed { value: -1 },
+            target: TargetFilter::SpecificObject { id: battery },
+        },
+    )
+    .sub_ability(AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::Draw {
+            count: QuantityExpr::Ref {
+                qty: QuantityRef::PreviousEffectCount,
+            },
+            target: TargetFilter::Controller,
         },
     ))
 }
@@ -2059,12 +2082,10 @@ fn a_prevented_child_removal_queue_and_rider_finish_before_the_cost_root() {
     assert_eq!(runner.life(P0) - life_before, 7, "+1 rider, +6 Bottle");
 }
 
-/// Control, an unrelated outer root: a mill cost's replacement starts a child
-/// counter removal that is prevented. The child's queue finishes, then the mill
-/// root resumes and the activation is placed.
-#[test]
-#[ignore = "Phase D T4 blocked: the mill cost's BatchDelivery frame sits above the child's CounterRemovals queue, so the top-only queue drain leaves it stranded; returned to the plan"]
-fn a_prevented_child_removal_under_a_mill_cost_root_resumes_that_root() {
+/// A mill cost whose optional Mill replacement removes a charge counter from the
+/// Battery as its post-effect; that child removal waits on the Steward's
+/// optional RemoveCounter replacement. Returns the runner at the child's prompt.
+fn mill_child_at_its_prompt() -> (GameRunner, ObjectId, ObjectId, i32) {
     let mut scenario = replacement_board();
     let miller = scenario
         .add_artifact_from_oracle(P0, "Miller", MILL_COST_CONTROL)
@@ -2112,6 +2133,27 @@ fn a_prevented_child_removal_under_a_mill_cost_root_resumes_that_root() {
         removal_queue(runner.state()).is_some_and(|queue| queue.in_flight.is_some()),
         "reach: the child queue's removal is in flight"
     );
+    assert!(
+        matches!(
+            runner.state().resolution_stack.last(),
+            Some(ResolutionFrame::BatchDelivery(_))
+        ),
+        "reach: the mill's batch is parked above the child's queue"
+    );
+    (runner, miller, battery, life_before)
+}
+
+fn is_milled(event: &GameEvent) -> bool {
+    matches!(event, GameEvent::Milled { .. })
+}
+
+/// Control, an unrelated outer root: a mill cost's replacement starts a child
+/// counter removal that is prevented. The mill's batch and the child's queue
+/// both settle (CR 614.6: they are the replaced mill), then the mill root
+/// resumes and the activation is placed.
+#[test]
+fn a_prevented_child_removal_under_a_mill_cost_root_resumes_that_root() {
+    let (mut runner, miller, battery, life_before) = mill_child_at_its_prompt();
     stage_prevented_counter_removal(&mut runner);
 
     let events = choose_replacement_events(&mut runner, 0);
@@ -2119,10 +2161,11 @@ fn a_prevented_child_removal_under_a_mill_cost_root_resumes_that_root() {
     assert_eq!(counters_on(&runner, battery, &counter("charge")), 1);
     assert_eq!(runner.state().stack.len(), 1, "the activation is placed");
     let resolved = event_index(&events, is_counter_removal_resolved);
+    let milled = event_index(&events, is_milled);
     let activated = event_index(&events, is_activation_of(miller));
     assert!(
-        resolved < activated,
-        "queue {resolved} < activation {activated}"
+        resolved < activated && milled < activated,
+        "queue {resolved} and mill {milled} < activation {activated}"
     );
     assert!(payment_ownership_is_clear(&runner));
 
@@ -2132,6 +2175,143 @@ fn a_prevented_child_removal_under_a_mill_cost_root_resumes_that_root() {
         &mut Answers::default(),
     );
     assert_eq!(runner.life(P0) - life_before, 1);
+    assert!(runner.state().resolution_stack.is_empty());
+}
+
+/// The Execute arm of the same shape: the child's removal is declined, so it
+/// happens. Settling the batch exposes the child's queue, which finishes before
+/// the mill root resumes.
+#[test]
+fn a_declined_child_removal_under_a_mill_cost_root_resumes_that_root() {
+    let (mut runner, miller, battery, life_before) = mill_child_at_its_prompt();
+
+    let events = choose_replacement_events(&mut runner, DECLINE);
+    assert_eq!(
+        counters_on(&runner, battery, &counter("charge")),
+        0,
+        "the declined removal happened"
+    );
+    assert!(removal_queue(runner.state()).is_none());
+    assert_eq!(runner.state().stack.len(), 1, "the activation is placed");
+    let resolved = event_index(&events, is_counter_removal_resolved);
+    let milled = event_index(&events, is_milled);
+    let activated = event_index(&events, is_activation_of(miller));
+    assert!(
+        resolved < activated && milled < activated,
+        "queue {resolved} and mill {milled} < activation {activated}"
+    );
+    assert!(payment_ownership_is_clear(&runner));
+
+    drive(
+        &mut runner,
+        priority_with_empty_stack,
+        &mut Answers::default(),
+    );
+    assert_eq!(runner.life(P0) - life_before, 1);
+    assert!(runner.state().resolution_stack.is_empty());
+}
+
+/// A1: a top batch that is not the removal's own. The Mill replacement's
+/// post-effect is an unless payment, so the mill's batch parks at that prompt.
+/// Saprazzan Cove is activated to pay it and its own removal is prevented: the
+/// Cove resumes and the unless payment is offered again, with the batch still
+/// parked under it. Paying settles the batch. The row pins the batch's owner
+/// only: what becomes of the mill activation after an unless payment inside its
+/// cost is outside this row.
+#[test]
+fn a_mana_root_prevented_above_an_unrelated_parked_batch_leaves_the_batch() {
+    let mut scenario = replacement_board();
+    let miller = scenario
+        .add_artifact_from_oracle(P0, "Miller", MILL_COST_CONTROL)
+        .id();
+    let cove = scenario
+        .add_land_from_oracle(P0, "Saprazzan Cove", SAPRAZZAN_COVE)
+        .id();
+    scenario.with_counter(cove, counter("storage"), 3);
+    add_mana(&mut scenario, &colorless(2));
+    let mut runner = scenario.build();
+    let lose_unless = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::LoseLife {
+            amount: QuantityExpr::Fixed { value: 1 },
+            target: None,
+        },
+    )
+    .unless_pay(UnlessPayModifier {
+        cost: AbilityCost::Mana {
+            cost: ManaCost::generic(2),
+        },
+        payer: TargetFilter::Controller,
+    });
+    install_replacement_on_steward(
+        &mut runner,
+        optional_replacement(ReplacementEvent::Mill, Some(lose_unless)),
+    );
+    install_optional_counter_removal_replacement(&mut runner);
+    let life_before = runner.life(P0);
+
+    activate(&mut runner, miller, 0);
+    choose_replacement(&mut runner, ACCEPT);
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { .. }),
+        "reach: the mill's post-effect waits on its unless payment: {:?}",
+        runner.state().waiting_for
+    );
+
+    let index = counter_cost_ability(&runner, cove, 0);
+    activate(&mut runner, cove, index);
+    drive(
+        &mut runner,
+        |state| matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }),
+        &mut Answers::pay(2),
+    );
+    assert!(
+        parked_mana_cursor(&runner).counter_removal.is_some(),
+        "reach: the Cove's own removal waits"
+    );
+    assert!(
+        matches!(
+            runner.state().resolution_stack.last(),
+            Some(ResolutionFrame::BatchDelivery(_))
+        ),
+        "reach: the mill's batch is the top frame at the Cove's prompt"
+    );
+    stage_prevented_counter_removal(&mut runner);
+
+    let events = choose_replacement_events(&mut runner, 0);
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { .. }),
+        "the unless payment is offered again: {:?}",
+        runner.state().waiting_for
+    );
+    assert!(
+        runner
+            .state()
+            .resolution_stack
+            .iter()
+            .any(|frame| matches!(frame, ResolutionFrame::BatchDelivery(_))),
+        "the mill's batch stays parked under the unless payment"
+    );
+    assert!(
+        !events.iter().any(is_milled),
+        "the batch does not settle mid-payment"
+    );
+    assert_eq!(counters_on(&runner, cove, &counter("storage")), 3);
+
+    let events = runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("the unless cost is paid")
+        .events;
+    assert!(events.iter().any(is_milled), "paying settles the batch");
+    assert!(
+        !runner
+            .state()
+            .resolution_stack
+            .iter()
+            .any(|frame| matches!(frame, ResolutionFrame::BatchDelivery(_))),
+        "the batch is gone"
+    );
+    assert_eq!(runner.life(P0), life_before, "paid: no life loss");
 }
 
 /// An unrecorded child removal: the replacement's post-effect deals damage to a
@@ -2392,16 +2572,18 @@ fn a_child_under_a_mana_cost_root_paying_a_spell_settles_before_the_spell_resume
     assert!(removal_queue(runner.state()).is_none());
 }
 
-/// The nested configuration through public actions: a Draw replacement's
-/// post-effect pauses at an unless payment, and the Cove is activated to pay it.
-/// The Cove's own child (queue and rider) nests into that paused frame; it
-/// finishes, the Cove produces its mana, and the unless payment is offered again.
+/// The nested configuration through public actions: a life gain's replacement
+/// post-effect (a life loss) pauses at an unless payment, and the Cove is
+/// activated to pay it. The Cove's own child (queue and a draw rider) nests into
+/// that paused frame; it finishes, the Cove produces its mana, and the unless
+/// payment is offered again. The rider draws rather than gains life, so it does
+/// not re-trigger the gain's replacement (CR 614.5 forbids re-application only to
+/// the same event).
 #[test]
-#[ignore = "Phase D T10 blocked: the Cove's child frames above a draw's post-replacement/multi-draw pair fail resolution-stack validation; returned to the plan"]
-fn a_child_under_a_mana_root_paying_inside_a_paused_post_effect_settles_first() {
+fn a_child_under_a_mana_root_paying_inside_a_paused_life_gain_post_effect_settles_first() {
     let mut scenario = replacement_board();
-    let drawer = scenario
-        .add_artifact_from_oracle(P0, "Drawer", DRAW_CONTROL)
+    let gainer = scenario
+        .add_artifact_from_oracle(P0, "Gainer", GAIN_CONTROL)
         .id();
     let cove = scenario
         .add_land_from_oracle(P0, "Saprazzan Cove", SAPRAZZAN_COVE)
@@ -2409,11 +2591,11 @@ fn a_child_under_a_mana_root_paying_inside_a_paused_post_effect_settles_first() 
     scenario.with_counter(cove, counter("storage"), 3);
     let battery = add_battery(&mut scenario);
     let mut runner = scenario.build();
-    let unless_gain = AbilityDefinition::new(
+    let lose_unless = AbilityDefinition::new(
         AbilityKind::Spell,
-        Effect::GainLife {
+        Effect::LoseLife {
             amount: QuantityExpr::Fixed { value: 1 },
-            player: TargetFilter::Controller,
+            target: None,
         },
     )
     .unless_pay(UnlessPayModifier {
@@ -2424,18 +2606,17 @@ fn a_child_under_a_mana_root_paying_inside_a_paused_post_effect_settles_first() 
     });
     install_replacement_on_steward(
         &mut runner,
-        optional_replacement(ReplacementEvent::Draw, Some(unless_gain))
-            .draw_scope(DrawReplacementScope::InstructionCount),
+        optional_replacement(ReplacementEvent::GainLife, Some(lose_unless)),
     );
     install_replacement_on_steward(
         &mut runner,
         optional_replacement(
             ReplacementEvent::RemoveCounter,
-            Some(t3_child_execute(battery)),
+            Some(t10_child_execute(battery)),
         ),
     );
 
-    activate(&mut runner, drawer, 0);
+    activate(&mut runner, gainer, 0);
     drive(
         &mut runner,
         |state| matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }),
@@ -2457,6 +2638,7 @@ fn a_child_under_a_mana_root_paying_inside_a_paused_post_effect_settles_first() 
         "reach (P6): the post-effect's drain is paused in the active frame"
     );
     let life_at_unless = runner.life(P0);
+    let hand_at_unless = runner.state().players[0].hand.len();
 
     let index = counter_cost_ability(&runner, cove, 0);
     activate(&mut runner, cove, index);
@@ -2483,14 +2665,17 @@ fn a_child_under_a_mana_root_paying_inside_a_paused_post_effect_settles_first() 
 
     let events = choose_replacement_events(&mut runner, DECLINE);
     let resolved = event_index(&events, is_counter_removal_resolved);
-    let gain = event_index(&events, is_life_gain);
+    let drew = event_index(
+        &events,
+        |event| matches!(event, GameEvent::CardDrawn { player_id, .. } if *player_id == P0),
+    );
     let mana = event_index(
         &events,
         |event| matches!(event, GameEvent::ManaAdded { source_id, .. } if *source_id == cove),
     );
     assert!(
-        resolved < gain && gain < mana,
-        "queue {resolved} < rider {gain} < Cove mana {mana}"
+        resolved < drew && drew < mana,
+        "queue {resolved} < rider {drew} < Cove mana {mana}"
     );
     assert!(
         matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { .. }),
@@ -2499,13 +2684,16 @@ fn a_child_under_a_mana_root_paying_inside_a_paused_post_effect_settles_first() 
     );
     assert_eq!(counters_on(&runner, cove, &counter("storage")), 1);
     assert!(removal_queue(runner.state()).is_none());
-    let life_after_rider = runner.life(P0);
-    assert_eq!(life_after_rider - life_at_unless, 1, "the rider ran");
+    assert_eq!(
+        runner.state().players[0].hand.len() - hand_at_unless,
+        1,
+        "the rider drew the 1 its own queue removed"
+    );
 
     runner
         .act(GameAction::PayUnlessCost { pay: true })
         .expect("the unless cost is paid");
-    assert_eq!(runner.life(P0), life_after_rider, "paid: no unless gain");
+    assert_eq!(runner.life(P0), life_at_unless, "paid: no life loss");
     assert!(runner.state().resolution_stack.is_empty());
     assert!(payment_ownership_is_clear(&runner));
 }

@@ -48749,8 +48749,8 @@ mod shared_zone_storage_tests {
 #[cfg(test)]
 mod replacement_subtree_boundary_tests {
     use super::{
-        GameState, PendingContinuation, PostReplacementDrain, ReplacementSubtreeBoundary,
-        ResidentDrainPolicy,
+        GameState, PendingContinuation, PostReplacementDrain, PostReplacementDrainStack,
+        ReplacementSubtreeBoundary, ResidentDrainPolicy,
     };
     use crate::types::ability::{
         AbilityDefinition, AbilityKind, Effect, PostReplacementContinuation, ResolvedAbility,
@@ -48855,6 +48855,85 @@ mod replacement_subtree_boundary_tests {
             "the enclosing frame, found by identity, still holds the nested child"
         );
 
+        assert!(state.finish_post_replacement_dispatch(child).is_some());
+        assert!(
+            boundary.is_retired(&state.resolution_stack),
+            "the subtree retires with the nested child"
+        );
+    }
+
+    /// A type-level contract fixture, not a claimed production shape: with the
+    /// frame above the parent consumed and a fresh, unstamped frame pushed in its
+    /// place, the stack is as deep as when the boundary was recorded and the
+    /// active frame holds one drain. Only the identity read sees that the
+    /// enclosing frame still holds the nested child.
+    #[test]
+    fn a_nested_child_is_read_in_its_own_frame_not_the_active_one() {
+        let mut state = state_with_paused_enclosing_frame();
+        let chain = Box::new(ResolvedAbility::new(
+            Effect::TargetOnly {
+                target: TargetFilter::Any,
+            },
+            vec![],
+            ObjectId(71),
+            PlayerId(0),
+        ));
+        let pending = PendingContinuation::new(chain, &state);
+        state.push_ability_continuation(AbilityContinuationFrame {
+            pending,
+            choose_zone_trigger_context: None,
+        });
+        let boundary = ReplacementSubtreeBoundary::at(&state.resolution_stack);
+        let enclosing = boundary
+            .enclosing
+            .expect("reach: the frame below the continuation is the paired parent");
+        let parent_id = enclosing
+            .frame
+            .expect("reach: the paused enclosing frame is stamped");
+        assert_eq!(enclosing.drains, 1);
+
+        state.install_post_replacement_drain(ready_drain("child"), ResidentDrainPolicy::Replace);
+        let (_, child) = state
+            .begin_post_replacement_dispatch()
+            .expect("the nested child drain dispatches");
+        state
+            .take_active_ability_continuation()
+            .expect("the continuation is the top frame")
+            .expect("the continuation is present");
+        let mut unrelated = PostReplacementDrainStack::default();
+        assert!(unrelated.install(ready_drain("unrelated"), ResidentDrainPolicy::Replace));
+        state.resolution_stack.push_post_replacement(unrelated);
+
+        assert_eq!(
+            state.resolution_stack.len(),
+            boundary.resolution_depth,
+            "reach: the stack is as deep as when the boundary was recorded"
+        );
+        assert_eq!(
+            state
+                .resolution_stack
+                .active_post_replacement_or_paired_parent()
+                .map(PostReplacementDrainStack::len),
+            Some(1),
+            "reach: the active frame is the unrelated one, holding one drain"
+        );
+        assert_eq!(
+            state
+                .resolution_stack
+                .post_replacement_frame_drain_count(parent_id),
+            Some(2),
+            "reach: the enclosing frame holds the nested child"
+        );
+        assert!(
+            !boundary.is_retired(&state.resolution_stack),
+            "the enclosing frame is read by identity, not as the active frame"
+        );
+
+        state
+            .resolution_stack
+            .take_active_post_replacement()
+            .expect("the unrelated frame is the top")
+            .expect("the unrelated frame is present");
         assert!(state.finish_post_replacement_dispatch(child).is_some());
         assert!(
             boundary.is_retired(&state.resolution_stack),

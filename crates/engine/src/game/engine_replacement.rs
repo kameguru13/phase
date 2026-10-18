@@ -1194,6 +1194,19 @@ fn handle_replacement_choice_inner(
                 }
             }
 
+            // CR 614.6 + CR 616.1: settling a batch parked above its member's
+            // delivery-tail child exposes that child's counter-removal queue. Finish
+            // it here, in the same order as the queue drain above, before any parked
+            // cost root resumes below.
+            if matches!(waiting_for, WaitingFor::Priority { .. })
+                && state.active_counter_removals().is_some()
+            {
+                effects::counters::drain_pending_counter_removals(state, events);
+                if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                    waiting_for = state.waiting_for.clone();
+                }
+            }
+
             if matches!(waiting_for, WaitingFor::Priority { .. })
                 && state.active_copy_token().is_some()
             {
@@ -1659,8 +1672,30 @@ fn handle_replacement_choice_inner(
                 state.waiting_for = WaitingFor::Priority {
                     player: state.active_player,
                 };
+                // CR 614.6 + CR 616.1: a batch zone move whose member's delivery-tail
+                // post-effect proposed this removal is parked on top of the removal's own
+                // work (`zone_pipeline::deliver_batch`, `NewChild`). It is part of the same
+                // modified event, so it settles first, as `resume_resolution_frames`'
+                // BatchDelivery arm does, exposing the removal's queue. A top batch is not
+                // always this removal's: a mana ability activated at an earlier prompt that
+                // parked a batch (an unless payment raised by a delivery-tail post-effect)
+                // proposes its removal above that batch, which belongs to the outer prompt.
+                // So it settles only where it is this removal's own work: with no
+                // counter-cost root, or above an unfinished root's recorded boundary; never
+                // under a retired root, whose own removal it cannot be.
                 match state.counter_cost_root_subtree() {
                     CounterCostRootSubtree::Unfinished => {
+                        let batch_in_subtree = state
+                            .pending_cost_move_resume
+                            .as_ref()
+                            .and_then(PendingCostMoveResume::paused_counter_removal)
+                            .is_some_and(|paused| {
+                                state.resolution_stack.len()
+                                    > paused.replacement_subtree.resolution_depth
+                            });
+                        if batch_in_subtree && !settle_parked_batch_delivery(state, events) {
+                            return Ok(state.waiting_for.clone());
+                        }
                         effects::counters::drain_pending_counter_removals(state, events);
                         super::engine::resume_pending_continuation_if_priority(state, events)?;
                     }
@@ -1672,6 +1707,9 @@ fn handle_replacement_choice_inner(
                         )?;
                     }
                     CounterCostRootSubtree::Absent => {
+                        if !settle_parked_batch_delivery(state, events) {
+                            return Ok(state.waiting_for.clone());
+                        }
                         effects::counters::drain_pending_counter_removals(state, events);
                         if matches!(state.waiting_for, WaitingFor::Priority { .. })
                             && !matches!(
@@ -1772,6 +1810,17 @@ fn handle_replacement_choice_inner(
             Ok(state.waiting_for.clone())
         }
     }
+}
+
+/// CR 614.6 + CR 616.1: settle a batch zone move parked on top of the
+/// resolution stack, if there is one. Returns whether the action is still at an
+/// ordinary Priority boundary afterwards (a later member can surface its own
+/// prompt).
+fn settle_parked_batch_delivery(state: &mut GameState, events: &mut Vec<GameEvent>) -> bool {
+    if state.active_batch_delivery().is_some() {
+        crate::game::zone_pipeline::drain_pending_batch_deliveries(state, events);
+    }
+    matches!(state.waiting_for, WaitingFor::Priority { .. })
 }
 
 /// CR 601.2h + CR 602.2b + CR 605.3b + CR 616.1: resume the parked cost-move
