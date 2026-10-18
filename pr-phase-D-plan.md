@@ -1106,3 +1106,36 @@ All three use A2's T10 board: Gainer (`GAIN_CONTROL`), the Steward `GainLife` re
 |---|---|
 | **FD1** (residual 9 false; direct-drain handlers leave a due root parked behind the gates) | Residual 9 deleted. One authority, `resume_due_counter_cost_root_at_action_boundary`, sits next to `owed_spell_final_part_is_due`. It is called at the core (site 2, every action) and before the shared post-action pipeline (site 1, trigger order, CR 603.3), following the token-realization precedent; no handler is patched. Verified that it runs after every action (all entry points → `apply_action_boundary_core`), and that 9461 cannot meet a due root. Residual 2 is narrowed to `Unfinished` exits. Rows **T12** (ChooseMana child, same-action placement) and **T12b** (site 1, trigger above the activation, with a delete-if-undiscriminated fallback). |
 | **FD2** (gates (b)/(c) undiscriminated; T10a revert-checks wrong) | T10a's revert-check corrected to gate (a). **T10e** (outer `RepeatFor` under the unless prompt) discriminates (c). **T10d** (a `Queued` Clash rider) discriminates (b). Each comes with an explicit "delete the gate and record a residual" fallback if its fixture cannot reach, so no gate ships undiscriminated. |
+
+---
+
+## Phase D impl-review r2 fixes (approved design: impl-review-r2 + fix-design review APPROVE-WITH-CHANGES)
+
+Sources: pr-phase-D-impl-review-r2.md (F1 MED, F2 MED, F3 LOW, T1 text) and pr-phase-D-impl-review-r2-fix-design-review.md (C1–C5). P1 probe at 618fb57 confirmed r2's trace exactly (phase-fit 92). Where the two documents differ, the fix-design review wins.
+
+1. **One custody authority for inline trigger collectors (C1 + C2).** In `announcement_triggers`, add one ownership predicate `announcement_owned_from` and make `stage_announcement_trigger_events` use it. Add one entry point, `take_inline_trigger_span(state, events, start) -> Range`, which returns the part the caller still owns. Under a live announcement it stages and claims, and the caller does NO inline scan, NO deferred collection and does not set `triggers_processed_inline`. Before taking custody, call the existing `resolve_tap_mana_triggers_inline` (CR 605.4a; the residual is ManaAdded-mode triggered mana abilities only — record it in a comment and in the PR body, with `partition_collected_mana_frame_contexts` as the follow-up route). Do NOT inline-scan "the unclaimed remainder" after staging: that remainder is cost-owner-retained events (C2). Route every same-buffer inline collector through it:
+   - engine.rs ChooseManaColor ResolvingEffect arm (~13256-13287);
+   - engine_resolution_choices.rs at ~789, ~817 (`batch_or_drain_observer_triggers`), ~836, ~870 (search collector), ~6036-6062, ~8394, ~8510, ~8594, ~8685;
+   - effects/mod.rs ~2545/2548.
+   Do NOT put the guard in `collect_triggers_into_deferred` or `process_triggers` (their slices include events outside the action buffer). Line numbers are from 618fb57; re-locate by symbol.
+2. **`commit_activation_announcement` (fix (ii) + C3).** It lives in `announcement_triggers` and shares one body with `commit_spell_announcement` (no copied code). Behaviour:
+   - `None` collection → end the announcement scope only. This is today's behaviour for every ordinary activation and must stay unchanged.
+   - `Some` → collect `unclaimed_events(state, events, scope_start)` minus `retained_by_cost_owners`, plus the filtered delayed scan, and claim `AllCollectors` over start..len minus retained events.
+   - `Some` with an `Unowned` scope → `debug_assert!` and start at 0, not `events.len()`.
+   - The doc comment carries the no-loss argument: no ledger writer claims without collecting, so the filter only removes re-collections, and the commit point is unchanged, so there is no reordering.
+   `push_ability_entry` (casting_costs.rs ~7323-7345) calls it.
+3. **Site 1 (C5).** Keep site 1 with the fix-design review's replacement comment: CR 704.3 / 117.5 / 117.3c — the shared pipeline's SBA loop and its `process_triggers` branch must not run mid-activation, or SBA-caused triggers land below the activation (CR 603.3). Discriminator row P3 → **T12e** `an_sba_trigger_from_the_childs_payment_goes_above_the_activation`:
+   - board: T12's, plus a P0 1/1 "When this creature dies, you gain 1 life";
+   - child: `DealDamage{1, SpecificObject(that creature)}` with no lose rider;
+   - reach guard: before the answer, the 1/1 has damage marked and is still on the battlefield;
+   - assert straight after the answer with no drive: stack is [B, D].
+   Expected red without site 1 ([D, B]). If it is green without site 1, delete site 1 and say so.
+4. **Tests.**
+   - F2: T12b is un-ignored and asserts straight after the colour answer with NO `drive`: exactly one Witness entry, above B.
+   - C4: T12c (Scry child + Witness: `Effect::Scry{1}.sub_ability(lose(1))` as the RemoveCounter post-effect; answer the Scry; stack == [B, W] with one W) and T12d (T12's child under a Cove mana root paying a sorcery's ManaPayment, plus Witness; exactly one Witness, collected with the cast batch). Both are asserted with no drive, and each gets a revert check against item 1.
+   - F3: T10f `an_outer_player_scope_seat_waits_for_the_mana_root` as in r2 §2, with P0 as the active player (APNAP), so P0's seat is the one that pauses. Reach: an AbilityContinuation frame (P1's leg) is parked at P0's UnlessPayment. Expected red with gate (a) removed.
+   - T1: replace T10c's doc comment with the text in r2.
+5. **Verification under the deferred policy:**
+   - fmt, CR grep, and targeted red/green only. The base for red/green is 618fb57 plus the new tests; one-revert columns: −item 1, −item 2, −site 1, −gate (a).
+   - Rows: T12b, T12c, T12d, T12e, T10f, plus the existing cost_removed_counter_amount file.
+   - The regression suites the fix-design review lists (activation/announcement, delayed triggers, Treasure/sacrifice costs, search dedup, engine_tests, triggers_dedup_regression_tests) are deferred to the final batched check after the upstream-main merge, where they are covered by the engine integration and lib runs.
