@@ -27724,7 +27724,22 @@ impl GameState {
         self.resolution_stack
             .observe_draw_sequence_frame_id(next_frame_id);
         let completed = self.resolution_stack.take_active_multi_draw()?;
-        if paired_post_replacement {
+        // CR 608.2c + CR 608.2e + CR 101.4 + CR 118.12a: the continuation directly
+        // below the paused drain is that dispatch's own tail only if it sits inside
+        // a parked counter-cost root's replacement subtree. One below the root's
+        // boundary is outer work (a later seat's "unless" choice of a resolving
+        // ability, say), and outer work never rises above the root's subtree: it
+        // stays where it is, and the drain retires as the top. With the draw
+        // popped the stack is `[.., continuation, drain]`, so the continuation is
+        // below the boundary exactly when `len < depth + 2`.
+        let continuation_is_outer = self
+            .pending_cost_move_resume
+            .as_ref()
+            .and_then(PendingCostMoveResume::paused_counter_removal)
+            .is_some_and(|paused| {
+                self.resolution_stack.len() < paused.replacement_subtree.resolution_depth + 2
+            });
+        if paired_post_replacement && !continuation_is_outer {
             let _ = self
                 .resolution_stack
                 .promote_ability_continuation_after_post_replacement_draw()?;

@@ -3380,47 +3380,6 @@ fn a_trigger_from_the_childs_payment_goes_on_the_stack_above_the_activation() {
     assert_eq!(stack_pushes(&events), 2, "one StackPushed per entry");
 }
 
-/// C4: the same with a Scry child. Answering the Scry finishes the child's
-/// life loss; Witness's trigger is collected once, above the activation.
-#[test]
-fn a_trigger_from_a_scry_childs_rider_goes_on_the_stack_above_the_activation() {
-    let mut scenario = replacement_board();
-    let witness = scenario
-        .add_artifact_from_oracle(P0, "Witness", WITNESS)
-        .id();
-    let bottle = scenario
-        .add_artifact_from_oracle(P0, "Essence Bottle", ESSENCE_BOTTLE)
-        .id();
-    scenario.with_counter(bottle, counter("elixir"), 3);
-    let mut runner = scenario.build();
-    install_replacement_on_steward(
-        &mut runner,
-        optional_replacement(
-            ReplacementEvent::RemoveCounter,
-            Some(scry_one().sub_ability(lose(1))),
-        ),
-    );
-    let index = counter_cost_ability(&runner, bottle, 0);
-    activate(&mut runner, bottle, index);
-    choose_replacement(&mut runner, ACCEPT);
-    let WaitingFor::ScryChoice { cards, .. } = runner.state().waiting_for.clone() else {
-        panic!("reach: the child scries: {:?}", runner.state().waiting_for);
-    };
-    assert_root_is_counter_cost(&runner);
-
-    let events = runner
-        .act(GameAction::SelectCards { cards })
-        .expect("the scry is answered")
-        .events;
-    assert_activation_then_one_trigger(&runner, bottle, witness);
-    assert_eq!(
-        witness_entries(runner.state(), witness),
-        1,
-        "collected once"
-    );
-    assert_eq!(stack_pushes(&events), 2, "one StackPushed per entry");
-}
-
 /// C4: the T12 child under Saprazzan Cove's mana root paying Divination. The
 /// child's life loss happens during the cast, so Witness's trigger waits for
 /// the cast and is collected once, with it (CR 601.2i + CR 603.3).
@@ -3565,13 +3524,28 @@ fn an_sba_trigger_from_the_childs_payment_goes_above_the_activation() {
     assert_activation_then_one_trigger(&runner, bottle, victim);
 }
 
-/// F3, gate (a): a "for each player" clause paused on P0's seat parks P1's leg
-/// as a continuation frame below P0's unless prompt. When the Cove paying it
-/// finishes its child, the Cove resumes and P0's prompt is offered again; P1's
-/// leg does not start first.
-#[test]
-#[ignore = "Phase D T10f blocked: P1's parked player_scope leg is gone after the Cove's child finishes (P1 never asked, a PostReplacement frame left behind); returned to the plan"]
-fn an_outer_player_scope_seat_waits_for_the_mana_root() {
+/// Whether the resolution stack holds exactly one continuation, and it is the
+/// `player_scope` leg bound to P1 (CR 608.2e: P1's own "unless" choice).
+fn p1_leg_is_the_only_continuation(state: &GameState) -> bool {
+    let legs: Vec<_> = state
+        .resolution_stack
+        .iter()
+        .filter_map(|frame| match frame {
+            ResolutionFrame::AbilityContinuation(continuation) => Some(continuation),
+            _ => None,
+        })
+        .collect();
+    legs.len() == 1
+        && matches!(legs[0].pending.chain.effect, Effect::LoseLife { .. })
+        && legs[0].pending.chain.controller == P1
+}
+
+/// A resolving "each player loses 1 life unless that player pays {2}" asks P0
+/// first (CR 101.4, APNAP) with P1's leg parked; P0 activates the Cove to pay,
+/// and the Cove's replacement runs `child`. When the child finishes, the Cove
+/// resumes and P0's prompt is offered again with P1's leg still parked; P0 then
+/// declines and P1 is asked (CR 608.2e + CR 118.12a).
+fn outer_player_scope_seat_waits_for_the_mana_root(child: fn(ObjectId) -> AbilityDefinition) {
     let mut scenario = replacement_board();
     let taxer = scenario.add_artifact_from_oracle(P0, "Taxer", "").id();
     let cove = scenario
@@ -3590,10 +3564,7 @@ fn an_outer_player_scope_seat_waits_for_the_mana_root() {
     install_taxer_ability(&mut runner, taxer, each_player);
     install_replacement_on_steward(
         &mut runner,
-        optional_replacement(
-            ReplacementEvent::RemoveCounter,
-            Some(t10_child_execute(battery)),
-        ),
+        optional_replacement(ReplacementEvent::RemoveCounter, Some(child(battery))),
     );
     activate(&mut runner, taxer, 0);
     drive(
@@ -3607,9 +3578,10 @@ fn an_outer_player_scope_seat_waits_for_the_mana_root() {
         runner.state().waiting_for
     );
     assert!(
-        parked_child_rider(runner.state()),
-        "reach: P1's leg is parked as a continuation frame"
+        p1_leg_is_the_only_continuation(runner.state()),
+        "reach: P1's leg is parked as the only continuation"
     );
+    let p1_life = runner.life(P1);
 
     cove_to_first_child_entry(&mut runner, cove);
     assert!(cove_removal_enclosing(&runner).is_none());
@@ -3623,10 +3595,171 @@ fn an_outer_player_scope_seat_waits_for_the_mana_root() {
         runner.state().waiting_for
     );
     assert!(
-        parked_child_rider(runner.state()),
-        "P1's leg is still parked"
+        p1_leg_is_the_only_continuation(runner.state()),
+        "P1's leg is still parked, and nothing else is"
     );
+    assert_eq!(runner.life(P1), p1_life, "P1's leg has not run");
     assert!(events.iter().any(is_cove_mana(cove)));
+
+    runner
+        .act(GameAction::PayUnlessCost { pay: false })
+        .expect("P0 declines");
+    assert!(
+        matches!(
+            &runner.state().waiting_for,
+            WaitingFor::UnlessPayment { pending_effect, .. }
+                if matches!(pending_effect.effect, Effect::LoseLife { .. })
+                    && pending_effect.controller == P1
+        ),
+        "P1's leg asks next: {:?}",
+        runner.state().waiting_for
+    );
+}
+
+/// F3: the child's rider draws, and the draw's completion must not lift P1's
+/// outer leg above the paused drain of the Cove's subtree.
+#[test]
+fn an_outer_player_scope_seat_waits_for_the_mana_root() {
+    outer_player_scope_seat_waits_for_the_mana_root(t10_child_execute);
+}
+
+/// Gate (a): the same with a life-gain rider, which raises no draw: once the
+/// child's drain retires, the recursive continuation drain must stop at the
+/// due root instead of running P1's leg.
+#[test]
+fn an_outer_player_scope_seat_waits_for_the_mana_root_after_a_life_gain_rider() {
+    outer_player_scope_seat_waits_for_the_mana_root(t3_child_execute);
+}
+
+/// F2: a rider-free "add one mana of any color" child. Nothing drains after the
+/// mana, so the child's drain is left paused; the action boundary still
+/// finishes it and places the activation in the same action.
+#[test]
+fn a_rider_free_mana_choice_child_places_the_activation_in_the_same_action() {
+    let mut child = mana_choice_child();
+    child.sub_ability = None;
+    let (mut runner, _, _) = bottle_at_child_mana_choice(replacement_board(), child);
+
+    choose_green(&mut runner);
+    assert_eq!(runner.state().stack.len(), 1, "placed in the same action");
+    assert_eq!(top_stack_count(&runner), Some(3));
+    assert_eq!(pool(&runner, ManaType::Green), 1);
+    assert!(payment_ownership_is_clear(&runner));
+    assert!(
+        !runner
+            .state()
+            .resolution_stack
+            .iter()
+            .any(|frame| matches!(frame, ResolutionFrame::PostReplacement(_))),
+        "the child's drain retired"
+    );
+}
+
+/// F1: "Scry 1. You lose 1 life. Scry 1." as the child. The life loss happens
+/// while the second Scry waits, so it is parked by the Scry handler under the
+/// live announcement; Witness's trigger goes on the stack once, above the
+/// activation.
+#[test]
+fn a_trigger_between_two_scry_children_goes_on_the_stack_once_above_the_activation() {
+    let mut scenario = replacement_board();
+    let witness = scenario
+        .add_artifact_from_oracle(P0, "Witness", WITNESS)
+        .id();
+    let bottle = scenario
+        .add_artifact_from_oracle(P0, "Essence Bottle", ESSENCE_BOTTLE)
+        .id();
+    scenario.with_counter(bottle, counter("elixir"), 3);
+    let mut runner = scenario.build();
+    install_replacement_on_steward(
+        &mut runner,
+        optional_replacement(
+            ReplacementEvent::RemoveCounter,
+            Some(scry_one().sub_ability(lose(1).sub_ability(scry_one()))),
+        ),
+    );
+    let index = counter_cost_ability(&runner, bottle, 0);
+    activate(&mut runner, bottle, index);
+    choose_replacement(&mut runner, ACCEPT);
+    for scry in ["first", "second"] {
+        let WaitingFor::ScryChoice { cards, .. } = runner.state().waiting_for.clone() else {
+            panic!(
+                "reach: the {scry} Scry asks: {:?}",
+                runner.state().waiting_for
+            );
+        };
+        assert_root_is_counter_cost(&runner);
+        assert!(
+            runner.state().stack.is_empty(),
+            "nothing is on the stack yet"
+        );
+        runner
+            .act(GameAction::SelectCards { cards })
+            .unwrap_or_else(|err| panic!("the {scry} Scry is answered: {err:?}"));
+    }
+    assert_activation_then_one_trigger(&runner, bottle, witness);
+    assert_eq!(
+        witness_entries(runner.state(), witness),
+        1,
+        "collected once"
+    );
+}
+
+/// Synthetic control: an observer of creatures dying.
+const DIES_WITNESS: &str = "Whenever a creature you control dies, you gain 1 life.";
+
+/// F5: a "sacrifice a creature" child asks which creature; the sacrifice's
+/// dies trigger goes on the stack once, above the activation.
+#[test]
+#[ignore = "Phase D F5 sacrifice row blocked: the EffectZoneChoice sacrifice completion resumes the root (whose commit collects the dies trigger) before batch_or_drain_observer_triggers B1 collects the same slice unfiltered, so the trigger is collected twice; returned to the plan"]
+fn a_dies_trigger_from_a_sacrifice_child_goes_on_the_stack_once_above_the_activation() {
+    let mut scenario = replacement_board();
+    let witness = scenario
+        .add_artifact_from_oracle(P0, "Witness", DIES_WITNESS)
+        .id();
+    let fodder = scenario.add_creature(P0, "Fodder", 1, 1).id();
+    let bottle = scenario
+        .add_artifact_from_oracle(P0, "Essence Bottle", ESSENCE_BOTTLE)
+        .id();
+    scenario.with_counter(bottle, counter("elixir"), 3);
+    let mut runner = scenario.build();
+    install_replacement_on_steward(
+        &mut runner,
+        optional_replacement(
+            ReplacementEvent::RemoveCounter,
+            Some(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Sacrifice {
+                    target: TargetFilter::Typed(
+                        TypedFilter::creature().controller(ControllerRef::You),
+                    ),
+                    count: QuantityExpr::Fixed { value: 1 },
+                    min_count: 1,
+                },
+            )),
+        ),
+    );
+    let index = counter_cost_ability(&runner, bottle, 0);
+    activate(&mut runner, bottle, index);
+    choose_replacement(&mut runner, ACCEPT);
+    assert!(
+        matches!(&runner.state().waiting_for, WaitingFor::EffectZoneChoice { cards, .. } if cards.contains(&fodder)),
+        "reach: the child asks which creature: {:?}",
+        runner.state().waiting_for
+    );
+    assert_root_is_counter_cost(&runner);
+
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![fodder],
+        })
+        .expect("Fodder is sacrificed");
+    assert_eq!(runner.state().objects[&fodder].zone, Zone::Graveyard);
+    assert_activation_then_one_trigger(&runner, bottle, witness);
+    assert_eq!(
+        witness_entries(runner.state(), witness),
+        1,
+        "collected once"
+    );
 }
 
 // ---------------------------------------------------------------------------

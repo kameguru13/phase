@@ -768,7 +768,7 @@ fn batch_or_drain_observer_triggers(
     // collected here.
     let owned =
         super::announcement_triggers::take_inline_trigger_span(state, events, event_slice_start);
-    let announced = owned.end != events.len();
+    let announced = owned.is_empty() && owned.end < events.len();
     let slice_end = event_slice_end.min(owned.end);
     let completion_events = event_slice_end.min(owned.end)..owned.end;
     let trigger_events: Vec<GameEvent> = events[event_slice_start..slice_end]
@@ -827,14 +827,7 @@ pub(crate) fn defer_observer_triggers_for_paused_choice(
     event_start: usize,
 ) {
     let owned = super::announcement_triggers::take_inline_trigger_span(state, events, event_start);
-    defer_observer_triggers_from(state, &events[owned]);
-}
-
-/// [`defer_observer_triggers_for_paused_choice`] for events that are not part
-/// of the current action buffer (a discard batch's own parked events), which no
-/// announcement can stage by index.
-pub(crate) fn defer_observer_triggers_from(state: &mut GameState, events: &[GameEvent]) {
-    let trigger_events: Vec<GameEvent> = events
+    let trigger_events: Vec<GameEvent> = events[owned]
         .iter()
         .filter(|event| !matches!(event, GameEvent::PhaseChanged { .. }))
         .cloned()
@@ -866,7 +859,7 @@ fn collect_search_observer_triggers(
     // CR 601.2h + CR 603.3: a live announcement takes custody of the span it owns.
     let owned =
         super::announcement_triggers::take_inline_trigger_span(state, events, events_before_drain);
-    let announced = owned.end != events.len();
+    let announced = owned.is_empty() && owned.end < events.len();
     let uncollected_events = super::triggers::filter_already_collected_trigger_events_from(
         state,
         &events[..owned.end],
@@ -6056,7 +6049,7 @@ pub(super) fn handle_resolution_choice(
                 events,
                 events_before_effect,
             );
-            let announced = owned.end != events.len();
+            let announced = owned.is_empty() && owned.end < events.len();
             for (start, end) in [
                 (events_before_effect, events_after_move.min(owned.end)),
                 (events_after_move, owned.end),

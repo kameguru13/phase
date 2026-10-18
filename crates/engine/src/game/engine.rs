@@ -1732,23 +1732,33 @@ fn owed_spell_final_part_is_due(state: &mut GameState, result: &ActionResult) ->
 }
 
 /// CR 601.2h + CR 602.2b + CR 605.3b + CR 608.2c: the action-boundary resume
-/// authority for a parked counter-cost root whose replacement subtree retired
-/// during this action. A handler may finish the subtree by draining directly
-/// (a resolution-time cost choice, a mana-colour choice, a Prevented-arm child
-/// block) without reaching the common boundary; the root is still the innermost
-/// unfinished work and resumes before the action returns. Inert unless a root is
-/// due under a Priority result.
+/// authority for a parked counter-cost root under a Priority result. A handler
+/// may finish the root's subtree by draining directly (a resolution-time cost
+/// choice, a mana-colour choice, a Prevented-arm child block), or leave it one
+/// advanceable step short (a mana-colour child whose last instruction is the
+/// mana, leaving its post-replacement dispatch paused), without reaching the
+/// common boundary. The activation is still being announced, so no player may
+/// receive priority until it is complete (CR 602.2b + CR 601.2h; CR 117.3c) and
+/// state-based actions are not checked mid-activation (CR 704.3): the common
+/// boundary's loop runs here, finishing the subtree and resuming the root before
+/// the action returns. `Some` only when that made progress — the wait changed or
+/// the root left its slot — so a subtree the loop cannot advance (residual 3)
+/// runs no convergence pass. Inert with no counter-cost root parked.
 fn resume_due_counter_cost_root_at_action_boundary(
     state: &mut GameState,
     waiting_for: &WaitingFor,
     events: &mut Vec<GameEvent>,
 ) -> Result<Option<WaitingFor>, EngineError> {
-    if !matches!(waiting_for, WaitingFor::Priority { .. }) || !state.counter_cost_root_is_due() {
+    if !matches!(waiting_for, WaitingFor::Priority { .. })
+        || state.counter_cost_root_subtree() == CounterCostRootSubtree::Absent
+    {
         return Ok(None);
     }
     sync_waiting_for(state, waiting_for);
     resume_pending_continuation_if_priority(state, events)?;
-    Ok(Some(state.waiting_for.clone()))
+    let progressed = state.waiting_for != *waiting_for
+        || state.counter_cost_root_subtree() == CounterCostRootSubtree::Absent;
+    Ok(progressed.then(|| state.waiting_for.clone()))
 }
 
 /// The action boundary's convergence pass: the ordinary post-action pipeline,
