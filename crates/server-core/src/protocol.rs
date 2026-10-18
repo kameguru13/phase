@@ -3473,11 +3473,11 @@ mod tests {
         }
     }
 
-    /// v148: `StaticCondition`, `TriggerCondition` and `AbilityCondition` gain
+    /// v150: `StaticCondition`, `TriggerCondition` and `AbilityCondition` gain
     /// `QuantityQuality { quantity, quality }` with the new `NumberQuality`
-    /// (CR 107.1, CR 603.4), carried in `GameState` ability definitions; a v147
+    /// (CR 107.1, CR 603.4), carried in `GameState` ability definitions; a v149
     /// peer cannot decode the new tag, so it must be refused before it receives
-    /// v148 state.
+    /// v150 state.
     /// The same bump adds the optional `created_tokens` channel to the private
     /// player-scope tail sidecar that `PendingContinuation` carries under its
     /// existing `player_scope_linked_exile` key (CR 608.2c + CR 608.2f: the
@@ -3485,6 +3485,15 @@ mod tests {
     /// tokens …" tail); it is serde-defaulted, so a sidecar without it decodes
     /// as the linked-exile-only sidecar.
     ///
+    /// v149: `GameState::deferred_spell_delivery` is gone and
+    /// `GameState::resolving_spell_final_part` marks the CR 608.2n final part a
+    /// paused instant or sorcery still owes; a v148 peer drops the key and would
+    /// move the spell before its paused instructions finish, so it must be refused
+    /// before it receives v149 state.
+    /// v148: Timesifter's top-card exile contest — `Effect::ExileTopCardContest`
+    /// in serialized ability definitions and the parked
+    /// `BatchCompletion::TopCardContestRoundComplete`; a v147 peer cannot parse
+    /// either tag, so it must be refused before it receives v148 state.
     /// v147: online physical contests (Eye to Eye, Mouth to Mouth) —
     /// `WaitingFor::PhysicalContest`, `Effect::PhysicalContest`, the two
     /// `PhysicalContest*` `GameEvent`s, `ClientMessage::ContestClick` and
@@ -3716,8 +3725,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_148_for_number_quality_conditions() {
-        assert_eq!(PROTOCOL_VERSION, 148);
+    fn protocol_version_is_150_for_number_quality_conditions() {
+        assert_eq!(PROTOCOL_VERSION, 150);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3728,7 +3737,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_148_for_number_quality_conditions` stays
+    /// `protocol_version_is_150_for_number_quality_conditions` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

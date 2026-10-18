@@ -3677,6 +3677,7 @@ fn legacy_effect(x: &Effect) -> bool {
             legacy_controller_ref(starting_with)
                 || per_choice_effect.iter().any(|d| legacy_definition(d))
         }
+        Effect::ExileTopCardContest { winner_effect } => legacy_definition(winner_effect),
         Effect::SeparateIntoPiles {
             object_filter,
             chosen_pile_effect,
@@ -6347,6 +6348,7 @@ fn rw_effect(
         | Effect::ChooseCard { .. }
         | Effect::ReturnAsAura { .. }
         | Effect::EpicCopy { .. }
+        | Effect::ExileTopCardContest { .. }
         | Effect::SeparateIntoPiles { .. }
         | Effect::ControlNextTurn { .. }
         | Effect::UnattachAll { .. }
