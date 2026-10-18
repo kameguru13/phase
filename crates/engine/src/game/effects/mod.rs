@@ -6498,18 +6498,25 @@ fn condition_reads_filter_population(
 /// carries in its OWN fields satisfies `leaf` — the effect-level twin of
 /// [`condition_reads_filter_population`].
 ///
-/// Boundary (the reader predicate): a position is read when it carries a
-/// `TargetFilter`, `PlayerFilter`, `StaticCondition` or `QuantityExpr` that
-/// this resolution evaluates while applying the effect, after which the answer
-/// is fixed — CR 608.2c (instructions in the order written), CR 608.2d (choices
-/// made on resolution), CR 608.2h (information determined once, when the effect
-/// is applied), CR 611.2b (a "for as long as" duration that never starts does
-/// nothing), CR 118.12 (a cost paid during resolution). An affected object
-/// need not be a target (CR 115.10a), so every population the effect names is a
-/// reader, whatever its role. Positions evaluated only later, when an event
-/// fires or a layer pass runs (trigger and replacement matchers, `StaticMode`
-/// filters, keyword payloads, a permission's or spend-grant's later cost), are
-/// not read here; filter-free types carry nothing to read.
+/// Boundary (the reader predicate): a position is a reader when it is
+/// reachable from the tail before the nearest publisher, carries a
+/// `TargetFilter`, `PlayerFilter`, `StaticCondition`, `TriggerCondition`,
+/// `ReplacementCondition` or `QuantityExpr`, and the engine evaluates it against
+/// `last_created_token_ids` at any time — while this resolution applies the
+/// effect, or later, while the ledger still holds what the route left. Now:
+/// CR 608.2c (instructions in the order written), CR 608.2d (choices made on
+/// resolution), CR 608.2h (information determined once, when the effect is
+/// applied), CR 611.2b (a "for as long as" duration), CR 118.12 (a cost paid
+/// during resolution). Later: trigger matchers when the event fires (CR 603.2,
+/// CR 603.4), replacement matchers each time the event would happen
+/// (CR 614.1), static modes and keyword payloads in live rules and layer checks
+/// (CR 611.3a), costs paid at a later cast. `LastCreated` is matched live in
+/// every such position (`filter.rs` reads the ledger), and a paused route that
+/// has not published the clause's union leaves only the last seat's tokens
+/// there, so a later read diverges from the synchronous route exactly as a
+/// read-once position does. An affected object need not be a target
+/// (CR 115.10a), so every population the effect names is a reader, whatever
+/// its role; filter-free types carry nothing to read.
 ///
 /// The walk is one level deep: nested definitions belong to
 /// [`nested_payload_reads_created_referent`], quantities to
@@ -6536,8 +6543,10 @@ fn effect_reads_filter_population(effect: &Effect, leaf: &dyn Fn(&TargetFilter) 
 }
 
 /// The own-field arms of [`effect_reads_filter_population`]: every filter,
-/// player population, duration, cost and choice the effect carries in its own
-/// fields, including each slot `target_filter()` surfaces (read by both).
+/// player population, duration, cost, choice, keyword, continuous
+/// modification, face-down profile and delayed-trigger matcher the effect
+/// carries in its own fields, including each slot `target_filter()` surfaces
+/// (read by both).
 /// EXHAUSTIVE on `Effect`, no `_` arm.
 fn effect_fields_read_filter_population(
     effect: &Effect,
@@ -6555,6 +6564,17 @@ fn effect_fields_read_filter_population(
     let has_duration = |duration: &Duration| duration_reads_filter_population(duration, leaf);
     let has_cost = |cost: &AbilityCost| ability_cost_reads_filter_population(cost, leaf);
     let has_choice = |choice: &ChoiceType| choice_type_reads_filter_population(choice, leaf);
+    let has_keyword =
+        |keyword: &crate::types::keywords::Keyword| keyword_reads_filter_population(keyword, leaf);
+    let has_modification = |modification: &ContinuousModification| {
+        continuous_modification_reads_filter_population(modification, leaf)
+    };
+    let has_face_down = |profile: &crate::types::ability::FaceDownProfile| {
+        profile
+            .ward
+            .as_ref()
+            .is_some_and(|ward| ward_cost_reads_filter_population(ward, leaf))
+    };
     match effect {
         // Populations `target_filter()` hides for an `EffectScope::All`
         // scope: CR 701.26a/b (tap/untap), CR 701.27a (transform), CR 615.1
@@ -6660,9 +6680,11 @@ fn effect_fields_read_filter_population(
             target,
             recipient,
             duration,
+            additional_modifications,
             ..
         } => {
             has_filter(target)
+                || additional_modifications.iter().any(has_modification)
                 || match recipient {
                     CopyRecipient::Target(filter) | CopyRecipient::Untargeted(filter) => {
                         has_filter(filter)
@@ -6700,8 +6722,12 @@ fn effect_fields_read_filter_population(
                     ManaSpellGrant::CantBeCountered { filter }
                     | ManaSpellGrant::EntersWithCounters { filter, .. }
                     | ManaSpellGrant::TriggerOnSpend { filter, .. } => has_filter(filter),
-                    // Applied when the mana is spent, later: not read here.
-                    ManaSpellGrant::AddKeywordUntilEndOfTurn { .. } => false,
+                    // Its `restriction` (`ManaRestriction`) carries no filter.
+                    ManaSpellGrant::AddKeywordUntilEndOfTurn {
+                        keyword,
+                        restriction: _,
+                        duration,
+                    } => has_keyword(keyword) || has_duration(duration),
                 })
                 || target.as_ref().is_some_and(|role| match role {
                     ManaTargetRole::Recipient { recipient } => has_filter(recipient),
@@ -6743,8 +6769,9 @@ fn effect_fields_read_filter_population(
             GameRestriction::DamagePreventionDisabled { .. }
             | GameRestriction::ProhibitActivity { .. } => false,
         },
-        // A permission granted now: its card filter and its duration. Its
-        // alternative cost is paid when the card is cast later.
+        // A permission granted now: its card filter, its duration, the
+        // alternative cost paid when the card is cast later, and the
+        // modifications the card enters with.
         Effect::GrantCastingPermission {
             permission, target, ..
         } => {
@@ -6753,11 +6780,23 @@ fn effect_fields_read_filter_population(
                     CastingPermission::PlayFromExile {
                         card_filter,
                         duration,
+                        alt_ability_cost,
                         ..
-                    } => card_filter.as_ref().is_some_and(has_filter) || has_duration(duration),
-                    CastingPermission::ExileWithAltCost { duration, .. }
-                    | CastingPermission::ExileWithAltAbilityCost { duration, .. } => {
+                    } => {
+                        card_filter.as_ref().is_some_and(has_filter)
+                            || has_duration(duration)
+                            || alt_ability_cost.as_ref().is_some_and(has_cost)
+                    }
+                    CastingPermission::ExileWithAltCost {
+                        duration,
+                        enters_with_modifications,
+                        ..
+                    } => {
                         duration.as_ref().is_some_and(has_duration)
+                            || enters_with_modifications.iter().any(has_modification)
+                    }
+                    CastingPermission::ExileWithAltAbilityCost { cost, duration, .. } => {
+                        has_cost(cost) || duration.as_ref().is_some_and(has_duration)
                     }
                     CastingPermission::AdventureCreature
                     | CastingPermission::ExileWithEnergyCost
@@ -6819,8 +6858,15 @@ fn effect_fields_read_filter_population(
         Effect::RemoveAllDamage { target } => has_filter(target),
         Effect::CounterAll { target } => has_filter(target),
         Effect::Token {
-            owner, attach_to, ..
-        } => has_filter(owner) || attach_to.as_ref().is_some_and(has_filter),
+            owner,
+            attach_to,
+            keywords,
+            ..
+        } => {
+            has_filter(owner)
+                || attach_to.as_ref().is_some_and(has_filter)
+                || keywords.iter().any(has_keyword)
+        }
         Effect::GainLife { player, .. } => has_filter(player),
         Effect::LoseLife { target, .. } => target.as_ref().is_some_and(has_filter),
         Effect::RemoveCounter { target, .. } => has_filter(target),
@@ -6834,15 +6880,21 @@ fn effect_fields_read_filter_population(
             target,
             conditional_enter_with_counters,
             enters_modified_if,
+            face_down_profile,
             ..
         } => {
             has_filter(target)
+                || face_down_profile.as_ref().is_some_and(has_face_down)
                 || conditional_enter_with_counters
                     .iter()
                     .any(|(filter, _, _)| has_filter(filter))
                 || enters_modified_if.as_ref().is_some_and(has_filter)
         }
-        Effect::ChangeZoneAll { target, .. } => has_filter(target),
+        Effect::ChangeZoneAll {
+            target,
+            face_down_profile,
+            ..
+        } => has_filter(target) || face_down_profile.as_ref().is_some_and(has_face_down),
         Effect::Dig { player, filter, .. } => has_filter(player) || has_filter(filter),
         Effect::GainControl { target } => has_filter(target),
         Effect::GainControlAll { target } => has_filter(target),
@@ -6860,17 +6912,25 @@ fn effect_fields_read_filter_population(
         Effect::Behold { filter } => has_filter(filter),
         Effect::SeparateIntoPiles { object_filter, .. } => has_filter(object_filter),
         Effect::SwitchPT { target } => has_filter(target),
-        Effect::CopySpell { target, .. } => has_filter(target),
+        Effect::CopySpell {
+            target,
+            additional_modifications,
+            ..
+        } => has_filter(target) || additional_modifications.iter().any(has_modification),
         Effect::CastCopyOfCard { target, .. } => has_filter(target),
         Effect::CopyTokenOf {
             target,
             owner,
             source_filter,
+            extra_keywords,
+            additional_modifications,
             ..
         } => {
             has_filter(target)
                 || has_filter(owner)
                 || source_filter.as_ref().is_some_and(has_filter)
+                || extra_keywords.iter().any(has_keyword)
+                || additional_modifications.iter().any(has_modification)
         }
         Effect::CreateTokenCopyFromPool {
             owner, type_filter, ..
@@ -6911,8 +6971,13 @@ fn effect_fields_read_filter_population(
         Effect::DoublePTAll { target, .. } => has_filter(target),
         Effect::MoveCounters { source, target, .. } => has_filter(source) || has_filter(target),
         Effect::ReproduceEventCounters { target, .. } => has_filter(target),
-        Effect::Animate { target, .. } => has_filter(target),
-        Effect::ReturnAsAura { enchant_filter, .. } => has_filter(enchant_filter),
+        Effect::Animate {
+            target, keywords, ..
+        } => has_filter(target) || keywords.iter().any(has_keyword),
+        Effect::ReturnAsAura {
+            enchant_filter,
+            grants,
+        } => has_filter(enchant_filter) || grants.iter().any(has_modification),
         Effect::GenericEffect {
             duration, target, ..
         } => duration.as_ref().is_some_and(has_duration) || target.as_ref().is_some_and(has_filter),
@@ -6955,8 +7020,20 @@ fn effect_fields_read_filter_population(
         Effect::ReduceNextSpellCost { spell_filter, .. } => {
             spell_filter.as_ref().is_some_and(has_filter)
         }
-        Effect::GrantNextSpellAbility { spell_filter, .. } => {
+        Effect::GrantNextSpellAbility {
+            modifier,
+            spell_filter,
+            ..
+        } => {
             spell_filter.as_ref().is_some_and(has_filter)
+                || match modifier {
+                    crate::types::game_state::NextSpellModifier::HasKeyword { keyword } => {
+                        has_keyword(keyword)
+                    }
+                    crate::types::game_state::NextSpellModifier::CantBeCountered
+                    | crate::types::game_state::NextSpellModifier::CastAsThoughFlash
+                    | crate::types::game_state::NextSpellModifier::WithoutPayingManaCost => false,
+                }
         }
         Effect::CreateBoon { recipient, .. } => has_filter(recipient),
         Effect::FreeCastFromZones { filter, .. } => has_filter(filter),
@@ -6990,7 +7067,11 @@ fn effect_fields_read_filter_population(
             sacrifice_filter,
             ..
         } => has_filter(choose_filter) || has_filter(sacrifice_filter),
-        Effect::EachPlayerCopyChosen { choose_filter, .. } => has_filter(choose_filter),
+        Effect::EachPlayerCopyChosen {
+            choose_filter,
+            copy_modifications,
+            ..
+        } => has_filter(choose_filter) || copy_modifications.iter().any(has_modification),
         Effect::Exploit { target } => has_filter(target),
         Effect::GivePlayerCounter { target, .. } => has_filter(target),
         Effect::LoseAllPlayerCounters { target } => has_filter(target),
@@ -7024,15 +7105,22 @@ fn effect_fields_read_filter_population(
         Effect::Manifest {
             target,
             object_source,
+            profile,
             ..
-        } => has_filter(target) || object_source.as_ref().is_some_and(has_filter),
+        } => {
+            has_filter(target)
+                || object_source.as_ref().is_some_and(has_filter)
+                || profile.as_ref().is_some_and(has_face_down)
+        }
         Effect::Cloak {
             target,
             object_source,
             ..
         } => has_filter(target) || object_source.as_ref().is_some_and(has_filter),
         Effect::TurnFaceUp { target } => has_filter(target),
-        Effect::TurnFaceDown { target, .. } => has_filter(target),
+        Effect::TurnFaceDown { target, profile } => {
+            has_filter(target) || profile.as_ref().is_some_and(has_face_down)
+        }
         Effect::ExtraTurn { target, .. } => has_filter(target),
         Effect::GrantExtraLoyaltyActivations { target, .. } => has_filter(target),
         Effect::SkipNextTurn { target, .. } => has_filter(target),
@@ -7050,7 +7138,15 @@ fn effect_fields_read_filter_population(
         Effect::GiveControl { target, recipient } => has_filter(target) || has_filter(recipient),
         Effect::RemoveFromCombat { target } => has_filter(target),
         Effect::BecomeBlocked { target } => has_filter(target),
-        Effect::ApplyPerpetual { target, .. } => has_filter(target),
+        Effect::ApplyPerpetual {
+            target,
+            modification,
+        } => {
+            has_filter(target) || perpetual_modification_reads_filter_population(modification, leaf)
+        }
+        Effect::AddPendingEntersModifications { modifications } => {
+            modifications.iter().any(has_modification)
+        }
         // Effects whose own fields carry no filter, player population,
         // duration, cost or choice: only their quantities (read above) and
         // nested definitions (the nested walk's) can read.
@@ -7076,7 +7172,6 @@ fn effect_fields_read_filter_population(
         | Effect::SolveCase
         | Effect::SetClassLevel { .. }
         | Effect::AddPendingETBCounters { .. }
-        | Effect::AddPendingEntersModifications { .. }
         | Effect::CreateEmblem { .. }
         | Effect::NoteNumber { .. }
         | Effect::CreateDrawReplacement { .. }
@@ -7126,12 +7221,12 @@ fn effect_fields_read_filter_population(
     }
 }
 
-/// CR 611.2b: a "for as long as" duration is tested once, when the effect
-/// would begin (`GameState::transient_duration_begins` →
-/// `layers::resolved_duration_begins`); if it never starts, the effect does
-/// nothing, so its condition is read on resolution. An `UntilEvent` deadline is
-/// a trigger matcher evaluated when a later event fires, and the remaining
-/// durations carry no filter. Exhaustive, no `_` arm.
+/// CR 611.2b: a "for as long as" duration is tested when the effect would
+/// begin (`GameState::transient_duration_begins` →
+/// `layers::resolved_duration_begins`) and on each later settled board, so its
+/// condition is read. An `UntilEvent` deadline's trigger matchers are matched
+/// against the live ledger when a later event fires, so they are read too. The
+/// remaining durations carry no filter. Exhaustive, no `_` arm.
 fn duration_reads_filter_population(
     duration: &Duration,
     leaf: &dyn Fn(&TargetFilter) -> bool,
@@ -7140,8 +7235,8 @@ fn duration_reads_filter_population(
         Duration::ForAsLongAs { condition } => {
             static_condition_reads_filter_population(condition, leaf)
         }
-        Duration::UntilEvent { .. }
-        | Duration::UntilEndOfTurn
+        Duration::UntilEvent { event } => trigger_matchers_read_filter_population(event, leaf),
+        Duration::UntilEndOfTurn
         | Duration::UntilEndOfCombat
         | Duration::UntilNextTurnOf { .. }
         | Duration::UntilEndOfNextTurnOf { .. }
@@ -7224,15 +7319,19 @@ fn ability_cost_reads_filter_population(
 }
 
 /// CR 608.2d: whether a choice made while this resolution applies its
-/// instructions restricts its options by a player population satisfying
-/// `leaf`. Only an opponent choice carries a `PlayerFilter`; every other kind
-/// offers a fixed vocabulary. Exhaustive, no `_` arm.
+/// instructions restricts or offers options naming a population satisfying
+/// `leaf`: an opponent choice's `PlayerFilter`, or the payloads of the keywords
+/// a keyword choice offers. Every other kind offers a fixed vocabulary.
+/// Exhaustive, no `_` arm.
 fn choice_type_reads_filter_population(
     choice: &crate::types::ability::ChoiceType,
     leaf: &dyn Fn(&TargetFilter) -> bool,
 ) -> bool {
     use crate::types::ability::ChoiceType;
     match choice {
+        ChoiceType::Keyword { options, count: _ } => options
+            .iter()
+            .any(|keyword| keyword_reads_filter_population(keyword, leaf)),
         ChoiceType::Opponent { restriction, .. } => restriction
             .as_deref()
             .is_some_and(|player| filter::player_filter_contains(player, leaf)),
@@ -7251,16 +7350,18 @@ fn choice_type_reads_filter_population(
         | ChoiceType::TwoColors
         | ChoiceType::Word
         | ChoiceType::Artist
-        | ChoiceType::Keyword { .. }
         | ChoiceType::CounterKind { .. } => false,
     }
 }
 
-/// The filters a delayed trigger's condition carries. CR 603.7c: a delayed
-/// trigger created by this resolution refers to the objects fixed when it is
-/// created, so its own filter arms are read. The embedded triggers of
-/// `WheneverEvent` / `WhenNextEvent` are matchers evaluated when a later event
-/// fires, and are not read here. Exhaustive, no `_` arm.
+/// The filters a delayed trigger's condition carries, grouped as
+/// `delayed_trigger::condition_filter_groups` enumerates them. Creation binds
+/// only `ParentTarget` slots there, and snapshots `LastCreated` only in a target
+/// position of the payload (CR 603.7c), so every condition filter — the four
+/// `filter` arms and the matchers of the embedded `WheneverEvent` /
+/// `WhenNextEvent` triggers (including `or_trigger`) — is evaluated live against
+/// `last_created_token_ids` when the event fires, and so is read. Exhaustive,
+/// no `_` arm.
 fn delayed_trigger_condition_reads_filter_population(
     condition: &crate::types::ability::DelayedTriggerCondition,
     leaf: &dyn Fn(&TargetFilter) -> bool,
@@ -7273,12 +7374,23 @@ fn delayed_trigger_condition_reads_filter_population(
         | DelayedTriggerCondition::WhenDiesOrExiled { filter } => {
             filter::filter_contains(filter, leaf)
         }
+        DelayedTriggerCondition::WheneverEvent { trigger, expiry: _ } => {
+            trigger_matchers_read_filter_population(trigger, leaf)
+        }
+        DelayedTriggerCondition::WhenNextEvent {
+            trigger,
+            or_trigger,
+            lifetime: _,
+        } => {
+            trigger_matchers_read_filter_population(trigger, leaf)
+                || or_trigger.as_deref().is_some_and(|alternative| {
+                    trigger_matchers_read_filter_population(alternative, leaf)
+                })
+        }
         DelayedTriggerCondition::AtNextPhase { .. }
         | DelayedTriggerCondition::AtNextPhaseForPlayer { .. }
         | DelayedTriggerCondition::AtBeginningOfAddedPhase { .. }
-        | DelayedTriggerCondition::WhenLeavesPlay { .. }
-        | DelayedTriggerCondition::WheneverEvent { .. }
-        | DelayedTriggerCondition::WhenNextEvent { .. } => false,
+        | DelayedTriggerCondition::WhenLeavesPlay { .. } => false,
     }
 }
 
@@ -7370,6 +7482,1198 @@ fn static_condition_reads_filter_population(
         | StaticCondition::AdditionalCostPaid
         | StaticCondition::CastingAsVariant { .. }
         | StaticCondition::None => false,
+    }
+}
+
+/// Whether a protection quality names a population satisfying `leaf`.
+/// Exhaustive, no `_` arm.
+fn protection_target_reads_filter_population(
+    target: &crate::types::keywords::ProtectionTarget,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    use crate::types::keywords::ProtectionTarget;
+    match target {
+        ProtectionTarget::Filter(filter) => filter::filter_contains(filter, leaf),
+        ProtectionTarget::Color(_)
+        | ProtectionTarget::CardType(_)
+        | ProtectionTarget::Quality(_)
+        | ProtectionTarget::Multicolored
+        | ProtectionTarget::ChosenColor
+        | ProtectionTarget::ChosenCardType
+        | ProtectionTarget::ChosenPlayer
+        | ProtectionTarget::Everything
+        | ProtectionTarget::FromPlayer(_) => false,
+    }
+}
+
+/// Whether a ward cost names a population satisfying `leaf`. Exhaustive, no
+/// `_` arm.
+fn ward_cost_reads_filter_population(
+    cost: &crate::types::keywords::WardCost,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    use crate::types::keywords::WardCost;
+    match cost {
+        WardCost::Sacrifice { filter, .. } => filter::filter_contains(filter, leaf),
+        WardCost::Compound(costs) => costs
+            .iter()
+            .any(|cost| ward_cost_reads_filter_population(cost, leaf)),
+        WardCost::Mana(_)
+        | WardCost::PayLife(_)
+        | WardCost::PayLifeEqualToPower
+        | WardCost::DiscardCard
+        | WardCost::Waterbend(_)
+        | WardCost::GetPlayerCounters { .. } => false,
+    }
+}
+
+/// Whether a trigger definition's MATCHERS name a population satisfying `leaf`:
+/// its four filter slots (`valid_card`, `valid_source`, `valid_target`,
+/// `valid_subject_player`, as `delayed_trigger::condition_filter_groups`
+/// enumerates them), its zone-change clauses, its constraint, its condition and
+/// its `unless_pay`. They are evaluated when the trigger's event fires
+/// (CR 603.2, CR 603.4), against the live ledger. Its `execute` chain is the
+/// nested walk's. The struct is destructured without `..`, so a new field is a
+/// compile error here.
+fn trigger_matchers_read_filter_population(
+    trigger: &crate::types::ability::TriggerDefinition,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    let crate::types::ability::TriggerDefinition {
+        mode: _,
+        execute: _,
+        valid_card,
+        origin: _,
+        origin_zones: _,
+        zone_change_clauses,
+        destination: _,
+        destination_constraint: _,
+        trigger_zones: _,
+        phase: _,
+        optional: _,
+        damage_kind: _,
+        secondary: _,
+        valid_target,
+        valid_subject_player,
+        valid_source,
+        spell_cast_origin: _,
+        description: _,
+        constraint,
+        condition,
+        counter_filter: _,
+        saga_chapter: _,
+        unless_pay,
+        batched: _,
+        die_sides: _,
+        expend_threshold: _,
+        attack_target_filter: _,
+        player_actions: _,
+        scry_bottom_count: _,
+        damage_amount: _,
+        life_amount: _,
+        coin_flip_result: _,
+        die_result: _,
+        taps_for_mana_produced: _,
+        mana_ability_produced: _,
+        clash_result: _,
+        room_door: _,
+        granting_object: _,
+    } = trigger;
+    [valid_card, valid_target, valid_subject_player, valid_source]
+        .into_iter()
+        .flatten()
+        .any(has_filter)
+        || zone_change_clauses
+            .iter()
+            .any(|clause| clause.valid_card.as_ref().is_some_and(has_filter))
+        || constraint
+            .as_ref()
+            .is_some_and(|constraint| trigger_constraint_reads_filter_population(constraint, leaf))
+        || condition
+            .as_ref()
+            .is_some_and(|condition| trigger_condition_reads_filter_population(condition, leaf))
+        || unless_pay.as_ref().is_some_and(|unless_pay| {
+            ability_cost_reads_filter_population(&unless_pay.cost, leaf)
+                || has_filter(&unless_pay.payer)
+        })
+}
+
+/// Whether a replacement definition's MATCHERS and own values name a
+/// population satisfying `leaf`: `valid_card`, `damage_source_filter`,
+/// `redirect_target`, its condition, a `MayCost` cost, a damage magnitude, and
+/// the keywords, statics and sacrifice duration of the token specs it adds.
+/// They are evaluated each time the replaced event would happen (CR 614.1),
+/// against the live ledger. Its `execute` and decline chains are the nested
+/// walk's. The struct is destructured without `..`, so a new field is a
+/// compile error here.
+fn replacement_matchers_read_filter_population(
+    replacement: &crate::types::ability::ReplacementDefinition,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    use crate::types::ability::{DamageModification, ReplacementMode};
+    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    let crate::types::ability::ReplacementDefinition {
+        event: _,
+        execute: _,
+        runtime_execute: _,
+        mode,
+        choice_authority: _,
+        valid_card,
+        description: _,
+        condition,
+        destination_zone: _,
+        active_zones: _,
+        damage_modification,
+        damage_source_filter,
+        damage_target_filter: _,
+        combat_scope: _,
+        draw_scope: _,
+        die_ignore_rule: _,
+        planeswalk_scope: _,
+        shield_kind: _,
+        quantity_modification: _,
+        token_owner_scope: _,
+        token_owner_redirect: _,
+        valid_player: _,
+        consume_on_apply: _,
+        is_consumed: _,
+        expiry: _,
+        redirect_target,
+        mana_modification: _,
+        mana_replacement_scope: _,
+        additional_token_spec,
+        ensure_token_specs,
+        counter_match: _,
+        enters_under: _,
+        source_controller: _,
+        source_object: _,
+        origin: _,
+        counter_replacement_subject: _,
+        granting_object: _,
+    } = replacement;
+    let token_spec_reads = |spec: &crate::types::proposed_event::TokenSpec| {
+        spec.characteristics
+            .keywords
+            .iter()
+            .any(|keyword| keyword_reads_filter_population(keyword, leaf))
+            || spec
+                .static_abilities
+                .iter()
+                .any(|static_def| static_definition_reads_filter_population(static_def, leaf))
+            || spec
+                .sacrifice_at
+                .as_ref()
+                .is_some_and(|duration| duration_reads_filter_population(duration, leaf))
+    };
+    [valid_card, damage_source_filter, redirect_target]
+        .into_iter()
+        .flatten()
+        .any(has_filter)
+        || condition
+            .as_ref()
+            .is_some_and(|condition| replacement_condition_reads_filter_population(condition, leaf))
+        || match mode {
+            ReplacementMode::MayCost { cost, decline: _ } => {
+                ability_cost_reads_filter_population(cost, leaf)
+            }
+            ReplacementMode::Mandatory | ReplacementMode::Optional { decline: _ } => false,
+        }
+        || match damage_modification {
+            Some(DamageModification::Plus { value }) => {
+                quantity_expr_counts_population_matching(value, leaf)
+            }
+            Some(
+                DamageModification::Double
+                | DamageModification::Triple
+                | DamageModification::Minus { .. }
+                | DamageModification::PreventionMinus { .. }
+                | DamageModification::SetToSourcePower
+                | DamageModification::SetTo { .. }
+                | DamageModification::LifeFloor { .. },
+            )
+            | None => false,
+        }
+        || additional_token_spec
+            .as_deref()
+            .is_some_and(token_spec_reads)
+        || ensure_token_specs.iter().flatten().any(token_spec_reads)
+}
+
+/// Whether a static definition's OWN positions name a population satisfying
+/// `leaf`: its `affected` set, its mode, each modification's own values, its
+/// enabling condition (compound operands included) and its per-player
+/// condition. A resolving effect evaluates the condition once when it is applied
+/// (CR 608.2h + CR 611.2d); everything else is evaluated live (CR 611.3a). The
+/// definitions its modifications grant or copy are nested and belong to the
+/// caller's walk. The struct is destructured without `..`, so a new field is a
+/// compile error here.
+fn static_definition_reads_filter_population(
+    static_def: &StaticDefinition,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    let StaticDefinition {
+        mode,
+        affected,
+        modifications,
+        condition,
+        per_player_condition,
+        affected_zone: _,
+        effect_zone: _,
+        active_zones: _,
+        characteristic_defining: _,
+        description: _,
+        attack_defended: _,
+        source_controller: _,
+        source_object: _,
+        bypass_beneficiary: _,
+        protection_does_not_remove: _,
+        room_door: _,
+        granting_object: _,
+    } = static_def;
+    affected
+        .as_ref()
+        .is_some_and(|affected| filter::filter_contains(affected, leaf))
+        || static_mode_reads_filter_population(mode, leaf)
+        || modifications
+            .iter()
+            .any(|modification| continuous_modification_reads_filter_population(modification, leaf))
+        || condition
+            .as_ref()
+            .is_some_and(|condition| static_condition_reads_filter_population(condition, leaf))
+        || per_player_condition
+            .as_ref()
+            .is_some_and(|condition| parsed_condition_reads_filter_population(condition, leaf))
+}
+
+/// Whether a perpetual modification's own values name a population satisfying
+/// `leaf`: its quantities, keywords, static modes and granted trigger
+/// matchers. A granted ability definition is nested. Exhaustive, no `_` arm.
+fn perpetual_modification_reads_filter_population(
+    modification: &crate::types::ability::PerpetualModification,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    use crate::types::ability::{PerpetualGrantModification, PerpetualModification};
+    let has_keywords = |keywords: &[crate::types::keywords::Keyword]| {
+        keywords
+            .iter()
+            .any(|keyword| keyword_reads_filter_population(keyword, leaf))
+    };
+    match modification {
+        PerpetualModification::ModifyPowerToughness {
+            power,
+            toughness,
+            keywords,
+        } => {
+            quantity_expr_counts_population_matching(power, leaf)
+                || quantity_expr_counts_population_matching(toughness, leaf)
+                || has_keywords(keywords)
+        }
+        PerpetualModification::GrantKeywords { keywords }
+        | PerpetualModification::Become { keywords, .. } => has_keywords(keywords),
+        PerpetualModification::GrantAbility { modifications } => {
+            modifications.iter().any(|grant| match grant {
+                PerpetualGrantModification::AddKeyword { keyword } => {
+                    keyword_reads_filter_population(keyword, leaf)
+                }
+                PerpetualGrantModification::AddStaticMode { mode } => {
+                    static_mode_reads_filter_population(mode, leaf)
+                }
+                PerpetualGrantModification::GrantTrigger { trigger } => {
+                    trigger_matchers_read_filter_population(trigger, leaf)
+                }
+                // A granted ability definition is a nested definition.
+                PerpetualGrantModification::GrantAbility { definition: _ } => false,
+            })
+        }
+        PerpetualModification::SetBasePowerToughness { .. }
+        | PerpetualModification::ModifyCost { .. } => false,
+    }
+}
+
+/// Whether a trigger condition names a population satisfying `leaf`. It is
+/// evaluated when the trigger's event fires, against the live ledger
+/// (CR 603.4 intervening "if" / CR 603.2 event matching). Exhaustive, no `_` arm.
+fn trigger_condition_reads_filter_population(
+    condition: &crate::types::ability::TriggerCondition,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    use crate::types::ability::{AttackersDeclaredCountSubject, TriggerCondition};
+    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    let has_player = |player: &PlayerFilter| filter::player_filter_contains(player, leaf);
+    let has_quantity =
+        |quantity: &QuantityExpr| quantity_expr_counts_population_matching(quantity, leaf);
+    let recurse = |inner: &TriggerCondition| trigger_condition_reads_filter_population(inner, leaf);
+    match condition {
+        TriggerCondition::ControlsType { filter } => has_filter(filter),
+        TriggerCondition::DuringPlayersTurn { player } => has_player(player),
+        TriggerCondition::MinCoAttackers { filter, .. } => filter.as_ref().is_some_and(has_filter),
+        TriggerCondition::DealtDamageThisTurnBySource { source } => has_filter(source),
+        TriggerCondition::ControlCount { filter, .. } => has_filter(filter),
+        TriggerCondition::ControlsNone { filter } => has_filter(filter),
+        TriggerCondition::CastSpellThisTurn { filter } => filter.as_ref().is_some_and(has_filter),
+        TriggerCondition::QuantityComparison { lhs, rhs, .. } => {
+            has_quantity(lhs) || has_quantity(rhs)
+        }
+        TriggerCondition::QuantityQuality { quantity, .. } => has_quantity(quantity),
+        TriggerCondition::DefendingPlayerControlsNone { filter } => has_filter(filter),
+        TriggerCondition::ZoneChangeObjectMatchesFilter { filter, .. } => has_filter(filter),
+        TriggerCondition::SourceMatchesFilter { filter } => has_filter(filter),
+        TriggerCondition::EventDamageSourceMatchesFilter { filter } => has_filter(filter),
+        TriggerCondition::EventObjectMatchesFilter { filter } => has_filter(filter),
+        TriggerCondition::AttackersDeclaredCount { subject, .. } => match subject {
+            AttackersDeclaredCountSubject::Controller { filter, .. }
+            | AttackersDeclaredCountSubject::AttackTarget { filter, .. } => {
+                filter.as_ref().is_some_and(has_filter)
+            }
+        },
+        TriggerCondition::TriggeringSpellTargetsFilter { filter } => has_filter(filter),
+        TriggerCondition::TriggeringSpellMatchesFilter { filter } => has_filter(filter),
+        TriggerCondition::And { conditions } => conditions.iter().any(recurse),
+        TriggerCondition::Or { conditions } => conditions.iter().any(recurse),
+        TriggerCondition::Not { condition } => recurse(condition),
+        TriggerCondition::EventTime { condition } => recurse(condition),
+        // Filter-free: nothing to read.
+        TriggerCondition::GainedLife { .. }
+        | TriggerCondition::LostLife
+        | TriggerCondition::Descended
+        | TriggerCondition::NoSpellsCastLastTurn
+        | TriggerCondition::TwoOrMoreSpellsCastLastTurn
+        | TriggerCondition::SourceEnteredThisTurn
+        | TriggerCondition::SourceAttackedThisCombat
+        | TriggerCondition::ChoseOtherRingBearer
+        | TriggerCondition::ChoseRingBearer
+        | TriggerCondition::EchoDue
+        | TriggerCondition::SolveConditionMet
+        | TriggerCondition::ClassLevelGE { .. }
+        | TriggerCondition::SourceIsHarnessed
+        | TriggerCondition::AttractionVisitRoll { .. }
+        | TriggerCondition::WasCast { .. }
+        | TriggerCondition::WasPlayed
+        | TriggerCondition::AdditionalCostPaid { .. }
+        | TriggerCondition::SourceIsAttacking
+        | TriggerCondition::CastVariantPaid { .. }
+        | TriggerCondition::CastVariantPaidPersistent { .. }
+        | TriggerCondition::ActivatedAbilityIsNonMana
+        | TriggerCondition::DealtDamageBySourceThisTurn
+        | TriggerCondition::FirstTimeObjectTappedThisTurn
+        | TriggerCondition::FirstTimeObjectCountersAddedThisTurn
+        | TriggerCondition::WasType { .. }
+        | TriggerCondition::LifeTotalGE { .. }
+        | TriggerCondition::AttackedThisTurn
+        | TriggerCondition::FirstCombatPhaseOfTurn
+        | TriggerCondition::HasMaxSpeed
+        | TriggerCondition::IsMonarch { .. }
+        | TriggerCondition::HasBoon { .. }
+        | TriggerCondition::IsInitiative
+        | TriggerCondition::NoMonarch
+        | TriggerCondition::WasStartingPlayer { .. }
+        | TriggerCondition::SpellCastWithVariantThisTurn { .. }
+        | TriggerCondition::HasCityBlessing
+        | TriggerCondition::HasEnduringStory
+        | TriggerCondition::CompletedDungeon { .. }
+        | TriggerCondition::SourceIsTapped
+        | TriggerCondition::SourceIsTransformed
+        | TriggerCondition::SourceIsFaceUp
+        | TriggerCondition::SourceIsFaceDown
+        | TriggerCondition::SourceInZone { .. }
+        | TriggerCondition::CounterAddedThisTurn
+        | TriggerCondition::LostLifeLastTurn
+        | TriggerCondition::TributeNotPaid
+        | TriggerCondition::CastDuringPhase { .. }
+        | TriggerCondition::CastTimingPermission { .. }
+        | TriggerCondition::ManaColorSpent { .. }
+        | TriggerCondition::ManaSpentCondition { .. }
+        | TriggerCondition::HadCounters { .. }
+        | TriggerCondition::ControlsCommander { .. }
+        | TriggerCondition::IsRenowned { .. }
+        | TriggerCondition::HasCounters { .. }
+        | TriggerCondition::ZoneChangeObjectIsTapped
+        | TriggerCondition::DamagedPlayerIsEventSourceOwner
+        | TriggerCondition::ChosenLabelIs { .. }
+        | TriggerCondition::ExceptFirstDrawInDrawStep
+        | TriggerCondition::PlacedByAbilitySource
+        | TriggerCondition::AddedManaWithThisAbilityThisTurn => false,
+    }
+}
+
+/// Whether a trigger constraint names a population satisfying `leaf`.
+/// Exhaustive, no `_` arm.
+fn trigger_constraint_reads_filter_population(
+    constraint: &crate::types::ability::TriggerConstraint,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    use crate::types::ability::TriggerConstraint;
+    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    match constraint {
+        TriggerConstraint::NthSpellThisTurn { filter, .. } => {
+            filter.as_ref().is_some_and(has_filter)
+        }
+        // Filter-free: nothing to read.
+        TriggerConstraint::OncePerTurn
+        | TriggerConstraint::OncePerGame
+        | TriggerConstraint::OnlyDuringYourTurn
+        | TriggerConstraint::NthDrawThisTurn { .. }
+        | TriggerConstraint::OnlyDuringOpponentsTurn
+        | TriggerConstraint::OnlyDuringYourMainPhase
+        | TriggerConstraint::AtClassLevel { .. }
+        | TriggerConstraint::MaxTimesPerTurn { .. }
+        | TriggerConstraint::OncePerOpponentPerTurn
+        | TriggerConstraint::EventSourceControlledBy { .. } => false,
+    }
+}
+
+/// Whether a replacement condition names a population satisfying `leaf`. It is
+/// evaluated each time the replaced event would happen (CR 614.1). Exhaustive,
+/// no `_` arm.
+fn replacement_condition_reads_filter_population(
+    condition: &crate::types::ability::ReplacementCondition,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    use crate::types::ability::ReplacementCondition;
+    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    let has_quantity =
+        |quantity: &QuantityExpr| quantity_expr_counts_population_matching(quantity, leaf);
+    let has_typed = |typed: &TypedFilter| {
+        typed
+            .properties
+            .iter()
+            .any(|prop| filter::filter_prop_contains(prop, leaf))
+    };
+    let recurse =
+        |inner: &ReplacementCondition| replacement_condition_reads_filter_population(inner, leaf);
+    match condition {
+        ReplacementCondition::And { conditions } => conditions.iter().any(recurse),
+        ReplacementCondition::UnlessControlsOtherLeq { filter, .. } => has_typed(filter),
+        ReplacementCondition::UnlessControlsMatching { filter } => has_filter(filter),
+        ReplacementCondition::UnlessControlsCountMatching { filter, .. } => has_filter(filter),
+        ReplacementCondition::UnlessQuantity { lhs, rhs, .. } => {
+            has_quantity(lhs) || has_quantity(rhs)
+        }
+        ReplacementCondition::OnlyIfQuantity { lhs, rhs, .. } => {
+            has_quantity(lhs) || has_quantity(rhs)
+        }
+        ReplacementCondition::DealtDamageThisTurnBySource { source } => has_filter(source),
+        ReplacementCondition::IfControlsMatching { filter, .. } => has_filter(filter),
+        // Filter-free: nothing to read.
+        ReplacementCondition::UnlessControlsSubtype { .. }
+        | ReplacementCondition::UnlessPlayerLifeAtMost { .. }
+        | ReplacementCondition::UnlessMultipleOpponents
+        | ReplacementCondition::UnlessYourTurn
+        | ReplacementCondition::HasMaxSpeed
+        | ReplacementCondition::CastViaEscape
+        | ReplacementCondition::CastVariantPaid { .. }
+        | ReplacementCondition::TurnUpCostSourcePaid { .. }
+        | ReplacementCondition::CastFromZone { .. }
+        | ReplacementCondition::EnteredFromZone { .. }
+        | ReplacementCondition::YouAttackedThisTurn
+        | ReplacementCondition::OpponentDamagedThisTurn
+        | ReplacementCondition::CastViaKicker { .. }
+        | ReplacementCondition::SourceTappedState { .. }
+        | ReplacementCondition::EventSourceControlledBy { .. }
+        | ReplacementCondition::EffectCausedDiscard
+        | ReplacementCondition::OnlyExtraTurn
+        | ReplacementCondition::TokenSubtypeMatches { .. }
+        | ReplacementCondition::TokenCoreTypeMatches { .. }
+        | ReplacementCondition::FirstTokenCreationEachTurn { .. }
+        | ReplacementCondition::ExceptFirstDrawInDrawStep
+        | ReplacementCondition::ClassLevelGE { .. }
+        | ReplacementCondition::DuringUntapStep
+        | ReplacementCondition::DuringDrawStep { .. }
+        | ReplacementCondition::ControllerControlsSource { .. }
+        | ReplacementCondition::Unrecognized { .. } => false,
+    }
+}
+
+/// Whether a static mode names a population satisfying `leaf`: its filters,
+/// player populations, costs, keywords and counted quantities, which the
+/// rules and layer checks evaluate live (CR 611.3a). Exhaustive, no `_` arm.
+fn static_mode_reads_filter_population(
+    mode: &StaticMode,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    use crate::types::statics::{
+        BlockExceptionKind, CostPaymentProhibition, HandSizeModification, RequiredDefender,
+    };
+    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    let has_player = |player: &PlayerFilter| filter::player_filter_contains(player, leaf);
+    let has_quantity =
+        |quantity: &QuantityExpr| quantity_expr_counts_population_matching(quantity, leaf);
+    let has_quantity_ref =
+        |quantity: &QuantityRef| quantity_ref_counts_population_matching(quantity, leaf);
+    let has_cost = |cost: &AbilityCost| ability_cost_reads_filter_population(cost, leaf);
+    let has_keyword =
+        |keyword: &crate::types::keywords::Keyword| keyword_reads_filter_population(keyword, leaf);
+    let has_protection = |target: &crate::types::keywords::ProtectionTarget| {
+        protection_target_reads_filter_population(target, leaf)
+    };
+    match mode {
+        StaticMode::CantBeActivated { source_filter, .. } => has_filter(source_filter),
+        StaticMode::CastWithKeyword { keyword } => has_keyword(keyword),
+        StaticMode::CastWithAlternativeCost { cost, .. } => has_cost(cost),
+        StaticMode::AlternativeKeywordCost { cost, .. } => has_cost(cost),
+        StaticMode::ModifyCost {
+            spell_filter,
+            dynamic_count,
+            ..
+        } => {
+            spell_filter.as_ref().is_some_and(has_filter)
+                || dynamic_count.as_ref().is_some_and(has_quantity_ref)
+        }
+        StaticMode::ImposeAdditionalCost {
+            cost, spell_filter, ..
+        } => has_cost(cost) || spell_filter.as_ref().is_some_and(has_filter),
+        StaticMode::ReduceAbilityCost {
+            dynamic_count,
+            activator,
+            targets,
+            ..
+        } => {
+            dynamic_count.as_ref().is_some_and(has_quantity_ref)
+                || activator.as_ref().is_some_and(has_player)
+                || targets.as_ref().is_some_and(has_filter)
+        }
+        StaticMode::CantPayCost { cost, .. } => match cost {
+            CostPaymentProhibition::Sacrifice { filter } => has_filter(filter),
+            CostPaymentProhibition::PayLife => false,
+        },
+        StaticMode::PlayerProtection(inner0) => has_protection(inner0),
+        StaticMode::MustAttackDefender { defender } => match defender {
+            RequiredDefender::Matching { filter } => has_player(filter),
+            RequiredDefender::Fixed { .. } | RequiredDefender::Permanent { .. } => false,
+        },
+        StaticMode::GraveyardCastPermission { extra_cost, .. } => extra_cost
+            .as_ref()
+            .is_some_and(|extra| has_cost(&extra.cost)),
+        StaticMode::TopOfLibraryCastPermission { alt_cost, .. } => {
+            alt_cost.as_ref().is_some_and(has_cost)
+        }
+        StaticMode::ExileCastPermission { extra_cost, .. } => extra_cost
+            .as_ref()
+            .is_some_and(|extra| has_cost(&extra.cost)),
+        StaticMode::PerTurnCastLimit { spell_filter, .. } => {
+            spell_filter.as_ref().is_some_and(has_filter)
+        }
+        StaticMode::SuppressTriggers {
+            source_filter,
+            trigger_source_filter,
+            ..
+        } => has_filter(source_filter) || trigger_source_filter.as_ref().is_some_and(has_filter),
+        StaticMode::CantBeBlockedExceptBy { kind } => match kind {
+            BlockExceptionKind::Quality(filter) => has_filter(filter),
+            BlockExceptionKind::MinBlockers { .. } => false,
+        },
+        StaticMode::CantBeBlockedBy { filter } => has_filter(filter),
+        StaticMode::AttachmentRestriction { filter } => has_filter(filter),
+        StaticMode::MustBeBlocked { by } => by.as_ref().is_some_and(has_filter),
+        StaticMode::MustBeBlockedByAll { blockers } => blockers.as_ref().is_some_and(has_filter),
+        StaticMode::BlockRestriction { filter } => has_filter(filter),
+        StaticMode::MaximumHandSize { modification } => match modification {
+            HandSizeModification::EqualTo(quantity) => has_quantity(quantity),
+            HandSizeModification::SetTo(_) | HandSizeModification::AdjustedBy(_) => false,
+        },
+        StaticMode::CantHaveKeyword { keyword } => has_keyword(keyword),
+        StaticMode::SpendManaAsAnyColor {
+            spell_filter,
+            activation_source_filter,
+            ..
+        } => {
+            spell_filter.as_ref().is_some_and(has_filter)
+                || activation_source_filter.as_ref().is_some_and(has_filter)
+        }
+        StaticMode::MaxUntapPerType { filter, .. } => has_filter(filter),
+        // Filter-free: nothing to read.
+        StaticMode::Continuous
+        | StaticMode::DamageNotRemovedDuringCleanup
+        | StaticMode::CantAttack
+        | StaticMode::CantBlock
+        | StaticMode::CantAttackOrBlock
+        | StaticMode::AttackOnlyNeighbor
+        | StaticMode::CantBecomeSuspected
+        | StaticMode::MaxAttackersEachCombat { .. }
+        | StaticMode::MaxBlockersEachCombat { .. }
+        | StaticMode::CantBeTargeted
+        | StaticMode::CantBeCast { .. }
+        | StaticMode::CantSearchLibrary { .. }
+        | StaticMode::RestrictLibrarySearchToTop { .. }
+        | StaticMode::ControlPlayersDuringOwnLibrarySearch { .. }
+        | StaticMode::CantCauseSacrificeOrExile { .. }
+        | StaticMode::CantCauseForcedAction { .. }
+        | StaticMode::CastWithFlash
+        | StaticMode::GrantsExtraVote
+        | StaticMode::GrantsExtraVillainousChoice
+        | StaticMode::ReduceActionCost { .. }
+        | StaticMode::ModifyActivationLimit { .. }
+        | StaticMode::ActivateAsInstant { .. }
+        | StaticMode::CantGainLife
+        | StaticMode::CantLoseLife
+        | StaticMode::MustAttack
+        | StaticMode::MustBlock
+        | StaticMode::MustBlockAttacker { .. }
+        | StaticMode::CantDraw { .. }
+        | StaticMode::DrawFromBottom { .. }
+        | StaticMode::DoubleTriggers { .. }
+        | StaticMode::IgnoreHexproof
+        | StaticMode::ExtraBlockers { .. }
+        | StaticMode::RevealTopOfLibrary { .. }
+        | StaticMode::RevealHand { .. }
+        | StaticMode::TopOfLibraryHasPlot
+        | StaticMode::TopOfLibraryPlotPermission
+        | StaticMode::CastFromHandFree { .. }
+        | StaticMode::LinkedCollectionCounterPlayPermission
+        | StaticMode::CountersPersistAcrossZones { .. }
+        | StaticMode::CantBeCountered
+        | StaticMode::CantBeCopied
+        | StaticMode::CantEnterBattlefieldFrom
+        | StaticMode::CantCastFrom { .. }
+        | StaticMode::CantCastDuring { .. }
+        | StaticMode::CantActivateDuring { .. }
+        | StaticMode::PerTurnDrawLimit { .. }
+        | StaticMode::CantBeBlocked
+        | StaticMode::CantBeBlockedByMoreThan { .. }
+        | StaticMode::CantBeBlockedUnlessAllBlock
+        | StaticMode::Protection
+        | StaticMode::Indestructible
+        | StaticMode::CantBeDestroyed
+        | StaticMode::CantBeRegenerated
+        | StaticMode::FlashBack
+        | StaticMode::Shroud
+        | StaticMode::Hexproof
+        | StaticMode::Vigilance
+        | StaticMode::Menace
+        | StaticMode::Reach
+        | StaticMode::Flying
+        | StaticMode::Trample
+        | StaticMode::Deathtouch
+        | StaticMode::Lifelink
+        | StaticMode::CantTap
+        | StaticMode::CantUntap
+        | StaticMode::Goaded
+        | StaticMode::MustAttackAwayFromSource
+        | StaticMode::CombatAlone { .. }
+        | StaticMode::CantCrew
+        | StaticMode::CantPhaseIn
+        | StaticMode::CrewContribution { .. }
+        | StaticMode::MayLookAtTopOfLibrary
+        | StaticMode::MayLookAtFaceDown
+        | StaticMode::CantBeTurnedFaceUp
+        | StaticMode::MayChooseNotToUntap
+        | StaticMode::AdditionalLandDrop { .. }
+        | StaticMode::EmblemStatic
+        | StaticMode::NoMaximumHandSize
+        | StaticMode::MayPlayAdditionalLand
+        | StaticMode::CantWinTheGame
+        | StaticMode::CantLoseTheGame
+        | StaticMode::LegendRuleDoesntApply
+        | StaticMode::SpeedCanIncreaseBeyondFour
+        | StaticMode::DefilerCostReduction { .. }
+        | StaticMode::SkipStep { .. }
+        | StaticMode::PayLifeAsColoredMana { .. }
+        | StaticMode::StepEndUnspentMana { .. }
+        | StaticMode::UnspentManaLossCausesLifeLoss
+        | StaticMode::CanAttackWithDefender
+        | StaticMode::IgnoreLandwalkForBlocking { .. }
+        | StaticMode::CanActivateAbilitiesAsThoughHaste
+        | StaticMode::CanBlockShadow
+        | StaticMode::AssignNoCombatDamage
+        | StaticMode::UntapsDuringEachOtherPlayersUntapStep
+        | StaticMode::EntersWithAdditionalCounters { .. }
+        | StaticMode::CountersCantBeRemoved { .. }
+        | StaticMode::CountsAsNamed { .. }
+        | StaticMode::Other(..) => false,
+    }
+}
+
+/// Whether one continuous modification's OWN values name a population
+/// satisfying `leaf`: a keyword, a static mode, a granting source, an
+/// activation cap or a dynamic quantity. The definitions it grants or copies
+/// are nested and belong to the caller's walk. Exhaustive, no `_` arm.
+fn continuous_modification_reads_filter_population(
+    modification: &ContinuousModification,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    let has_quantity =
+        |quantity: &QuantityExpr| quantity_expr_counts_population_matching(quantity, leaf);
+    let has_keyword =
+        |keyword: &crate::types::keywords::Keyword| keyword_reads_filter_population(keyword, leaf);
+    let has_static_mode = |mode: &StaticMode| static_mode_reads_filter_population(mode, leaf);
+    let has_restriction = |restriction: &crate::types::ability::ActivationRestriction| {
+        activation_restriction_reads_filter_population(restriction, leaf)
+    };
+    match modification {
+        ContinuousModification::AddKeyword { keyword } => has_keyword(keyword),
+        ContinuousModification::RemoveKeyword { keyword } => has_keyword(keyword),
+        ContinuousModification::GrantAllActivatedAbilitiesOf { source, cap } => {
+            has_filter(source) || cap.as_ref().is_some_and(has_restriction)
+        }
+        ContinuousModification::GrantAllTriggeredAbilitiesOf { source } => has_filter(source),
+        ContinuousModification::SetDynamicPower { value } => has_quantity(value),
+        ContinuousModification::SetDynamicToughness { value } => has_quantity(value),
+        ContinuousModification::SetPowerDynamic { value } => has_quantity(value),
+        ContinuousModification::SetToughnessDynamic { value } => has_quantity(value),
+        ContinuousModification::AddDynamicPower { value } => has_quantity(value),
+        ContinuousModification::AddDynamicToughness { value } => has_quantity(value),
+        ContinuousModification::AddDynamicKeyword { value, .. } => has_quantity(value),
+        ContinuousModification::AddStaticMode { mode } => has_static_mode(mode),
+        ContinuousModification::AddCounterOnEnter { count, .. } => has_quantity(count),
+        // Nested definitions (`CopyValues`, the grants) are the caller's walk;
+        // every other modification carries no filter, keyword, mode or quantity.
+        ContinuousModification::CopyValues { .. }
+        | ContinuousModification::GrantTrigger { .. }
+        | ContinuousModification::CopyChosen
+        | ContinuousModification::SetName { .. }
+        | ContinuousModification::SetTextName { .. }
+        | ContinuousModification::SubstituteTextWord { .. }
+        | ContinuousModification::AddPower { .. }
+        | ContinuousModification::AddToughness { .. }
+        | ContinuousModification::SetPower { .. }
+        | ContinuousModification::SetToughness { .. }
+        | ContinuousModification::GrantAbility { .. }
+        | ContinuousModification::GrantReplacement { .. }
+        | ContinuousModification::RemoveAllAbilities
+        | ContinuousModification::AddType { .. }
+        | ContinuousModification::RemoveType { .. }
+        | ContinuousModification::AddSubtype { .. }
+        | ContinuousModification::RemoveSubtype { .. }
+        | ContinuousModification::SetCardTypes { .. }
+        | ContinuousModification::RemoveAllSubtypes { .. }
+        | ContinuousModification::AddKeywordWithDerivedCost { .. }
+        | ContinuousModification::AddAllCreatureTypes
+        | ContinuousModification::AddAllBasicLandTypes
+        | ContinuousModification::AddAllLandTypes
+        | ContinuousModification::AddChosenSubtype { .. }
+        | ContinuousModification::AddChosenColor { .. }
+        | ContinuousModification::RemoveChosenKeyword
+        | ContinuousModification::AddChosenKeyword
+        | ContinuousModification::SetColor { .. }
+        | ContinuousModification::AddColor { .. }
+        | ContinuousModification::GrantStaticAbility { .. }
+        | ContinuousModification::SwitchPowerToughness
+        | ContinuousModification::AssignDamageFromToughness
+        | ContinuousModification::AssignDamageAsThoughUnblocked
+        | ContinuousModification::AssignNoCombatDamage
+        | ContinuousModification::ChangeController
+        | ContinuousModification::SetBasicLandType { .. }
+        | ContinuousModification::SetChosenBasicLandType
+        | ContinuousModification::SetChosenName
+        | ContinuousModification::RetainPrintedTriggerFromSource { .. }
+        | ContinuousModification::RetainPrintedAbilityFromSource { .. }
+        | ContinuousModification::RetainAllOtherAbilitiesFromSource
+        | ContinuousModification::AddSupertype { .. }
+        | ContinuousModification::RemoveSupertype { .. }
+        | ContinuousModification::SetStartingLoyalty { .. }
+        | ContinuousModification::RemoveManaCost => false,
+    }
+}
+
+/// Whether a keyword's payload names a population satisfying `leaf`: an
+/// enchant or protection quality, a cost, a ward cost, a material filter, an
+/// activation restriction or a quantity. A keyword ability is read whenever its
+/// rule applies (CR 702.1). Exhaustive, no `_` arm.
+fn keyword_reads_filter_population(
+    keyword: &crate::types::keywords::Keyword,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    use crate::types::keywords::{
+        BestowCost, BlitzCost, BuybackCost, CyclingCost, DisguiseCost, EchoCost, EmbalmCost,
+        EscapeCost, EternalizeCost, EvokeCost, FlashbackCost, Keyword,
+    };
+    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    let has_quantity =
+        |quantity: &QuantityExpr| quantity_expr_counts_population_matching(quantity, leaf);
+    let has_cost = |cost: &AbilityCost| ability_cost_reads_filter_population(cost, leaf);
+    let has_protection = |target: &crate::types::keywords::ProtectionTarget| {
+        protection_target_reads_filter_population(target, leaf)
+    };
+    let has_ward =
+        |cost: &crate::types::keywords::WardCost| ward_cost_reads_filter_population(cost, leaf);
+    let has_cost_reduction = |reduction: &crate::types::ability::CostReduction| {
+        quantity_expr_counts_population_matching(&reduction.count, leaf)
+            || reduction
+                .condition
+                .as_ref()
+                .is_some_and(|condition| parsed_condition_reads_filter_population(condition, leaf))
+    };
+    let has_typed = |typed: &TypedFilter| {
+        typed
+            .properties
+            .iter()
+            .any(|prop| filter::filter_prop_contains(prop, leaf))
+    };
+    let has_restriction = |restriction: &crate::types::ability::ActivationRestriction| {
+        activation_restriction_reads_filter_population(restriction, leaf)
+    };
+    match keyword {
+        Keyword::Enchant(inner0) => has_filter(inner0),
+        Keyword::Bestow(inner0) => match inner0 {
+            BestowCost::Mana(_) => false,
+            BestowCost::NonMana(cost) => has_cost(cost),
+        },
+        Keyword::Embalm(inner0) => match inner0 {
+            EmbalmCost::Mana(_) => false,
+            EmbalmCost::NonMana(cost) => has_cost(cost),
+        },
+        Keyword::Eternalize(inner0) => match inner0 {
+            EternalizeCost::Mana(_) => false,
+            EternalizeCost::NonMana(cost) => has_cost(cost),
+        },
+        Keyword::Protection(inner0) => has_protection(inner0),
+        Keyword::Cycling(inner0) => match inner0 {
+            CyclingCost::Mana(_) => false,
+            CyclingCost::NonMana(cost) => has_cost(cost),
+        },
+        Keyword::Flashback(inner0) => match inner0 {
+            FlashbackCost::Mana(_) => false,
+            FlashbackCost::NonMana(cost) => has_cost(cost),
+        },
+        Keyword::Ward(inner0) => has_ward(inner0),
+        Keyword::Crew { once_per_turn, .. } => {
+            once_per_turn.as_deref().is_some_and(has_restriction)
+        }
+        Keyword::Emerge(inner0) => has_filter(&inner0.sacrifice_filter),
+        Keyword::Escape(inner0) => match inner0 {
+            EscapeCost::Mana(_) => false,
+            EscapeCost::NonMana(cost) => has_cost(cost),
+        },
+        Keyword::Evoke(inner0) => match inner0 {
+            EvokeCost::Mana(_) => false,
+            EvokeCost::NonMana(cost) => has_cost(cost),
+        },
+        Keyword::Disguise(inner0) => match inner0 {
+            DisguiseCost::Mana(_) => false,
+            DisguiseCost::Reduced { reduction, .. } => has_cost_reduction(reduction),
+        },
+        Keyword::Blitz(inner0) => match inner0 {
+            BlitzCost::Mana(_) => false,
+            BlitzCost::NonMana(cost) => has_cost(cost),
+        },
+        Keyword::Buyback(inner0) => match inner0 {
+            BuybackCost::Mana(_) => false,
+            BuybackCost::NonMana(cost) => has_cost(cost),
+        },
+        Keyword::Echo(inner0) => match inner0 {
+            EchoCost::Mana(_) => false,
+            EchoCost::NonMana(cost) => has_cost(cost),
+        },
+        Keyword::Craft { materials, .. } => has_filter(materials),
+        Keyword::Affinity(inner0) => has_typed(inner0),
+        Keyword::CumulativeUpkeep(inner0) => has_cost(inner0),
+        Keyword::Mobilize(inner0) => has_quantity(inner0),
+        Keyword::Firebending(inner0) => has_quantity(inner0),
+        Keyword::Escalate(inner0) => has_cost(inner0),
+        // Filter-free: nothing to read.
+        Keyword::Flying
+        | Keyword::FirstStrike
+        | Keyword::DoubleStrike
+        | Keyword::Trample
+        | Keyword::TrampleOverPlaneswalkers
+        | Keyword::Deathtouch
+        | Keyword::Lifelink
+        | Keyword::Vigilance
+        | Keyword::Haste
+        | Keyword::Reach
+        | Keyword::Defender
+        | Keyword::Menace
+        | Keyword::Indestructible
+        | Keyword::Hexproof
+        | Keyword::HexproofFrom(..)
+        | Keyword::Shroud
+        | Keyword::Flash
+        | Keyword::Fear
+        | Keyword::Intimidate
+        | Keyword::Skulk
+        | Keyword::Shadow
+        | Keyword::Horsemanship
+        | Keyword::Wither
+        | Keyword::Infect
+        | Keyword::Afflict(..)
+        | Keyword::StartingIntensity(..)
+        | Keyword::Prowess
+        | Keyword::Undying
+        | Keyword::Persist
+        | Keyword::Cascade
+        | Keyword::Exalted
+        | Keyword::Flanking
+        | Keyword::Evolve
+        | Keyword::Extort
+        | Keyword::Exploit
+        | Keyword::Explore
+        | Keyword::Ascend
+        | Keyword::Storied
+        | Keyword::StartYourEngines
+        | Keyword::Dredge(..)
+        | Keyword::Modular(..)
+        | Keyword::Renown(..)
+        | Keyword::Fabricate(..)
+        | Keyword::Annihilator(..)
+        | Keyword::Bushido(..)
+        | Keyword::Frenzy(..)
+        | Keyword::Tribute(..)
+        | Keyword::Soulbond
+        | Keyword::Unearth(..)
+        | Keyword::Convoke
+        | Keyword::Waterbend
+        | Keyword::Delve
+        | Keyword::Devoid
+        | Keyword::Changeling
+        | Keyword::Phasing
+        | Keyword::Battlecry
+        | Keyword::Decayed
+        | Keyword::Unleash
+        | Keyword::Riot
+        | Keyword::Afterlife(..)
+        | Keyword::EtbCounter { .. }
+        | Keyword::Reconfigure(..)
+        | Keyword::LivingWeapon
+        | Keyword::JobSelect
+        | Keyword::TotemArmor
+        | Keyword::Fading(..)
+        | Keyword::Vanishing(..)
+        | Keyword::Kicker(..)
+        | Keyword::Equip(..)
+        | Keyword::Landwalk(..)
+        | Keyword::Rampage(..)
+        | Keyword::Absorb(..)
+        | Keyword::Partner(..)
+        | Keyword::Companion(..)
+        | Keyword::Ninjutsu(..)
+        | Keyword::CommanderNinjutsu(..)
+        | Keyword::Prowl(..)
+        | Keyword::Morph(..)
+        | Keyword::Megamorph(..)
+        | Keyword::Mayhem(..)
+        | Keyword::Madness(..)
+        | Keyword::Miracle(..)
+        | Keyword::Dash(..)
+        | Keyword::Harmonize(..)
+        | Keyword::Foretell(..)
+        | Keyword::Mutate(..)
+        | Keyword::Disturb(..)
+        | Keyword::Overload(..)
+        | Keyword::Spectacle(..)
+        | Keyword::Surge(..)
+        | Keyword::Encore(..)
+        | Keyword::Casualty(..)
+        | Keyword::Entwine(..)
+        | Keyword::Outlast(..)
+        | Keyword::Scavenge(..)
+        | Keyword::Reinforce { .. }
+        | Keyword::Fortify(..)
+        | Keyword::Prototype { .. }
+        | Keyword::Plot(..)
+        | Keyword::Offspring(..)
+        | Keyword::Impending { .. }
+        | Keyword::LevelUp(..)
+        | Keyword::Banding
+        | Keyword::BandsWithOther(..)
+        | Keyword::Epic
+        | Keyword::Fuse
+        | Keyword::Gravestorm
+        | Keyword::Haunt
+        | Keyword::Hideaway(..)
+        | Keyword::Improvise
+        | Keyword::Ingest
+        | Keyword::Melee
+        | Keyword::Mentor
+        | Keyword::Myriad
+        | Keyword::Provoke
+        | Keyword::Rebound
+        | Keyword::Retrace
+        | Keyword::Ripple(..)
+        | Keyword::SplitSecond
+        | Keyword::Storm
+        | Keyword::Suspend { .. }
+        | Keyword::Totem
+        | Keyword::Warp(..)
+        | Keyword::Sneak(..)
+        | Keyword::WebSlinging(..)
+        | Keyword::Gift(..)
+        | Keyword::Discover(..)
+        | Keyword::Spree
+        | Keyword::Tiered
+        | Keyword::Ravenous
+        | Keyword::Daybound
+        | Keyword::Nightbound
+        | Keyword::Enlist
+        | Keyword::ReadAhead
+        | Keyword::Compleated
+        | Keyword::Conspire
+        | Keyword::Demonstrate
+        | Keyword::Dethrone
+        | Keyword::DoubleTeam
+        | Keyword::LivingMetal
+        | Keyword::Poisonous(..)
+        | Keyword::Bloodthirst(..)
+        | Keyword::Amplify(..)
+        | Keyword::Graft(..)
+        | Keyword::Devour { .. }
+        | Keyword::Toxic(..)
+        | Keyword::Saddle(..)
+        | Keyword::Teamwork(..)
+        | Keyword::Soulshift(..)
+        | Keyword::Backup(..)
+        | Keyword::Squad(..)
+        | Keyword::Typecycling { .. }
+        | Keyword::Splice { .. }
+        | Keyword::Bargain
+        | Keyword::Sunburst
+        | Keyword::Champion(..)
+        | Keyword::Training
+        | Keyword::Assist
+        | Keyword::Augment
+        | Keyword::Aftermath
+        | Keyword::JumpStart
+        | Keyword::Cipher
+        | Keyword::Transmute(..)
+        | Keyword::Transfigure(..)
+        | Keyword::Recover(..)
+        | Keyword::Cleave(..)
+        | Keyword::Undaunted
+        | Keyword::Paradigm
+        | Keyword::Station
+        | Keyword::Replicate(..)
+        | Keyword::Awaken { .. }
+        | Keyword::ForMirrodin
+        | Keyword::MoreThanMeetsTheEye(..)
+        | Keyword::Freerunning(..)
+        | Keyword::Increment
+        | Keyword::Specialize(..)
+        | Keyword::Offering(..)
+        | Keyword::Unknown(..) => false,
+    }
+}
+
+/// Whether a parsed (activation or per-player) condition names a population
+/// satisfying `leaf`. Exhaustive, no `_` arm.
+fn parsed_condition_reads_filter_population(
+    condition: &crate::types::ability::ParsedCondition,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    use crate::types::ability::ParsedCondition;
+    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    let has_player = |player: &PlayerFilter| filter::player_filter_contains(player, leaf);
+    let has_quantity =
+        |quantity: &QuantityExpr| quantity_expr_counts_population_matching(quantity, leaf);
+    let has_quantity_ref =
+        |quantity: &QuantityRef| quantity_ref_counts_population_matching(quantity, leaf);
+    let has_keyword =
+        |keyword: &crate::types::keywords::Keyword| keyword_reads_filter_population(keyword, leaf);
+    let recurse = |inner: &ParsedCondition| parsed_condition_reads_filter_population(inner, leaf);
+    match condition {
+        ParsedCondition::SourceLacksKeyword { keyword } => has_keyword(keyword),
+        ParsedCondition::QuantityVsEachOpponent { lhs, rhs, .. } => {
+            has_quantity_ref(lhs) || has_quantity_ref(rhs)
+        }
+        ParsedCondition::QuantityComparison { lhs, rhs, .. } => {
+            has_quantity(lhs) || has_quantity(rhs)
+        }
+        ParsedCondition::ControlsCreatureWithKeyword { keyword, .. } => has_keyword(keyword),
+        ParsedCondition::YouAttackedWithAtLeast { filter, .. } => {
+            filter.as_ref().is_some_and(has_filter)
+        }
+        ParsedCondition::YouCastSpellThisTurn { filter } => filter.as_ref().is_some_and(has_filter),
+        ParsedCondition::BattlefieldEntriesThisTurn { filter, .. } => has_filter(filter),
+        ParsedCondition::PlayerCountAtLeast { filter, .. } => has_player(filter),
+        ParsedCondition::SpellTargetsFilter { filter } => has_filter(filter),
+        ParsedCondition::And { conditions } => conditions.iter().any(recurse),
+        ParsedCondition::Or { conditions } => conditions.iter().any(recurse),
+        ParsedCondition::Not { condition } => recurse(condition),
+        // Filter-free: nothing to read.
+        ParsedCondition::SourceInZone { .. }
+        | ParsedCondition::SourceIsAttacking
+        | ParsedCondition::SourceIsAttackingOrBlocking
+        | ParsedCondition::SourceIsBlocked
+        | ParsedCondition::SourcePowerAtLeast { .. }
+        | ParsedCondition::SourceHasCounterAtLeast { .. }
+        | ParsedCondition::SourceHasNoCounter { .. }
+        | ParsedCondition::SourceEnteredThisTurn
+        | ParsedCondition::SourceAttackedThisTurn
+        | ParsedCondition::SourceIsCreature
+        | ParsedCondition::SourceAttachedTo { .. }
+        | ParsedCondition::SourceUntappedAttachedTo { .. }
+        | ParsedCondition::SourceIsColor { .. }
+        | ParsedCondition::FirstSpellThisGame
+        | ParsedCondition::OpponentSearchedLibraryThisTurn
+        | ParsedCondition::BeenAttackedThisStep
+        | ParsedCondition::ZoneCardCountAtLeast { .. }
+        | ParsedCondition::ZoneCardTypeCountAtLeast { .. }
+        | ParsedCondition::ZoneCoreTypeCardCountAtLeast { .. }
+        | ParsedCondition::ZoneSubtypeCardCountAtLeast { .. }
+        | ParsedCondition::OpponentPoisonAtLeast { .. }
+        | ParsedCondition::HandSizeExact { .. }
+        | ParsedCondition::HandSizeOneOf { .. }
+        | ParsedCondition::CreaturesYouControlTotalPowerAtLeast { .. }
+        | ParsedCondition::YouControlLandSubtypeAny { .. }
+        | ParsedCondition::YouControlSubtypeCountAtLeast { .. }
+        | ParsedCondition::YouControlCoreTypeCountAtLeast { .. }
+        | ParsedCondition::YouControlColorPermanentCountAtLeast { .. }
+        | ParsedCondition::YouControlSubtypeOrGraveyardCardSubtype { .. }
+        | ParsedCondition::YouControlLegendaryCreature
+        | ParsedCondition::YouControlNamedPlaneswalker { .. }
+        | ParsedCondition::YouControlCreatureWithPowerAtLeast { .. }
+        | ParsedCondition::YouControlCreatureWithPt { .. }
+        | ParsedCondition::YouControlAnotherColorlessCreature
+        | ParsedCondition::YouControlSnowPermanentCountAtLeast { .. }
+        | ParsedCondition::YouControlDifferentPowerCreatureCountAtLeast { .. }
+        | ParsedCondition::YouControlLandsWithSameNameAtLeast { .. }
+        | ParsedCondition::YouControlNoCreatures
+        | ParsedCondition::YouAttackedThisTurn
+        | ParsedCondition::YouAttackedSourceControllerThisTurn
+        | ParsedCondition::YouPlayedLandThisTurn
+        | ParsedCondition::YouCastNoncreatureSpellThisTurn
+        | ParsedCondition::YouCastSpellCountAtLeast { .. }
+        | ParsedCondition::YouGainedLifeThisTurn
+        | ParsedCondition::YouCreatedTokenThisTurn
+        | ParsedCondition::YouDiscardedCardThisTurn
+        | ParsedCondition::YouSacrificedArtifactThisTurn
+        | ParsedCondition::CreatureDiedThisTurn
+        | ParsedCondition::YouHadCreatureEnterThisTurn
+        | ParsedCondition::YouHadAngelOrBerserkerEnterThisTurn
+        | ParsedCondition::YouHadArtifactEnterThisTurn
+        | ParsedCondition::CardsLeftYourGraveyardThisTurnAtLeast { .. }
+        | ParsedCondition::HasCityBlessing
+        | ParsedCondition::HasEnduringStory
+        | ParsedCondition::CompletedDungeon { .. }
+        | ParsedCondition::HasMaxSpeed
+        | ParsedCondition::IsYourTurn
+        | ParsedCondition::IsOpponentsTurn
+        | ParsedCondition::IsDuringUpkeep
+        | ParsedCondition::ControlsCommander { .. } => false,
+    }
+}
+
+/// Whether an activation restriction names a population satisfying `leaf`.
+/// Exhaustive, no `_` arm.
+fn activation_restriction_reads_filter_population(
+    restriction: &crate::types::ability::ActivationRestriction,
+    leaf: &dyn Fn(&TargetFilter) -> bool,
+) -> bool {
+    use crate::types::ability::ActivationRestriction;
+    let has_parsed = |condition: &crate::types::ability::ParsedCondition| {
+        parsed_condition_reads_filter_population(condition, leaf)
+    };
+    match restriction {
+        ActivationRestriction::RequiresCondition { condition } => {
+            condition.as_ref().is_some_and(has_parsed)
+        }
+        // Filter-free: nothing to read.
+        ActivationRestriction::AsSorcery
+        | ActivationRestriction::AsInstant
+        | ActivationRestriction::DuringYourTurn
+        | ActivationRestriction::DuringYourUpkeep
+        | ActivationRestriction::DuringCombat
+        | ActivationRestriction::BeforeAttackersDeclared
+        | ActivationRestriction::BeforeCombatDamage
+        | ActivationRestriction::OnlyOnceEachTurn
+        | ActivationRestriction::OnlyOnce
+        | ActivationRestriction::MaxTimesEachTurn { .. }
+        | ActivationRestriction::IsSolved
+        | ActivationRestriction::SourceIsHarnessed
+        | ActivationRestriction::ClassLevelIs { .. }
+        | ActivationRestriction::LevelCounterRange { .. }
+        | ActivationRestriction::CounterThreshold { .. }
+        | ActivationRestriction::MatchesCardCastTiming => false,
     }
 }
 
@@ -14901,7 +16205,8 @@ fn tail_links_exile(scope: &PendingPlayerScopeTail) -> bool {
 /// its effect ([`effect_reads_created_referent`]), its condition, its
 /// `repeat_for` count, its `player_scope` population, its duration, its
 /// `unless_pay` cost or its `optional_player` ([`node_reads_created_referent`]),
-/// or through a nested
+/// its `repeat_until` condition, a nested definition's activation positions
+/// ([`definition_activation_reads_created_referent`]), or through a nested
 /// branch: its `else_ability` chain (CR 608.2c) or a `mode_abilities` chain
 /// (CR 700.2: each mode is an alternative chain; CR 700.2b + CR 603.12 for a
 /// reflexive modal trigger), each walked as its own chain.
@@ -14920,9 +16225,13 @@ fn tail_reads_created_referent(tail: &ResolvedAbility) -> bool {
             node.unless_pay.as_ref(),
             node.optional_player.as_ref(),
         ) || node
-            .else_ability
-            .as_deref()
-            .is_some_and(tail_reads_created_referent)
+            .repeat_until
+            .as_ref()
+            .is_some_and(repeat_continuation_reads_created_referent)
+            || node
+                .else_ability
+                .as_deref()
+                .is_some_and(tail_reads_created_referent)
             || node
                 .mode_abilities
                 .iter()
@@ -14951,9 +16260,14 @@ fn definition_reads_created_referent(definition: &AbilityDefinition) -> bool {
             node.unless_pay.as_ref(),
             node.optional_player.as_ref(),
         ) || node
-            .else_ability
-            .as_deref()
-            .is_some_and(definition_reads_created_referent)
+            .repeat_until
+            .as_ref()
+            .is_some_and(repeat_continuation_reads_created_referent)
+            || definition_activation_reads_created_referent(node)
+            || node
+                .else_ability
+                .as_deref()
+                .is_some_and(definition_reads_created_referent)
             || node
                 .mode_abilities
                 .iter()
@@ -14966,6 +16280,46 @@ fn definition_reads_created_referent(definition: &AbilityDefinition) -> bool {
         }
     }
     false
+}
+
+/// CR 608.2c: a "repeat while" continuation's condition is evaluated against
+/// the live ledger before each repetition of this resolution's loop.
+/// Exhaustive, no `_` arm.
+fn repeat_continuation_reads_created_referent(
+    continuation: &crate::types::ability::RepeatContinuation,
+) -> bool {
+    use crate::types::ability::RepeatContinuation;
+    match continuation {
+        RepeatContinuation::WhileCondition {
+            condition,
+            max_iterations: _,
+        } => condition_depends_on_last_created(condition),
+        RepeatContinuation::ControllerChoice | RepeatContinuation::UntilStopConditions { .. } => {
+            false
+        }
+    }
+}
+
+/// The activation positions of a nested definition (a granted or copied
+/// ability): its activation cost (CR 602.2), its activator filter and its
+/// activation restrictions (CR 602.5, CR 602.5b), each evaluated against the
+/// live ledger whenever the ability is activated. The positions a definition
+/// fixes as it is put on the stack — targets, target constraints and their
+/// counts (CR 601.2c) — precede this resolution's tokens and are not read.
+fn definition_activation_reads_created_referent(definition: &AbilityDefinition) -> bool {
+    let leaf: &dyn Fn(&TargetFilter) -> bool = &filter_contains_last_created;
+    definition
+        .cost
+        .as_ref()
+        .is_some_and(|cost| ability_cost_reads_filter_population(cost, leaf))
+        || definition
+            .activator_filter
+            .as_ref()
+            .is_some_and(|players| filter::player_filter_contains(players, leaf))
+        || definition
+            .activation_restrictions
+            .iter()
+            .any(|restriction| activation_restriction_reads_filter_population(restriction, leaf))
 }
 
 /// One chain node's reader positions for the created referent: its effect, a
@@ -15090,25 +16444,34 @@ fn nested_payload_reads_created_referent(effect: &Effect) -> bool {
 }
 
 /// Mirrors `ability_visit::visit_trigger_scoped`: a granted, copied or emblem
-/// trigger reads the created referent through its `execute` chain. Its
-/// `unless_pay` is the cost axis, outside the carrier question.
+/// trigger reads the created referent through its matchers — the filter slots,
+/// zone-change clauses, constraint, condition and `unless_pay`, matched against
+/// the live ledger when its event fires (CR 603.2, CR 603.4;
+/// [`trigger_matchers_read_filter_population`]) — and through its `execute`
+/// chain.
 fn trigger_reads_created_referent(trigger: &crate::types::ability::TriggerDefinition) -> bool {
-    trigger
-        .execute
-        .as_deref()
-        .is_some_and(definition_reads_created_referent)
+    trigger_matchers_read_filter_population(trigger, &filter_contains_last_created)
+        || trigger
+            .execute
+            .as_deref()
+            .is_some_and(definition_reads_created_referent)
 }
 
 /// Mirrors `ability_visit::visit_replacement_scoped`: a registered, granted or
 /// copied replacement (CR 614.1a) reads the created referent through its
-/// `execute` chain or its decline branch. `MayCost.cost` is the cost axis.
+/// matchers and own values — `valid_card`, `damage_source_filter`,
+/// `redirect_target`, its condition, a `MayCost` cost, matched against the live
+/// ledger each time the event would happen (CR 614.1;
+/// [`replacement_matchers_read_filter_population`]) — and through its `execute`
+/// chain or its decline branch.
 fn replacement_reads_created_referent(
     replacement: &crate::types::ability::ReplacementDefinition,
 ) -> bool {
-    replacement
-        .execute
-        .as_deref()
-        .is_some_and(definition_reads_created_referent)
+    replacement_matchers_read_filter_population(replacement, &filter_contains_last_created)
+        || replacement
+            .execute
+            .as_deref()
+            .is_some_and(definition_reads_created_referent)
         || match &replacement.mode {
             crate::types::ability::ReplacementMode::Optional { decline }
             | crate::types::ability::ReplacementMode::MayCost { decline, .. } => decline
@@ -15120,27 +16483,23 @@ fn replacement_reads_created_referent(
 
 /// Mirrors `ability_visit::visit_static_scoped`. A static definition this
 /// resolution creates (CR 611.2c; CR 611.3a: its effect applies to whatever its
-/// text indicates at each moment) reads the created referent through four
-/// positions: its `affected` set, each modification's dynamic magnitude
+/// text indicates at each moment) reads the created referent through its own
+/// positions ([`static_definition_reads_filter_population`]: its `affected`
+/// set, its mode's filters, each modification's own values, its enabling
+/// condition with compound operands, and its per-player condition), each
+/// modification's dynamic magnitude
 /// (`quantity::continuous_modification_dynamic_quantity`, the exhaustive
-/// magnitude authority), the definitions its modifications carry
+/// magnitude authority), and the definitions its modifications carry
 /// (CR 113.1a: an ability an effect grants is defined by that effect's text) —
-/// exactly the descending arms of `visit_continuous_mod_scoped` — and its
-/// enabling condition, compound operands included
-/// ([`static_condition_reads_filter_population`]), which a resolving effect
-/// evaluates once when it is applied (CR 608.2h + CR 611.2d; `effects/effect.rs`
-/// registers only a satisfied definition and drops the condition), and which a
-/// token's or emblem's static evaluates live (CR 611.3a). The modification
-/// match's `_ => false` defers to those two wildcard-free authorities; a new
-/// descending modification must add a census fixture.
+/// exactly the descending arms of `visit_continuous_mod_scoped`. A resolving
+/// effect evaluates the enabling condition once when it is applied
+/// (CR 608.2h + CR 611.2d; `effects/effect.rs` registers only a satisfied
+/// definition and drops the condition); a token's or emblem's static evaluates
+/// it live (CR 611.3a). The modification match's `_ => false` defers to those
+/// two wildcard-free authorities; a new descending modification must add a
+/// census fixture.
 fn static_reads_created_referent(static_def: &StaticDefinition) -> bool {
-    static_def
-        .affected
-        .as_ref()
-        .is_some_and(filter_contains_last_created)
-        || static_def.condition.as_ref().is_some_and(|condition| {
-            static_condition_reads_filter_population(condition, &filter_contains_last_created)
-        })
+    static_definition_reads_filter_population(static_def, &filter_contains_last_created)
         || static_def.modifications.iter().any(|modification| {
             crate::game::quantity::continuous_modification_dynamic_quantity(modification)
                 .is_some_and(|quantity| {
@@ -15163,7 +16522,9 @@ fn static_reads_created_referent(static_def: &StaticDefinition) -> bool {
                         static_reads_created_referent(definition)
                     }
                     ContinuousModification::CopyValues { values, .. } => {
-                        values
+                        values.keywords.iter().any(|keyword| {
+                            keyword_reads_filter_population(keyword, &filter_contains_last_created)
+                        }) || values
                             .abilities
                             .iter()
                             .any(definition_reads_created_referent)
@@ -41118,6 +42479,420 @@ mod tests {
             amount: one(),
             player: TargetFilter::Controller,
         })));
+    }
+
+    /// Round-4 review r1 (MED): positions evaluated LATER — when an event fires,
+    /// each time a replaced event would happen, in live rules and layer checks,
+    /// or when a granted ability is activated — are matched against the live
+    /// `last_created_token_ids` ledger, so they read the created referent
+    /// exactly as read-once positions do. Each fixture is built from one
+    /// constructor: with `LastCreated` (and `And[LastCreated, Typed creature]`)
+    /// in the position it reads; with `Typed creature` in the same position it
+    /// does not.
+    #[test]
+    fn created_referent_later_evaluated_positions_read() {
+        use crate::types::ability::{
+            AbilityCost, CastingPermission, DelayedTriggerLifetime, RepeatContinuation,
+            ReplacementCondition, ReplacementDefinition, TriggerCondition, TriggerDefinition,
+            WheneverEventExpiry,
+        };
+        use crate::types::keywords::{Keyword, ProtectionTarget};
+        use crate::types::mana::{ManaCost, ManaSpellGrant};
+        use crate::types::replacements::ReplacementEvent;
+        use crate::types::statics::{
+            ActivationExemption, AdditionalCostTaxAction, CostModifyMode, CostReductionReach,
+            ProhibitionScope,
+        };
+        use crate::types::triggers::TriggerMode;
+
+        let typed_creature = || TargetFilter::Typed(TypedFilter::creature());
+        let compound = || TargetFilter::And {
+            filters: vec![TargetFilter::LastCreated, typed_creature()],
+        };
+        let noop = || Box::new(AbilityDefinition::new(AbilityKind::Spell, Effect::NoOp));
+        let dies = |filter: TargetFilter| {
+            TriggerDefinition::new(TriggerMode::ChangesZone)
+                .origin(Zone::Battlefield)
+                .destination(Zone::Graveyard)
+                .valid_card(filter)
+        };
+        let self_static = |modification: ContinuousModification| {
+            StaticDefinition::continuous()
+                .affected(TargetFilter::SelfRef)
+                .modifications(vec![modification])
+        };
+        let generic = |static_def: StaticDefinition| Effect::GenericEffect {
+            static_abilities: vec![static_def],
+            duration: None,
+            target: None,
+            end_cost: None,
+        };
+        let with_mode = move |mode: StaticMode| generic(StaticDefinition::new(mode));
+        let replacement_row = |replacement: ReplacementDefinition| Effect::AddTargetReplacement {
+            replacement: Box::new(replacement),
+            target: TargetFilter::Any,
+        };
+        let sacrifice = |filter: TargetFilter| {
+            AbilityCost::Sacrifice(SacrificeCost::new(
+                filter,
+                SacrificeRequirement::Count { count: 1 },
+            ))
+        };
+        let effect_row = |build: Box<dyn Fn(TargetFilter) -> Effect>| {
+            Box::new(move |filter: TargetFilter| {
+                ResolvedAbility::new(build(filter), vec![], ObjectId(1), PlayerId(0))
+            }) as Box<dyn Fn(TargetFilter) -> ResolvedAbility>
+        };
+
+        type Row = (&'static str, Box<dyn Fn(TargetFilter) -> ResolvedAbility>);
+        let rows: Vec<Row> = vec![
+            // Delayed-trigger matchers (`condition_filter_groups`'s groups).
+            (
+                "WheneverEvent trigger valid_card",
+                effect_row(Box::new(move |filter| Effect::CreateDelayedTrigger {
+                    condition: DelayedTriggerCondition::WheneverEvent {
+                        trigger: Box::new(dies(filter)),
+                        expiry: WheneverEventExpiry::default(),
+                    },
+                    effect: noop(),
+                    uses_tracked_set: false,
+                })),
+            ),
+            (
+                "WhenNextEvent trigger valid_card",
+                effect_row(Box::new(move |filter| Effect::CreateDelayedTrigger {
+                    condition: DelayedTriggerCondition::WhenNextEvent {
+                        trigger: Box::new(dies(filter)),
+                        or_trigger: None,
+                        lifetime: DelayedTriggerLifetime::ThisTurn,
+                    },
+                    effect: noop(),
+                    uses_tracked_set: false,
+                })),
+            ),
+            (
+                "WhenNextEvent or_trigger valid_source",
+                effect_row(Box::new(move |filter| {
+                    let mut alternative = TriggerDefinition::new(TriggerMode::Attacks);
+                    alternative.valid_source = Some(filter);
+                    Effect::CreateDelayedTrigger {
+                        condition: DelayedTriggerCondition::WhenNextEvent {
+                            trigger: Box::new(TriggerDefinition::new(TriggerMode::Attacks)),
+                            or_trigger: Some(Box::new(alternative)),
+                            lifetime: DelayedTriggerLifetime::ThisTurn,
+                        },
+                        effect: noop(),
+                        uses_tracked_set: false,
+                    }
+                })),
+            ),
+            (
+                "WhenNextEvent trigger condition ControlsType",
+                effect_row(Box::new(move |filter| {
+                    let mut trigger = TriggerDefinition::new(TriggerMode::Attacks);
+                    trigger.condition = Some(TriggerCondition::ControlsType { filter });
+                    Effect::CreateDelayedTrigger {
+                        condition: DelayedTriggerCondition::WhenNextEvent {
+                            trigger: Box::new(trigger),
+                            or_trigger: None,
+                            lifetime: DelayedTriggerLifetime::ThisTurn,
+                        },
+                        effect: noop(),
+                        uses_tracked_set: false,
+                    }
+                })),
+            ),
+            (
+                "Duration::UntilEvent deadline valid_card",
+                effect_row(Box::new(move |filter| Effect::GenericEffect {
+                    static_abilities: vec![StaticDefinition::continuous()
+                        .affected(TargetFilter::SelfRef)
+                        .modifications(vec![ContinuousModification::AddPower { value: 1 }])],
+                    duration: Some(Duration::UntilEvent {
+                        event: Box::new(dies(filter)),
+                    }),
+                    target: None,
+                    end_cost: None,
+                })),
+            ),
+            // Granted and emblem trigger matchers (not only `execute`).
+            (
+                "granted trigger valid_card",
+                effect_row(Box::new(move |filter| {
+                    generic(self_static(ContinuousModification::GrantTrigger {
+                        trigger: Box::new(dies(filter)),
+                    }))
+                })),
+            ),
+            (
+                "emblem trigger valid_card",
+                effect_row(Box::new(move |filter| Effect::CreateEmblem {
+                    statics: vec![],
+                    triggers: vec![dies(filter)],
+                })),
+            ),
+            // Replacement matchers.
+            (
+                "replacement valid_card",
+                effect_row(Box::new(move |filter| {
+                    replacement_row(
+                        ReplacementDefinition::new(ReplacementEvent::DamageDone).valid_card(filter),
+                    )
+                })),
+            ),
+            (
+                "replacement damage_source_filter",
+                effect_row(Box::new(move |filter| {
+                    let mut replacement = ReplacementDefinition::new(ReplacementEvent::DamageDone);
+                    replacement.damage_source_filter = Some(filter);
+                    replacement_row(replacement)
+                })),
+            ),
+            (
+                "replacement redirect_target",
+                effect_row(Box::new(move |filter| {
+                    let mut replacement = ReplacementDefinition::new(ReplacementEvent::DamageDone);
+                    replacement.redirect_target = Some(filter);
+                    replacement_row(replacement)
+                })),
+            ),
+            (
+                "replacement condition IfControlsMatching",
+                effect_row(Box::new(move |filter| {
+                    let mut replacement = ReplacementDefinition::new(ReplacementEvent::DamageDone);
+                    replacement.condition =
+                        Some(ReplacementCondition::IfControlsMatching { minimum: 1, filter });
+                    replacement_row(replacement)
+                })),
+            ),
+            // The 13 filter-bearing `StaticMode` variants.
+            (
+                "StaticMode::CantBeActivated",
+                effect_row(Box::new(move |source_filter| {
+                    with_mode(StaticMode::CantBeActivated {
+                        who: ProhibitionScope::AllPlayers,
+                        source_filter,
+                        exemption: ActivationExemption::None,
+                        kind: None,
+                    })
+                })),
+            ),
+            (
+                "StaticMode::ModifyCost",
+                effect_row(Box::new(move |filter| {
+                    with_mode(StaticMode::ModifyCost {
+                        mode: CostModifyMode::Reduce,
+                        amount: ManaCost::NoCost,
+                        spell_filter: Some(filter),
+                        dynamic_count: None,
+                        reach: CostReductionReach::SpillsToGeneric,
+                    })
+                })),
+            ),
+            (
+                "StaticMode::ImposeAdditionalCost",
+                effect_row(Box::new(move |filter| {
+                    with_mode(StaticMode::ImposeAdditionalCost {
+                        cost: AbilityCost::Tap,
+                        spell_filter: Some(filter),
+                        action: AdditionalCostTaxAction::Cast,
+                    })
+                })),
+            ),
+            (
+                "StaticMode::ReduceAbilityCost",
+                effect_row(Box::new(move |filter| {
+                    with_mode(StaticMode::ReduceAbilityCost {
+                        mode: CostModifyMode::Reduce,
+                        keyword: "equip".to_string(),
+                        amount: 1,
+                        minimum_mana: None,
+                        dynamic_count: None,
+                        exemption: ActivationExemption::None,
+                        activator: None,
+                        targets: Some(filter),
+                        frequency: None,
+                    })
+                })),
+            ),
+            (
+                "StaticMode::PerTurnCastLimit",
+                effect_row(Box::new(move |filter| {
+                    with_mode(StaticMode::PerTurnCastLimit {
+                        who: ProhibitionScope::AllPlayers,
+                        max: 1,
+                        spell_filter: Some(filter),
+                    })
+                })),
+            ),
+            (
+                "StaticMode::SuppressTriggers",
+                effect_row(Box::new(move |source_filter| {
+                    with_mode(StaticMode::SuppressTriggers {
+                        source_filter,
+                        trigger_source_filter: None,
+                        events: vec![],
+                    })
+                })),
+            ),
+            (
+                "StaticMode::CantBeBlockedBy",
+                effect_row(Box::new(move |filter| {
+                    with_mode(StaticMode::CantBeBlockedBy { filter })
+                })),
+            ),
+            (
+                "StaticMode::AttachmentRestriction",
+                effect_row(Box::new(move |filter| {
+                    with_mode(StaticMode::AttachmentRestriction { filter })
+                })),
+            ),
+            (
+                "StaticMode::MustBeBlocked",
+                effect_row(Box::new(move |filter| {
+                    with_mode(StaticMode::MustBeBlocked { by: Some(filter) })
+                })),
+            ),
+            (
+                "StaticMode::MustBeBlockedByAll",
+                effect_row(Box::new(move |filter| {
+                    with_mode(StaticMode::MustBeBlockedByAll {
+                        blockers: Some(filter),
+                    })
+                })),
+            ),
+            (
+                "StaticMode::BlockRestriction",
+                effect_row(Box::new(move |filter| {
+                    with_mode(StaticMode::BlockRestriction { filter })
+                })),
+            ),
+            (
+                "StaticMode::SpendManaAsAnyColor",
+                effect_row(Box::new(move |filter| {
+                    with_mode(StaticMode::SpendManaAsAnyColor {
+                        spell_filter: Some(filter),
+                        activation_source_filter: None,
+                        concession: crate::types::ability::ManaSpendPermission::AnyColor,
+                    })
+                })),
+            ),
+            (
+                "StaticMode::MaxUntapPerType",
+                effect_row(Box::new(move |filter| {
+                    with_mode(StaticMode::MaxUntapPerType { filter, max: 1 })
+                })),
+            ),
+            // A static mode granted by a modification.
+            (
+                "ContinuousModification::AddStaticMode",
+                effect_row(Box::new(move |filter| {
+                    generic(self_static(ContinuousModification::AddStaticMode {
+                        mode: StaticMode::CantBeBlockedBy { filter },
+                    }))
+                })),
+            ),
+            // Keyword payloads.
+            (
+                "Token keyword Protection(Filter)",
+                effect_row(Box::new(move |filter| Effect::Token {
+                    name: "Soldier".to_string(),
+                    power: PtValue::Fixed(1),
+                    toughness: PtValue::Fixed(1),
+                    types: vec!["Creature".to_string(), "Soldier".to_string()],
+                    colors: vec![],
+                    keywords: vec![Keyword::Protection(ProtectionTarget::Filter(filter))],
+                    tapped: false,
+                    count: QuantityExpr::Fixed { value: 1 },
+                    owner: TargetFilter::Controller,
+                    attach_to: None,
+                    enters_attacking: false,
+                    supertypes: vec![],
+                    static_abilities: vec![],
+                    enter_with_counters: vec![],
+                })),
+            ),
+            (
+                "ContinuousModification::AddKeyword Enchant",
+                effect_row(Box::new(move |filter| {
+                    generic(self_static(ContinuousModification::AddKeyword {
+                        keyword: Keyword::Enchant(filter),
+                    }))
+                })),
+            ),
+            (
+                "ManaSpellGrant::AddKeywordUntilEndOfTurn keyword",
+                effect_row(Box::new(move |filter| Effect::Mana {
+                    produced: ManaProduction::Colorless {
+                        count: QuantityExpr::Fixed { value: 1 },
+                    },
+                    restrictions: vec![],
+                    grants: vec![ManaSpellGrant::AddKeywordUntilEndOfTurn {
+                        keyword: Keyword::Protection(ProtectionTarget::Filter(filter)),
+                        restriction: None,
+                        duration: Box::new(Duration::UntilEndOfTurn),
+                    }],
+                    expiry: None,
+                    target: None,
+                })),
+            ),
+            // A permission's alternative cost, paid when the card is cast later.
+            (
+                "CastingPermission::ExileWithAltAbilityCost cost",
+                effect_row(Box::new(move |filter| Effect::GrantCastingPermission {
+                    permission: CastingPermission::ExileWithAltAbilityCost {
+                        cost: sacrifice(filter),
+                        constraint: None,
+                        granted_to: None,
+                        duration: None,
+                        source_id: None,
+                        cast_cost_modifier: None,
+                    },
+                    target: TargetFilter::Any,
+                    grantee: Default::default(),
+                })),
+            ),
+            // A granted ability's activation cost (CR 602.2).
+            (
+                "granted ability activation cost",
+                effect_row(Box::new(move |filter| {
+                    let mut granted = AbilityDefinition::new(AbilityKind::Activated, Effect::NoOp);
+                    granted.cost = Some(sacrifice(filter));
+                    generic(self_static(ContinuousModification::GrantAbility {
+                        definition: Box::new(granted),
+                    }))
+                })),
+            ),
+            // A "repeat while" condition, checked before each repetition.
+            (
+                "node repeat_until WhileCondition",
+                Box::new(move |filter: TargetFilter| {
+                    let mut ability =
+                        ResolvedAbility::new(Effect::NoOp, vec![], ObjectId(1), PlayerId(0));
+                    ability.repeat_until = Some(RepeatContinuation::WhileCondition {
+                        condition: Box::new(AbilityCondition::ControllerControlsMatching {
+                            filter,
+                        }),
+                        max_iterations: None,
+                    });
+                    ability
+                }),
+            ),
+        ];
+        for (label, build) in &rows {
+            assert!(
+                tail_reads_created_referent(&build(TargetFilter::LastCreated)),
+                "{label}: LastCreated in the position reads the referent"
+            );
+            assert!(
+                tail_reads_created_referent(&build(compound())),
+                "{label}: And[LastCreated, Typed creature] in the position reads the referent"
+            );
+            assert!(
+                !tail_reads_created_referent(&build(typed_creature())),
+                "{label}: Typed creature in the same position reads nothing"
+            );
+        }
     }
 
     /// CR 608.2c — a non-choosing per-player reveal introduces no per-iteration

@@ -16,9 +16,10 @@ use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::zones::{create_object, move_to_zone};
 use engine::types::ability::{
     AbilityDefinition, AbilityKind, Comparator, ContinuousModification, ControllerRef,
-    DelayedTriggerCondition, DieResultBranch, Duration, Effect, EffectScope, FilterProp,
-    NumberQuality, PlayerFilter, PtValue, QuantityExpr, QuantityRef, ResolvedAbility,
-    StaticCondition, StaticDefinition, TapStateChange, TargetFilter, TargetRef, TypedFilter,
+    DelayedTriggerCondition, DelayedTriggerLifetime, DieResultBranch, Duration, Effect,
+    EffectScope, FilterProp, NumberQuality, PlayerFilter, PtValue, QuantityExpr, QuantityRef,
+    ResolvedAbility, StaticCondition, StaticDefinition, TapStateChange, TargetFilter, TargetRef,
+    TriggerDefinition, TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
@@ -29,6 +30,7 @@ use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::statics::StaticMode;
+use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
 
 const P2: PlayerId = PlayerId(2);
@@ -950,6 +952,8 @@ struct UnionCast {
     runner: GameRunner,
     prompted: Vec<PlayerId>,
     channels_at_prompts: Vec<Option<usize>>,
+    /// P0's follow-up "Destroy all creatures you control" sorcery, still in hand.
+    sweep: ObjectId,
 }
 
 /// P0 casts a spell whose typed definition is "Each player creates a 1/1
@@ -969,6 +973,16 @@ fn cast_union_fan_out(tail: AbilityDefinition, paused: bool) -> UnionCast {
     let spell = scenario
         .add_spell_to_hand(P0, "Union probe", false)
         .with_ability_definition(definition)
+        .id();
+    let sweep = scenario
+        .add_spell_to_hand(P0, "Sweep probe", false)
+        .with_ability_definition(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::DestroyAll {
+                target: TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
+                cant_regenerate: false,
+            },
+        ))
         .id();
     let mut runner = scenario.build();
     runner.cast(spell).commit();
@@ -1022,6 +1036,7 @@ fn cast_union_fan_out(tail: AbilityDefinition, paused: bool) -> UnionCast {
         runner,
         prompted,
         channels_at_prompts,
+        sweep,
     }
 }
 
@@ -1275,4 +1290,73 @@ fn paused_cast_for_as_long_as_duration_sees_both_seats_tokens() {
 fn sync_cast_for_as_long_as_duration_sees_both_seats_tokens() {
     let mut cast = cast_union_fan_out(for_as_long_as_two_created(), false);
     assert_eq!(p0_fractal_power_and_grants(&mut cast), (Some(2), 1));
+}
+
+/// "When the next of those tokens dies this turn, you gain 1 life": a delayed
+/// trigger whose embedded `WhenNextEvent` matcher names the created referent.
+/// Creation snapshots only payload targets (CR 603.7c); the matcher is matched
+/// against the live ledger when the event fires, so it must see the union.
+fn when_next_created_token_dies_gain_life() -> AbilityDefinition {
+    let dies = TriggerDefinition::new(TriggerMode::ChangesZone)
+        .origin(Zone::Battlefield)
+        .destination(Zone::Graveyard)
+        .valid_card(TargetFilter::LastCreated);
+    tail_definition(Effect::CreateDelayedTrigger {
+        condition: DelayedTriggerCondition::WhenNextEvent {
+            trigger: Box::new(dies),
+            or_trigger: None,
+            lifetime: DelayedTriggerLifetime::ThisTurn,
+        },
+        effect: Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+        )),
+        uses_tracked_set: false,
+    })
+}
+
+/// After the union cast settles, P0 casts the harness's "Destroy all creatures
+/// you control" sorcery through the public cast, so P0's Fractal (one of "those
+/// tokens") dies. Returns P0's life gain from that point.
+fn destroy_p0_fractal_and_measure_life_gain(cast: &mut UnionCast) -> i32 {
+    let state = cast.runner.state();
+    assert_eq!(
+        state.delayed_triggers.len(),
+        1,
+        "reach guard: the tail created its delayed trigger"
+    );
+    let life_before = state.players[0].life;
+    let sweep = cast.sweep;
+    cast.runner.cast(sweep).commit();
+    let prompted = drive(&mut cast.runner, &mut no_replacement, &no_optional);
+    assert!(prompted.is_empty());
+    let state = cast.runner.state();
+    assert!(
+        tokens(state, P0, "Fractal").is_empty(),
+        "reach guard: P0's Fractal died"
+    );
+    assert_eq!(tokens(state, P1, "Fractal").len(), 1);
+    assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+    assert!(state.stack.is_empty());
+    assert!(state.active_ability_continuation().is_none());
+    state.players[0].life - life_before
+}
+
+/// PR-8 — the review's counterexample: P0's Fractal is one of "those tokens",
+/// so its death fires the `WhenNextEvent` trigger on the paused route as on the
+/// synchronous one.
+#[test]
+fn paused_cast_when_next_event_matcher_sees_both_seats_tokens() {
+    let mut cast = cast_union_fan_out(when_next_created_token_dies_gain_life(), true);
+    assert_paused_reader_reach(&cast);
+    assert_eq!(destroy_p0_fractal_and_measure_life_gain(&mut cast), 1);
+}
+
+#[test]
+fn sync_cast_when_next_event_matcher_sees_both_seats_tokens() {
+    let mut cast = cast_union_fan_out(when_next_created_token_dies_gain_life(), false);
+    assert_eq!(destroy_p0_fractal_and_measure_life_gain(&mut cast), 1);
 }
