@@ -27685,6 +27685,33 @@ impl GameState {
             .expect("the active spell-resolution frame must be structurally consumable")
     }
 
+    /// CR 608.2c + CR 608.2e + CR 101.4 + CR 118.12a: make the continuation
+    /// directly below the active paused drain that drain's active child, as
+    /// `ResolutionStack::promote_ability_continuation_after_post_replacement_draw`
+    /// does — unless it sits below a parked counter-cost root's replacement
+    /// subtree. A continuation below the root's boundary is outer work (a later
+    /// seat's "unless" choice of a resolving ability, say), and outer work never
+    /// rises above the root's subtree: it stays where it is, and the drain retires
+    /// as the top. The stack is `[.., continuation, drain]` here, so the
+    /// continuation is below the boundary exactly when `len < depth + 2`. The one
+    /// guard for both promote callers.
+    fn promote_paused_drain_tail_within_counter_cost_subtree(
+        &mut self,
+    ) -> Result<bool, ResolutionStackError> {
+        let continuation_is_outer = self
+            .pending_cost_move_resume
+            .as_ref()
+            .and_then(PendingCostMoveResume::paused_counter_removal)
+            .is_some_and(|paused| {
+                self.resolution_stack.len() < paused.replacement_subtree.resolution_depth + 2
+            });
+        if continuation_is_outer {
+            return Ok(false);
+        }
+        self.resolution_stack
+            .promote_ability_continuation_after_post_replacement_draw()
+    }
+
     /// Removes a completed independent MultiDraw frame. A frame carrying the
     /// deferred connive re-entry remains resident until that exact link is
     /// consumed by its action/resume owner.
@@ -27724,25 +27751,8 @@ impl GameState {
         self.resolution_stack
             .observe_draw_sequence_frame_id(next_frame_id);
         let completed = self.resolution_stack.take_active_multi_draw()?;
-        // CR 608.2c + CR 608.2e + CR 101.4 + CR 118.12a: the continuation directly
-        // below the paused drain is that dispatch's own tail only if it sits inside
-        // a parked counter-cost root's replacement subtree. One below the root's
-        // boundary is outer work (a later seat's "unless" choice of a resolving
-        // ability, say), and outer work never rises above the root's subtree: it
-        // stays where it is, and the drain retires as the top. With the draw
-        // popped the stack is `[.., continuation, drain]`, so the continuation is
-        // below the boundary exactly when `len < depth + 2`.
-        let continuation_is_outer = self
-            .pending_cost_move_resume
-            .as_ref()
-            .and_then(PendingCostMoveResume::paused_counter_removal)
-            .is_some_and(|paused| {
-                self.resolution_stack.len() < paused.replacement_subtree.resolution_depth + 2
-            });
-        if paired_post_replacement && !continuation_is_outer {
-            let _ = self
-                .resolution_stack
-                .promote_ability_continuation_after_post_replacement_draw()?;
+        if paired_post_replacement {
+            let _ = self.promote_paused_drain_tail_within_counter_cost_subtree()?;
         }
         Ok(completed)
     }
@@ -27815,9 +27825,7 @@ impl GameState {
             // own later instructions (an outer chain's tail parked outside the
             // pair) now resume with that outer event context readable, so promote
             // them out from under its frame; their completion retires it.
-            let _ = self
-                .resolution_stack
-                .promote_ability_continuation_after_post_replacement_draw();
+            let _ = self.promote_paused_drain_tail_within_counter_cost_subtree();
             // CR 614.12a + CR 614.13a: a Devour-only ChangeZone snapshot stays
             // resident while its exact post-replacement child resolves. Once that
             // child is retired, the snapshot is again the active owner and its

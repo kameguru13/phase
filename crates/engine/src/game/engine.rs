@@ -1656,10 +1656,10 @@ fn apply_action_boundary_core(
     // `false` when nothing was parked or an earlier convergence point already consumed it
     // (`Option::take_if`).
     let scan_from = result.events.len();
-    // CR 601.2h + CR 602.2b + CR 605.3b: a counter-cost root this action made due
-    // resumes before the action returns, and its events join the convergence
-    // pass below.
-    let resumed_due_root = match resume_due_counter_cost_root_at_action_boundary(
+    // CR 601.2h + CR 602.2b + CR 605.3b: a parked counter-cost root's subtree is
+    // finished and the root resumed before the action returns; when that made
+    // progress, its events join the convergence pass below.
+    let resumed_parked_root = match resume_parked_counter_cost_root_at_action_boundary(
         state,
         &result.waiting_for,
         &mut result.events,
@@ -1684,7 +1684,7 @@ fn apply_action_boundary_core(
     // triggers. A token realization and an owed final part on the same action
     // share one pass.
     let owed_spell_final_part_is_due = owed_spell_final_part_is_due(state, &result);
-    if (resumed_due_root && matches!(result.waiting_for, WaitingFor::Priority { .. }))
+    if (resumed_parked_root && matches!(result.waiting_for, WaitingFor::Priority { .. }))
         || realized_token_entry
         || owed_spell_final_part_is_due
     {
@@ -1744,7 +1744,7 @@ fn owed_spell_final_part_is_due(state: &mut GameState, result: &ActionResult) ->
 /// the action returns. `Some` only when that made progress — the wait changed or
 /// the root left its slot — so a subtree the loop cannot advance (residual 3)
 /// runs no convergence pass. Inert with no counter-cost root parked.
-fn resume_due_counter_cost_root_at_action_boundary(
+fn resume_parked_counter_cost_root_at_action_boundary(
     state: &mut GameState,
     waiting_for: &WaitingFor,
     events: &mut Vec<GameEvent>,
@@ -1755,9 +1755,20 @@ fn resume_due_counter_cost_root_at_action_boundary(
         return Ok(None);
     }
     sync_waiting_for(state, waiting_for);
+    let events_before = events.len();
     resume_pending_continuation_if_priority(state, events)?;
     let progressed = state.waiting_for != *waiting_for
         || state.counter_cost_root_subtree() == CounterCostRootSubtree::Absent;
+    if !progressed {
+        // CR 603.2 + CR 603.3: the loop advanced part of the subtree and stopped
+        // short of the root. Whatever it emitted waits in the still-live
+        // announcement's carrier, as the next pipeline pass would have staged it.
+        super::announcement_triggers::stage_announcement_trigger_events(
+            state,
+            events,
+            events_before,
+        );
+    }
     Ok(progressed.then(|| state.waiting_for.clone()))
 }
 
@@ -16408,14 +16419,14 @@ fn apply_non_priority_pass_action(
         &action_for_divergence,
     );
 
-    // CR 704.3 + CR 117.5 + CR 117.3c: a counter-cost root this handler made due
-    // resumes before the pipeline below, so the activation is on the stack before
-    // the game checks state-based actions — no player receives priority
-    // mid-activation (CR 602.2b + CR 601.2h), and triggers those actions cause go
-    // on the stack above the activation (CR 603.3). Same authority as the action
-    // boundary's call in `apply_action_boundary_core`.
+    // CR 704.3 + CR 117.5 + CR 117.3c: a parked counter-cost root's subtree is
+    // finished and the root resumed before the pipeline below, so the activation
+    // is on the stack before the game checks state-based actions — no player
+    // receives priority mid-activation (CR 602.2b + CR 601.2h), and triggers
+    // those actions cause go on the stack above the activation (CR 603.3). Same
+    // authority as the action boundary's call in `apply_action_boundary_core`.
     let waiting_for =
-        resume_due_counter_cost_root_at_action_boundary(state, &waiting_for, &mut events)?
+        resume_parked_counter_cost_root_at_action_boundary(state, &waiting_for, &mut events)?
             .unwrap_or(waiting_for);
 
     // Run post-action pipeline (SBAs, triggers, layers) and check for terminal states.

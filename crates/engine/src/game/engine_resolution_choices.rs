@@ -737,6 +737,28 @@ pub(super) fn park_cast_during_resolution_cast_observers(
     Ok(Some(settled))
 }
 
+/// CR 603.2c: the not-yet-collected events of `events[start..end]`. A
+/// completion that resumes a parked counter-cost root before collecting has
+/// already had that root's announcement commit collect and claim them; every
+/// ledger writer pairs its claim with a collection, so this drops only those
+/// re-collections and is a no-op when nothing was claimed.
+fn unclaimed_observer_events(
+    state: &GameState,
+    events: &[GameEvent],
+    start: usize,
+    end: usize,
+) -> Vec<GameEvent> {
+    if end <= start {
+        return Vec::new();
+    }
+    super::triggers::filter_consumed_trigger_events_from(
+        &events[..end],
+        start,
+        super::triggers::TriggerCollectionRequester::Ordinary,
+        &state.consumed_before_priority_trigger_events,
+    )
+}
+
 /// CR 603.2 + CR 603.3b: After a resolution-choice handler has moved objects
 /// (sacrifice, change-zone, bounce, discard) and resolved any reflexive
 /// continuation, dispatch the observer triggers (dies-, discarded-, etc.)
@@ -770,26 +792,25 @@ fn batch_or_drain_observer_triggers(
         super::announcement_triggers::take_inline_trigger_span(state, events, event_slice_start);
     let announced = owned.is_empty() && owned.end < events.len();
     let slice_end = event_slice_end.min(owned.end);
-    let completion_events = event_slice_end.min(owned.end)..owned.end;
-    let trigger_events: Vec<GameEvent> = events[event_slice_start..slice_end]
-        .iter()
-        .filter(|ev| {
-            !matches!(ev, GameEvent::PhaseChanged { .. })
-                && (!zone_changes_are_logically_owned
-                    || !matches!(ev, GameEvent::ZoneChanged { .. }))
-        })
-        .cloned()
-        .chain(
-            // CR 603.2 + CR 608.2c: a typed completion continuation may
-            // publish the player action that the interactive move just
-            // completed. Include that semantic event without widening the
-            // owner-bounded zone slice to continuation-produced zone moves.
-            events[completion_events]
-                .iter()
-                .filter(|event| matches!(event, GameEvent::PlayerPerformedAction { .. }))
-                .cloned(),
-        )
-        .collect();
+    let completion_start = event_slice_end.min(owned.end);
+    let trigger_events: Vec<GameEvent> =
+        unclaimed_observer_events(state, events, event_slice_start, slice_end)
+            .into_iter()
+            .filter(|ev| {
+                !matches!(ev, GameEvent::PhaseChanged { .. })
+                    && (!zone_changes_are_logically_owned
+                        || !matches!(ev, GameEvent::ZoneChanged { .. }))
+            })
+            .chain(
+                // CR 603.2 + CR 608.2c: a typed completion continuation may
+                // publish the player action that the interactive move just
+                // completed. Include that semantic event without widening the
+                // owner-bounded zone slice to continuation-produced zone moves.
+                unclaimed_observer_events(state, events, completion_start, owned.end)
+                    .into_iter()
+                    .filter(|event| matches!(event, GameEvent::PlayerPerformedAction { .. })),
+            )
+            .collect();
     if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
         // B1: this action settled. Merge this slice's observer triggers into
         // the parked queue before draining — otherwise the last segment's
@@ -6057,11 +6078,11 @@ pub(super) fn handle_resolution_choice(
                 if end <= start {
                     continue;
                 }
-                let trigger_events: Vec<GameEvent> = events[start..end]
-                    .iter()
-                    .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
-                    .cloned()
-                    .collect();
+                let trigger_events: Vec<GameEvent> =
+                    unclaimed_observer_events(state, events, start, end)
+                        .into_iter()
+                        .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
+                        .collect();
                 if !trigger_events.is_empty() {
                     super::triggers::collect_triggers_into_deferred(state, &trigger_events);
                 }
@@ -8624,12 +8645,15 @@ pub(super) fn handle_resolution_choice(
                         events,
                         events_before_sacrifice,
                     );
-                    let trigger_events: Vec<GameEvent> = events
-                        [events_before_sacrifice..events_after_sacrifice.min(owned.end)]
-                        .iter()
-                        .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
-                        .cloned()
-                        .collect();
+                    let trigger_events: Vec<GameEvent> = unclaimed_observer_events(
+                        state,
+                        events,
+                        events_before_sacrifice,
+                        events_after_sacrifice.min(owned.end),
+                    )
+                    .into_iter()
+                    .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
+                    .collect();
                     super::triggers::collect_triggers_into_deferred(state, &trigger_events);
                 }
                 ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
@@ -8722,12 +8746,15 @@ pub(super) fn handle_resolution_choice(
                     events,
                     events_before_sacrifice,
                 );
-                let trigger_events: Vec<GameEvent> = events
-                    [events_before_sacrifice..events_after_sacrifice.min(owned.end)]
-                    .iter()
-                    .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
-                    .cloned()
-                    .collect();
+                let trigger_events: Vec<GameEvent> = unclaimed_observer_events(
+                    state,
+                    events,
+                    events_before_sacrifice,
+                    events_after_sacrifice.min(owned.end),
+                )
+                .into_iter()
+                .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
+                .collect();
                 super::triggers::collect_triggers_into_deferred(state, &trigger_events);
             }
             ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())

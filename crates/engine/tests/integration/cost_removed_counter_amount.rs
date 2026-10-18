@@ -30,10 +30,10 @@ use engine::game::perf_counters;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
-    ChosenAttribute, Comparator, ControllerRef, CounterCostSelection, DamageChannel, Effect,
-    EffectKind, ManaContribution, ManaProduction, PlayerFilter, QuantityExpr, QuantityRef,
-    ReplacementDefinition, ReplacementMode, RoundingMode, TargetFilter, TargetRef, TypedFilter,
-    UnlessPayModifier, REMOVE_COUNTER_COST_ALL,
+    CardSelectionMode, ChosenAttribute, Comparator, ControllerRef, CounterCostSelection,
+    DamageChannel, Effect, EffectKind, ManaContribution, ManaProduction, PlayerFilter,
+    QuantityExpr, QuantityRef, ReplacementDefinition, ReplacementMode, RoundingMode, TargetFilter,
+    TargetRef, TypedFilter, UnlessPayModifier, REMOVE_COUNTER_COST_ALL,
 };
 use engine::types::actions::GameAction;
 use engine::types::counter::{parse_counter_type, CounterMatch, CounterType};
@@ -3559,7 +3559,14 @@ fn outer_player_scope_seat_waits_for_the_mana_root(child: fn(ObjectId) -> Abilit
         P0,
         "reach: P0's seat is first"
     );
-    let mut each_player = lose_unless_two(1);
+    // "Each player loses 1 life unless that player pays {2}": the unless payer
+    // is the scoped seat, as the parser emits it for that card class.
+    let mut each_player = lose(1).unless_pay(UnlessPayModifier {
+        cost: AbilityCost::Mana {
+            cost: ManaCost::generic(2),
+        },
+        payer: TargetFilter::ScopedPlayer,
+    });
     each_player.player_scope = Some(PlayerFilter::All);
     install_taxer_ability(&mut runner, taxer, each_player);
     install_replacement_on_steward(
@@ -3607,11 +3614,12 @@ fn outer_player_scope_seat_waits_for_the_mana_root(child: fn(ObjectId) -> Abilit
     assert!(
         matches!(
             &runner.state().waiting_for,
-            WaitingFor::UnlessPayment { pending_effect, .. }
-                if matches!(pending_effect.effect, Effect::LoseLife { .. })
+            WaitingFor::UnlessPayment { player, pending_effect, .. }
+                if *player == P1
+                    && matches!(pending_effect.effect, Effect::LoseLife { .. })
                     && pending_effect.controller == P1
         ),
-        "P1's leg asks next: {:?}",
+        "P1 is asked next, for P1's leg: {:?}",
         runner.state().waiting_for
     );
 }
@@ -3704,13 +3712,69 @@ fn a_trigger_between_two_scry_children_goes_on_the_stack_once_above_the_activati
     );
 }
 
+/// Synthetic control: an observer of discards.
+const DISCARD_WITNESS: &str = "Whenever a player discards a card, you gain 1 life.";
+
+/// R4-F1: a "discard a card" child asks which card; the discard's trigger goes
+/// on the stack once, above the activation, although the completion resumes
+/// the root (whose commit collects it) before its own observer collector runs.
+#[test]
+fn a_discard_trigger_from_a_discard_child_goes_on_the_stack_once_above_the_activation() {
+    let mut scenario = replacement_board();
+    let witness = scenario
+        .add_artifact_from_oracle(P0, "Witness", DISCARD_WITNESS)
+        .id();
+    let first = scenario.add_card_to_hand(P0, "Forest");
+    scenario.add_card_to_hand(P0, "Island");
+    let bottle = scenario
+        .add_artifact_from_oracle(P0, "Essence Bottle", ESSENCE_BOTTLE)
+        .id();
+    scenario.with_counter(bottle, counter("elixir"), 3);
+    let mut runner = scenario.build();
+    install_replacement_on_steward(
+        &mut runner,
+        optional_replacement(
+            ReplacementEvent::RemoveCounter,
+            Some(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Discard {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                    selection: CardSelectionMode::Chosen,
+                    unless_filter: None,
+                    filter: None,
+                },
+            )),
+        ),
+    );
+    let index = counter_cost_ability(&runner, bottle, 0);
+    activate(&mut runner, bottle, index);
+    choose_replacement(&mut runner, ACCEPT);
+    assert!(
+        matches!(&runner.state().waiting_for, WaitingFor::DiscardChoice { cards, .. } if cards.contains(&first)),
+        "reach: the child asks which card: {:?}",
+        runner.state().waiting_for
+    );
+    assert_root_is_counter_cost(&runner);
+
+    runner
+        .act(GameAction::SelectCards { cards: vec![first] })
+        .expect("Forest is discarded");
+    assert_eq!(runner.state().objects[&first].zone, Zone::Graveyard);
+    assert_activation_then_one_trigger(&runner, bottle, witness);
+    assert_eq!(
+        witness_entries(runner.state(), witness),
+        1,
+        "collected once"
+    );
+}
+
 /// Synthetic control: an observer of creatures dying.
 const DIES_WITNESS: &str = "Whenever a creature you control dies, you gain 1 life.";
 
 /// F5: a "sacrifice a creature" child asks which creature; the sacrifice's
 /// dies trigger goes on the stack once, above the activation.
 #[test]
-#[ignore = "Phase D F5 sacrifice row blocked: the EffectZoneChoice sacrifice completion resumes the root (whose commit collects the dies trigger) before batch_or_drain_observer_triggers B1 collects the same slice unfiltered, so the trigger is collected twice; returned to the plan"]
 fn a_dies_trigger_from_a_sacrifice_child_goes_on_the_stack_once_above_the_activation() {
     let mut scenario = replacement_board();
     let witness = scenario
