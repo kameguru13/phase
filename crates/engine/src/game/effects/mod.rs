@@ -16728,6 +16728,7 @@ fn static_reads_created_referent(static_def: &StaticDefinition) -> bool {
                         static_reads_created_referent(definition)
                     }
                     ContinuousModification::CopyValues { values, .. } => {
+                        // allow-raw-authority: walks a CopyValues payload's keyword definitions for filters, not a live object's effective keywords
                         values.keywords.iter().any(|keyword| {
                             keyword_reads_filter_population(keyword, &filter_contains_last_created)
                         }) || values
