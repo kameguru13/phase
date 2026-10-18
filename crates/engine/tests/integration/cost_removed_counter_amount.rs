@@ -33,7 +33,7 @@ use engine::types::ability::{
     CardSelectionMode, ChosenAttribute, Comparator, ControllerRef, CounterCostSelection,
     DamageChannel, Effect, EffectKind, ManaContribution, ManaProduction, PlayerFilter,
     QuantityExpr, QuantityRef, ReplacementDefinition, ReplacementMode, RoundingMode, TargetFilter,
-    TargetRef, TypedFilter, UnlessPayModifier, REMOVE_COUNTER_COST_ALL,
+    TargetRef, TriggerDefinition, TypedFilter, UnlessPayModifier, REMOVE_COUNTER_COST_ALL,
 };
 use engine::types::actions::GameAction;
 use engine::types::counter::{parse_counter_type, CounterMatch, CounterType};
@@ -48,9 +48,11 @@ use engine::types::game_state::{
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
+use engine::types::player::PlayerId;
 use engine::types::proposed_event::{ProposedEvent, ReplacementId};
 use engine::types::replacements::ReplacementEvent;
 use engine::types::resolution::ResolutionFrame;
+use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
 
 const ESSENCE_BOTTLE: &str = "{3}, {T}: Put an elixir counter on this artifact.\n{T}, Remove all elixir counters from this artifact: You gain 2 life for each elixir counter removed this way.";
@@ -1626,6 +1628,164 @@ fn magosi_deferred_counter_leg_completes_its_selected_return_after_the_choice() 
         assert_eq!(runner.state().extra_turns.len(), 1, "replaced {replaced}");
         assert!(payment_ownership_is_clear(&runner), "replaced {replaced}");
     }
+}
+
+/// Typed control: "Whenever a counter is removed from a permanent you control,
+/// you gain 1 life." The parser reads a counter-removed trigger only when it is
+/// self-referential (Vanishing, suspend), so the observer is built typed.
+fn counter_removed_witness() -> TriggerDefinition {
+    TriggerDefinition::new(TriggerMode::CounterRemoved)
+        .valid_card(TargetFilter::Typed(
+            TypedFilter::permanent().controller(ControllerRef::You),
+        ))
+        .trigger_zones(vec![Zone::Battlefield])
+        .execute(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+        ))
+}
+
+/// The sources of an ordering prompt, sorted; panics when `waiting_for` is not one.
+fn ordering_prompt_sources(waiting_for: &WaitingFor, controller: PlayerId) -> Vec<ObjectId> {
+    let WaitingFor::OrderTriggers { player, triggers } = waiting_for else {
+        panic!("expected one ordering prompt, got {waiting_for:?}");
+    };
+    assert_eq!(*player, controller);
+    let mut sources: Vec<ObjectId> = triggers.iter().map(|trigger| trigger.source_id).collect();
+    sources.sort();
+    sources
+}
+
+/// Sync-review F1: a counter-cost root whose resumed selected return pauses on
+/// its own replacement. Magosi's removal waits on its choice; once it settles,
+/// the root resumes into the selected self-return, which pauses again (a Moved
+/// replacement), parking the activation as a cost-move root. That cost park
+/// stands down for a live activation (CR 602.2a-b + CR 603.3b), so the
+/// removal's observer waits in the activation's carrier, and the activation's
+/// own observer joins it: one CR 603.3b batch, one ordering prompt, both above
+/// the activation.
+#[test]
+fn a_stood_down_cost_park_inside_a_resumed_counter_root_keeps_one_activation_batch() {
+    let mut scenario = replacement_board();
+    let magosi = scenario
+        .add_land_from_oracle(P0, "Magosi, the Waterveil", MAGOSI)
+        .id();
+    scenario.with_counter(magosi, counter("eon"), 2);
+    let witness = {
+        let mut builder = scenario.add_artifact_from_oracle(P0, "Witness", "");
+        builder.with_trigger_definition(counter_removed_witness());
+        builder.id()
+    };
+    let rings = scenario
+        .add_artifact_from_oracle(P0, "Rings of Brighthearth", RINGS_OF_BRIGHTHEARTH)
+        .id();
+    let mut runner = scenario.build();
+    runner.state_mut().objects.get_mut(&magosi).unwrap().tapped = false;
+    install_optional_counter_removal_replacement(&mut runner);
+    install_replacement_on_steward(
+        &mut runner,
+        optional_replacement(ReplacementEvent::Moved, None).destination_zone(Zone::Hand),
+    );
+    for observer in [witness, rings] {
+        assert_eq!(
+            runner.state().objects[&observer].trigger_definitions.len(),
+            1,
+            "reach: each observer has its trigger"
+        );
+    }
+
+    let index = counter_cost_ability(&runner, magosi, 0);
+    activate(&mut runner, magosi, index);
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![magosi],
+        })
+        .expect("Magosi is chosen for its return");
+    assert_optional_replacement_prompt(&runner);
+    let (_, _, completion) = parked_counter_cost_root(&runner);
+    assert!(
+        matches!(
+            completion,
+            PendingCostMoveCompletion::CompleteSelectedReturnToHand { .. }
+        ),
+        "reach: the counter root carries the selected return"
+    );
+
+    // The removal settles and the root resumes into the selected return, which
+    // pauses on its own replacement.
+    choose_replacement(&mut runner, ACCEPT);
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ),
+        "reach: the selected return waits on its replacement: {:?}",
+        runner.state().waiting_for
+    );
+    assert!(
+        matches!(
+            runner.state().pending_cost_move_resume,
+            Some(PendingCostMoveResume::Cast {
+                pending: Some(_),
+                ..
+            })
+        ),
+        "reach: the activation is parked on its cost move: {:?}",
+        runner.state().pending_cost_move_resume
+    );
+    assert_eq!(counters_on(&runner, magosi, &counter("eon")), 1);
+    assert_eq!(runner.state().objects[&magosi].zone, Zone::Battlefield);
+    assert!(
+        runner.state().stack.is_empty(),
+        "nothing is on the stack mid-activation"
+    );
+    assert!(
+        runner.state().deferred_triggers.is_empty(),
+        "the removal's observer is not parked publicly"
+    );
+
+    choose_replacement(&mut runner, ACCEPT);
+    assert_eq!(runner.state().objects[&magosi].zone, Zone::Hand);
+    assert_eq!(
+        ordering_prompt_sources(&runner.state().waiting_for, P0),
+        {
+            let mut both = vec![witness, rings];
+            both.sort();
+            both
+        },
+        "one ordering prompt for the whole activation batch"
+    );
+    let WaitingFor::OrderTriggers { triggers, .. } = runner.state().waiting_for.clone() else {
+        unreachable!("checked above");
+    };
+    runner
+        .act(GameAction::OrderTriggers {
+            order: (0..triggers.len()).collect(),
+        })
+        .expect("the batch is ordered");
+    let stack = &runner.state().stack;
+    assert!(
+        matches!(stack[0].kind, StackEntryKind::ActivatedAbility { .. })
+            && stack[0].source_id == magosi,
+        "the activation is at the bottom: {:?}",
+        stack
+            .iter()
+            .map(|entry| entry.source_id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(stack.len(), 3, "the activation and its two triggers");
+    assert_eq!(
+        witness_entries(runner.state(), witness),
+        1,
+        "collected once"
+    );
+    assert!(
+        !matches!(runner.state().waiting_for, WaitingFor::OrderTriggers { .. }),
+        "no second ordering prompt follows"
+    );
 }
 
 /// Stage a full prevention of the parked counter removal. No RemoveCounter
