@@ -215,19 +215,22 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
- * 151 — StaticCondition, TriggerCondition and AbilityCondition gain
+ * 152 — StaticCondition, TriggerCondition and AbilityCondition gain
  *      QuantityQuality { quantity, quality } with the new NumberQuality
  *      ({"type":"Prime"} / {"type":"Parity","value":"Odd"|"Even"}), carried
  *      in GameState ability definitions (CR 107.1, CR 603.4) — see
- *      PROTOCOL_VERSION's own `/// 151` entry in
- *      crates/lobby-broker/src/protocol.rs. A v150 peer cannot parse the
+ *      PROTOCOL_VERSION's own `/// 152` entry in
+ *      crates/lobby-broker/src/protocol.rs. A v151 peer cannot parse the
  *      tag; the exact-match version check at connect refuses the pairing.
  *      The same bump adds the optional `created_tokens` channel to the private
  *      player-scope tail sidecar that `PendingContinuation` carries under its
  *      existing `player_scope_linked_exile` key (CR 608.2c + CR 608.2f: the
  *      tokens every seat created, for a paused "each player creates … The
  *      tokens …" tail); it is serde-defaulted, so a sidecar without it decodes
- *      as the linked-exile-only sidecar. Wire 133 moves with it.
+ *      as the linked-exile-only sidecar. Wire 134 moves with it.
+ * 151: Populated GameObject.bestow_form carries the removed creature subtypes
+ *      as an object instead of a boolean. Old native readers cannot decode it.
+ *      Wire 133 moves with it.
  * 150 — The cast-this-way gains rider's serialized payload is reshaped: the
  *      ExileWithAltCost permission's enters_with_modifications becomes a
  *      PendingEntersModifications object (was a ContinuousModification array) and
@@ -929,7 +932,8 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 151;
+export const PROTOCOL_VERSION = 152;
+
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

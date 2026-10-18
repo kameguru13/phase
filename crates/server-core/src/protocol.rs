@@ -3473,11 +3473,11 @@ mod tests {
         }
     }
 
-    /// v151: `StaticCondition`, `TriggerCondition` and `AbilityCondition` gain
+    /// v152: `StaticCondition`, `TriggerCondition` and `AbilityCondition` gain
     /// `QuantityQuality { quantity, quality }` with the new `NumberQuality`
-    /// (CR 107.1, CR 603.4), carried in `GameState` ability definitions; a v150
+    /// (CR 107.1, CR 603.4), carried in `GameState` ability definitions; a v151
     /// peer cannot decode the new tag, so it must be refused before it receives
-    /// v151 state.
+    /// v152 state.
     /// The same bump adds the optional `created_tokens` channel to the private
     /// player-scope tail sidecar that `PendingContinuation` carries under its
     /// existing `player_scope_linked_exile` key (CR 608.2c + CR 608.2f: the
@@ -3485,6 +3485,7 @@ mod tests {
     /// tokens …" tail); it is serde-defaulted, so a sidecar without it decodes
     /// as the linked-exile-only sidecar.
     ///
+    /// v151: populated Bestow form payloads require a versioned full-game peer.
     /// v150: the cast-this-way gains rider is reshaped —
     /// `CastingPermission::ExileWithAltCost.enters_with_modifications` becomes a
     /// `PendingEntersModifications` object and
@@ -3731,8 +3732,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_151_for_number_quality_conditions() {
-        assert_eq!(PROTOCOL_VERSION, 151);
+    fn protocol_version_is_152_for_number_quality_conditions() {
+        assert_eq!(PROTOCOL_VERSION, 152);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3743,7 +3744,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_151_for_number_quality_conditions` stays
+    /// `protocol_version_is_152_for_number_quality_conditions` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
