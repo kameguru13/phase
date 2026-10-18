@@ -33909,6 +33909,7 @@ mod forced_cascade_window_tests {
                         per_cycle: None,
                         shortened_by: None,
                         published_declaration: None,
+                        leading_aims: Vec::new(),
                         road: crate::analysis::loop_check::OfferRoad::Ring,
                         period: Default::default(),
                     },

@@ -85,7 +85,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // permission's `enters_with_modifications` becomes a `PendingEntersModifications` object
 // (was a `ContinuousModification` array) and `Effect::AddPendingEntersModifications`
 // carries its `rider` object in place of the required `modifications` array.
-// v153 (after v152, reserved for #10004) adds `PendingCostMoveResume::CounterCostRemovalPayment`
+// v154 (after v153, reserved for #10004) adds `PendingCostMoveResume::CounterCostRemovalPayment`
 // (CR 616.1 deferred counter-cost removal) and `ManaAbilityCostCursor.counter_removal` to GameState.
 // v134 adds `GameEvent::AbilityActivated.stack_entry` (the activation's stack object).
 // v147 adds the Eye to Eye / Mouth to Mouth physical contest.
@@ -93,6 +93,8 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // `BatchCompletion::TopCardContestRoundComplete`).
 // v149 moves the CR 608.2n owed final part of a paused spell onto the resolution
 // carrier (`GameState.resolving_spell_final_part`; `deferred_spell_delivery` removed).
+// v152 adds `ShortcutDecisionSchema.suggested_declaration` and `.leading_aims`, and
+// `ShortcutProposal.leading_aims`.
 // Keep the measured base so a future merge cannot collapse independent wire
 // changes onto one number.
 const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
@@ -189,10 +191,12 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 //      `enters_with_modifications` object and the effect's `rider` key), neither parseable
 //      by a v149 peer.
 // +80: v151 carries populated Bestow restoration payloads.
-// (+81, v152, is reserved for the Zimone PR, #10004.)
-// +82: v153 adds `PendingCostMoveResume::CounterCostRemovalPayment` and
+// +81: v152 adds `ShortcutDecisionSchema.suggested_declaration` and `.leading_aims`,
+//      and `ShortcutProposal.leading_aims`.
+// (+82, v153, is reserved for the Zimone PR, #10004.)
+// +83: v154 adds `PendingCostMoveResume::CounterCostRemovalPayment` and
 //      `ManaAbilityCostCursor.counter_removal` to GameState.
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 82;
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 83;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
@@ -298,9 +302,10 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 //      payload reshape (the permission's `enters_with_modifications` object and the
 //      effect's `rider` key).
 // +79: wire 133 moves with full-game v151 for populated Bestow payloads.
-// (+80, wire 134, is reserved for the Zimone PR, #10004.)
-// +81: wire 135 moves with full-game v153 for the deferred counter-cost removal root.
-const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 81;
+// +80: wire 134 moves with full-game v152 for the shortcut suggestion fields.
+// (+81, wire 135, is reserved for the Zimone PR, #10004.)
+// +82: wire 136 moves with full-game v154 for the deferred counter-cost removal root.
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 82;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
 // EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse

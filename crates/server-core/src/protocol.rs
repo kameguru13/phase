@@ -3473,15 +3473,18 @@ mod tests {
         }
     }
 
-    /// v153: `PendingCostMoveResume` gains `CounterCostRemovalPayment` (a
+    /// v154: `PendingCostMoveResume` gains `CounterCostRemovalPayment` (a
     /// counter-removal cost paused on a CR 616.1 replacement choice, whose
     /// settled count the activation reads, CR 118.11) and
     /// `ManaAbilityCostCursor` gains `counter_removal`, both carried in
-    /// `GameState::pending_cost_move_resume`; a v152 peer cannot parse the new
-    /// tag, so it must be refused before it receives v153 state;
+    /// `GameState::pending_cost_move_resume`; a v153 peer cannot parse the new
+    /// tag, so it must be refused before it receives v154 state;
     /// `PausedCounterCostRemoval` carries its `replacement_subtree` boundary.
-    /// (v152 is reserved for the Zimone PR, #10004.)
+    /// (v153 is reserved for the Zimone PR, #10004.)
     ///
+    /// v152: `ShortcutDecisionSchema` gains `suggested_declaration` and
+    /// `leading_aims`, and `ShortcutProposal` gains `leading_aims`; a v151 peer
+    /// drops them, so it must be refused before it receives v152 state.
     /// v151: populated Bestow form payloads require a versioned full-game peer.
     /// v149: `GameState::deferred_spell_delivery` is gone and
     /// `GameState::resolving_spell_final_part` marks the CR 608.2n final part a
@@ -3723,8 +3726,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_153_for_counter_cost_removal_payment() {
-        assert_eq!(PROTOCOL_VERSION, 153);
+    fn protocol_version_is_154_for_counter_cost_removal_payment() {
+        assert_eq!(PROTOCOL_VERSION, 154);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3735,7 +3738,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_153_for_counter_cost_removal_payment` stays
+    /// `protocol_version_is_154_for_counter_cost_removal_payment` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
