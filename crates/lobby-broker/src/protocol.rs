@@ -60,14 +60,24 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
-/// 150 — `PendingChangeZoneIteration` members carry their pre-event entry
+/// 152 — `PendingChangeZoneIteration` members carry their pre-event entry
 ///      modifications (CR 603.6a + CR 614.12): `remaining` becomes
 ///      `ChangeZoneMemberEntry` records and the raw gate fields are removed; old
 ///      peers cannot parse a parked ChangeZone frame. `RESOLUTION_STATE_WIRE_VERSION`
-///      moves from 6 to 7 with it: a v149 peer refuses the version-7 resolution
-///      state. Full-game peers and P2P move in lockstep (wire 132); no lobby
+///      moves from 6 to 7 with it: a v151 peer refuses the version-7 resolution
+///      state. Full-game peers and P2P move in lockstep (wire 134); no lobby
 ///      carrier names it.
-///
+/// 151: Populated `GameObject.bestow_form` carries removed creature subtypes as
+///      an object instead of the legacy boolean. Old readers cannot decode it;
+///      full-game and P2P (wire 133) refuse them before state delivery.
+/// 150 — The cast-this-way gains rider's serialized payload is reshaped:
+///      `CastingPermission::ExileWithAltCost.enters_with_modifications` becomes a
+///      `PendingEntersModifications` object (a bare `ContinuousModification`
+///      array on a v149 peer) and `Effect::AddPendingEntersModifications` carries
+///      its `rider` object in place of the required `modifications` array (the
+///      compat reader accepts the legacy shapes; a v149 peer cannot parse either
+///      new shape). Full-game peers and P2P move in lockstep (wire 132); no lobby
+///      carrier names it.
 /// 149 — The CR 608.2n final part of a spell's resolution is owed on the
 ///      resolution carrier. `GameState::deferred_spell_delivery` (v110: the
 ///      destination recorded while a spell paused on its own free-cast window)
@@ -1139,7 +1149,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 150;
+pub const PROTOCOL_VERSION: u32 = 152;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2396,12 +2406,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 150);
+        assert_eq!(PROTOCOL_VERSION, 152);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 149);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 151);
     }
 
     #[test]
