@@ -123,3 +123,7 @@ When filing, mention the enter-trigger timing PR as "found while working on".
 **Expected:** CR 614.1c. The rider is a conditional entry replacement, like What Must Be Done's.
 
 **Notes:** Low priority; no printed card is affected today.
+
+## C1 follow-up PR scope additions (from the §5 cross-check at a0e023a78)
+- D1 deferral (`entry_observation_deferred` / `effect_may_apply_with_entry`) works around the AST's missing rider onset (CR 611.2e "is/has" vs "gains/becomes"). C1 adds the typed onset and replaces the blanket classifier.
+- `effect_may_apply_with_entry` and `effect_enters_battlefield` (game/effects/mod.rs) are `matches!` subset classifiers over `Effect`. Make them exhaustive in C1, or justify keeping them as subset predicates; C1 removes the former.
