@@ -3830,7 +3830,8 @@ const LEGACY_DEALERLESS_RESOLUTION_STATE_WIRE_VERSION: u64 = 4;
 /// Last wire version whose parked ChangeZone carrier held bare member ids
 /// with carrier-level entry modifications and gates. Its readers migrate or
 /// refuse that carrier before the typed decode
-/// (`migrate_legacy_change_zone_member_entries`).
+/// (`migrate_legacy_change_zone_member_entries` for v2–v6 frames and the v1
+/// reader arm for v1, both through `migrate_legacy_change_zone_carrier`).
 const LEGACY_UNRESOLVED_CHANGE_ZONE_MEMBER_RESOLUTION_STATE_WIRE_VERSION: u64 = 6;
 
 /// Stable, machine-recognizable restore refusal for a v1–v6 save paused inside
@@ -4264,24 +4265,25 @@ fn migrate_legacy_change_zone_carrier(carrier: &mut Value) -> Result<(), String>
     Ok(())
 }
 
-/// The single v1–v6 → v7 authority for parked ChangeZone carriers. Runs before
-/// any typed carrier decode: every ungated carrier is expanded into per-member
-/// records from its own fields, and every carrier whose unprocessed members'
-/// entries depend on a gate is refused with
-/// [`LEGACY_GATED_CHANGE_ZONE_ENTRY_RESTORE_ERROR`]. v7 and later decode
-/// directly.
+/// The v2–v6 typed-frame half of the → v7 migration for parked ChangeZone
+/// carriers. Runs before any typed carrier decode: every ungated frame carrier
+/// is expanded into per-member records from its own fields, and every carrier
+/// whose unprocessed members' entries depend on a gate is refused with
+/// [`LEGACY_GATED_CHANGE_ZONE_ENTRY_RESTORE_ERROR`]. The v1 top-level carrier
+/// is migrated by the v1 reader arm of `ResolutionStateWire::from_value`
+/// through the same `migrate_legacy_change_zone_carrier`, which stays the
+/// single per-carrier authority. v7 and later decode directly.
 fn migrate_legacy_change_zone_member_entries(
     value: &mut Value,
     version: u64,
 ) -> Result<(), String> {
-    if version > LEGACY_UNRESOLVED_CHANGE_ZONE_MEMBER_RESOLUTION_STATE_WIRE_VERSION {
+    // v1 carries its carrier at a top-level v1 key, which only the v1 reader
+    // arm of `ResolutionStateWire::from_value` may read; it migrates it there.
+    if !(LEGACY_TYPED_FRAME_RESOLUTION_STATE_WIRE_VERSION
+        ..=LEGACY_UNRESOLVED_CHANGE_ZONE_MEMBER_RESOLUTION_STATE_WIRE_VERSION)
+        .contains(&version)
+    {
         return Ok(());
-    }
-    if version == LEGACY_RESOLUTION_STATE_WIRE_VERSION {
-        return match value.get_mut("pending_change_zone_iteration") {
-            Some(carrier) if !carrier.is_null() => migrate_legacy_change_zone_carrier(carrier),
-            _ => Ok(()),
-        };
     }
     let Some(frames) = value
         .get_mut("resolution_frames")
@@ -4580,9 +4582,10 @@ impl ResolutionStateWire {
     /// Version 1 is read only through the legacy migration path below. Versions
     /// 2 and 3 share the typed-frame reader; versions 4 through 7 use the same
     /// frame layout with an explicit draw-result-owner presence check, and a
-    /// version-4 draw frame simply has no dealer. A v1–v6 parked ChangeZone
-    /// carrier is migrated or refused first by
-    /// `migrate_legacy_change_zone_member_entries`.
+    /// version-4 draw frame simply has no dealer. A v2–v6 parked ChangeZone
+    /// frame carrier is migrated or refused first by
+    /// `migrate_legacy_change_zone_member_entries`; the v1 top-level carrier,
+    /// by the v1 reader arm before that arm's validation and legacy decodes.
     fn from_value(mut value: Value) -> Result<Self, String> {
         let version = {
             let object = value
@@ -4647,6 +4650,19 @@ impl ResolutionStateWire {
             // V1 reader compatibility path: historical keys are consumed here
             // and projected into typed frames before runtime state is restored.
             GameStateDecodeMode::ResolutionWireV1 => {
+                // CR 603.6a + CR 614.12: a v1 save paused inside a multi-object
+                // ChangeZone wrote bare member ids with carrier-level entry
+                // modifications. Migrate (or refuse, when a gate decides the
+                // entries) before this arm's validation or the `LegacyChangeZoneWire`
+                // decode reads it. Unlike the v2–v6 frame migration, this runs after
+                // `prepare_resolution_wire` and the provenance migration, neither of
+                // which reads the carrier's `remaining` or entry fields.
+                if let Some(carrier) = value
+                    .get_mut("pending_change_zone_iteration")
+                    .filter(|carrier| !carrier.is_null())
+                {
+                    migrate_legacy_change_zone_carrier(carrier)?;
+                }
                 let legacy_draw_sequence_frames = value
                     .get("draw_sequences")
                     .and_then(|stack| stack.get("frames"))

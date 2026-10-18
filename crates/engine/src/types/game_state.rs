@@ -45597,7 +45597,9 @@ mod tests {
 
         // The carrier itself never accepts bare-id members. A persisted v1–v6
         // carrier is migrated or refused before this decode by
-        // `migrate_legacy_change_zone_member_entries` (`types/resolution.rs`).
+        // `migrate_legacy_change_zone_carrier` (`types/resolution.rs`), reached
+        // from the v1 reader arm and from
+        // `migrate_legacy_change_zone_member_entries` for v2–v6.
         let mut bare_ids = serde_json::to_value(&original).expect("serialize modern carrier");
         bare_ids
             .as_object_mut()

@@ -87954,6 +87954,18 @@ fn put_counter_if_its_a_type_stays_later_instruction() {
         ),
         "{sub:#?}"
     );
+    // Reach guard: the "if it's a creature" clause survives as the later
+    // instruction's type gate, so the negative check below cannot pass by the
+    // clause being dropped.
+    assert_eq!(
+        sub.condition,
+        Some(AbilityCondition::RevealedHasCardType {
+            card_types: vec![CoreType::Creature],
+            additional_filter: None,
+            subtype_filter: None,
+        }),
+        "{sub:#?}"
+    );
     assert!(
         !matches!(
             sub.condition,
