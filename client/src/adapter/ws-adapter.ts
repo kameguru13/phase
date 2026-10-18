@@ -222,7 +222,8 @@ export class NativeEngineVersionMismatchError extends Error {
  *      PROTOCOL_VERSION's own `/// 152` entry in
  *      crates/lobby-broker/src/protocol.rs. A v151 peer cannot parse the
  *      tag; the exact-match version check at connect refuses the pairing.
- *      The same bump adds the optional `created_tokens` channel to the private
+ *      The same bump adds the optional per-seat `created_tokens` channel (each
+ *      seat's pinned creation result) to the private
  *      player-scope tail sidecar that `PendingContinuation` carries under its
  *      existing `player_scope_linked_exile` key (CR 608.2c + CR 608.2f: the
  *      tokens every seat created, for a paused "each player creates … The

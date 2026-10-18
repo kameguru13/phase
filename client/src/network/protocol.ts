@@ -108,9 +108,9 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * Bumps to date:
  *  134 — game_setup and state_update carry GameState whose ability conditions
  *       may carry QuantityQuality/NumberQuality. Bumped in lockstep with
- *       full-game protocol 152, which also adds the optional created_tokens
- *       channel on the player-scope tail sidecar inside paused resolution
- *       frames.
+ *       full-game protocol 152, which also adds the optional per-seat
+ *       created_tokens channel (each seat's pinned creation result) on the
+ *       player-scope tail sidecar inside paused resolution frames.
  *  133: Populated GameObject.bestow_form carries removed creature subtypes
  *       as an object instead of the legacy boolean; full-game protocol 151.
  *  132 — game_setup and state_update carry GameState whose casting permissions may

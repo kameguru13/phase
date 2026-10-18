@@ -3478,7 +3478,8 @@ mod tests {
     /// (CR 107.1, CR 603.4), carried in `GameState` ability definitions; a v151
     /// peer cannot decode the new tag, so it must be refused before it receives
     /// v152 state.
-    /// The same bump adds the optional `created_tokens` channel to the private
+    /// The same bump adds the optional per-seat `created_tokens` channel (each
+    /// seat's pinned creation result) to the private
     /// player-scope tail sidecar that `PendingContinuation` carries under its
     /// existing `player_scope_linked_exile` key (CR 608.2c + CR 608.2f: the
     /// tokens every seat created, for a paused "each player creates … The

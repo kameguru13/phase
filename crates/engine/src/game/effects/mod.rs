@@ -28,13 +28,14 @@ use crate::types::ability::{AttackSubject, CombatHistoryScope};
 use crate::types::events::{ClashResult, GameEvent, PlayerActionKind};
 use crate::types::format::ZoneScope;
 use crate::types::game_state::{
-    AutoMayChoice, CastOfferKind, ClauseMinimumSnapshot, DayNight, DiscardBatchCursor, GameState,
-    LKISnapshot, ManaAbilityResume, MayTriggerAutoChoiceKey, PendingContinuation,
-    PendingCostMoveResume, PendingDiscardBatchCompletion, PendingPlayerScopeSacrificeChoice,
-    PendingPlayerScopeSacrificeCompletion, PendingPlayerScopeSacrificeFollowUp,
-    PendingPlayerScopeTail, RepeatIterationChoice, RepeatIterationMovement,
-    RepeatUntilIterationWitness, RepeatUntilStopWitness, ResolutionOptionalPaymentOption,
-    ReturnResultOccurrenceId, WaitingFor, ZoneChangeRecord, ZoneOpponentChooserPurpose,
+    AutoMayChoice, CastOfferKind, ClauseMinimumSnapshot, CreatedTokenSeatsHandoff, DayNight,
+    DiscardBatchCursor, GameState, LKISnapshot, ManaAbilityResume, MayTriggerAutoChoiceKey,
+    PendingContinuation, PendingCostMoveResume, PendingDiscardBatchCompletion,
+    PendingPlayerScopeSacrificeChoice, PendingPlayerScopeSacrificeCompletion,
+    PendingPlayerScopeSacrificeFollowUp, PendingPlayerScopeTail, RepeatIterationChoice,
+    RepeatIterationMovement, RepeatUntilIterationWitness, RepeatUntilStopWitness,
+    ResolutionOptionalPaymentOption, ReturnResultOccurrenceId, SeatCreatedTokens, WaitingFor,
+    ZoneChangeRecord, ZoneOpponentChooserPurpose,
 };
 use crate::types::identifiers::{DiscardFrameId, ObjectId, ObjectIncarnationRef, TrackedSetId};
 use crate::types::mana::ManaCost;
@@ -1298,8 +1299,12 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
                 .and_then(|frame| frame.pending.player_scope_tail.as_mut())
             {
                 extend_pinned_batch(&mut scope.linked_exile_batch, linked_additions);
+                // CR 608.2e: the answered pause belongs to the seat in
+                // progress — the last entry — so its tokens are that seat's.
                 if let Some(created) = scope.created_tokens.as_mut() {
-                    extend_pinned_batch(created, created_additions);
+                    if let Some(seat) = created.last().map(|entry| entry.seat) {
+                        extend_seat_created_tokens(created, seat, created_additions);
+                    }
                 }
             }
         }
@@ -1415,11 +1420,22 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
                 }
                 // CR 608.2c + CR 608.2f: the paused clause has completed, so its
                 // one action's created referent is every token it made.
-                if let Some(union) = scope.created_tokens.as_deref() {
-                    publish_created_token_union(state, union);
-                }
-                chain_progress =
-                    resolve_ability_chain_step(state, &scope.after_scope, events, 1).ok();
+                // CR 608.2e: its tail also receives each seat's own result.
+                let handoff = scope.created_tokens.take().map(|seats| {
+                    publish_created_token_union(state, &seats);
+                    CreatedTokenSeatsHandoff {
+                        source_id: scope.source_id,
+                        seats,
+                    }
+                });
+                chain_progress = resolve_after_scope_with_created_seats(
+                    state,
+                    &scope.after_scope,
+                    handoff,
+                    events,
+                    1,
+                )
+                .ok();
             }
         }
         if let Some(kind) = parent_kind {
@@ -6154,205 +6170,37 @@ fn filter_contains_last_created(filter: &TargetFilter) -> bool {
     crate::game::filter::filter_contains_last_created(filter)
 }
 
-/// Whether the object population a `CardTypeSetSource` reads is selected by a
-/// filter satisfying `filter_pred`.
+/// Whether evaluating `qty` reads a population selected by a `TargetFilter`
+/// satisfying `filter_pred` — its counted population, the player filter it
+/// counts, or any filter nested behind one of their quantity operands (a
+/// `Cmc` / `Counters` / `PtComparison` threshold, `ControlsCount.count`,
+/// `PlayerAttribute.{attr, value}`).
 ///
-/// Exhaustive: the three fixed-vocabulary sources name a zone, the source's
-/// exile set, or a tracked set, none of which carries a `TargetFilter`. The
-/// journal carries an optional narrowing filter, and `AnyOf` recurses.
-fn card_type_set_source_counts_population_matching(
-    source: &crate::types::ability::CardTypeSetSource,
-    filter_pred: &dyn Fn(&TargetFilter) -> bool,
-) -> bool {
-    let mut found = false;
-    let complete =
-        source.try_for_each_member(crate::types::ability::UNION_DEPTH_BUDGET, &mut |leaf| {
-            if !found {
-                found = card_type_set_leaf_counts_population_matching(leaf, filter_pred);
-            }
-        });
-    // A truncated walk claims the match: an unreported anaphor is the silent
-    // failure this predicate exists to prevent.
-    found || !complete
-}
-
-fn card_type_set_leaf_counts_population_matching(
-    source: &crate::types::ability::CardTypeSetSource,
-    filter_pred: &dyn Fn(&TargetFilter) -> bool,
-) -> bool {
-    use crate::types::ability::CardTypeSetSource;
-    match source {
-        CardTypeSetSource::Objects { filter } => filter_pred(filter),
-        // The journal's optional narrowing filter is a population selector like
-        // any other, so an anaphor inside it must be reported. Uncited: this is
-        // an engine claim about where filters live, not a rule. (It cited
-        // CR 601.2a, which describes putting a spell on the stack as it is cast
-        // — the event the journal records, not its narrowing filter.)
-        CardTypeSetSource::TurnJournal { filter, .. } => filter.as_ref().is_some_and(filter_pred),
-        // Unrolled by the bounded walker in the caller, so a union never reaches
-        // this arm. Uncited for the same reason as the union arm in
-        // `ability_rw::characteristic_source_read`: no CR rule defines set union
-        // of populations. (It cited CR 109.2, the battlefield-default rule for a
-        // bare type description.)
-        CardTypeSetSource::AnyOf { .. } => false,
-        CardTypeSetSource::Zone { .. }
-        | CardTypeSetSource::ExiledBySource
-        | CardTypeSetSource::TrackedSet { .. } => false,
-    }
-}
-
-/// Whether the population `qty` counts over is selected by a `TargetFilter`
-/// satisfying `filter_pred`.
-///
-/// Single enumeration of the "this ref reads a population" variant set, shared
-/// by every predicate that asks whether a magnitude depends on a particular
+/// Single authority: delegates to `filter::quantity_ref_operands_contain`, the
+/// operand-closed walk over the filter grammar's one exhaustive topology, so a
+/// new population-reading `QuantityRef` is classified once, in `filter.rs`,
+/// for every predicate that asks whether a magnitude depends on a
 /// resolution-local anaphor ledger (`LastZoneChanged`, `LastCreated`, …).
-/// Without it each such predicate re-listed the same variants and a new
-/// population-counting `QuantityRef` had to be threaded once per predicate.
-///
-/// EXHAUSTIVE, no `_` arm. The wildcard this replaced classified every unlisted
-/// variant as filter-free, which was wrong for thirteen variants that already
-/// carried one (`SacrificedThisTurn`, `ZoneChangeCountThisTurn`,
-/// `DamageDealtThisTurn`, `TokensCreatedThisTurn`, …) and would have been wrong
-/// by default for every future one. A new `QuantityRef` now has to be classified
-/// here before it compiles, which is the point: "does this magnitude read a
-/// population?" is a decision, not a default.
-///
-/// Returning a predicate rather than an `Option<&TargetFilter>` is what lets
-/// `DamageDealtThisTurn` report BOTH of its filters; a single-filter accessor
-/// structurally could not.
+/// The full-predicate contract is unchanged: `filter_pred` is offered every
+/// reachable `TargetFilter`, so `DamageDealtThisTurn` still reports both of its
+/// filters.
 fn quantity_ref_counts_population_matching(
     qty: &QuantityRef,
     filter_pred: &dyn Fn(&TargetFilter) -> bool,
 ) -> bool {
-    match qty {
-        // Owned `TargetFilter` naming the counted population.
-        QuantityRef::ObjectCount { filter }
-        | QuantityRef::ObjectCountDistinct { filter, .. }
-        | QuantityRef::ObjectCountBySharedQuality { filter, .. }
-        | QuantityRef::CountersOnObjects { filter, .. }
-        | QuantityRef::ControlledByEachPlayer { filter, .. }
-        | QuantityRef::DistinctCounterKindsAmong { filter }
-        | QuantityRef::EnteredThisTurn { filter }
-        | QuantityRef::SacrificedThisTurn { filter, .. }
-        | QuantityRef::BattlefieldEntriesThisTurn { filter, .. }
-        | QuantityRef::ZoneChangeCountThisTurn { filter, .. }
-        | QuantityRef::ZoneChangeAggregateThisTurn { filter, .. }
-        | QuantityRef::TokensCreatedThisTurn { filter, .. } => filter_pred(filter),
-        // Same, under a field named for what it selects rather than `filter`.
-        QuantityRef::CounterAddedThisTurn { target, .. } => filter_pred(target),
-        // Boxed.
-        QuantityRef::TargetObjectManaValue { filter }
-        | QuantityRef::FilteredTrackedSetSize { filter, .. } => filter_pred(filter),
-        // Optional narrowing on an otherwise unfiltered count.
-        QuantityRef::ZoneCardCount { filter, .. }
-        | QuantityRef::SpellsCastThisTurn { filter, .. }
-        | QuantityRef::SpellsCastBeforeTriggeringSpell { filter, .. }
-        | QuantityRef::AttackedThisTurn { filter, .. }
-        | QuantityRef::SpellsCastThisGame { filter, .. } => {
-            filter.as_ref().is_some_and(filter_pred)
-        }
-        // CR 120.1 + CR 120.2: two independent populations — what dealt the damage
-        // and what received it. Either one can carry the anaphor.
-        QuantityRef::DamageDealtThisTurn { source, target, .. } => {
-            filter_pred(source) || filter_pred(target)
-        }
-        QuantityRef::DistinctCardTypes { source }
-        | QuantityRef::SharedCardTypes { source }
-        | QuantityRef::DistinctSubtypes { source, .. }
-        | QuantityRef::DistinctColorsAmong { source } => {
-            card_type_set_source_counts_population_matching(source, filter_pred)
-        }
-        QuantityRef::PropertyAggregate(aggregate) => {
-            card_type_set_source_counts_population_matching(aggregate.source(), filter_pred)
-        }
-        // No `TargetFilter` anywhere: player-scoped totals, per-object scopes,
-        // resolution/turn counters, and cost bookkeeping.
-        QuantityRef::HandSize { .. }
-        | QuantityRef::LifeTotal { .. }
-        | QuantityRef::GraveyardSize { .. }
-        | QuantityRef::LifeAboveStarting
-        | QuantityRef::StartingLifeTotal { .. }
-        | QuantityRef::TriggeringDiscoverValue
-        | QuantityRef::TriggeringScryLookCount
-        | QuantityRef::TriggeringScryBottomCount
-        | QuantityRef::PlayerCount { .. }
-        | QuantityRef::CountersOn { .. }
-        | QuantityRef::PlayerCounter { .. }
-        // CR 101.4: reads a per-player scalar off `Player::chosen_attributes`.
-        // It counts no POPULATION of objects — its `PlayerScope` selects which
-        // players contribute and how they fold, never a `TargetFilter`.
-        | QuantityRef::PlayerChosenNumber { .. }
-        | QuantityRef::TargetControllerCounter { .. }
-        | QuantityRef::Variable { .. }
-        | QuantityRef::Power { .. }
-        | QuantityRef::BasePower { .. }
-        | QuantityRef::Intensity { .. }
-        | QuantityRef::Toughness { .. }
-        | QuantityRef::ObjectManaValue { .. }
-        | QuantityRef::ObjectColorCount { .. }
-        | QuantityRef::ObjectNameWordCount { .. }
-        | QuantityRef::NameStickerLetterCount { .. }
-        | QuantityRef::ObjectTypelineComponentCount { .. }
-        | QuantityRef::ManaSymbolsInManaCost { .. }
-        | QuantityRef::SelfManaValue
-        | QuantityRef::TargetZoneCardCount { .. }
-        | QuantityRef::Devotion { .. }
-        | QuantityRef::CardsExiledBySource
-        | QuantityRef::ExiledCardPower { .. }
-        | QuantityRef::BasicLandTypeCount { .. }
-        | QuantityRef::TrackedSetSize
-        | QuantityRef::ExiledFromHandThisResolution
-        | QuantityRef::PreviousEffectAmount { .. }
-        | QuantityRef::PreviousEffectCount
-        | QuantityRef::LifeLostThisTurn { .. }
-        | QuantityRef::PartySize { .. }
-        | QuantityRef::UnspentMana { .. }
-        | QuantityRef::Speed { .. }
-        | QuantityRef::EventContextAmount
-        | QuantityRef::EventContextPlayerCount { .. }
-        | QuantityRef::AttachmentsOnLeavingObject { .. }
-        | QuantityRef::EventContextSourceCostX
-        | QuantityRef::EventContextSourceModesChosen
-        | QuantityRef::CrimesCommittedThisTurn
-        | QuantityRef::BendTypesThisTurn
-        | QuantityRef::LifeGainedThisTurn { .. }
-        | QuantityRef::CardsDrawnThisTurn { .. }
-        | QuantityRef::LandsPlayedThisTurn { .. }
-        | QuantityRef::TurnsTaken
-        | QuantityRef::ChosenNumber
-        | QuantityRef::NotedNumber
-        | QuantityRef::DescendedThisTurn
-        | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. }
-        | QuantityRef::SpellsCastLastTurn
-        | QuantityRef::CardsDiscardedThisTurn { .. }
-        | QuantityRef::PlayerActionsThisTurn { .. }
-        | QuantityRef::DungeonsCompleted
-        | QuantityRef::CostXPaid
-        | QuantityRef::KickerCount
-        | QuantityRef::AdditionalCostPaymentCount
-        | QuantityRef::AdditionalCostPaymentCountFor { .. }
-        | QuantityRef::ConvokedCreatureCount
-        | QuantityRef::TimesCostPaidThisResolution
-        | QuantityRef::ManaSpentToCast { .. }
-        | QuantityRef::ColorsInCommandersColorIdentity
-        | QuantityRef::CommanderCastFromCommandZoneCount
-        | QuantityRef::CommanderManaValue { .. }
-        | QuantityRef::VoteCount { .. } => false,
-    }
+    filter::quantity_ref_operands_contain(qty, filter_pred)
 }
 
-/// Whether any magnitude in `expr` counts a population selected by a filter
-/// satisfying `filter_pred`. Traversal delegates to `QuantityExpr::any_ref`
-/// (the single composition-form authority) and the variant set to
+/// Whether any magnitude in `expr` reads a population selected by a filter
+/// satisfying `filter_pred`. Delegates to
+/// `filter::quantity_expr_operands_contain`, which walks every composition
+/// form and every reference through the same operand-closed topology as
 /// [`quantity_ref_counts_population_matching`].
 fn quantity_expr_counts_population_matching(
     expr: &QuantityExpr,
     filter_pred: &dyn Fn(&TargetFilter) -> bool,
 ) -> bool {
-    quantity_expr_any_ref(expr, &mut |qty| {
-        quantity_ref_counts_population_matching(qty, filter_pred)
-    })
+    filter::quantity_expr_operands_contain(expr, filter_pred)
 }
 
 fn condition_depends_on_zone_change_this_way(condition: &AbilityCondition) -> bool {
@@ -6406,14 +6254,15 @@ fn condition_depends_on_last_created(condition: &AbilityCondition) -> bool {
 /// prevent.
 ///
 /// Both carriers of a filter are covered: a `TargetFilter` mentioned directly
-/// (via `filter_contains`, which also descends `FilterProp` and `PlayerFilter`),
-/// and a population COUNTED by a `QuantityExpr` (via
-/// `quantity_expr_counts_population_matching`).
+/// (via `filter::filter_operands_contain`, which also descends `FilterProp`,
+/// `PlayerFilter` and the quantity operands they carry), and a population
+/// COUNTED by a `QuantityExpr` (via `quantity_expr_counts_population_matching`).
 fn condition_reads_filter_population(
     condition: &AbilityCondition,
     leaf: &dyn Fn(&TargetFilter) -> bool,
 ) -> bool {
-    let has_filter = |filter: &TargetFilter| crate::game::filter::filter_contains(filter, leaf);
+    let has_filter =
+        |filter: &TargetFilter| crate::game::filter::filter_operands_contain(filter, leaf);
     let has_quantity =
         |quantity: &QuantityExpr| quantity_expr_counts_population_matching(quantity, leaf);
     let recurse = |inner: &AbilityCondition| condition_reads_filter_population(inner, leaf);
@@ -6450,10 +6299,10 @@ fn condition_reads_filter_population(
             subtype_filter.as_deref().is_some_and(has_filter)
                 || additional_filter
                     .as_ref()
-                    .is_some_and(|prop| crate::game::filter::filter_prop_contains(prop, leaf))
+                    .is_some_and(|prop| crate::game::filter::filter_prop_operands_contain(prop, leaf))
         }
         AbilityCondition::ScopedPlayerMatches { filter } => {
-            crate::game::filter::player_filter_contains(filter, leaf)
+            crate::game::filter::player_filter_operands_contain(filter, leaf)
         }
         // Conditions that COUNT a population.
         AbilityCondition::QuantityCheck { lhs, rhs, .. } => has_quantity(lhs) || has_quantity(rhs),
@@ -6550,7 +6399,7 @@ fn effect_reads_filter_population(effect: &Effect, leaf: &dyn Fn(&TargetFilter) 
     counts_population
         || effect
             .target_filter()
-            .is_some_and(|filter| filter::filter_contains(filter, leaf))
+            .is_some_and(|filter| filter::filter_operands_contain(filter, leaf))
         || effect_fields_read_filter_population(effect, leaf)
 }
 
@@ -6571,8 +6420,8 @@ fn effect_fields_read_filter_population(
     };
     use crate::types::mana::ManaSpellGrant;
 
-    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
-    let has_player = |player: &PlayerFilter| filter::player_filter_contains(player, leaf);
+    let has_filter = |filter: &TargetFilter| filter::filter_operands_contain(filter, leaf);
+    let has_player = |player: &PlayerFilter| filter::player_filter_operands_contain(player, leaf);
     let has_duration = |duration: &Duration| duration_reads_filter_population(duration, leaf);
     let has_cost = |cost: &AbilityCost| ability_cost_reads_filter_population(cost, leaf);
     let has_choice = |choice: &ChoiceType| choice_type_reads_filter_population(choice, leaf);
@@ -7345,7 +7194,7 @@ fn ability_cost_reads_filter_population(
     cost: &AbilityCost,
     leaf: &dyn Fn(&TargetFilter) -> bool,
 ) -> bool {
-    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    let has_filter = |filter: &TargetFilter| filter::filter_operands_contain(filter, leaf);
     let recurse = |inner: &AbilityCost| ability_cost_reads_filter_population(inner, leaf);
     let mut counts_population = false;
     cost.for_each_quantity_expr(&mut |quantity| {
@@ -7420,7 +7269,7 @@ fn choice_type_reads_filter_population(
             .any(|keyword| keyword_reads_filter_population(keyword, leaf)),
         ChoiceType::Opponent { restriction, .. } => restriction
             .as_deref()
-            .is_some_and(|player| filter::player_filter_contains(player, leaf)),
+            .is_some_and(|player| filter::player_filter_operands_contain(player, leaf)),
         ChoiceType::CreatureType { .. }
         | ChoiceType::Color { .. }
         | ChoiceType::OddOrEven
@@ -7458,7 +7307,7 @@ fn delayed_trigger_condition_reads_filter_population(
         | DelayedTriggerCondition::WhenLeavesPlayFiltered { filter }
         | DelayedTriggerCondition::WhenEntersBattlefield { filter }
         | DelayedTriggerCondition::WhenDiesOrExiled { filter } => {
-            filter::filter_contains(filter, leaf)
+            filter::filter_operands_contain(filter, leaf)
         }
         DelayedTriggerCondition::WheneverEvent { trigger, expiry: _ } => {
             trigger_matchers_read_filter_population(trigger, leaf)
@@ -7494,7 +7343,7 @@ fn static_condition_reads_filter_population(
     leaf: &dyn Fn(&TargetFilter) -> bool,
 ) -> bool {
     use crate::types::ability::StaticCondition;
-    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    let has_filter = |filter: &TargetFilter| filter::filter_operands_contain(filter, leaf);
     let has_quantity =
         |quantity: &QuantityExpr| quantity_expr_counts_population_matching(quantity, leaf);
     let recurse = |inner: &StaticCondition| static_condition_reads_filter_population(inner, leaf);
@@ -7580,7 +7429,7 @@ fn protection_target_reads_filter_population(
 ) -> bool {
     use crate::types::keywords::ProtectionTarget;
     match target {
-        ProtectionTarget::Filter(filter) => filter::filter_contains(filter, leaf),
+        ProtectionTarget::Filter(filter) => filter::filter_operands_contain(filter, leaf),
         ProtectionTarget::Color(_)
         | ProtectionTarget::CardType(_)
         | ProtectionTarget::Quality(_)
@@ -7601,7 +7450,7 @@ fn ward_cost_reads_filter_population(
 ) -> bool {
     use crate::types::keywords::WardCost;
     match cost {
-        WardCost::Sacrifice { filter, .. } => filter::filter_contains(filter, leaf),
+        WardCost::Sacrifice { filter, .. } => filter::filter_operands_contain(filter, leaf),
         WardCost::Compound(costs) => costs
             .iter()
             .any(|cost| ward_cost_reads_filter_population(cost, leaf)),
@@ -7626,7 +7475,7 @@ fn trigger_matchers_read_filter_population(
     trigger: &crate::types::ability::TriggerDefinition,
     leaf: &dyn Fn(&TargetFilter) -> bool,
 ) -> bool {
-    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    let has_filter = |filter: &TargetFilter| filter::filter_operands_contain(filter, leaf);
     let crate::types::ability::TriggerDefinition {
         mode: _,
         execute: _,
@@ -7699,7 +7548,7 @@ fn replacement_matchers_read_filter_population(
     leaf: &dyn Fn(&TargetFilter) -> bool,
 ) -> bool {
     use crate::types::ability::ReplacementMode;
-    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    let has_filter = |filter: &TargetFilter| filter::filter_operands_contain(filter, leaf);
     let crate::types::ability::ReplacementDefinition {
         event: _,
         execute: _,
@@ -7834,7 +7683,7 @@ fn static_definition_reads_filter_population(
     } = static_def;
     affected
         .as_ref()
-        .is_some_and(|affected| filter::filter_contains(affected, leaf))
+        .is_some_and(|affected| filter::filter_operands_contain(affected, leaf))
         || static_mode_reads_filter_population(mode, leaf)
         || modifications
             .iter()
@@ -7900,8 +7749,8 @@ fn trigger_condition_reads_filter_population(
     leaf: &dyn Fn(&TargetFilter) -> bool,
 ) -> bool {
     use crate::types::ability::{AttackersDeclaredCountSubject, TriggerCondition};
-    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
-    let has_player = |player: &PlayerFilter| filter::player_filter_contains(player, leaf);
+    let has_filter = |filter: &TargetFilter| filter::filter_operands_contain(filter, leaf);
+    let has_player = |player: &PlayerFilter| filter::player_filter_operands_contain(player, leaf);
     let has_quantity =
         |quantity: &QuantityExpr| quantity_expr_counts_population_matching(quantity, leaf);
     let recurse = |inner: &TriggerCondition| trigger_condition_reads_filter_population(inner, leaf);
@@ -8005,7 +7854,7 @@ fn trigger_constraint_reads_filter_population(
     leaf: &dyn Fn(&TargetFilter) -> bool,
 ) -> bool {
     use crate::types::ability::TriggerConstraint;
-    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    let has_filter = |filter: &TargetFilter| filter::filter_operands_contain(filter, leaf);
     match constraint {
         TriggerConstraint::NthSpellThisTurn { filter, .. } => {
             filter.as_ref().is_some_and(has_filter)
@@ -8032,14 +7881,14 @@ fn replacement_condition_reads_filter_population(
     leaf: &dyn Fn(&TargetFilter) -> bool,
 ) -> bool {
     use crate::types::ability::ReplacementCondition;
-    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    let has_filter = |filter: &TargetFilter| filter::filter_operands_contain(filter, leaf);
     let has_quantity =
         |quantity: &QuantityExpr| quantity_expr_counts_population_matching(quantity, leaf);
     let has_typed = |typed: &TypedFilter| {
         typed
             .properties
             .iter()
-            .any(|prop| filter::filter_prop_contains(prop, leaf))
+            .any(|prop| filter::filter_prop_operands_contain(prop, leaf))
     };
     let recurse =
         |inner: &ReplacementCondition| replacement_condition_reads_filter_population(inner, leaf);
@@ -8096,8 +7945,8 @@ fn static_mode_reads_filter_population(
     use crate::types::statics::{
         BlockExceptionKind, CostPaymentProhibition, HandSizeModification, RequiredDefender,
     };
-    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
-    let has_player = |player: &PlayerFilter| filter::player_filter_contains(player, leaf);
+    let has_filter = |filter: &TargetFilter| filter::filter_operands_contain(filter, leaf);
+    let has_player = |player: &PlayerFilter| filter::player_filter_operands_contain(player, leaf);
     let has_quantity =
         |quantity: &QuantityExpr| quantity_expr_counts_population_matching(quantity, leaf);
     let has_quantity_ref =
@@ -8293,7 +8142,7 @@ fn continuous_modification_reads_filter_population(
     modification: &ContinuousModification,
     leaf: &dyn Fn(&TargetFilter) -> bool,
 ) -> bool {
-    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    let has_filter = |filter: &TargetFilter| filter::filter_operands_contain(filter, leaf);
     let has_quantity =
         |quantity: &QuantityExpr| quantity_expr_counts_population_matching(quantity, leaf);
     let has_keyword =
@@ -8380,7 +8229,7 @@ fn keyword_reads_filter_population(
         BestowCost, BlitzCost, BuybackCost, CyclingCost, DisguiseCost, EchoCost, EmbalmCost,
         EscapeCost, EternalizeCost, EvokeCost, FlashbackCost, Keyword,
     };
-    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
+    let has_filter = |filter: &TargetFilter| filter::filter_operands_contain(filter, leaf);
     let has_quantity =
         |quantity: &QuantityExpr| quantity_expr_counts_population_matching(quantity, leaf);
     let has_cost = |cost: &AbilityCost| ability_cost_reads_filter_population(cost, leaf);
@@ -8400,7 +8249,7 @@ fn keyword_reads_filter_population(
         typed
             .properties
             .iter()
-            .any(|prop| filter::filter_prop_contains(prop, leaf))
+            .any(|prop| filter::filter_prop_operands_contain(prop, leaf))
     };
     let has_restriction = |restriction: &crate::types::ability::ActivationRestriction| {
         activation_restriction_reads_filter_population(restriction, leaf)
@@ -8652,8 +8501,8 @@ fn parsed_condition_reads_filter_population(
     leaf: &dyn Fn(&TargetFilter) -> bool,
 ) -> bool {
     use crate::types::ability::ParsedCondition;
-    let has_filter = |filter: &TargetFilter| filter::filter_contains(filter, leaf);
-    let has_player = |player: &PlayerFilter| filter::player_filter_contains(player, leaf);
+    let has_filter = |filter: &TargetFilter| filter::filter_operands_contain(filter, leaf);
+    let has_player = |player: &PlayerFilter| filter::player_filter_operands_contain(player, leaf);
     let has_quantity =
         |quantity: &QuantityExpr| quantity_expr_counts_population_matching(quantity, leaf);
     let has_quantity_ref =
@@ -16147,10 +15996,10 @@ fn install_previous_effect_counts_by_player(
 /// slice; a resumed batch passes its pre-pause span reunited with the resumed
 /// action's buffer.
 ///
-/// It also returns the clause's created-token union (CR 608.2c + CR 608.2f) for
-/// a token-creation clause — every token created inside `scoped_events`, which
-/// is the clause's own window; the caller publishes it when the clause has
-/// completed (`publish_created_token_union`), never mid-fan-out.
+/// It returns the clause's linked-exile batch. A token-creation clause's
+/// created referent is not derived here: the driver collects it per seat
+/// ([`SeatCreatedTokens`]) and publishes it when the clause has completed
+/// (`publish_created_token_union`), never mid-fan-out.
 fn publish_player_scope_clause_results(
     state: &mut GameState,
     outer: &ResolvedAbility,
@@ -16233,23 +16082,15 @@ fn publish_player_scope_clause_results(
         );
     }
     let linked_exile = linked_exile_batch_from_events(state, outer.source_id, scoped_events);
-    let created_tokens = if scoped_template.effect.is_token_creator() {
-        created_token_union_from_events(state, scoped_events)
-    } else {
-        Vec::new()
-    };
-    PlayerScopeClauseBatches {
-        linked_exile,
-        created_tokens,
-    }
+    PlayerScopeClauseBatches { linked_exile }
 }
 
-/// The pinned batches one completed (or paused) `player_scope` clause span
-/// yields for its detached tail: the linked-exile batch and the created-token
-/// union.
+/// The pinned batch one completed (or paused) `player_scope` clause span yields
+/// for its detached tail: the linked-exile batch. The clause's created tokens
+/// are collected per seat by the driver itself ([`SeatCreatedTokens`]), since
+/// only the driver knows which seat's instruction each window belongs to.
 struct PlayerScopeClauseBatches {
     linked_exile: Vec<ObjectIncarnationRef>,
-    created_tokens: Vec<ObjectIncarnationRef>,
 }
 
 /// CR 111.1 + CR 400.7 + CR 608.2f + CR 614.1a: the tokens created inside one
@@ -16282,16 +16123,93 @@ fn created_token_union_from_events(
 }
 
 /// CR 608.2c + CR 608.2f + CR 609.3: publish a completed player-scope token
-/// clause's created referent — every token its one action created — keeping
-/// only members that are still the object they were when created (CR 400.7).
+/// clause's created referent — every token its one action created, across
+/// every seat's result — keeping only members that are still the object they
+/// were when created (CR 400.7).
 /// Called only at clause completion: a paused copy-token creation resumes from
 /// the ledger, so it must never be overwritten mid-fan-out.
-fn publish_created_token_union(state: &mut GameState, union: &[ObjectIncarnationRef]) {
-    state.last_created_token_ids = union
+fn publish_created_token_union(state: &mut GameState, seats: &[SeatCreatedTokens]) {
+    state.last_created_token_ids = seats
         .iter()
+        .flat_map(|entry| &entry.tokens)
         .filter(|pin| pin.is_current(state))
         .map(|pin| pin.object_id)
         .collect();
+}
+
+/// CR 608.2e: `seat`'s instruction of the clause in progress begins. Its entry
+/// becomes the last one — the seat a pause in this window belongs to — and an
+/// existing entry keeps the tokens already attributed to it.
+fn begin_seat_created_tokens(results: &mut Vec<SeatCreatedTokens>, seat: PlayerId) {
+    if results.last().is_some_and(|entry| entry.seat == seat) {
+        return;
+    }
+    let entry = match results.iter().position(|entry| entry.seat == seat) {
+        Some(index) => results.remove(index),
+        None => SeatCreatedTokens {
+            seat,
+            tokens: Vec::new(),
+        },
+    };
+    results.push(entry);
+}
+
+/// CR 608.2e + CR 400.7: add the tokens one window of `seat`'s instruction
+/// created to that seat's creation result, as pinned at creation. A token
+/// already attributed to any seat is not re-added: overlapping windows (a
+/// resumed action's buffer, a generated leg's node) report it once, to the
+/// seat whose window saw it first.
+fn extend_seat_created_tokens(
+    results: &mut Vec<SeatCreatedTokens>,
+    seat: PlayerId,
+    additions: Vec<ObjectIncarnationRef>,
+) {
+    let fresh: Vec<ObjectIncarnationRef> = additions
+        .into_iter()
+        .filter(|pin| {
+            !results
+                .iter()
+                .flat_map(|entry| &entry.tokens)
+                .any(|existing| existing.object_id == pin.object_id)
+        })
+        .collect();
+    begin_seat_created_tokens_if_absent(results, seat);
+    if let Some(entry) = results.iter_mut().find(|entry| entry.seat == seat) {
+        extend_pinned_batch(&mut entry.tokens, fresh);
+    }
+}
+
+/// Appends an empty entry for `seat` when it has none, without moving an
+/// existing entry (attribution to a seat never changes which seat is in
+/// progress).
+fn begin_seat_created_tokens_if_absent(results: &mut Vec<SeatCreatedTokens>, seat: PlayerId) {
+    if !results.iter().any(|entry| entry.seat == seat) {
+        results.push(SeatCreatedTokens {
+            seat,
+            tokens: Vec::new(),
+        });
+    }
+}
+
+/// CR 608.2c + CR 608.2e: resolve a completed player-scope token clause's
+/// detached tail with that clause's per-seat creation results handed to it, so
+/// a co-scoped second action binds each seat to the tokens that seat's
+/// instruction created. The handoff lives only for this call and is restored
+/// before any error propagates (its own tail's pauses carry no handoff).
+fn resolve_after_scope_with_created_seats(
+    state: &mut GameState,
+    after_scope: &ResolvedAbility,
+    handoff: Option<CreatedTokenSeatsHandoff>,
+    events: &mut Vec<GameEvent>,
+    depth: u32,
+) -> Result<ResolutionProgress, EffectError> {
+    let Some(handoff) = handoff else {
+        return resolve_ability_chain_step(state, after_scope, events, depth);
+    };
+    let prior = state.resolving_created_token_seats.replace(handoff);
+    let outcome = resolve_ability_chain_step(state, after_scope, events, depth);
+    state.resolving_created_token_seats = prior;
+    outcome
 }
 
 /// CR 607.2a: the linked-exile channel is live exactly when the detached tail
@@ -16442,7 +16360,7 @@ fn definition_activation_reads_created_referent(definition: &AbilityDefinition) 
         || definition
             .activator_filter
             .as_ref()
-            .is_some_and(|players| filter::player_filter_contains(players, leaf))
+            .is_some_and(|players| filter::player_filter_operands_contain(players, leaf))
         || definition
             .activation_restrictions
             .iter()
@@ -16501,7 +16419,7 @@ fn target_choice_positions_read_created_referent(
              selection: _,
              dynamic_max_choices,
          }| {
-            filter::player_filter_contains(chooser, leaf)
+            filter::player_filter_operands_contain(chooser, leaf)
                 || dynamic_max_choices.as_ref().is_some_and(has_quantity)
                 || constraints.iter().any(|constraint| match constraint {
                     ModalSelectionConstraint::ConditionalMaxChoices {
@@ -16523,7 +16441,7 @@ fn target_choice_positions_read_created_referent(
     );
     multi_target_reads
         || constraint_reads
-        || target_chooser.is_some_and(|chooser| filter::filter_contains(chooser, leaf))
+        || target_chooser.is_some_and(|chooser| filter::filter_operands_contain(chooser, leaf))
         || announced_x.is_some_and(has_quantity)
         || modal_reads
 }
@@ -16554,16 +16472,18 @@ fn node_reads_created_referent(
             quantity_expr_counts_population_matching(quantity, &filter_contains_last_created)
         })
         || player_scope.is_some_and(|players| {
-            filter::player_filter_contains(players, &filter_contains_last_created)
+            filter::player_filter_operands_contain(players, &filter_contains_last_created)
         })
         || duration.is_some_and(|duration| {
             duration_reads_filter_population(duration, &filter_contains_last_created)
         })
         || unless_pay.is_some_and(|unless_pay| {
             ability_cost_reads_filter_population(&unless_pay.cost, &filter_contains_last_created)
-                || filter_contains_last_created(&unless_pay.payer)
+                || filter::filter_operands_contain(&unless_pay.payer, &filter_contains_last_created)
         })
-        || optional_player.is_some_and(filter_contains_last_created)
+        || optional_player.is_some_and(|player| {
+            filter::filter_operands_contain(player, &filter_contains_last_created)
+        })
 }
 
 /// Whether one effect reads the created referent. Readers are every filter and
@@ -19141,7 +19061,7 @@ fn resolve_chain_body(
         let scoped_search_delivery_is_safe =
             scoped_library_search::has_only_detachable_shuffle_tail(ability);
         let (scoped_template, mut after_scope) = split_player_scope_chain(ability, scope);
-        // CR 608.2e + CR 111.2: prove the per-seat created-referent partition at
+        // CR 608.2e: prove the per-seat created-referent partition at
         // split time, before any completion route (sync, sidecar, sacrifice,
         // search, draw, discard batch) takes the tail.
         mark_co_scoped_created_referent_consumer(&scoped_template, scope, &mut after_scope);
@@ -19318,6 +19238,13 @@ fn resolve_chain_body(
         // CR 608.2e: a co-scoped second action ("… and puts counters on it")
         // reads each seat's own created tokens; snapshot them before any seat acts.
         let created_referent = seat_created_referent_snapshot(state, &scoped_template);
+        // CR 608.2e + CR 400.7: a token-creation clause records each seat's
+        // creation result in its own window, keyed by the instructed seat, so
+        // a co-scoped second action binds every seat to its own products
+        // whoever ends up owning or controlling them. The paused seat's entry
+        // is always the last one: it is the seat in progress.
+        let collects_seat_results = scoped_template.effect.is_token_creator();
+        let mut seat_results: Vec<SeatCreatedTokens> = Vec::new();
         for (i, pid) in matching_players.iter().enumerate() {
             // CR 608.2c + CR 101.3: Each scoped iteration is a fresh
             // sub-resolution of the scoped template — read the whole
@@ -19336,12 +19263,17 @@ fn resolve_chain_body(
                 state,
                 bind_scoped_seat(&scoped_template, controller, *pid),
                 *pid,
-                created_referent.as_deref(),
+                created_referent.as_ref(),
             )
             .into_leg() else {
                 continue;
             };
+            let seat_events_before = events.len();
             progress = resolve_ability_chain_step(state, &scoped, events, depth + 1)?;
+            if collects_seat_results {
+                let created = created_token_union_from_events(state, &events[seat_events_before..]);
+                extend_seat_created_tokens(&mut seat_results, *pid, created);
+            }
 
             // CR 608.2e: Break if inner effect entered a player-choice state —
             // remaining players resume after the choice resolves via continuation.
@@ -19427,7 +19359,7 @@ fn resolve_chain_body(
                         state,
                         bind_scoped_seat(&scoped_template, controller, remaining_pid),
                         remaining_pid,
-                        created_referent.as_deref(),
+                        created_referent.as_ref(),
                     );
                     let closes_every_route =
                         matches!(bound_leg, SeatCreatedReferent::NoReferent(_));
@@ -19490,13 +19422,27 @@ fn resolve_chain_body(
             // capture its own fresh snapshot against the post-this-clause board.
             state.clause_minimum_snapshot = None;
             // CR 608.2c + CR 608.2f: one action ⇒ one created referent — every
-            // token this clause created, for every seat.
-            if scoped_template.effect.is_token_creator() {
-                publish_created_token_union(state, &batches.created_tokens);
-            }
+            // token this clause created, for every seat. CR 608.2e: the tail
+            // also receives each seat's own result for a co-scoped second
+            // action.
+            let handoff = if collects_seat_results {
+                publish_created_token_union(state, &seat_results);
+                Some(CreatedTokenSeatsHandoff {
+                    source_id: ability.source_id,
+                    seats: seat_results,
+                })
+            } else {
+                None
+            };
             if let Some(mut after_scope) = after_scope {
                 bind_resolution_exile_batch_paths(&mut after_scope, &batches.linked_exile);
-                progress = resolve_ability_chain_step(state, &after_scope, events, depth + 1)?;
+                progress = resolve_after_scope_with_created_seats(
+                    state,
+                    &after_scope,
+                    handoff,
+                    events,
+                    depth + 1,
+                )?;
             }
         } else if after_scope_owned_by_sidecar {
             if let Some(after_scope) = after_scope {
@@ -19504,15 +19450,14 @@ fn resolve_chain_body(
                     park_player_scope_queue_end(state, after_scope.as_ref().clone());
                 }
                 if let Some(frame) = state.active_ability_continuation_frame_mut() {
-                    // CR 608.2f: generated APNAP nodes and their exact union are
-                    // explicit pause authority. The detached tail resolves once only
-                    // after every generated seat has drained.
+                    // CR 608.2f: generated APNAP nodes and their exact per-seat
+                    // results are explicit pause authority. The detached tail
+                    // resolves once only after every generated seat has drained.
                     frame.pending.player_scope_tail = Some(PendingPlayerScopeTail {
                         source_id: ability.source_id,
                         after_scope,
                         linked_exile_batch: batches.linked_exile,
-                        created_tokens: after_scope_needs_created_union
-                            .then_some(batches.created_tokens),
+                        created_tokens: after_scope_needs_created_union.then_some(seat_results),
                     });
                 }
             }
@@ -20298,6 +20243,19 @@ fn resolve_chain_body(
 
     // CR 608.2c: Snapshot event count so we can detect objects moved by this effect.
     let events_before = events.len();
+    // CR 608.2e: a generated seat leg of a paused player-scope token clause
+    // begins that seat's instruction. Its entry becomes the seat in progress
+    // before the node acts, so a pause inside it re-parks the sidecar (cloned
+    // by `PendingContinuation::new`) with the answer attributed to this seat.
+    if let (Some(seat), Some(created)) = (
+        ability.scoped_player,
+        state
+            .resolving_player_scope_tail
+            .as_mut()
+            .and_then(|scope| scope.created_tokens.as_mut()),
+    ) {
+        begin_seat_created_tokens(created, seat);
+    }
     let mut immediate_effect_result = None;
     // CR 610.3a / CR 610.3b + CR 118.12: per-call verdicts for this node's bounded zone
     // move. Each `resolve_effect` call (one per repeat iteration) is judged on
@@ -20897,8 +20855,16 @@ fn resolve_chain_body(
             if links {
                 extend_pinned_batch(&mut scope.linked_exile_batch, linked_batch.iter().copied());
             }
+            // CR 608.2e: the node's tokens are the product of its seat's
+            // instruction — its `scoped_player`, or the seat in progress for a
+            // node that carries none.
             if let Some(created) = scope.created_tokens.as_mut() {
-                extend_pinned_batch(created, created_additions);
+                if let Some(seat) = ability
+                    .scoped_player
+                    .or_else(|| created.last().map(|entry| entry.seat))
+                {
+                    extend_seat_created_tokens(created, seat, created_additions);
+                }
             }
         }
     }
@@ -22833,11 +22799,13 @@ fn record_player_actions_performed(state: &mut GameState, new_events: &[GameEven
     }
 }
 
-/// CR 608.2e + CR 111.2: "it" in a co-scoped second action — the members of
-/// the created referent the acting seat owns. The typed carrier of the
+/// CR 608.2e: "it" in a co-scoped second action — the members of the created
+/// referent the acting seat's instruction created. The typed carrier of the
 /// split-time proof (`mark_co_scoped_created_referent_consumer`); it rides the
 /// consumer's existing serialized `TargetFilter`, so a paused fan-out carries
-/// it inside the sidecar's `after_scope`.
+/// it inside the sidecar's `after_scope`. The binder replaces it per seat
+/// ([`bind_seat_created_referent`]); its `Owned { ScopedPlayer }` conjunct is
+/// the owner partition the binder falls back to without a handoff.
 fn seat_created_referent_filter() -> TargetFilter {
     TargetFilter::And {
         filters: vec![
@@ -22849,11 +22817,10 @@ fn seat_created_referent_filter() -> TargetFilter {
     }
 }
 
-/// CR 608.2e + CR 111.2: "it" in a co-scoped second action — the members of the
-/// created referent the acting seat owns. Ownership (CR 111.2: the player who
-/// creates a token is its owner) supports the per-seat binding only when the
-/// consumer's player domain is the producer's: the detached head is marked
-/// with [`seat_created_referent_filter`] only when
+/// CR 608.2e: "it" in a co-scoped second action — the members of the created
+/// referent the acting seat's instruction created. The per-seat binding is
+/// supported only when the consumer's player domain is the producer's: the
+/// detached head is marked with [`seat_created_referent_filter`] only when
 /// - the scoped template creates tokens and nothing in its retained chain
 ///   publishes a later created referent (it is the nearest publisher),
 /// - the head has the same `player_scope`, and
@@ -22888,9 +22855,9 @@ fn mark_co_scoped_created_referent_consumer(
 enum SeatCreatedReferent {
     /// No partition was proven (no snapshot): the leg reads the full set.
     Unpartitioned(ResolvedAbility),
-    /// The seat owns members of the snapshot; the leg is bound to them.
+    /// The seat has members in the snapshot; the leg is bound to them.
     Bound(ResolvedAbility),
-    /// The seat owns none. `None` when no route of its leg can run anything
+    /// The seat has none. `None` when no route of its leg can run anything
     /// (the bare placement is skipped); otherwise the leg built by
     /// [`no_referent_leg`].
     NoReferent(Option<ResolvedAbility>),
@@ -22906,38 +22873,67 @@ impl SeatCreatedReferent {
     }
 }
 
-/// CR 608.2e + CR 111.2 + CR 400.7: the created referent a co-scoped second
-/// action reads ("Each player creates a token and puts counters on it"),
-/// snapshotted once when that action's all-seats loop begins — after every
-/// seat's creation and after the clause published its created-token union.
-/// The partition is proven at split time: `None` unless the scoped template's
-/// own target carries [`seat_created_referent_filter`]
-/// (`mark_co_scoped_created_referent_consumer`). A bare `LastCreated` under a
-/// player scope is the full latest-created set for every seat, as is a template
-/// reading the referent elsewhere (a grant's `affected`, a condition, a sub).
+/// The created referent a co-scoped second action partitions per seat, taken
+/// once by [`seat_created_referent_snapshot`] before any seat acts and held
+/// across the driver's seat loop and its post-pause remaining-leg loop (owned,
+/// because those loops resolve with `&mut GameState`).
+enum SeatCreatedReferentSnapshot {
+    /// CR 608.2e: the producing clause's per-seat creation results, handed to
+    /// its tail ([`resolve_after_scope_with_created_seats`]). Each seat binds
+    /// the tokens its own instruction created.
+    Origin(Vec<SeatCreatedTokens>),
+    /// No handoff from this consumer's producer reached the driver (a
+    /// `repeat_for` / `repeat_until` iteration re-entered after a pause, a
+    /// discard-batch hand-off): the battlefield members of the published
+    /// created referent, each seat binding the members it owns (CR 111.2).
+    Owner(Vec<ObjectIncarnationRef>),
+}
+
+/// CR 608.2e + CR 400.7: the created referent a co-scoped second action reads
+/// ("Each player creates a token and puts counters on it"), snapshotted once
+/// when that action's all-seats loop begins — after every seat's creation and
+/// after the clause published its created-token union. The partition is proven
+/// at split time: `None` unless the scoped template's own target carries
+/// [`seat_created_referent_filter`] (`mark_co_scoped_created_referent_consumer`).
+/// A bare `LastCreated` under a player scope is the full latest-created set for
+/// every seat, as is a template reading the referent elsewhere (a grant's
+/// `affected`, a condition, a sub).
+///
+/// `Origin` when the handoff installed by this template's own producer (same
+/// source) is present; otherwise `Owner`.
 fn seat_created_referent_snapshot(
     state: &GameState,
     template: &ResolvedAbility,
-) -> Option<Vec<ObjectIncarnationRef>> {
-    (template.effect.target_filter() == Some(&seat_created_referent_filter())).then(|| {
-        state
-            .last_created_token_ids
-            .iter()
-            .filter_map(|id| state.objects.get(id))
-            .filter(|object| object.zone == Zone::Battlefield)
-            .map(ObjectIncarnationRef::from_object)
-            .collect()
+) -> Option<SeatCreatedReferentSnapshot> {
+    (template.effect.target_filter() == Some(&seat_created_referent_filter())).then(|| match state
+        .resolving_created_token_seats
+        .as_ref()
+        .filter(|handoff| handoff.source_id == template.source_id)
+    {
+        Some(handoff) => SeatCreatedReferentSnapshot::Origin(handoff.seats.clone()),
+        None => SeatCreatedReferentSnapshot::Owner(
+            state
+                .last_created_token_ids
+                .iter()
+                .filter_map(|id| state.objects.get(id))
+                .filter(|object| object.zone == Zone::Battlefield)
+                .map(ObjectIncarnationRef::from_object)
+                .collect(),
+        ),
     })
 }
 
-/// CR 608.2e + CR 111.2: bind `seat`'s leg of a co-scoped second action to
-/// the tokens that seat created — the ones it owns (control may have changed
-/// since; ownership cannot) — as explicit objects pinned to their current
-/// incarnations (CR 400.7), rewriting `LastCreated` to `ParentTarget` as the
-/// delayed-trigger snapshot does. These are affected objects, not targets
-/// (CR 115.10a). Outcomes:
+/// CR 608.2e + CR 614.1a: bind `seat`'s leg of a co-scoped second action to
+/// the tokens that seat's instruction created — replacement-made tokens
+/// included, whoever controls or owns them now — as explicit objects pinned to
+/// their creation incarnations (CR 400.7), rewriting `LastCreated` to
+/// `ParentTarget` as the delayed-trigger snapshot does. A pin that is no longer
+/// current or has left the battlefield is not "it" (CR 400.7, CR 609.3). These
+/// are affected objects, not targets (CR 115.10a). Without a handoff the
+/// snapshot is the owner partition (see [`SeatCreatedReferentSnapshot`]).
+/// Outcomes:
 /// - `Unpartitioned` when there is no snapshot (no proven partition);
-/// - `Bound` when the seat owns members of the snapshot;
+/// - `Bound` when the seat has members in the snapshot;
 /// - `NoReferent` when the seat created none: its "puts counters on it" has
 ///   nothing to act on (CR 609.3), an impossible "may" is not offered
 ///   (CR 608.2d), and an empty `ParentTarget` would fall back to unrelated
@@ -22947,38 +22943,53 @@ fn bind_seat_created_referent(
     state: &GameState,
     mut seat_leg: ResolvedAbility,
     seat: PlayerId,
-    snapshot: Option<&[ObjectIncarnationRef]>,
+    snapshot: Option<&SeatCreatedReferentSnapshot>,
 ) -> SeatCreatedReferent {
     let Some(snapshot) = snapshot else {
         return SeatCreatedReferent::Unpartitioned(seat_leg);
     };
-    let owned: Vec<ObjectIncarnationRef> = snapshot
-        .iter()
-        .filter(|pin| {
-            state
-                .objects
-                .get(&pin.object_id)
-                .is_some_and(|object| object.owner == seat)
-        })
-        .cloned()
-        .collect();
-    if owned.is_empty() {
+    let members: Vec<ObjectIncarnationRef> = match snapshot {
+        SeatCreatedReferentSnapshot::Origin(seats) => seats
+            .iter()
+            .filter(|entry| entry.seat == seat)
+            .flat_map(|entry| &entry.tokens)
+            .filter(|pin| {
+                pin.is_current(state)
+                    && state
+                        .objects
+                        .get(&pin.object_id)
+                        .is_some_and(|object| object.zone == Zone::Battlefield)
+            })
+            .copied()
+            .collect(),
+        SeatCreatedReferentSnapshot::Owner(members) => members
+            .iter()
+            .filter(|pin| {
+                state
+                    .objects
+                    .get(&pin.object_id)
+                    .is_some_and(|object| object.owner == seat)
+            })
+            .copied()
+            .collect(),
+    };
+    if members.is_empty() {
         return SeatCreatedReferent::NoReferent(no_referent_leg(seat_leg));
     }
     if let Some(filter) = seat_leg.effect.target_filter_mut() {
         *filter = TargetFilter::ParentTarget;
     }
     seat_leg.set_unpinned_targets(
-        owned
+        members
             .iter()
             .map(|pin| TargetRef::Object(pin.object_id))
             .collect(),
     );
-    seat_leg.set_target_incarnations_recursive(owned);
+    seat_leg.set_target_incarnations_recursive(members);
     SeatCreatedReferent::Bound(seat_leg)
 }
 
-/// The leg of a seat that owns none of the created referent.
+/// The leg of a seat that has none of the created referent.
 ///
 /// `None` when no route of the leg can run anything: no `sub_ability`, and no
 /// `else_ability` under a `condition` (an else without a condition is
@@ -41273,16 +41284,18 @@ mod tests {
         }
     }
 
-    /// CR 608.2e + CR 111.2 + CR 400.7 — the per-seat binding of a co-scoped
+    /// CR 608.2e + CR 614.1a + CR 400.7 — the per-seat binding of a co-scoped
     /// second action's created referent: each seat's leg names exactly the
-    /// tokens that seat owns, as pinned explicit objects behind a
-    /// `ParentTarget`; a seat that owns none gets no leg when nothing of it can
-    /// run (CR 609.3), and otherwise a `NoOp` head (plus a gate carrying its
-    /// condition and "otherwise" leg) in front of its retained continuation; a
-    /// bare `LastCreated` template (no split-time proof) is unpartitioned; and a
-    /// pin that went stale before placement is dropped by the consumer.
+    /// tokens that seat's instruction created (its entry in the producer's
+    /// handoff), as pinned explicit objects behind a `ParentTarget`, whoever
+    /// owns them — here P0 owns every token, yet P1's Fractal is P1's "it". A
+    /// seat with none gets no leg when nothing of it can run (CR 609.3), and
+    /// otherwise a `NoOp` head (plus a gate carrying its condition and
+    /// "otherwise" leg) in front of its retained continuation; a bare
+    /// `LastCreated` template (no split-time proof) is unpartitioned; and a pin
+    /// that went stale before placement is dropped by the consumer.
     #[test]
-    fn bind_seat_created_referent_binds_each_seat_to_the_tokens_it_owns() {
+    fn bind_seat_created_referent_binds_each_seat_to_the_tokens_its_instruction_created() {
         let mut state = GameState::new_two_player(42);
         let token = |state: &mut GameState, owner: PlayerId, name: &str| {
             let id = create_object(state, CardId(0), owner, name.to_string(), Zone::Battlefield);
@@ -41291,8 +41304,26 @@ mod tests {
         };
         let p0_first = token(&mut state, PlayerId(0), "Angel A");
         let p0_second = token(&mut state, PlayerId(0), "Angel B");
-        let p1_only = token(&mut state, PlayerId(1), "Fractal");
+        // Created by P1's instruction, but owned by P0 (a redirected creation).
+        let p1_only = token(&mut state, PlayerId(0), "Fractal");
         state.last_created_token_ids = vec![p0_first, p0_second, p1_only];
+        let pin_of = |state: &GameState, id: ObjectId| {
+            ObjectIncarnationRef::from_object(&state.objects[&id])
+        };
+        let seats = vec![
+            SeatCreatedTokens {
+                seat: PlayerId(0),
+                tokens: vec![pin_of(&state, p0_first), pin_of(&state, p0_second)],
+            },
+            SeatCreatedTokens {
+                seat: PlayerId(1),
+                tokens: vec![pin_of(&state, p1_only)],
+            },
+        ];
+        state.resolving_created_token_seats = Some(CreatedTokenSeatsHandoff {
+            source_id: ObjectId(99),
+            seats: seats.clone(),
+        });
 
         let placement = |target: TargetFilter| {
             let mut leg = ResolvedAbility::new(
@@ -41311,13 +41342,16 @@ mod tests {
         let template = placement(seat_created_referent_filter());
         let snapshot = seat_created_referent_snapshot(&state, &template)
             .expect("a marked template snapshots the created referent");
-        assert_eq!(snapshot.len(), 3);
+        assert!(
+            matches!(&snapshot, SeatCreatedReferentSnapshot::Origin(origin) if *origin == seats),
+            "the producer's handoff is the snapshot"
+        );
         let pin = |id: ObjectId| ObjectIncarnationRef::from_object(&state.objects[&id]);
 
         let SeatCreatedReferent::Bound(p0_leg) =
             bind_seat_created_referent(&state, template.clone(), PlayerId(0), Some(&snapshot))
         else {
-            panic!("P0 owns two created tokens");
+            panic!("P0's instruction created two tokens");
         };
         assert!(matches!(
             p0_leg.effect,
@@ -41338,15 +41372,18 @@ mod tests {
         let SeatCreatedReferent::Bound(p1_leg) =
             bind_seat_created_referent(&state, template.clone(), PlayerId(1), Some(&snapshot))
         else {
-            panic!("P1 owns one created token");
+            panic!("P1's instruction created one token, though P0 owns it");
         };
         assert_eq!(p1_leg.targets, vec![TargetRef::Object(p1_only)]);
         assert_eq!(p1_leg.target_incarnations, vec![pin(p1_only)]);
 
-        // A seat that owns none of the referent has no "it" (CR 609.3). A bare
-        // placement, or a conditioned one with neither sub nor else, has no
-        // route that runs anything: no leg.
-        let p1_only_snapshot = vec![pin(p1_only)];
+        // A seat whose instruction created none of the referent has no "it"
+        // (CR 609.3). A bare placement, or a conditioned one with neither sub
+        // nor else, has no route that runs anything: no leg.
+        let p1_only_snapshot = SeatCreatedReferentSnapshot::Origin(vec![SeatCreatedTokens {
+            seat: PlayerId(1),
+            tokens: vec![pin(p1_only)],
+        }]);
         let bind_empty = |leg: ResolvedAbility| {
             bind_seat_created_referent(&state, leg, PlayerId(0), Some(&p1_only_snapshot))
         };
@@ -41524,6 +41561,102 @@ mod tests {
             p0_leg.live_object_targets(&state),
             vec![TargetRef::Object(p0_first)]
         );
+    }
+
+    /// A marked consumer reached without its producer's handoff (a `repeat_for`
+    /// / `repeat_until` iteration re-entered after a pause, a discard-batch
+    /// hand-off) binds by the owner partition, exactly as before the per-seat
+    /// channel existed (CR 111.2): each seat binds the published members it
+    /// owns, and no leg falls back to the bare `LastCreated`. A handoff from a
+    /// different producer (another source) is not this consumer's and leaves
+    /// the same owner partition.
+    #[test]
+    fn seat_created_referent_without_its_producers_handoff_binds_the_owner_partition() {
+        let mut state = GameState::new_two_player(42);
+        let token = |state: &mut GameState, owner: PlayerId| {
+            let id = create_object(
+                state,
+                CardId(0),
+                owner,
+                "Fractal".to_string(),
+                Zone::Battlefield,
+            );
+            state.objects.get_mut(&id).unwrap().is_token = true;
+            id
+        };
+        let p0_fractal = token(&mut state, PlayerId(0));
+        let p1_fractal = token(&mut state, PlayerId(1));
+        state.last_created_token_ids = vec![p0_fractal, p1_fractal];
+        let mut template = ResolvedAbility::new(
+            Effect::PutCounter {
+                counter_type: CounterType::Plus1Plus1,
+                count: QuantityExpr::Fixed { value: 1 },
+                target: seat_created_referent_filter(),
+            },
+            vec![],
+            ObjectId(99),
+            PlayerId(0),
+        );
+        template.player_scope = Some(PlayerFilter::All);
+        let pin = |state: &GameState, id: ObjectId| {
+            ObjectIncarnationRef::from_object(&state.objects[&id])
+        };
+
+        let assert_owner_partition = |state: &GameState| {
+            let snapshot = seat_created_referent_snapshot(state, &template)
+                .expect("a marked template always snapshots");
+            assert!(
+                matches!(&snapshot, SeatCreatedReferentSnapshot::Owner(members) if members.len() == 2),
+                "no matching handoff: the owner partition over the published referent"
+            );
+            for (seat, owned) in [(PlayerId(0), p0_fractal), (PlayerId(1), p1_fractal)] {
+                let SeatCreatedReferent::Bound(leg) =
+                    bind_seat_created_referent(state, template.clone(), seat, Some(&snapshot))
+                else {
+                    panic!("{seat:?} owns one published Fractal");
+                };
+                assert_eq!(leg.targets, vec![TargetRef::Object(owned)]);
+                assert_eq!(leg.target_incarnations, vec![pin(state, owned)]);
+                assert!(
+                    matches!(
+                        leg.effect,
+                        Effect::PutCounter {
+                            target: TargetFilter::ParentTarget,
+                            ..
+                        }
+                    ),
+                    "{seat:?}'s leg is bound, never the bare LastCreated"
+                );
+            }
+        };
+
+        // No handoff at all.
+        assert_owner_partition(&state);
+
+        // A handoff installed by another source's clause, attributing both
+        // Fractals to P0, is not this consumer's producer's.
+        let both_to_p0 = vec![SeatCreatedTokens {
+            seat: PlayerId(0),
+            tokens: vec![pin(&state, p0_fractal), pin(&state, p1_fractal)],
+        }];
+        state.resolving_created_token_seats = Some(CreatedTokenSeatsHandoff {
+            source_id: ObjectId(98),
+            seats: both_to_p0.clone(),
+        });
+        assert_owner_partition(&state);
+
+        // Reach guard: the same handoff under this consumer's own source is
+        // taken as origin, and P1's instruction created nothing in it.
+        state.resolving_created_token_seats = Some(CreatedTokenSeatsHandoff {
+            source_id: ObjectId(99),
+            seats: both_to_p0,
+        });
+        let snapshot = seat_created_referent_snapshot(&state, &template).expect("marked");
+        assert!(matches!(snapshot, SeatCreatedReferentSnapshot::Origin(_)));
+        assert!(matches!(
+            bind_seat_created_referent(&state, template.clone(), PlayerId(1), Some(&snapshot)),
+            SeatCreatedReferent::NoReferent(None)
+        ));
     }
 
     /// CR 608.2c: `append_after_every_route` ends every route through a leg (its
@@ -41919,6 +42052,153 @@ mod tests {
         let mut suspect_then_creation = node(suspect_all());
         suspect_then_creation.sub_ability = Some(Box::new(node(elemental())));
         assert!(tail_reads_created_referent(&suspect_then_creation));
+    }
+
+    /// CR 608.2c: a tail whose only read of the created referent is nested
+    /// behind a quantity, threshold or player operand still reads it — a
+    /// player count (`PlayerCount` / `EventContextPlayerCount`), a
+    /// `ControlsCount` count, a `PlayerAttribute` value, an `AllExcept`
+    /// exclusion, `ManaSpentToCast`'s source filter, and a `Cmc` / `Counters` /
+    /// `PtComparison` threshold inside a counted population, a `player_scope`
+    /// or a placement's own filter. Each row's `LastZoneChanged` sibling reads
+    /// nothing; the zone-change classifier, sharing the operand-closed
+    /// authority, now sees the same nesting for its own ledger.
+    #[test]
+    fn created_referent_reader_reaches_nested_quantity_filter_and_player_operands() {
+        use crate::types::ability::{
+            CastManaObjectScope, CastManaSpentMetric, PtStat, PtValueScope,
+        };
+        let node = |effect: Effect| ResolvedAbility::new(effect, vec![], ObjectId(1), PlayerId(0));
+        let count_of = |filter: TargetFilter| QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount { filter },
+        };
+        let controls = |filter: TargetFilter, count: QuantityExpr| PlayerFilter::ControlsCount {
+            relation: PlayerRelation::All,
+            filter,
+            comparator: Comparator::GE,
+            count: Box::new(count),
+        };
+        let one = || QuantityExpr::Fixed { value: 1 };
+        let player_count = |filter: PlayerFilter| QuantityExpr::Ref {
+            qty: QuantityRef::PlayerCount { filter },
+        };
+        let gain = |amount: QuantityExpr| {
+            node(Effect::GainLife {
+                amount,
+                player: TargetFilter::Controller,
+            })
+        };
+        let creature_with =
+            |prop: FilterProp| TargetFilter::Typed(TypedFilter::creature().properties(vec![prop]));
+        let thresholds = |anaphor: TargetFilter| {
+            vec![
+                FilterProp::Cmc {
+                    comparator: Comparator::GE,
+                    value: count_of(anaphor.clone()),
+                },
+                FilterProp::Counters {
+                    counters: CounterMatch::Any,
+                    comparator: Comparator::GE,
+                    count: count_of(anaphor.clone()),
+                },
+                FilterProp::PtComparison {
+                    stat: PtStat::Power,
+                    scope: PtValueScope::Current,
+                    comparator: Comparator::LT,
+                    value: count_of(anaphor),
+                },
+            ]
+        };
+        let rows = |anaphor: TargetFilter| {
+            let mut rows: Vec<(String, ResolvedAbility)> = vec![
+                (
+                    "PlayerCount(ControlsCount)".to_string(),
+                    gain(player_count(controls(anaphor.clone(), one()))),
+                ),
+                (
+                    "EventContextPlayerCount(ControlsCount)".to_string(),
+                    gain(QuantityExpr::Ref {
+                        qty: QuantityRef::EventContextPlayerCount {
+                            filter: controls(anaphor.clone(), one()),
+                        },
+                    }),
+                ),
+                (
+                    "PlayerCount(PlayerAttribute.value)".to_string(),
+                    gain(player_count(PlayerFilter::PlayerAttribute {
+                        relation: PlayerRelation::All,
+                        attr: Box::new(QuantityRef::TurnsTaken),
+                        comparator: Comparator::GE,
+                        value: Box::new(count_of(anaphor.clone())),
+                    })),
+                ),
+                (
+                    "PlayerCount(AllExcept(ControlsCount))".to_string(),
+                    gain(player_count(PlayerFilter::AllExcept {
+                        exclude: Box::new(controls(anaphor.clone(), one())),
+                    })),
+                ),
+                (
+                    "ManaSpentToCast(FromSource)".to_string(),
+                    gain(QuantityExpr::Ref {
+                        qty: QuantityRef::ManaSpentToCast {
+                            scope: CastManaObjectScope::SelfObject,
+                            metric: CastManaSpentMetric::FromSource {
+                                source_filter: anaphor.clone(),
+                            },
+                        },
+                    }),
+                ),
+            ];
+            for prop in thresholds(anaphor.clone()) {
+                rows.push((
+                    format!("ObjectCount(creature with {prop:?})"),
+                    gain(count_of(creature_with(prop))),
+                ));
+            }
+            let mut scoped = node(Effect::NoOp);
+            scoped.player_scope = Some(controls(TargetFilter::Any, count_of(anaphor.clone())));
+            rows.push(("player_scope ControlsCount.count".to_string(), scoped));
+            let threshold = thresholds(anaphor).pop().expect("a PtComparison row");
+            rows.push((
+                "PutCounter on Not(PtComparison)".to_string(),
+                node(Effect::PutCounter {
+                    counter_type: CounterType::Plus1Plus1,
+                    count: one(),
+                    target: creature_with(FilterProp::Not {
+                        prop: Box::new(threshold),
+                    }),
+                }),
+            ));
+            rows
+        };
+        for (label, tail) in rows(TargetFilter::LastCreated) {
+            assert!(tail_reads_created_referent(&tail), "{label} reads it");
+        }
+        for (label, tail) in rows(TargetFilter::LastZoneChanged) {
+            assert!(
+                !tail_reads_created_referent(&tail),
+                "{label}: the LastZoneChanged sibling reads no created referent"
+            );
+        }
+
+        // The zone-change classifier shares the operand-closed authority: a
+        // player count over the moved set is classified as its
+        // `ObjectCount(LastZoneChanged)` sibling already is.
+        let check = |lhs: QuantityExpr| AbilityCondition::QuantityCheck {
+            lhs,
+            comparator: Comparator::GE,
+            rhs: one(),
+        };
+        assert!(condition_depends_on_zone_change_this_way(&check(
+            player_count(controls(TargetFilter::LastZoneChanged, one()))
+        )));
+        assert!(condition_depends_on_zone_change_this_way(&check(count_of(
+            TargetFilter::LastZoneChanged
+        ))));
+        assert!(!condition_depends_on_zone_change_this_way(&check(
+            player_count(controls(TargetFilter::LastCreated, one()))
+        )));
     }
 
     /// CR 608.2c + CR 611.2c + CR 113.1a: every carrier that the scoped

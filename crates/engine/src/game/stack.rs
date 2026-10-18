@@ -2152,6 +2152,13 @@ fn clear_deferred_final_part(state: &mut GameState) {
 
 /// CR 608.2: Resolve the top object on the stack.
 pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
+    // Engine invariant: a player-scope clause's per-seat creation handoff
+    // lives only inside its detached tail's resolution call, so none can be
+    // live when a stack object begins resolving.
+    debug_assert!(
+        state.resolving_created_token_seats.is_none(),
+        "a player-scope created-token handoff leaked past its tail's resolution"
+    );
     // CR 603.3c + CR 603.3d: The top of the stack may be a trigger entry that
     // is still being constructed (mode / target / division pending). Such an
     // entry MUST NOT resolve — it is mid-flight while the controller is
