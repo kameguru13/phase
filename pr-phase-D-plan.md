@@ -1163,3 +1163,5 @@ The source is pr-phase-D-impl-review-r3.md, section "Findings" F1–F6. Its sugg
    - One-revert columns: −F1 routing (triggers.rs 8400), −F2 (restore `is_due`), −F3 guard, −gate (a), −sacrifice-site routing.
    - Run the whole cost_removed_counter_amount file at head.
    - No workspace clippy/tests, coverage, audits or parser comparison.
+
+Note (r3 fix F2): the action-boundary authority now runs the D5 loop for ANY parked counter-cost root under a Priority result, which narrows residual 2: a Prevented-arm child block that returns Priority with an advanceable subtree is now resumed in the same action. Residual 2 remains only for subtrees the loop cannot advance (residual 3's no-progress case).
