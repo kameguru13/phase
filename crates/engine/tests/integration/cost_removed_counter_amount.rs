@@ -39,10 +39,11 @@ use engine::types::actions::GameAction;
 use engine::types::counter::{parse_counter_type, CounterMatch, CounterType};
 use engine::types::events::GameEvent;
 use engine::types::game_state::{
-    CastPaymentMode, CounterCostChoice, DrainStatus, GameState, ManaAbilityCostCursor, ManaChoice,
-    ManaChoiceContext, ManaChoicePrompt, PausedCounterCostRemoval, PayCostKind, PendingCast,
-    PendingCostMoveCompletion, PendingCostMoveResume, PendingCounterRemovalQueue,
-    ReplacementChoiceKind, StackEntryKind, WaitingFor,
+    CastPaymentMode, CounterCostChoice, DrainStatus, EnclosingPostReplacementFrame, GameState,
+    ManaAbilityCostCursor, ManaChoice, ManaChoiceContext, ManaChoicePrompt,
+    PausedCounterCostRemoval, PayCostKind, PendingCast, PendingCostMoveCompletion,
+    PendingCostMoveResume, PendingCounterRemovalQueue, ReplacementChoiceKind, StackEntryKind,
+    WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
@@ -1635,6 +1636,13 @@ fn magosi_deferred_counter_leg_completes_its_selected_return_after_the_choice() 
 /// `engine_replacement.rs`. The parked event is still the RemoveCounter, and the
 /// resume runs through the real `GameAction::ChooseReplacement` entry.
 fn stage_prevented_counter_removal(runner: &mut GameRunner) {
+    stage_prevented_pending_event(runner, |proposed| {
+        matches!(proposed, ProposedEvent::RemoveCounter { .. })
+    });
+}
+
+/// `stage_prevented_counter_removal` for any parked event `expected` accepts.
+fn stage_prevented_pending_event(runner: &mut GameRunner, expected: fn(&ProposedEvent) -> bool) {
     let prevention = install_replacement_on_steward(
         runner,
         ReplacementDefinition::new(ReplacementEvent::BeginTurn),
@@ -1643,10 +1651,10 @@ fn stage_prevented_counter_removal(runner: &mut GameRunner) {
         .state_mut()
         .pending_replacement
         .as_mut()
-        .expect("a counter removal waits on its replacement choice");
+        .expect("an event waits on its replacement choice");
     assert!(
-        matches!(pending.proposed, ProposedEvent::RemoveCounter { .. }),
-        "reach: the parked event is the counter removal: {:?}",
+        expected(&pending.proposed),
+        "reach: the parked event is the expected one: {:?}",
         pending.proposed
     );
     pending.candidates = vec![prevention];
@@ -2696,6 +2704,638 @@ fn a_child_under_a_mana_root_paying_inside_a_paused_life_gain_post_effect_settle
     assert_eq!(runner.life(P0), life_at_unless, "paid: no life loss");
     assert!(runner.state().resolution_stack.is_empty());
     assert!(payment_ownership_is_clear(&runner));
+}
+
+// ---------------------------------------------------------------------------
+// R6 — once the subtree retires, no outer work runs before the root resumes
+// ---------------------------------------------------------------------------
+//
+// CR 601.2h + CR 605.3b + CR 608.2c: a cost being paid is the innermost
+// unfinished work. Once the counter-cost root's replacement subtree has
+// retired, the root resumes before any later instruction of an outer owner is
+// followed, and before the action returns.
+
+fn lose(amount: i32) -> AbilityDefinition {
+    AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::LoseLife {
+            amount: QuantityExpr::Fixed { value: amount },
+            target: None,
+        },
+    )
+}
+
+/// "You lose `amount` life unless you pay {2}."
+fn lose_unless_two(amount: i32) -> AbilityDefinition {
+    lose(amount).unless_pay(UnlessPayModifier {
+        cost: AbilityCost::Mana {
+            cost: ManaCost::generic(2),
+        },
+        payer: TargetFilter::Controller,
+    })
+}
+
+fn active_drain_is_paused(state: &GameState) -> bool {
+    state
+        .resolution_stack
+        .active_post_replacement_or_paired_parent()
+        .and_then(|drains| drains.resident())
+        .is_some_and(|drain| matches!(drain.status, DrainStatus::Paused))
+}
+
+fn is_cove_mana(cove: ObjectId) -> impl Fn(&GameEvent) -> bool {
+    move |event| matches!(event, GameEvent::ManaAdded { source_id, .. } if *source_id == cove)
+}
+
+fn cove_removal_enclosing(runner: &GameRunner) -> Option<EnclosingPostReplacementFrame> {
+    parked_mana_cursor(runner)
+        .counter_removal
+        .as_ref()
+        .expect("reach: the Cove's removal is parked")
+        .replacement_subtree
+        .enclosing
+}
+
+/// The A2 T10 board at the life gain's `UnlessPayment`: the Steward's GainLife
+/// replacement runs `outer` as its post-effect, and its RemoveCounter
+/// replacement runs `child`. Both P6 reaches are asserted.
+fn gain_board_at_unless(
+    mut scenario: GameScenario,
+    outer: AbilityDefinition,
+    child: impl FnOnce(ObjectId) -> AbilityDefinition,
+) -> (GameRunner, ObjectId) {
+    let gainer = scenario
+        .add_artifact_from_oracle(P0, "Gainer", GAIN_CONTROL)
+        .id();
+    let cove = scenario
+        .add_land_from_oracle(P0, "Saprazzan Cove", SAPRAZZAN_COVE)
+        .id();
+    scenario.with_counter(cove, counter("storage"), 3);
+    let battery = add_battery(&mut scenario);
+    let mut runner = scenario.build();
+    install_replacement_on_steward(
+        &mut runner,
+        optional_replacement(ReplacementEvent::GainLife, Some(outer)),
+    );
+    install_replacement_on_steward(
+        &mut runner,
+        optional_replacement(ReplacementEvent::RemoveCounter, Some(child(battery))),
+    );
+    activate(&mut runner, gainer, 0);
+    drive(
+        &mut runner,
+        |state| matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }),
+        &mut Answers::default(),
+    );
+    choose_replacement(&mut runner, ACCEPT);
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { .. }),
+        "reach (P6): the post-effect waits on its unless payment: {:?}",
+        runner.state().waiting_for
+    );
+    assert!(
+        active_drain_is_paused(runner.state()),
+        "reach (P6): the post-effect's drain is paused in the active frame"
+    );
+    (runner, cove)
+}
+
+/// Give the P0 artifact `taxer` the typed activated ability "{T}: <effect>",
+/// pushed the way `install_replacement_on_steward` pushes a replacement.
+fn install_taxer_ability(runner: &mut GameRunner, taxer: ObjectId, effect: AbilityDefinition) {
+    let mut ability = effect;
+    ability.kind = AbilityKind::Activated;
+    let ability = ability.cost(AbilityCost::Tap);
+    let obj = runner.state_mut().objects.get_mut(&taxer).unwrap();
+    Arc::make_mut(&mut obj.base_abilities).push(ability.clone());
+    Arc::make_mut(&mut obj.abilities).push(ability);
+}
+
+/// Activate the Cove at the unless payment, pay 2, and accept the replacement of
+/// its own removal: the child queue's first entry then waits on its choice.
+fn cove_to_first_child_entry(runner: &mut GameRunner, cove: ObjectId) {
+    let index = counter_cost_ability(runner, cove, 0);
+    activate(runner, cove, index);
+    drive(
+        runner,
+        |state| matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }),
+        &mut Answers::pay(2),
+    );
+    choose_replacement(runner, ACCEPT);
+    assert_mana_root_waits_with_child_rider(runner);
+}
+
+/// Whether the unless prompt still holds the paused effect's later instruction
+/// (its `sub_ability`): the outer tail has not run.
+fn unless_prompt_holds_its_tail(state: &GameState) -> bool {
+    matches!(
+        &state.waiting_for,
+        WaitingFor::UnlessPayment { pending_effect, .. } if pending_effect.sub_ability.is_some()
+    )
+}
+
+fn is_life_loss(event: &GameEvent) -> bool {
+    matches!(event, GameEvent::LifeChanged { player_id, amount, .. } if *player_id == P0 && *amount < 0)
+}
+
+/// Trace 1: the outer post-effect's later instruction (lose 3) waits until the
+/// Cove's root has resumed and the unless payment is answered.
+#[test]
+fn an_outer_tail_waits_for_the_mana_root_paying_its_unless_cost() {
+    let (mut runner, cove) = gain_board_at_unless(
+        replacement_board(),
+        lose_unless_two(1).sub_ability(lose(3)),
+        t10_child_execute,
+    );
+    assert!(
+        unless_prompt_holds_its_tail(runner.state()),
+        "reach: the unless prompt holds the outer tail"
+    );
+    let life_at_unless = runner.life(P0);
+
+    cove_to_first_child_entry(&mut runner, cove);
+    assert!(cove_removal_enclosing(&runner).is_some_and(|e| e.frame.is_some()));
+    choose_replacement(&mut runner, DECLINE);
+    assert_mana_root_waits_with_child_rider(&runner);
+    assert!(cove_removal_enclosing(&runner).is_some_and(|e| e.frame.is_some()));
+
+    let events = choose_replacement_events(&mut runner, DECLINE);
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { .. }),
+        "the unless payment is offered again: {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(
+        runner.life(P0),
+        life_at_unless,
+        "the outer tail has not run"
+    );
+    assert!(active_drain_is_paused(runner.state()));
+    assert!(
+        unless_prompt_holds_its_tail(runner.state()),
+        "the unless prompt still holds the outer tail"
+    );
+    let resolved = event_index(&events, is_counter_removal_resolved);
+    let mana = event_index(&events, is_cove_mana(cove));
+    assert!(resolved < mana, "queue {resolved} < Cove mana {mana}");
+
+    // Declined, so the unless loss and then the tail run (paying skips the whole
+    // pending effect, its later instruction included).
+    runner
+        .act(GameAction::PayUnlessCost { pay: false })
+        .expect("the unless cost is declined");
+    assert_eq!(
+        runner.life(P0) - life_at_unless,
+        -4,
+        "the loss and then the tail ran"
+    );
+    assert!(runner.state().resolution_stack.is_empty());
+    assert!(payment_ownership_is_clear(&runner));
+}
+
+/// Trace 2: the child's last entry is prevented. The Cove's root resumes and
+/// the outer post-effect's dispatch stays paused under the re-offered unless
+/// payment.
+#[test]
+fn a_prevented_last_child_entry_leaves_the_outer_unless_post_effect_paused() {
+    let (mut runner, cove) =
+        gain_board_at_unless(replacement_board(), lose_unless_two(1), t10_child_execute);
+    let life_at_unless = runner.life(P0);
+
+    cove_to_first_child_entry(&mut runner, cove);
+    choose_replacement(&mut runner, DECLINE);
+    assert_mana_root_waits_with_child_rider(&runner);
+    assert!(
+        removal_queue(runner.state()).is_some_and(|queue| queue.in_flight.is_some()),
+        "reach: the second entry is in flight"
+    );
+    assert!(cove_removal_enclosing(&runner).is_some_and(|e| e.frame.is_some()));
+    stage_prevented_counter_removal(&mut runner);
+
+    let events = choose_replacement_events(&mut runner, 0);
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { .. }),
+        "the unless payment is offered again: {:?}",
+        runner.state().waiting_for
+    );
+    assert!(
+        active_drain_is_paused(runner.state()),
+        "the outer dispatch was not retired"
+    );
+    let resolved = event_index(&events, is_counter_removal_resolved);
+    let mana = event_index(&events, is_cove_mana(cove));
+    assert!(resolved < mana, "queue {resolved} < Cove mana {mana}");
+    assert_eq!(counters_on(&runner, cove, &counter("storage")), 1);
+    assert!(removal_queue(runner.state()).is_none());
+
+    runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("the unless cost is paid");
+    assert_eq!(runner.life(P0), life_at_unless, "paid: no unless loss");
+    assert!(runner.state().resolution_stack.is_empty());
+}
+
+/// The non-nested case: a resolving ability's later instruction is parked below
+/// the root's boundary under its own unless payment.
+#[test]
+fn an_outer_tail_below_the_boundary_waits_for_the_mana_root() {
+    let mut scenario = replacement_board();
+    let taxer = scenario.add_artifact_from_oracle(P0, "Taxer", "").id();
+    let cove = scenario
+        .add_land_from_oracle(P0, "Saprazzan Cove", SAPRAZZAN_COVE)
+        .id();
+    scenario.with_counter(cove, counter("storage"), 3);
+    let battery = add_battery(&mut scenario);
+    let mut runner = scenario.build();
+    install_taxer_ability(&mut runner, taxer, lose_unless_two(1).sub_ability(lose(3)));
+    install_replacement_on_steward(
+        &mut runner,
+        optional_replacement(
+            ReplacementEvent::RemoveCounter,
+            Some(t10_child_execute(battery)),
+        ),
+    );
+    activate(&mut runner, taxer, 0);
+    drive(
+        &mut runner,
+        |state| matches!(state.waiting_for, WaitingFor::UnlessPayment { .. }),
+        &mut Answers::default(),
+    );
+    let life_at_unless = runner.life(P0);
+    assert!(
+        unless_prompt_holds_its_tail(runner.state()),
+        "reach: the unless prompt holds the tail"
+    );
+
+    cove_to_first_child_entry(&mut runner, cove);
+    assert!(
+        cove_removal_enclosing(&runner).is_none(),
+        "reach: the root parked with no post-replacement frame on top"
+    );
+    choose_replacement(&mut runner, DECLINE);
+    assert_mana_root_waits_with_child_rider(&runner);
+
+    choose_replacement(&mut runner, DECLINE);
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { .. }),
+        "the unless payment is offered again: {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(runner.life(P0), life_at_unless, "the tail has not run");
+    assert!(
+        unless_prompt_holds_its_tail(runner.state()),
+        "the unless prompt still holds the tail"
+    );
+
+    runner
+        .act(GameAction::PayUnlessCost { pay: false })
+        .expect("the unless cost is declined");
+    drive(
+        &mut runner,
+        priority_with_empty_stack,
+        &mut Answers::default(),
+    );
+    assert_eq!(
+        runner.life(P0) - life_at_unless,
+        -4,
+        "the loss and then the tail ran"
+    );
+}
+
+/// Gate (b): the child's rider is a Clash with a life-loss tail. With both
+/// libraries empty it queues its tail without a placement prompt, and the
+/// queued tail must not retire the outer paused dispatch.
+#[test]
+fn a_queued_child_rider_leaves_the_outer_unless_post_effect_paused() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_creature(P0, "Steward", 1, 1);
+    let child = |battery: ObjectId| {
+        AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::RemoveCounter {
+                counter_type: None,
+                count: QuantityExpr::Fixed { value: -1 },
+                target: TargetFilter::SpecificObject { id: battery },
+            },
+        )
+        .sub_ability(AbilityDefinition::new(AbilityKind::Spell, Effect::Clash).sub_ability(lose(1)))
+    };
+    let (mut runner, cove) = gain_board_at_unless(scenario, lose_unless_two(1), child);
+    assert!(
+        runner
+            .state()
+            .players
+            .iter()
+            .all(|player| player.library.is_empty()),
+        "reach: both libraries are empty"
+    );
+    let life_at_unless = runner.life(P0);
+
+    cove_to_first_child_entry(&mut runner, cove);
+    assert!(cove_removal_enclosing(&runner).is_some_and(|e| e.frame.is_some()));
+    choose_replacement(&mut runner, DECLINE);
+    assert_mana_root_waits_with_child_rider(&runner);
+
+    let events = choose_replacement_events(&mut runner, DECLINE);
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { .. }),
+        "the unless payment is offered again: {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(runner.life(P0) - life_at_unless, -1, "the queued tail ran");
+    assert!(
+        active_drain_is_paused(runner.state()),
+        "the outer dispatch survived"
+    );
+    let resolved = event_index(&events, is_counter_removal_resolved);
+    let mana = event_index(&events, is_cove_mana(cove));
+    assert!(resolved < mana, "queue {resolved} < Cove mana {mana}");
+
+    runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("the unless cost is paid");
+    assert_eq!(runner.life(P0) - life_at_unless, -1, "paid: no unless loss");
+    assert!(runner.state().resolution_stack.is_empty());
+}
+
+/// Gate (c): an outer "repeat twice" loop waits for the Cove's root before
+/// starting its second iteration.
+#[test]
+fn an_outer_repeat_waits_for_the_mana_root_paying_its_unless_cost() {
+    let mut scenario = replacement_board();
+    let mut repeated = lose_unless_two(1);
+    repeated.repeat_for = Some(QuantityExpr::Fixed { value: 2 });
+    let taxer = scenario.add_artifact_from_oracle(P0, "Taxer", "").id();
+    let cove = scenario
+        .add_land_from_oracle(P0, "Saprazzan Cove", SAPRAZZAN_COVE)
+        .id();
+    scenario.with_counter(cove, counter("storage"), 3);
+    let battery = add_battery(&mut scenario);
+    let mut runner = scenario.build();
+    install_taxer_ability(&mut runner, taxer, repeated);
+    install_replacement_on_steward(
+        &mut runner,
+        optional_replacement(
+            ReplacementEvent::RemoveCounter,
+            Some(t10_child_execute(battery)),
+        ),
+    );
+    let life_before = runner.life(P0);
+    activate(&mut runner, taxer, 0);
+    drive(
+        &mut runner,
+        |state| matches!(state.waiting_for, WaitingFor::UnlessPayment { .. }),
+        &mut Answers::default(),
+    );
+    let repeat = runner
+        .state()
+        .resolution_stack
+        .iter()
+        .find(|frame| matches!(frame, ResolutionFrame::RepeatFor(_)))
+        .cloned();
+    assert!(
+        repeat.is_some(),
+        "reach (P9): the repeat is parked under iteration 1"
+    );
+
+    cove_to_first_child_entry(&mut runner, cove);
+    assert!(cove_removal_enclosing(&runner).is_none());
+    choose_replacement(&mut runner, DECLINE);
+    assert_mana_root_waits_with_child_rider(&runner);
+
+    let events = choose_replacement_events(&mut runner, DECLINE);
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { .. }),
+        "the unless payment is offered again: {:?}",
+        runner.state().waiting_for
+    );
+    let repeat_now = runner
+        .state()
+        .resolution_stack
+        .iter()
+        .find(|frame| matches!(frame, ResolutionFrame::RepeatFor(_)))
+        .cloned();
+    assert_eq!(repeat_now, repeat, "iteration 2 has not started");
+    assert!(events.iter().any(is_cove_mana(cove)));
+    assert_eq!(counters_on(&runner, cove, &counter("storage")), 1);
+
+    runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("iteration 1 is paid");
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { .. }),
+        "iteration 2 asks again: {:?}",
+        runner.state().waiting_for
+    );
+    runner
+        .act(GameAction::PayUnlessCost { pay: false })
+        .expect("iteration 2 is declined");
+    drive(
+        &mut runner,
+        priority_with_empty_stack,
+        &mut Answers::default(),
+    );
+    assert_eq!(runner.life(P0) - life_before, -1, "only iteration 2's loss");
+    assert!(runner.state().resolution_stack.is_empty());
+}
+
+/// D4(c): a prevented non-counter event inside the root's subtree (the child's
+/// life gain) still lets the child's rider run before the activation is placed.
+#[test]
+fn a_prevented_non_counter_child_event_finishes_its_rider_before_the_cost_root() {
+    let mut scenario = replacement_board();
+    let bottle = scenario
+        .add_artifact_from_oracle(P0, "Essence Bottle", ESSENCE_BOTTLE)
+        .id();
+    scenario.with_counter(bottle, counter("elixir"), 3);
+    let mut runner = scenario.build();
+    let execute = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 2 },
+            player: TargetFilter::Controller,
+        },
+    )
+    .sub_ability(lose(1));
+    install_replacement_on_steward(
+        &mut runner,
+        optional_replacement(ReplacementEvent::RemoveCounter, Some(execute)),
+    );
+    install_replacement_on_steward(
+        &mut runner,
+        optional_replacement(ReplacementEvent::GainLife, None),
+    );
+    let life_before = runner.life(P0);
+
+    let index = counter_cost_ability(&runner, bottle, 0);
+    activate(&mut runner, bottle, index);
+    choose_replacement(&mut runner, ACCEPT);
+    assert_root_is_counter_cost(&runner);
+    assert!(
+        parked_child_rider(runner.state()),
+        "reach: the rider is parked"
+    );
+    assert!(runner.state().stack.is_empty());
+    stage_prevented_pending_event(&mut runner, |proposed| {
+        matches!(proposed, ProposedEvent::LifeGain { .. })
+    });
+
+    let events = choose_replacement_events(&mut runner, 0);
+    assert_eq!(
+        runner.life(P0) - life_before,
+        -1,
+        "the gain was prevented; the rider ran"
+    );
+    let loss = event_index(&events, is_life_loss);
+    let activated = event_index(&events, is_activation_of(bottle));
+    assert!(loss < activated, "rider {loss} < activation {activated}");
+    assert_eq!(runner.state().stack.len(), 1);
+    assert_eq!(top_stack_count(&runner), Some(3));
+    assert!(!parked_child_rider(runner.state()));
+    assert!(payment_ownership_is_clear(&runner));
+
+    let mut answers = Answers::default();
+    answers.replacement_choices.push_back(DECLINE);
+    drive(&mut runner, priority_with_empty_stack, &mut answers);
+    assert_eq!(runner.life(P0) - life_before, 5, "-1 rider, +6 Bottle");
+}
+
+/// "Add one mana of any color. You lose 1 life." as the Bottle's removal's
+/// post-effect.
+fn mana_choice_child() -> AbilityDefinition {
+    AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::Mana {
+            produced: ManaProduction::AnyOneColor {
+                count: QuantityExpr::Fixed { value: 1 },
+                color_options: vec![
+                    ManaColor::White,
+                    ManaColor::Blue,
+                    ManaColor::Black,
+                    ManaColor::Red,
+                    ManaColor::Green,
+                ],
+                contribution: ManaContribution::Base,
+            },
+            restrictions: vec![],
+            grants: vec![],
+            expiry: None,
+            target: None,
+        },
+    )
+    .sub_ability(lose(1))
+}
+
+fn bottle_at_mana_choice(scenario: GameScenario) -> (GameRunner, ObjectId, i32) {
+    let mut scenario = scenario;
+    let bottle = scenario
+        .add_artifact_from_oracle(P0, "Essence Bottle", ESSENCE_BOTTLE)
+        .id();
+    scenario.with_counter(bottle, counter("elixir"), 3);
+    let mut runner = scenario.build();
+    install_replacement_on_steward(
+        &mut runner,
+        optional_replacement(ReplacementEvent::RemoveCounter, Some(mana_choice_child())),
+    );
+    let life_before = runner.life(P0);
+    let index = counter_cost_ability(&runner, bottle, 0);
+    activate(&mut runner, bottle, index);
+    choose_replacement(&mut runner, ACCEPT);
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::ChooseManaColor {
+                context: ManaChoiceContext::ResolvingEffect(_),
+                ..
+            }
+        ),
+        "reach: the child asks for its colour: {:?}",
+        runner.state().waiting_for
+    );
+    assert_root_is_counter_cost(&runner);
+    assert!(
+        parked_child_rider(runner.state()),
+        "reach: the rider is parked"
+    );
+    assert!(runner.state().stack.is_empty());
+    (runner, bottle, life_before)
+}
+
+fn choose_green(runner: &mut GameRunner) -> Vec<GameEvent> {
+    runner
+        .act(GameAction::ChooseManaColor {
+            choice: ManaChoice::SingleColor(ManaType::Green),
+            count: 1,
+        })
+        .expect("the colour is chosen")
+        .events
+}
+
+/// FD1: the child finishes inside the mana-colour handler, which drains
+/// directly; the activation is still placed in that same action.
+#[test]
+fn a_mana_choice_child_finishes_and_places_the_activation_in_the_same_action() {
+    let (mut runner, bottle, life_before) = bottle_at_mana_choice(replacement_board());
+
+    let events = choose_green(&mut runner);
+    assert_eq!(pool(&runner, ManaType::Green), 1);
+    assert_eq!(runner.life(P0) - life_before, -1);
+    let loss = event_index(&events, is_life_loss);
+    let activated = event_index(&events, is_activation_of(bottle));
+    assert!(loss < activated, "rider {loss} < activation {activated}");
+    assert_eq!(runner.state().stack.len(), 1, "placed in the same action");
+    assert_eq!(top_stack_count(&runner), Some(3));
+    assert!(!parked_child_rider(runner.state()));
+    assert!(payment_ownership_is_clear(&runner));
+
+    drive(
+        &mut runner,
+        priority_with_empty_stack,
+        &mut Answers::default(),
+    );
+    assert_eq!(runner.life(P0) - life_before, 5);
+}
+
+/// Synthetic control: a trigger the child's life loss raises.
+const WITNESS: &str = "Whenever you lose life, you gain 1 life.";
+
+/// Site 1: a trigger raised by the child's payment is collected after the
+/// activation exists, so it goes on the stack above it (CR 603.3).
+#[test]
+#[ignore = "Phase D T12b blocked: Witness's one life-loss trigger is collected twice (once below the activation, once above it via site 1; three times with site 1 removed); returned to the plan"]
+fn a_trigger_from_the_childs_payment_goes_on_the_stack_above_the_activation() {
+    let mut scenario = replacement_board();
+    let witness = scenario
+        .add_artifact_from_oracle(P0, "Witness", WITNESS)
+        .id();
+    let (mut runner, bottle, _) = bottle_at_mana_choice(scenario);
+    assert_eq!(
+        runner.state().objects[&witness].trigger_definitions.len(),
+        1,
+        "reach: Witness has its trigger"
+    );
+
+    choose_green(&mut runner);
+    drive(
+        &mut runner,
+        |state| matches!(state.waiting_for, WaitingFor::Priority { .. }) && state.stack.len() == 2,
+        &mut Answers::default(),
+    );
+    let stack = &runner.state().stack;
+    assert!(
+        matches!(stack[1].kind, StackEntryKind::TriggeredAbility { .. })
+            && stack[1].source_id == witness,
+        "the trigger is on top: {:?}",
+        stack[1].kind
+    );
+    match &stack[0].kind {
+        StackEntryKind::ActivatedAbility { ability, .. } => {
+            assert_eq!(stack[0].source_id, bottle);
+            assert_eq!(ability.context.cost_removed_counter_amount, Some(3));
+        }
+        other => panic!("the activation is below the trigger: {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

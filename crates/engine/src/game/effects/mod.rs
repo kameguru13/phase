@@ -1207,6 +1207,12 @@ pub(crate) fn settle_empty_forwarded_zone_result(state: &mut GameState, producer
 }
 
 pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec<GameEvent>) {
+    // CR 601.2h + CR 605.3b + CR 608.2c: a parked counter-cost root whose
+    // replacement subtree has retired resumes before any further resolution
+    // work; every frame left on top of it is outer work.
+    if state.counter_cost_root_is_due() {
+        return;
+    }
     counters::drain_pending_counter_moves(state, events);
     counters::drain_pending_counter_removals(state, events);
     counters::drain_pending_counter_additions(state, events);
@@ -1387,7 +1393,12 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
             drain_pending_continuation(state, events);
             resume_resolution_frames(state, events);
         }
-        if !waits_for_resolution_choice(&state.waiting_for) {
+        // CR 601.2h + CR 605.3b + CR 608.2c: a parked counter-cost root whose
+        // replacement subtree has retired resumes before any further resolution
+        // work; every frame left on top of it is outer work. Once the subtree
+        // retired with the continuation that just ran, the paused dispatch on top
+        // belongs to an outer owner and stays paused.
+        if !waits_for_resolution_choice(&state.waiting_for) && !state.counter_cost_root_is_due() {
             // CR 615.5: a resumed continuation completes its own paused
             // resident drain only after it has not raised another choice.
             state.finish_active_paused_post_replacement_dispatch();
@@ -1400,6 +1411,12 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
                 drain_pending_continuation(state, events);
             }
         }
+    }
+    // CR 601.2h + CR 605.3b + CR 608.2c: a parked counter-cost root whose
+    // replacement subtree has retired resumes before any further resolution
+    // work; every frame left on top of it is outer work.
+    if state.counter_cost_root_is_due() {
+        return;
     }
     // CR 701.38d: Resume per-ballot vote iteration after an interactive
     // choice resolves. Must run after change_zone_iteration (which may be
@@ -1657,6 +1674,12 @@ pub(crate) fn resume_resolution_frames(state: &mut GameState, events: &mut Vec<G
         if waits_for_resolution_choice(&state.waiting_for) {
             state.resolution_stack.note_repeat_until_descendant_choice();
         }
+        return;
+    }
+    // CR 601.2h + CR 605.3b + CR 608.2c: a parked counter-cost root whose
+    // replacement subtree has retired resumes before any further resolution
+    // work; every frame left on top of it is outer work.
+    if state.counter_cost_root_is_due() {
         return;
     }
 

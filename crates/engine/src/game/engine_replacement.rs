@@ -1386,10 +1386,10 @@ fn handle_replacement_choice_inner(
 
             // CR 601.2h + CR 605.3b + CR 608.2c + CR 616.1: a counter-cost root
             // deferred at the delivery drain above because its replacement subtree
-            // was live resumes as soon as the child's rider has retired that
-            // subtree — at this same replacement boundary, before any outer cast or
-            // activation it is paying for (a mana ability paying a spell's cost) is
-            // finished below.
+            // was live: the continuation drain above stops at the moment the subtree
+            // retires (`counter_cost_root_is_due`), and the root resumes here, before
+            // any outer frame work and before any outer cast or activation it is
+            // paying for (a mana ability paying a spell's cost) is finished below.
             if matches!(waiting_for, WaitingFor::Priority { .. })
                 && state.counter_cost_root_subtree() == CounterCostRootSubtree::Retired
             {

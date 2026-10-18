@@ -8450,6 +8450,13 @@ impl GameState {
             Some(_) => CounterCostRootSubtree::Unfinished,
         }
     }
+
+    /// CR 601.2h + CR 605.3b + CR 616.1: a parked counter-cost root whose
+    /// replacement subtree has retired is due: it is the innermost unfinished
+    /// work and resumes before any other resolution work.
+    pub(crate) fn counter_cost_root_is_due(&self) -> bool {
+        self.counter_cost_root_subtree() == CounterCostRootSubtree::Retired
+    }
 }
 
 impl PendingCostMoveResume {

@@ -1656,6 +1656,24 @@ fn apply_action_boundary_core(
     // `false` when nothing was parked or an earlier convergence point already consumed it
     // (`Option::take_if`).
     let scan_from = result.events.len();
+    // CR 601.2h + CR 602.2b + CR 605.3b: a counter-cost root this action made due
+    // resumes before the action returns, and its events join the convergence
+    // pass below.
+    let resumed_due_root = match resume_due_counter_cost_root_at_action_boundary(
+        state,
+        &result.waiting_for,
+        &mut result.events,
+    ) {
+        Ok(Some(waiting_for)) => {
+            result.waiting_for = waiting_for;
+            true
+        }
+        Ok(None) => false,
+        Err(err) => {
+            *state = boundary_snapshot;
+            return Err(err);
+        }
+    };
     let realized_token_entry =
         effects::token::realize_settled_token_battlefield_entry(state, &mut result.events);
     // CR 608.2c + CR 608.2n: the same convergence for a resolution this action
@@ -1666,7 +1684,10 @@ fn apply_action_boundary_core(
     // triggers. A token realization and an owed final part on the same action
     // share one pass.
     let owed_spell_final_part_is_due = owed_spell_final_part_is_due(state, &result);
-    if realized_token_entry || owed_spell_final_part_is_due {
+    if (resumed_due_root && matches!(result.waiting_for, WaitingFor::Priority { .. }))
+        || realized_token_entry
+        || owed_spell_final_part_is_due
+    {
         if let Err(err) = run_boundary_convergence_pipeline(state, &mut result, scan_from) {
             *state = boundary_snapshot;
             return Err(err);
@@ -1708,6 +1729,26 @@ fn owed_spell_final_part_is_due(state: &mut GameState, result: &ActionResult) ->
         sync_waiting_for(state, &result.waiting_for);
     }
     owes_spell_final_part && resolution_instructions_are_done(state)
+}
+
+/// CR 601.2h + CR 602.2b + CR 605.3b + CR 608.2c: the action-boundary resume
+/// authority for a parked counter-cost root whose replacement subtree retired
+/// during this action. A handler may finish the subtree by draining directly
+/// (a resolution-time cost choice, a mana-colour choice, a Prevented-arm child
+/// block) without reaching the common boundary; the root is still the innermost
+/// unfinished work and resumes before the action returns. Inert unless a root is
+/// due under a Priority result.
+fn resume_due_counter_cost_root_at_action_boundary(
+    state: &mut GameState,
+    waiting_for: &WaitingFor,
+    events: &mut Vec<GameEvent>,
+) -> Result<Option<WaitingFor>, EngineError> {
+    if !matches!(waiting_for, WaitingFor::Priority { .. }) || !state.counter_cost_root_is_due() {
+        return Ok(None);
+    }
+    sync_waiting_for(state, waiting_for);
+    resume_pending_continuation_if_priority(state, events)?;
+    Ok(Some(state.waiting_for.clone()))
 }
 
 /// The action boundary's convergence pass: the ordinary post-action pipeline,
@@ -8884,7 +8925,8 @@ pub(crate) fn drain_pending_cost_move_resume(
 /// for every state except a parked counter-cost root whose replacement subtree
 /// is still live: `resume_resolution_frames` advances one top frame per pass,
 /// so a subtree several frames deep needs several, and the root resumes in the
-/// pass that retires the last of it (the cost-move drain admits it at
+/// pass that retires the last of it (a due root resumes mid-pass through
+/// `resume_due_counter_cost_root`; the cost-move drain admits it at
 /// `PriorityBoundary`). A repeat needs the position to strictly decrease, so
 /// the loop ends.
 pub(super) fn resume_pending_continuation_if_priority(
@@ -8936,6 +8978,22 @@ impl SubtreePosition {
     }
 }
 
+/// CR 601.2h + CR 605.3b + CR 608.2c + CR 616.1: once a parked counter-cost
+/// root's replacement subtree has retired, resume that root at this boundary
+/// before any further frame, liminal-entry or phase-transition work.
+fn resume_due_counter_cost_root(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EngineError> {
+    if matches!(state.waiting_for, WaitingFor::Priority { .. }) && state.counter_cost_root_is_due()
+    {
+        super::life_safety::observe_boundary_carrier(state);
+        let _ =
+            drain_pending_cost_move_resume(state, events, CostMoveDrainBoundary::PriorityBoundary)?;
+    }
+    Ok(())
+}
+
 fn resume_pending_continuation_pass(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
@@ -8953,12 +9011,14 @@ fn resume_pending_continuation_pass(
             super::life_safety::observe_boundary_carrier(state);
             effects::drain_pending_continuation(state, events);
         }
+        resume_due_counter_cost_root(state, events)?;
         if matches!(state.waiting_for, WaitingFor::Priority { .. })
             && deferred_life_boundary.is_none_or(|boundary| state.resolution_stack.len() > boundary)
         {
             super::life_safety::observe_boundary_carrier(state);
             effects::resume_resolution_frames(state, events);
         }
+        resume_due_counter_cost_root(state, events)?;
         let mut drained_deferred_life = false;
         if matches!(state.waiting_for, WaitingFor::Priority { .. })
             && state
@@ -16319,6 +16379,14 @@ fn apply_non_priority_pass_action(
         semantic_actor,
         &action_for_divergence,
     );
+
+    // CR 601.2h + CR 602.2b + CR 603.3: a counter-cost root this handler made due
+    // resumes before the pipeline below, so triggers raised while paying are
+    // collected after the activation exists. Same authority as the action
+    // boundary's call in `apply_action_boundary_core`.
+    let waiting_for =
+        resume_due_counter_cost_root_at_action_boundary(state, &waiting_for, &mut events)?
+            .unwrap_or(waiting_for);
 
     // Run post-action pipeline (SBAs, triggers, layers) and check for terminal states.
     // When triggers were already processed inline (e.g., DeclareAttackers, combat damage),
