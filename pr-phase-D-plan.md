@@ -1184,3 +1184,10 @@ The brief is pr-phase-D-impl-review-r4.md (findings R4-F1 to R4-F5 and their sug
    - One-revert columns: −ledger filter in batch_or_drain, −discard-loop filter, −shared promote guard (both callers), −F4 staging.
    - Run the whole cost_removed_counter_amount file at head.
    - Run engine clippy before committing.
+
+## Phase D impl-review r5 fix (R5-F1, expansion case 104)
+
+1. `engine_resolution_choices.rs` CategoryChoice keeper arm (the B2 `else` branch after `resume_with_error_propagation` at ~:8413, raw slice ~:8429-8440): replace the raw `events[events_before_sacrifice..events_after_sacrifice.min(owned.end)]` slice with `unclaimed_observer_events(state, events, events_before_sacrifice, events_after_sacrifice.min(owned.end))`, keeping the `PhaseChanged` filter, exactly as the two sibling keeper arms (~:8648, ~:8749) do. Comment: same CR 603.2c / 603.3 note as the siblings.
+2. No new test row (latent, residual-3 shape, like its siblings); add this site to the residual note listing the keeper arms without a discriminating row.
+3. Check: `rg -n "resume_with_error_propagation\(state, events\)\?;" -A30 crates/engine/src/game/engine_resolution_choices.rs` shows no raw `events[..]` -> `collect_triggers_into_deferred` after a resume.
+4. Verify: cargo fmt --all; engine clippy (`-p phase-engine --all-targets --features engine/proptest -D warnings`); counter-cost integration suite (expect 72/0/0). Commit on top of c909249, push to engine/cost-removed-counters-wip only.
