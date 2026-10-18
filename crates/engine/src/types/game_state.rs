@@ -45255,8 +45255,9 @@ mod tests {
             "missing latch rejection must name the missing authority: {error}"
         );
 
-        // A legacy carrier whose members are bare ids has no pre-event entry
-        // modifications to resume with, so it must reject rather than default.
+        // The carrier itself never accepts bare-id members. A persisted v1–v6
+        // carrier is migrated or refused before this decode by
+        // `migrate_legacy_change_zone_member_entries` (`types/resolution.rs`).
         let mut bare_ids = serde_json::to_value(&original).expect("serialize modern carrier");
         bare_ids
             .as_object_mut()
