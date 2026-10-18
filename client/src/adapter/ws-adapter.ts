@@ -222,7 +222,8 @@ export class NativeEngineVersionMismatchError extends Error {
  *       PROTOCOL_VERSION's own `/// 151` entry in
  *       crates/lobby-broker/src/protocol.rs. A v150 peer cannot parse the tag;
  *       the exact-match version check at connect refuses the pairing. Wire 133
- *       moves with it. Follows #10004's 150.
+ *       moves with it. Follows #10004's 150; PausedCounterCostRemoval carries
+ *       its replacement_subtree boundary.
  * 149 — The CR 608.2n final part of a spell's resolution is owed on the
  *      resolution carrier: `GameState::deferred_spell_delivery` (v110) is removed
  *      and `GameState::resolving_spell_final_part` (`{ spell }`) marks an instant

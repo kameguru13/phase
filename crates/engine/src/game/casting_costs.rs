@@ -5020,6 +5020,7 @@ pub(crate) fn resume_counter_cost_removal_payment(
     let PausedCounterCostRemoval {
         in_flight,
         remaining,
+        replacement_subtree: _,
     } = *removal;
     let settled = super::effects::counters::settled_in_flight_counter_removal(state, &in_flight);
     let is_activation = pending.activation_ability_index.is_some();

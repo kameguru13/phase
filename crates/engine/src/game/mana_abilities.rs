@@ -4138,6 +4138,7 @@ fn continue_mana_ability_cost_payment_in_node(
         let PausedCounterCostRemoval {
             in_flight,
             remaining,
+            replacement_subtree: _,
         } = *paused;
         let settled =
             super::effects::counters::settled_in_flight_counter_removal(state, &in_flight);

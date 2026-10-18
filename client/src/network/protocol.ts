@@ -112,7 +112,8 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  *       replacement choice) and whose mana cost cursor may hold
  *       counter_removal. A v132 peer cannot parse the new tag, so first
  *       contact rejects the skew. Bumped in lockstep with full-game protocol
- *       151 (after #10004's 150 / wire 132).
+ *       151 (after #10004's 150 / wire 132); PausedCounterCostRemoval carries
+ *       its replacement_subtree boundary.
  *  131 — GameState.deferred_spell_delivery is removed and GameState.resolving_spell_final_part
  *       ({ spell }) marks the CR 608.2n final part a paused instant or sorcery still owes,
  *       in game_setup and state_update; a v130 peer drops the key and would move the spell

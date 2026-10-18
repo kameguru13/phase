@@ -3478,7 +3478,8 @@ mod tests {
     /// settled count the activation reads, CR 118.11) and
     /// `ManaAbilityCostCursor` gains `counter_removal`, both carried in
     /// `GameState::pending_cost_move_resume`; a v150 peer cannot parse the new
-    /// tag, so it must be refused before it receives v151 state.
+    /// tag, so it must be refused before it receives v151 state;
+    /// `PausedCounterCostRemoval` carries its `replacement_subtree` boundary.
     ///
     /// v149: `GameState::deferred_spell_delivery` is gone and
     /// `GameState::resolving_spell_final_part` marks the CR 608.2n final part a

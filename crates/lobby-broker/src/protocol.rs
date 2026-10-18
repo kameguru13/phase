@@ -71,7 +71,8 @@ pub struct TournamentRequestId(pub u64);
 ///      `ManaAbilityCostCursor.cost_removed_counters`,
 ///      `PendingManaAbility.cost_removed_counters`; optional, skipped when
 ///      unset), which a v150 peer re-encoding state would drop. Full-game
-///      peers and P2P move in lockstep (wire 133); no lobby carrier names it. Follows #10004 (150 / wire 132).
+///      peers and P2P move in lockstep (wire 133); no lobby carrier names it. Follows #10004 (150 / wire 132);
+///      `PausedCounterCostRemoval` carries its `replacement_subtree` boundary.
 ///
 /// 149 — The CR 608.2n final part of a spell's resolution is owed on the
 ///      resolution carrier. `GameState::deferred_spell_delivery` (v110: the

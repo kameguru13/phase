@@ -6043,6 +6043,71 @@ pub struct PendingCounterRemovalInFlight {
 pub struct PausedCounterCostRemoval {
     pub in_flight: PendingCounterRemovalInFlight,
     pub remaining: Vec<PendingCounterRemoval>,
+    /// Where this removal's replacement subtree begins, recorded when the payer
+    /// proposed it. Required on the wire: a missing boundary must not decode as
+    /// depth 0, which would read a mid-resolution subtree as retired.
+    pub replacement_subtree: ReplacementSubtreeBoundary,
+}
+
+/// CR 616.1 + CR 608.2c: where a counter removal's replacement subtree begins.
+/// Everything the removal's replacement installs (its post-effect drain, an
+/// effect removal queue, a rider) is above this position: on frames above
+/// `resolution_depth`, or nested (CR 616.1g) into the post-replacement frame
+/// that was the drain owner when the removal was proposed
+/// (`install_post_replacement_drain`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplacementSubtreeBoundary {
+    pub resolution_depth: usize,
+    pub enclosing: Option<EnclosingPostReplacementFrame>,
+}
+
+/// The post-replacement frame a removal's own post-effect drain nests into, and
+/// how many drains it held when the removal was proposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnclosingPostReplacementFrame {
+    /// The frame's identity. `None` for an unstamped frame: never dispatched,
+    /// journal-replayed, or from a pre-identity payload. An unstamped frame is
+    /// then read positionally.
+    pub frame: Option<PostReplacementFrameId>,
+    pub drains: usize,
+}
+
+impl ReplacementSubtreeBoundary {
+    /// The current position of `stack`, as the payer records it.
+    pub(crate) fn at(stack: &ResolutionStack) -> Self {
+        Self {
+            resolution_depth: stack.len(),
+            enclosing: stack
+                .active_post_replacement_or_paired_parent()
+                .map(|drains| EnclosingPostReplacementFrame {
+                    frame: drains.frame_id(),
+                    drains: drains.len(),
+                }),
+        }
+    }
+
+    /// Whether nothing the subtree installed remains: no frame above the
+    /// recorded depth, and the enclosing frame (found by identity, wherever it
+    /// now sits) holds no more drains than it did.
+    pub(crate) fn is_retired(&self, stack: &ResolutionStack) -> bool {
+        stack.len() <= self.resolution_depth
+            && self
+                .enclosing
+                .is_none_or(|enclosing| enclosing.is_retired(stack))
+    }
+}
+
+impl EnclosingPostReplacementFrame {
+    fn is_retired(self, stack: &ResolutionStack) -> bool {
+        let drains_now = match self.frame {
+            Some(id) => stack.post_replacement_frame_drain_count(id),
+            None => stack
+                .active_post_replacement_or_paired_parent()
+                .map(PostReplacementDrainStack::len),
+        };
+        // A consumed frame took its nested drains with it.
+        drains_now.is_none_or(|drains| drains <= self.drains)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -8355,7 +8420,60 @@ pub enum PendingCostMoveResume {
     RandomDiscardUnlessPayment(Box<RandomDiscardUnlessPaymentResume>),
 }
 
+/// CR 616.1 + CR 608.2c: where a parked counter-cost root's own replacement
+/// subtree stands. Private plumbing; not serialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CounterCostRootSubtree {
+    Absent,
+    Unfinished,
+    Retired,
+}
+
+impl GameState {
+    /// CR 616.1 + CR 608.2c: whether the parked root holds a counter-cost
+    /// removal, and if so whether everything that removal's replacement
+    /// installed has finished.
+    pub(crate) fn counter_cost_root_subtree(&self) -> CounterCostRootSubtree {
+        match self
+            .pending_cost_move_resume
+            .as_ref()
+            .and_then(PendingCostMoveResume::paused_counter_removal)
+        {
+            None => CounterCostRootSubtree::Absent,
+            Some(paused)
+                if paused
+                    .replacement_subtree
+                    .is_retired(&self.resolution_stack) =>
+            {
+                CounterCostRootSubtree::Retired
+            }
+            Some(_) => CounterCostRootSubtree::Unfinished,
+        }
+    }
+}
+
 impl PendingCostMoveResume {
+    /// CR 601.2h + CR 616.1: the counter-cost removal this root holds paused on
+    /// its replacement choice — the stack route's own record, or the mana cursor's.
+    /// Exhaustive so a new root is classified.
+    pub(crate) fn paused_counter_removal(&self) -> Option<&PausedCounterCostRemoval> {
+        match self {
+            Self::CounterCostRemovalPayment { removal, .. } => Some(removal),
+            Self::ManaAbilityPayment { cursor, .. } => cursor.counter_removal.as_deref(),
+            Self::Cast { .. }
+            | Self::SacrificeForCost { .. }
+            | Self::WardSacrificePayment { .. }
+            | Self::ReplacementMayCost { .. }
+            | Self::Foretell { .. }
+            | Self::CollectEvidencePayment { .. }
+            | Self::UnlessBouncePayment { .. }
+            | Self::ActivationMillPayment { .. }
+            | Self::LoyaltyActivation { .. }
+            | Self::CounterAdditionUnlessPayment { .. }
+            | Self::RandomDiscardUnlessPayment(_) => None,
+        }
+    }
+
     /// CR 601.2h + CR 602.2b + CR 605.3b + CR 116.2h: Whether the paused cost
     /// move belongs to casting a spell, activating an ability (a mana ability
     /// included) or performing a special action, none of which gives a player
@@ -24941,6 +25059,10 @@ impl PostReplacementDrain {
 impl PostReplacementDrainStack {
     pub fn is_empty(&self) -> bool {
         self.drains.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.drains.len()
     }
 
     /// Is there a continuation that has not run yet?
@@ -48617,6 +48739,126 @@ mod shared_zone_storage_tests {
             dandan.loop_fingerprint(),
             stray.loop_fingerprint(),
             "the non-canonical seat's own container is hashed too"
+        );
+    }
+}
+
+/// CR 616.1g + CR 608.2c: a counter removal's replacement subtree boundary sees
+/// a child drain that nests into the enclosing post-replacement frame, which a
+/// stack-depth check alone cannot.
+#[cfg(test)]
+mod replacement_subtree_boundary_tests {
+    use super::{
+        GameState, PendingContinuation, PostReplacementDrain, ReplacementSubtreeBoundary,
+        ResidentDrainPolicy,
+    };
+    use crate::types::ability::{
+        AbilityDefinition, AbilityKind, Effect, PostReplacementContinuation, ResolvedAbility,
+        TargetFilter,
+    };
+    use crate::types::identifiers::ObjectId;
+    use crate::types::player::PlayerId;
+    use crate::types::resolution::AbilityContinuationFrame;
+
+    fn ready_drain(name: &str) -> PostReplacementDrain {
+        PostReplacementDrain::ready(PostReplacementContinuation::Template(Box::new(
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::unimplemented(name, "subtree-boundary fixture"),
+            ),
+        )))
+    }
+
+    /// One post-replacement frame whose only drain is dispatched (stamping the
+    /// frame) and paused, as an outer post-effect waiting on a prompt is.
+    fn state_with_paused_enclosing_frame() -> GameState {
+        let mut state = GameState::new_two_player(42);
+        state.install_post_replacement_drain(ready_drain("outer"), ResidentDrainPolicy::Replace);
+        let (_, outer) = state
+            .begin_post_replacement_dispatch()
+            .expect("the outer drain dispatches");
+        assert!(state.pause_post_replacement_dispatch(outer));
+        state
+    }
+
+    #[test]
+    fn a_child_nested_into_the_enclosing_frame_keeps_the_subtree_live() {
+        let mut state = state_with_paused_enclosing_frame();
+        let boundary = ReplacementSubtreeBoundary::at(&state.resolution_stack);
+        assert!(
+            boundary
+                .enclosing
+                .is_some_and(|enclosing| enclosing.frame.is_some() && enclosing.drains == 1),
+            "reach: the boundary names the stamped enclosing frame: {boundary:?}"
+        );
+
+        state.install_post_replacement_drain(ready_drain("child"), ResidentDrainPolicy::Replace);
+        let (_, child) = state
+            .begin_post_replacement_dispatch()
+            .expect("the nested child drain dispatches");
+        assert_eq!(
+            state.resolution_stack.len(),
+            boundary.resolution_depth,
+            "the child nested into the frame without growing the stack"
+        );
+        assert!(
+            !boundary.is_retired(&state.resolution_stack),
+            "a nested child drain keeps the subtree live"
+        );
+
+        assert!(state.finish_post_replacement_dispatch(child).is_some());
+        assert!(
+            boundary.is_retired(&state.resolution_stack),
+            "the subtree retires with the nested child"
+        );
+    }
+
+    #[test]
+    fn a_nested_child_stays_live_after_the_frame_above_its_parent_is_consumed() {
+        let mut state = state_with_paused_enclosing_frame();
+        let chain = Box::new(ResolvedAbility::new(
+            Effect::TargetOnly {
+                target: TargetFilter::Any,
+            },
+            vec![],
+            ObjectId(70),
+            PlayerId(0),
+        ));
+        let pending = PendingContinuation::new(chain, &state);
+        state.push_ability_continuation(AbilityContinuationFrame {
+            pending,
+            choose_zone_trigger_context: None,
+        });
+        let boundary = ReplacementSubtreeBoundary::at(&state.resolution_stack);
+        assert!(
+            boundary
+                .enclosing
+                .is_some_and(|enclosing| enclosing.frame.is_some() && enclosing.drains == 1),
+            "reach: the frame below the continuation is the paired parent: {boundary:?}"
+        );
+
+        state.install_post_replacement_drain(ready_drain("child"), ResidentDrainPolicy::Replace);
+        let (_, child) = state
+            .begin_post_replacement_dispatch()
+            .expect("the nested child drain dispatches");
+        state
+            .take_active_ability_continuation()
+            .expect("the continuation is the top frame")
+            .expect("the continuation is present");
+        assert_eq!(
+            state.resolution_stack.len(),
+            boundary.resolution_depth - 1,
+            "reach: the frame above the parent was consumed first"
+        );
+        assert!(
+            !boundary.is_retired(&state.resolution_stack),
+            "the enclosing frame, found by identity, still holds the nested child"
+        );
+
+        assert!(state.finish_post_replacement_dispatch(child).is_some());
+        assert!(
+            boundary.is_retired(&state.resolution_stack),
+            "the subtree retires with the nested child"
         );
     }
 }

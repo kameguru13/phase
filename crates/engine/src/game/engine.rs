@@ -14,9 +14,10 @@ use crate::types::actions::{
 use crate::types::events::{BendingType, ContestRound, GameEvent, ManaTapState};
 use crate::types::game_state::{
     ActionResult, AssistState, AutoMayChoice, AutoPassMode, AutoPassRequest, CastOfferKind,
-    CastingVariant, ConvokeMode, CostResume, GameState, LandPlayRecord, LoopDetectionMode,
-    ManaAbilityResume, MayTriggerAutoChoiceKey, PayCostKind, PendingCostMoveCompletion,
-    PendingCostMoveResume, PendingCounterPostAction, PendingEffectResolved, PersistedRestoreError,
+    CastingVariant, ConvokeMode, CostResume, CounterCostRootSubtree, GameState, LandPlayRecord,
+    LoopDetectionMode, ManaAbilityResume, MayTriggerAutoChoiceKey, PayCostKind,
+    PendingCostMoveCompletion, PendingCostMoveResume, PendingCounterPostAction,
+    PendingEffectResolved, PersistedRestoreError, PostReplacementDrainStack,
     ResolveAllConsentParticipant, ResolveAllConsentRun, ResolveAllPrioritySnapshot, RetargetScope,
     RetargetSlotAddress, StackEntry, StackEntryKind, StackResolutionAutoPassOverlay,
     StackResolutionBudget, StackResolutionEntryFence, StackResolutionPolicy,
@@ -28,6 +29,7 @@ use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
 #[cfg(debug_assertions)]
 use crate::types::resolution::debug_assert_runtime_resolution_invariants;
+use crate::types::resolution::ResolutionStack;
 use crate::types::resolved_commands::{
     ResolvedInformationAudience, ResolvedInformationEdit, ResolvedInformationLifetime,
     ResolvedOncePerTurnPermission, ResolvedRulesCommand,
@@ -8728,12 +8730,18 @@ pub(crate) enum CostMoveDrainBoundary {
 /// CR 601.2h + CR 602.2b + CR 605.3b + CR 616.1: Drain the one typed cost-move
 /// root eligible at this exact reducer boundary. Replacement delivery happens
 /// before ordinary continuations; the common Priority boundary only resumes
-/// Delve and mana-ability cursors after those continuations have settled.
+/// Delve, mana-ability cursors, and a counter-cost root whose replacement
+/// subtree has retired, after those continuations have settled.
 pub(crate) fn drain_pending_cost_move_resume(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
     boundary: CostMoveDrainBoundary,
 ) -> Result<Option<WaitingFor>, EngineError> {
+    // CR 616.1 + CR 608.2c: a root whose replacement subtree is still live is not
+    // resumable at any boundary.
+    if state.counter_cost_root_subtree() == CounterCostRootSubtree::Unfinished {
+        return Ok(None);
+    }
     let eligible = match boundary {
         CostMoveDrainBoundary::ReplacementDelivered { .. } => matches!(
             state.pending_cost_move_resume,
@@ -8787,6 +8795,7 @@ pub(crate) fn drain_pending_cost_move_resume(
                     completion: PendingCostMoveCompletion::FinalizeDelvedCast { .. },
                     ..
                 } | PendingCostMoveResume::ManaAbilityPayment { .. }
+                    | PendingCostMoveResume::CounterCostRemovalPayment { .. }
             )
         ),
     };
@@ -8871,7 +8880,63 @@ pub(crate) fn drain_pending_cost_move_resume(
     Ok(Some(waiting_for))
 }
 
+/// CR 605.3b + CR 616.1 + CR 608.2c: the common priority boundary. One pass
+/// for every state except a parked counter-cost root whose replacement subtree
+/// is still live: `resume_resolution_frames` advances one top frame per pass,
+/// so a subtree several frames deep needs several, and the root resumes in the
+/// pass that retires the last of it (the cost-move drain admits it at
+/// `PriorityBoundary`). A repeat needs the position to strictly decrease, so
+/// the loop ends.
 pub(super) fn resume_pending_continuation_if_priority(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EngineError> {
+    loop {
+        let before = SubtreePosition::at(&state.resolution_stack);
+        resume_pending_continuation_pass(state, events)?;
+        let after = SubtreePosition::at(&state.resolution_stack);
+        if !matches!(state.waiting_for, WaitingFor::Priority { .. })
+            || state.counter_cost_root_subtree() != CounterCostRootSubtree::Unfinished
+            || !after.is_strictly_inside(&before)
+        {
+            return Ok(());
+        }
+    }
+}
+
+/// The loop's progress measure: stack depth, then the drain count of the active
+/// post-replacement frame. Positional on purpose: it only has to be
+/// well-founded, not to name the subtree (that is `ReplacementSubtreeBoundary`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SubtreePosition {
+    resolution_depth: usize,
+    enclosing_post_replacement_drains: usize,
+}
+
+impl SubtreePosition {
+    fn at(stack: &ResolutionStack) -> Self {
+        Self {
+            resolution_depth: stack.len(),
+            enclosing_post_replacement_drains: stack
+                .active_post_replacement_or_paired_parent()
+                .map_or(0, PostReplacementDrainStack::len),
+        }
+    }
+
+    /// Strictly less of the subtree remains: the stack is lower, or as high
+    /// with fewer drains in the enclosing frame (lexicographic on ℕ×ℕ).
+    fn is_strictly_inside(&self, before: &Self) -> bool {
+        (
+            self.resolution_depth,
+            self.enclosing_post_replacement_drains,
+        ) < (
+            before.resolution_depth,
+            before.enclosing_post_replacement_drains,
+        )
+    }
+}
+
+fn resume_pending_continuation_pass(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EngineError> {
@@ -27037,16 +27102,22 @@ mod resolving_carrier_settle_tests {
 #[cfg(test)]
 mod cost_move_drain_priority_boundary_tests {
     use super::{drain_pending_cost_move_resume, CostMoveDrainBoundary};
-    use crate::types::ability::{AbilityCost, Effect, ResolvedAbility, TargetFilter};
-    use crate::types::game_state::{GameState, PendingCostMoveResume};
+    use crate::types::ability::{AbilityCost, Effect, EffectKind, ResolvedAbility, TargetFilter};
+    use crate::types::counter::CounterType;
+    use crate::types::game_state::{
+        GameState, PausedCounterCostRemoval, PendingCostMoveCompletion, PendingCostMoveResume,
+        PendingCounterRemoval, PendingCounterRemovalInFlight, PendingCounterRemovalQueue,
+        ReplacementSubtreeBoundary, WaitingFor,
+    };
     use crate::types::identifiers::ObjectId;
     use crate::types::mana::ManaCost;
     use crate::types::player::PlayerId;
 
     /// `engine_payment_choices::resume_counter_addition_unless_payment` maps
     /// `CostMoveDrainBoundary::PriorityBoundary` to `unreachable!`, and nothing but
-    /// this eligibility table makes that true: it admits only a Delve-commit `Cast` and
-    /// `ManaAbilityPayment` at that boundary. Nothing else in the crate pinned that
+    /// this eligibility table makes that true: it admits only a Delve-commit `Cast`,
+    /// `ManaAbilityPayment`, and a counter-cost root whose replacement subtree has
+    /// retired at that boundary. Nothing else in the crate pinned that
     /// premise, so widening the table would leave the suite green and abort a live
     /// session instead.
     ///
@@ -27094,6 +27165,86 @@ mod cost_move_drain_priority_boundary_tests {
             "the continuation must stay parked for the replacement boundary that owns it"
         );
         assert!(events.is_empty(), "an ineligible drain must emit no events");
+    }
+
+    /// CR 616.1 + CR 608.2c: a counter-cost root recorded at an empty stack is
+    /// not resumable at any boundary while a frame its replacement installed
+    /// (here an effect removal queue) is live, and is resumable at the priority
+    /// boundary once that frame retires.
+    #[test]
+    fn a_counter_cost_root_waits_for_its_subtree_at_every_boundary() {
+        let mut state = GameState::new_two_player(42);
+        let removal = PendingCounterRemoval {
+            object_id: ObjectId(61),
+            counter_type: CounterType::Generic("charge".to_string()),
+            count: 1,
+        };
+        state.pending_cost_move_resume = Some(PendingCostMoveResume::CounterCostRemovalPayment {
+            player: PlayerId(0),
+            pending: None,
+            removal: Box::new(PausedCounterCostRemoval {
+                in_flight: PendingCounterRemovalInFlight {
+                    removal: removal.clone(),
+                    counter_count_before: 1,
+                },
+                remaining: Vec::new(),
+                replacement_subtree: ReplacementSubtreeBoundary::at(&state.resolution_stack),
+            }),
+            cost_paid_object: None,
+            completion: PendingCostMoveCompletion::FinishPending,
+        });
+        state.push_counter_removals(PendingCounterRemovalQueue {
+            remaining: vec![removal],
+            effect_kind: EffectKind::RemoveCounter,
+            source_ability_id: ObjectId(62),
+            total: 1,
+            applied_total: 0,
+            in_flight: None,
+        });
+
+        for boundary in [
+            CostMoveDrainBoundary::ReplacementDelivered {
+                action_event_start: 0,
+            },
+            CostMoveDrainBoundary::ReplacementPrevented {
+                action_event_start: 0,
+            },
+            CostMoveDrainBoundary::PriorityBoundary,
+        ] {
+            let mut events = Vec::new();
+            let drained = drain_pending_cost_move_resume(&mut state, &mut events, boundary);
+            assert!(
+                matches!(drained, Ok(None)),
+                "{boundary:?}: a live subtree keeps the root parked"
+            );
+            assert!(
+                matches!(
+                    state.pending_cost_move_resume,
+                    Some(PendingCostMoveResume::CounterCostRemovalPayment { .. })
+                ),
+                "{boundary:?}: the root stays parked"
+            );
+            assert!(events.is_empty(), "{boundary:?}: no events while parked");
+        }
+
+        state
+            .take_active_counter_removals()
+            .expect("the queue is the top frame")
+            .expect("the queue is present");
+        let mut events = Vec::new();
+        let drained = drain_pending_cost_move_resume(
+            &mut state,
+            &mut events,
+            CostMoveDrainBoundary::PriorityBoundary,
+        );
+        assert!(
+            matches!(drained, Ok(Some(WaitingFor::Priority { .. }))),
+            "a retired subtree lets the priority boundary resume the root: {drained:?}"
+        );
+        assert!(
+            state.pending_cost_move_resume.is_none(),
+            "the resume took the root"
+        );
     }
 }
 

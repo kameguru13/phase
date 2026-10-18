@@ -49,7 +49,8 @@ use crate::types::ability::{
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
     CostResume, GameState, ManaAbilityResume, PausedCounterCostRemoval, PayCostKind,
-    PendingCostMoveCompletion, PendingCostMoveResume, PendingCounterRemoval, WaitingFor,
+    PendingCostMoveCompletion, PendingCostMoveResume, PendingCounterRemoval,
+    ReplacementSubtreeBoundary, WaitingFor,
 };
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::player::PlayerId;
@@ -789,6 +790,9 @@ pub(crate) fn pay_counter_cost_removals(
     mut cost_removed_counters: Option<&mut Option<u32>>,
     events: &mut Vec<GameEvent>,
 ) -> CounterCostRemovalProgress {
+    // CR 616.1 + CR 608.2c: everything a removal's replacement installs sits
+    // above this position, so the parked root can tell when that subtree retires.
+    let replacement_subtree = ReplacementSubtreeBoundary::at(&state.resolution_stack);
     let mut removals = removals.into_iter();
     while let Some(removal) = removals.next() {
         let in_flight = super::effects::counters::begin_in_flight_counter_removal(state, removal);
@@ -809,6 +813,7 @@ pub(crate) fn pay_counter_cost_removals(
                     PausedCounterCostRemoval {
                         in_flight,
                         remaining: removals.collect(),
+                        replacement_subtree,
                     },
                 );
             }
