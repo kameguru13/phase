@@ -4655,8 +4655,10 @@ impl ResolutionStateWire {
                 // modifications. Migrate (or refuse, when a gate decides the
                 // entries) before this arm's validation or the `LegacyChangeZoneWire`
                 // decode reads it. Unlike the v2–v6 frame migration, this runs after
-                // `prepare_resolution_wire` and the provenance migration, neither of
-                // which reads the carrier's `remaining` or entry fields.
+                // `prepare_resolution_wire` and the provenance migration. Their
+                // whole-value walks reach this carrier, but they only rewrite or
+                // refuse shapes a writer never puts in its `remaining` or entry
+                // fields, so the migrated result is unchanged.
                 if let Some(carrier) = value
                     .get_mut("pending_change_zone_iteration")
                     .filter(|carrier| !carrier.is_null())
