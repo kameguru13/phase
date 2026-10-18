@@ -802,14 +802,15 @@ mod constructed {
     use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
     use engine::game::zones::create_object;
     use engine::types::ability::{
-        AbilityCondition, ControllerRef, Effect, EffectOutcomeSignal, PlayerFilter, PtValue,
-        QuantityExpr, ResolvedAbility, SubAbilityLink, TargetFilter, TypeFilter, TypedFilter,
+        AbilityCondition, AbilityCost, ControllerRef, Effect, EffectOutcomeSignal, PlayerFilter,
+        PtValue, QuantityExpr, ResolvedAbility, SubAbilityLink, TargetFilter, TypeFilter,
+        TypedFilter, UnlessPayModifier,
     };
     use engine::types::actions::GameAction;
     use engine::types::counter::CounterType;
     use engine::types::game_state::WaitingFor;
     use engine::types::identifiers::{CardId, ObjectId};
-    use engine::types::mana::ManaColor;
+    use engine::types::mana::{ManaColor, ManaCost};
     use engine::types::phase::Phase;
     use engine::types::player::PlayerId;
     use engine::types::zones::Zone;
@@ -1095,6 +1096,12 @@ mod constructed {
                     runner
                         .act(GameAction::ChooseReplacement { index })
                         .expect("replacement choice accepted");
+                }
+                WaitingFor::UnlessPayment { player, .. } => {
+                    prompts.push((player, "unless"));
+                    runner
+                        .act(GameAction::PayUnlessCost { pay: false })
+                        .expect("unless answer accepted");
                 }
                 other => panic!("unexpected prompt {other:?}"),
             }
@@ -1468,6 +1475,42 @@ mod constructed {
                 vec![4, 1, 0],
                 "(iii) P2, {link:?}"
             );
+        }
+    }
+
+    /// L1 — CR 608.2c + CR 118.12a: "If it's your turn, put a counter on it
+    /// unless [you] pay {1}. Each player who doesn't gains 1 life." The empty
+    /// seat (P1, Halving Season) offers its unless payment once, and only when
+    /// its condition holds: the condition is checked before the payment choice.
+    #[test]
+    fn matched_empty_seat_offers_its_unless_payment_once_behind_its_condition() {
+        for (active, expected) in [(P1, vec![(P1, "unless")]), (P0, vec![(P0, "unless")])] {
+            let row = Row::new(2, Board::HalvingP1)
+                .gate(Gate::YourTurn)
+                .rider(Rider::WhoDoesnt)
+                .active(active);
+            let outcome = settle(
+                2,
+                Board::HalvingP1,
+                active,
+                None,
+                &|source| {
+                    let mut chain = chain(source, &row);
+                    chain
+                        .sub_ability
+                        .as_deref_mut()
+                        .expect("the placement follows the creation")
+                        .unless_pay = Some(UnlessPayModifier {
+                        cost: AbilityCost::Mana {
+                            cost: ManaCost::generic(1),
+                        },
+                        payer: TargetFilter::Controller,
+                    });
+                    chain
+                },
+                &mut |_| {},
+            );
+            assert_eq!(outcome.prompts, expected, "{active:?}'s turn");
         }
     }
 

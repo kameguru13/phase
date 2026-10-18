@@ -20496,7 +20496,10 @@ fn bind_seat_created_referent(
 /// - **Gate (only when the placement had a `condition`).** A second `NoOp`, the
 ///   head's `ContinuationStep` sub, carrying the `condition`, the
 ///   `else_ability` and the retained continuation (CR 608.2c: the condition
-///   and the "otherwise" leg stay the seat's instructions, in order).
+///   and the "otherwise" leg stay the seat's instructions, in order), and the
+///   placement's `unless_pay`, `declares_return_result`, `distribute`,
+///   `multi_target` and `forward_result`, which the head then drops so each
+///   applies once.
 ///
 /// The gate is a sub of the head so that its condition is decided parent-side
 /// (the sub hand-off in `resolve_chain_body`), against this seat's own head.
@@ -20528,6 +20531,16 @@ fn no_referent_leg(mut seat_leg: ResolvedAbility) -> Option<ResolvedAbility> {
     gate.condition = Some(condition);
     gate.sub_link = SubAbilityLink::ContinuationStep;
     seat_leg.else_ability = None;
+    // CR 608.2c + CR 118.12a: the gate stands in for the placement, so the
+    // placement's own modifiers apply once, there: its condition is checked
+    // before any unless-payment choice, its false route settles the declared
+    // return result, and its result is what the retained continuation reads
+    // (`forward_result`). The head is outcome bookkeeping only.
+    seat_leg.unless_pay = None;
+    seat_leg.declares_return_result = None;
+    seat_leg.distribute = None;
+    seat_leg.multi_target = None;
+    seat_leg.forward_result = false;
     seat_leg.sub_ability = Some(Box::new(gate));
     Some(seat_leg)
 }
@@ -38598,6 +38611,55 @@ mod tests {
         assert_eq!(gate.effect, Effect::NoOp);
         assert_eq!(gate.condition.as_ref(), Some(&your_turn));
         assert_eq!(gate.sub_ability.as_deref(), Some(&rider));
+
+        // CR 608.2c + CR 118.12a: the placement's modifiers apply once. With a
+        // condition they ride the gate (checked before any unless choice) and
+        // the head drops them; without one the head is the only node and keeps
+        // them.
+        let unless = crate::types::ability::UnlessPayModifier {
+            cost: AbilityCost::Mana {
+                cost: ManaCost::generic(1),
+            },
+            payer: TargetFilter::Controller,
+        };
+        let result_id = crate::types::ability::ReturnResultId(7);
+        let unit = crate::types::game_state::DistributionUnit::Counters("+1/+1".to_string());
+        let spec = crate::types::ability::MultiTargetSpec::unlimited(0);
+        let mut modified = with_rider.clone();
+        modified.unless_pay = Some(unless.clone());
+        modified.declares_return_result = Some(result_id);
+        modified.distribute = Some(unit.clone());
+        modified.multi_target = Some(spec.clone());
+        modified.forward_result = true;
+        let mut conditioned_modified = modified.clone();
+        conditioned_modified.condition = Some(your_turn.clone());
+        let SeatCreatedReferent::NoReferent(Some(head)) = bind_empty(conditioned_modified) else {
+            panic!("a conditioned rider keeps the empty seat's leg");
+        };
+        assert_eq!(head.unless_pay, None);
+        assert_eq!(head.declares_return_result, None);
+        assert_eq!(head.distribute, None);
+        assert_eq!(head.multi_target, None);
+        assert!(!head.forward_result);
+        let gate = head
+            .sub_ability
+            .as_deref()
+            .expect("the gate follows the head");
+        assert_eq!(gate.unless_pay.as_ref(), Some(&unless));
+        assert_eq!(gate.declares_return_result, Some(result_id));
+        assert_eq!(gate.distribute.as_ref(), Some(&unit));
+        assert_eq!(gate.multi_target.as_ref(), Some(&spec));
+        assert!(gate.forward_result);
+        assert_eq!(gate.sub_ability.as_deref(), Some(&rider));
+        let SeatCreatedReferent::NoReferent(Some(head)) = bind_empty(modified) else {
+            panic!("a retained rider keeps the empty seat's leg");
+        };
+        assert_eq!(head.unless_pay.as_ref(), Some(&unless));
+        assert_eq!(head.declares_return_result, Some(result_id));
+        assert_eq!(head.distribute.as_ref(), Some(&unit));
+        assert_eq!(head.multi_target.as_ref(), Some(&spec));
+        assert!(head.forward_result);
+        assert_eq!(head.sub_ability.as_deref(), Some(&rider));
 
         // A bare `LastCreated` template carries no split-time proof: no
         // snapshot, so every seat reads the full set.

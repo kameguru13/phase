@@ -455,4 +455,11 @@ fn divine_purge_quoted_enters_tapped_is_not_a_self_replacement() {
             ..
         })
     ));
+    // The perpetual grant and the play permission stay unsupported: the card
+    // remains an honest coverage gap.
+    assert!(
+        !card_face_gaps(&purge).is_empty(),
+        "Divine Purge must stay a coverage gap"
+    );
+    assert!(has_unimplemented(&purge, None));
 }
