@@ -3473,14 +3473,16 @@ mod tests {
         }
     }
 
-    /// v151: `PendingCostMoveResume` gains `CounterCostRemovalPayment` (a
+    /// v153: `PendingCostMoveResume` gains `CounterCostRemovalPayment` (a
     /// counter-removal cost paused on a CR 616.1 replacement choice, whose
     /// settled count the activation reads, CR 118.11) and
     /// `ManaAbilityCostCursor` gains `counter_removal`, both carried in
-    /// `GameState::pending_cost_move_resume`; a v150 peer cannot parse the new
-    /// tag, so it must be refused before it receives v151 state;
+    /// `GameState::pending_cost_move_resume`; a v152 peer cannot parse the new
+    /// tag, so it must be refused before it receives v153 state;
     /// `PausedCounterCostRemoval` carries its `replacement_subtree` boundary.
+    /// (v152 is reserved for the Zimone PR, #10004.)
     ///
+    /// v151: populated Bestow form payloads require a versioned full-game peer.
     /// v149: `GameState::deferred_spell_delivery` is gone and
     /// `GameState::resolving_spell_final_part` marks the CR 608.2n final part a
     /// paused instant or sorcery still owes; a v148 peer drops the key and would
@@ -3721,8 +3723,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_151_for_counter_cost_removal_payment() {
-        assert_eq!(PROTOCOL_VERSION, 151);
+    fn protocol_version_is_153_for_counter_cost_removal_payment() {
+        assert_eq!(PROTOCOL_VERSION, 153);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3733,7 +3735,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_151_for_counter_cost_removal_payment` stays
+    /// `protocol_version_is_153_for_counter_cost_removal_payment` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
