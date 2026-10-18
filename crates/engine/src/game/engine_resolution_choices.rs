@@ -841,18 +841,20 @@ fn batch_or_drain_observer_triggers(
 /// window's APNAP placement rather than being lost with the action's event slice.
 ///
 /// `events` is the current action buffer. Under a live announcement only the
-/// span it does not own is collected here (CR 601.2h + CR 603.3).
+/// span it does not own is collected here (CR 601.2h + CR 603.3), and an event
+/// another collector already claimed this action is not collected again
+/// (CR 603.2c).
 pub(crate) fn defer_observer_triggers_for_paused_choice(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
     event_start: usize,
 ) {
     let owned = super::announcement_triggers::take_inline_trigger_span(state, events, event_start);
-    let trigger_events: Vec<GameEvent> = events[owned]
-        .iter()
-        .filter(|event| !matches!(event, GameEvent::PhaseChanged { .. }))
-        .cloned()
-        .collect();
+    let trigger_events: Vec<GameEvent> =
+        unclaimed_observer_events(state, events, owned.start, owned.end)
+            .into_iter()
+            .filter(|event| !matches!(event, GameEvent::PhaseChanged { .. }))
+            .collect();
     if !trigger_events.is_empty() {
         super::triggers::collect_triggers_into_deferred(state, &trigger_events);
     }
@@ -8562,17 +8564,18 @@ pub(super) fn handle_resolution_choice(
                 }
             } else {
                 // CR 601.2h + CR 603.3: a live announcement takes custody of the
-                // span it owns; only the rest is parked here.
+                // span it owns; only the rest is parked here, less any event
+                // another collector already claimed (CR 603.2c).
                 let owned = super::announcement_triggers::take_inline_trigger_span(
                     state,
                     events,
                     events_before,
                 );
-                let trigger_events: Vec<GameEvent> = events[owned]
-                    .iter()
-                    .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
-                    .cloned()
-                    .collect();
+                let trigger_events: Vec<GameEvent> =
+                    unclaimed_observer_events(state, events, owned.start, owned.end)
+                        .into_iter()
+                        .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
+                        .collect();
                 super::triggers::collect_triggers_into_deferred(state, &trigger_events);
             }
             ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
