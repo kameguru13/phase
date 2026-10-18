@@ -60,18 +60,34 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
-/// 150 — `PendingCostMoveResume` gains `CounterCostRemovalPayment`, a
+/// 151 — `PendingCostMoveResume` gains `CounterCostRemovalPayment`, a
 ///      counter-removal cost paused while a replacement choice settles its
 ///      current removal (CR 616.1; the settled count is credited to the
 ///      activation, CR 118.11), with its `PausedCounterCostRemoval` record;
 ///      `ManaAbilityCostCursor` gains the optional `counter_removal` record.
-///      Serialized in `GameState.pending_cost_move_resume`: a v149 peer cannot
+///      Serialized in `GameState.pending_cost_move_resume`: a v150 peer cannot
 ///      parse the new tag. The same version carries the activation-owned
 ///      removed-counter count (`SpellContext.cost_removed_counter_amount`,
 ///      `ManaAbilityCostCursor.cost_removed_counters`,
 ///      `PendingManaAbility.cost_removed_counters`; optional, skipped when
-///      unset), which a v149 peer re-encoding state would drop. Full-game
-///      peers and P2P move in lockstep (wire 132); no lobby carrier names it. Follows #10004 (149 / wire 131).
+///      unset), which a v150 peer re-encoding state would drop. Full-game
+///      peers and P2P move in lockstep (wire 133); no lobby carrier names it. Follows #10004 (150 / wire 132).
+///
+/// 149 — The CR 608.2n final part of a spell's resolution is owed on the
+///      resolution carrier. `GameState::deferred_spell_delivery` (v110: the
+///      destination recorded while a spell paused on its own free-cast window)
+///      is removed, and `GameState` gains `resolving_spell_final_part`
+///      (`{ spell }`, omitted when none): an instant or
+///      sorcery whose instructions paused for a choice (Faithless Looting's
+///      discard, Doomsday's search, a free-cast window) stays on the stack, and
+///      the marker says it still owes its on-resolution hooks, destination and
+///      move. A v148 peer drops the key and would move the spell before its
+///      paused instructions finish, or leave it on the stack in no zone after a
+///      free-cast window, so full-game and P2P refuse the mismatch (wire 131).
+///      A pre-v149 snapshot that carries `deferred_spell_delivery` is refused at
+///      restore: it cannot say which hooks (rebound, paradigm, epic) already
+///      ran, and replaying them would install a second delayed trigger. Lobby
+///      messages are unchanged.
 ///
 /// 148 — Timesifter's top-card exile contest. `Effect::ExileTopCardContest`
 ///      (with its nested winner `AbilityDefinition`) serializes in ability
@@ -1128,7 +1144,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 150;
+pub const PROTOCOL_VERSION: u32 = 151;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2385,12 +2401,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 150);
+        assert_eq!(PROTOCOL_VERSION, 151);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 149);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 150);
     }
 
     #[test]

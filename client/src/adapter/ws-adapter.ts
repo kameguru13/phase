@@ -215,14 +215,20 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
- * 150 — PendingCostMoveResume gains CounterCostRemovalPayment (a counter-removal
+ * 151 — PendingCostMoveResume gains CounterCostRemovalPayment (a counter-removal
  *       cost paused on a CR 616.1 replacement choice; the activation reads the
  *       settled count, CR 118.11) and ManaAbilityCostCursor gains
  *       counter_removal, carried in GameState.pending_cost_move_resume — see
- *       PROTOCOL_VERSION's own `/// 150` entry in
- *       crates/lobby-broker/src/protocol.rs. A v149 peer cannot parse the tag;
- *       the exact-match version check at connect refuses the pairing. Wire 132
- *       moves with it. Follows #10004's 149.
+ *       PROTOCOL_VERSION's own `/// 151` entry in
+ *       crates/lobby-broker/src/protocol.rs. A v150 peer cannot parse the tag;
+ *       the exact-match version check at connect refuses the pairing. Wire 133
+ *       moves with it. Follows #10004's 150.
+ * 149 — The CR 608.2n final part of a spell's resolution is owed on the
+ *      resolution carrier: `GameState::deferred_spell_delivery` (v110) is removed
+ *      and `GameState::resolving_spell_final_part` (`{ spell }`) marks an instant
+ *      or sorcery whose paused instructions have not finished. A v148 peer drops
+ *      the key and would move the spell too early (or leave it on the stack after
+ *      a free-cast window). Wire 131 moves with it; no lobby frame names it.
  * 148 — Timesifter's top-card exile contest: Effect::ExileTopCardContest and
  *      BatchCompletion::TopCardContestRoundComplete in GameState — see
  *      PROTOCOL_VERSION's own `/// 148` entry in crates/lobby-broker/src/protocol.rs.
@@ -910,7 +916,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 150;
+export const PROTOCOL_VERSION = 151;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
