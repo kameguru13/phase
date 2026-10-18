@@ -7320,28 +7320,14 @@ pub(super) fn push_ability_entry(
         record,
         events,
     );
-    if let Some(mut collection) = activation_trigger_collection {
-        collection.collect(state, events);
-        let mut deferred_contexts = std::mem::take(&mut state.deferred_triggers);
-        collection.commit_into(state, &mut deferred_contexts);
-        state.deferred_triggers = deferred_contexts;
-        // CR 602.2b + CR 603.3b + CR 603.7c: Cost-payment events are claimed
-        // below because the activation transaction owns their trigger batch.
-        // Collect delayed triggers before that claim too; otherwise a one-shot
-        // delayed trigger such as Earthbend's dies-or-exiled return is hidden
-        // from the later priority scan and never reaches the stack.
-        super::triggers::collect_delayed_triggers_into_deferred(state, events);
-        state
-            .consumed_before_priority_trigger_events
-            .extend(events.iter().enumerate().map(|(index, event)| {
-                crate::game::triggers::ConsumedTriggerEventOccurrence {
-                    event: event.clone(),
-                    occurrence: crate::game::triggers::trigger_event_occurrence(events, index),
-                    scope: crate::game::triggers::ConsumedTriggerEventScope::AllCollectors,
-                }
-            }));
-    }
-    super::announcement_triggers::end_activation_announcement(state);
+    // CR 602.2b + CR 603.3b + CR 603.7c: the activation transaction owns its
+    // cost-payment events' trigger batch, delayed triggers included (Earthbend's
+    // dies-or-exiled return); the announcement authority commits it.
+    super::announcement_triggers::commit_activation_announcement(
+        state,
+        activation_trigger_collection,
+        events,
+    );
     priority::clear_priority_passes(state);
 
     Ok(WaitingFor::Priority { player })

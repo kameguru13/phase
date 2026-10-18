@@ -2531,7 +2531,15 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
         // landed us back at Priority (no further replacement choice), B1-drain the
         // deferred observer triggers parked during earlier pause segments plus the
         // ones this resume produced; otherwise leave them parked for the next drain.
-        let trigger_events: Vec<GameEvent> = events[events_before_drain..]
+        //
+        // CR 601.2h + CR 603.3: a live announcement takes custody of the span it
+        // owns; only the rest is collected here.
+        let owned = crate::game::announcement_triggers::take_inline_trigger_span(
+            state,
+            events,
+            events_before_drain,
+        );
+        let trigger_events: Vec<GameEvent> = events[owned]
             .iter()
             .filter(|ev| {
                 !matches!(

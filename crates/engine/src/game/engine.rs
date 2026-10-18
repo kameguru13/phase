@@ -13256,9 +13256,24 @@ fn apply_non_priority_pass_action(
             // completed-frame seam, so a second scan here would rediscover
             // events the frame already claimed and dispatch an ordinary cost
             // observer separately from that frame's synthetic reflexive.
+            //
+            // CR 601.2h + CR 602.2b + CR 603.3: under a live announcement (a child
+            // of a parked cost root, or a resolution-time step under a cast's
+            // payment) the announcement takes custody of these events and its
+            // carrier puts their ordinary triggers on the stack once it is
+            // complete; only the span it does not own is scanned here.
+            let mut scanned_inline = true;
             if !is_completed_mana_frame && events.len() > events_before {
-                let mana_events: Vec<_> = events[events_before..].to_vec();
-                super::triggers::process_triggers(state, &mana_events);
+                let owned = super::announcement_triggers::take_inline_trigger_span(
+                    state,
+                    &mut events,
+                    events_before,
+                );
+                scanned_inline = !owned.is_empty();
+                if scanned_inline {
+                    let mana_events: Vec<_> = events[owned].to_vec();
+                    super::triggers::process_triggers(state, &mana_events);
+                }
             }
             // CR 603.3b (#531): if the inline trigger scan paused on an
             // OrderTriggers prompt (controller has 2+ simultaneous TapsForMana
@@ -13282,7 +13297,10 @@ fn apply_non_priority_pass_action(
             // occurrence journal already narrows the pipeline's scan to exactly
             // the events the mana frames did not claim, and the pipeline's
             // guarded deferred drain is what releases their queued contexts once.
-            if !is_completed_mana_frame && matches!(wf, WaitingFor::Priority { .. }) {
+            if !is_completed_mana_frame
+                && scanned_inline
+                && matches!(wf, WaitingFor::Priority { .. })
+            {
                 triggers_processed_inline = true;
             }
             wf
@@ -16380,9 +16398,11 @@ fn apply_non_priority_pass_action(
         &action_for_divergence,
     );
 
-    // CR 601.2h + CR 602.2b + CR 603.3: a counter-cost root this handler made due
-    // resumes before the pipeline below, so triggers raised while paying are
-    // collected after the activation exists. Same authority as the action
+    // CR 704.3 + CR 117.5 + CR 117.3c: a counter-cost root this handler made due
+    // resumes before the pipeline below, so the activation is on the stack before
+    // the game checks state-based actions — no player receives priority
+    // mid-activation (CR 602.2b + CR 601.2h), and triggers those actions cause go
+    // on the stack above the activation (CR 603.3). Same authority as the action
     // boundary's call in `apply_action_boundary_core`.
     let waiting_for =
         resume_due_counter_cost_root_at_action_boundary(state, &waiting_for, &mut events)?

@@ -201,11 +201,7 @@ fn park_discard_batch(
         fan_out: None,
         preceding_events,
     }));
-    crate::game::engine_resolution_choices::defer_observer_triggers_for_paused_choice(
-        state,
-        &paused_events,
-        0,
-    );
+    crate::game::engine_resolution_choices::defer_observer_triggers_from(state, &paused_events);
 }
 
 /// CR 400.7: pin the occurrence a replacement pause parked, while the card is

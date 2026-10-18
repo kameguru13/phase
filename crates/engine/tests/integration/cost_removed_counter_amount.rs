@@ -31,9 +31,9 @@ use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
     ChosenAttribute, Comparator, ControllerRef, CounterCostSelection, DamageChannel, Effect,
-    EffectKind, ManaContribution, ManaProduction, QuantityExpr, QuantityRef, ReplacementDefinition,
-    ReplacementMode, RoundingMode, TargetFilter, TargetRef, TypedFilter, UnlessPayModifier,
-    REMOVE_COUNTER_COST_ALL,
+    EffectKind, ManaContribution, ManaProduction, PlayerFilter, QuantityExpr, QuantityRef,
+    ReplacementDefinition, ReplacementMode, RoundingMode, TargetFilter, TargetRef, TypedFilter,
+    UnlessPayModifier, REMOVE_COUNTER_COST_ALL,
 };
 use engine::types::actions::GameAction;
 use engine::types::counter::{parse_counter_type, CounterMatch, CounterType};
@@ -2935,8 +2935,9 @@ fn a_prevented_last_child_entry_leaves_the_outer_unless_post_effect_paused() {
     assert!(runner.state().resolution_stack.is_empty());
 }
 
-/// The non-nested case: a resolving ability's later instruction is parked below
-/// the root's boundary under its own unless payment.
+/// The non-nested control: the root parks with no post-replacement frame on
+/// top, and the ability's later instruction rides in the unless prompt's
+/// pending effect, so it can only run after the prompt is answered.
 #[test]
 fn an_outer_tail_below_the_boundary_waits_for_the_mana_root() {
     let mut scenario = replacement_board();
@@ -3228,6 +3229,15 @@ fn mana_choice_child() -> AbilityDefinition {
 }
 
 fn bottle_at_mana_choice(scenario: GameScenario) -> (GameRunner, ObjectId, i32) {
+    bottle_at_child_mana_choice(scenario, mana_choice_child())
+}
+
+/// Essence Bottle (3 elixir) whose removal's accepted replacement runs `child`,
+/// stopped at the child's `ResolvingEffect` colour prompt.
+fn bottle_at_child_mana_choice(
+    scenario: GameScenario,
+    child: AbilityDefinition,
+) -> (GameRunner, ObjectId, i32) {
     let mut scenario = scenario;
     let bottle = scenario
         .add_artifact_from_oracle(P0, "Essence Bottle", ESSENCE_BOTTLE)
@@ -3236,7 +3246,7 @@ fn bottle_at_mana_choice(scenario: GameScenario) -> (GameRunner, ObjectId, i32) 
     let mut runner = scenario.build();
     install_replacement_on_steward(
         &mut runner,
-        optional_replacement(ReplacementEvent::RemoveCounter, Some(mana_choice_child())),
+        optional_replacement(ReplacementEvent::RemoveCounter, Some(child)),
     );
     let life_before = runner.life(P0);
     let index = counter_cost_ability(&runner, bottle, 0);
@@ -3254,10 +3264,6 @@ fn bottle_at_mana_choice(scenario: GameScenario) -> (GameRunner, ObjectId, i32) 
         runner.state().waiting_for
     );
     assert_root_is_counter_cost(&runner);
-    assert!(
-        parked_child_rider(runner.state()),
-        "reach: the rider is parked"
-    );
     assert!(runner.state().stack.is_empty());
     (runner, bottle, life_before)
 }
@@ -3277,6 +3283,10 @@ fn choose_green(runner: &mut GameRunner) -> Vec<GameEvent> {
 #[test]
 fn a_mana_choice_child_finishes_and_places_the_activation_in_the_same_action() {
     let (mut runner, bottle, life_before) = bottle_at_mana_choice(replacement_board());
+    assert!(
+        parked_child_rider(runner.state()),
+        "reach: the rider is parked"
+    );
 
     let events = choose_green(&mut runner);
     assert_eq!(pool(&runner, ManaType::Green), 1);
@@ -3300,10 +3310,54 @@ fn a_mana_choice_child_finishes_and_places_the_activation_in_the_same_action() {
 /// Synthetic control: a trigger the child's life loss raises.
 const WITNESS: &str = "Whenever you lose life, you gain 1 life.";
 
-/// Site 1: a trigger raised by the child's payment is collected after the
-/// activation exists, so it goes on the stack above it (CR 603.3).
+fn witness_entries(state: &GameState, witness: ObjectId) -> usize {
+    state
+        .stack
+        .iter()
+        .filter(|entry| {
+            matches!(entry.kind, StackEntryKind::TriggeredAbility { .. })
+                && entry.source_id == witness
+        })
+        .count()
+}
+
+fn stack_pushes(events: &[GameEvent]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, GameEvent::StackPushed { .. }))
+        .count()
+}
+
+/// The stack is [the Bottle's activation reading 3, one trigger from `source`].
+fn assert_activation_then_one_trigger(runner: &GameRunner, bottle: ObjectId, source: ObjectId) {
+    let stack = &runner.state().stack;
+    assert_eq!(
+        stack.len(),
+        2,
+        "the activation and one trigger: {:?}",
+        stack
+            .iter()
+            .map(|entry| entry.source_id)
+            .collect::<Vec<_>>()
+    );
+    match &stack[0].kind {
+        StackEntryKind::ActivatedAbility { ability, .. } => {
+            assert_eq!(stack[0].source_id, bottle);
+            assert_eq!(ability.context.cost_removed_counter_amount, Some(3));
+        }
+        other => panic!("the activation is at the bottom: {other:?}"),
+    }
+    assert!(
+        matches!(stack[1].kind, StackEntryKind::TriggeredAbility { .. })
+            && stack[1].source_id == source,
+        "the trigger is on top: {:?}",
+        stack[1].kind
+    );
+}
+
+/// F1: a trigger raised by the child's payment waits in the activation's
+/// announcement and goes on the stack once, above the activation (CR 603.3).
 #[test]
-#[ignore = "Phase D T12b blocked: Witness's one life-loss trigger is collected twice (once below the activation, once above it via site 1; three times with site 1 removed); returned to the plan"]
 fn a_trigger_from_the_childs_payment_goes_on_the_stack_above_the_activation() {
     let mut scenario = replacement_board();
     let witness = scenario
@@ -3316,26 +3370,263 @@ fn a_trigger_from_the_childs_payment_goes_on_the_stack_above_the_activation() {
         "reach: Witness has its trigger"
     );
 
-    choose_green(&mut runner);
+    let events = choose_green(&mut runner);
+    assert_activation_then_one_trigger(&runner, bottle, witness);
+    assert_eq!(
+        witness_entries(runner.state(), witness),
+        1,
+        "collected once"
+    );
+    assert_eq!(stack_pushes(&events), 2, "one StackPushed per entry");
+}
+
+/// C4: the same with a Scry child. Answering the Scry finishes the child's
+/// life loss; Witness's trigger is collected once, above the activation.
+#[test]
+fn a_trigger_from_a_scry_childs_rider_goes_on_the_stack_above_the_activation() {
+    let mut scenario = replacement_board();
+    let witness = scenario
+        .add_artifact_from_oracle(P0, "Witness", WITNESS)
+        .id();
+    let bottle = scenario
+        .add_artifact_from_oracle(P0, "Essence Bottle", ESSENCE_BOTTLE)
+        .id();
+    scenario.with_counter(bottle, counter("elixir"), 3);
+    let mut runner = scenario.build();
+    install_replacement_on_steward(
+        &mut runner,
+        optional_replacement(
+            ReplacementEvent::RemoveCounter,
+            Some(scry_one().sub_ability(lose(1))),
+        ),
+    );
+    let index = counter_cost_ability(&runner, bottle, 0);
+    activate(&mut runner, bottle, index);
+    choose_replacement(&mut runner, ACCEPT);
+    let WaitingFor::ScryChoice { cards, .. } = runner.state().waiting_for.clone() else {
+        panic!("reach: the child scries: {:?}", runner.state().waiting_for);
+    };
+    assert_root_is_counter_cost(&runner);
+
+    let events = runner
+        .act(GameAction::SelectCards { cards })
+        .expect("the scry is answered")
+        .events;
+    assert_activation_then_one_trigger(&runner, bottle, witness);
+    assert_eq!(
+        witness_entries(runner.state(), witness),
+        1,
+        "collected once"
+    );
+    assert_eq!(stack_pushes(&events), 2, "one StackPushed per entry");
+}
+
+/// C4: the T12 child under Saprazzan Cove's mana root paying Divination. The
+/// child's life loss happens during the cast, so Witness's trigger waits for
+/// the cast and is collected once, with it (CR 601.2i + CR 603.3).
+#[test]
+fn a_trigger_from_a_child_under_a_mana_root_is_collected_with_the_cast() {
+    let mut scenario = replacement_board();
+    let witness = scenario
+        .add_artifact_from_oracle(P0, "Witness", WITNESS)
+        .id();
+    let divination = scenario
+        .add_spell_to_hand_from_oracle(P0, "Divination", false, DIVINATION)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Blue],
+            generic: 2,
+        })
+        .id();
+    let cove = scenario
+        .add_land_from_oracle(P0, "Saprazzan Cove", SAPRAZZAN_COVE)
+        .id();
+    scenario.with_counter(cove, counter("storage"), 3);
+    let mut runner = scenario.build();
+    install_replacement_on_steward(
+        &mut runner,
+        optional_replacement(ReplacementEvent::RemoveCounter, Some(mana_choice_child())),
+    );
+    let card_id = runner.state().objects[&divination].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: divination,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Manual,
+        })
+        .unwrap_or_else(|err| panic!("Divination is cast: {err:?}"));
+    assert!(
+        is_mana_payment(runner.state()),
+        "reach: Divination waits for mana"
+    );
+    let index = counter_cost_ability(&runner, cove, 0);
+    activate(&mut runner, cove, index);
     drive(
         &mut runner,
-        |state| matches!(state.waiting_for, WaitingFor::Priority { .. }) && state.stack.len() == 2,
+        |state| matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }),
+        &mut Answers::pay(2),
+    );
+    choose_replacement(&mut runner, ACCEPT);
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::ChooseManaColor {
+                context: ManaChoiceContext::ResolvingEffect(_),
+                ..
+            }
+        ),
+        "reach: the child asks for its colour: {:?}",
+        runner.state().waiting_for
+    );
+    assert!(
+        runner.state().pending_cast.is_some(),
+        "reach: Divination waits"
+    );
+
+    choose_green(&mut runner);
+    assert!(
+        is_mana_payment(runner.state()),
+        "Divination still waits for mana: {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(
+        runner
+            .state()
+            .stack
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        vec![divination],
+        "only the spell being cast is on the stack"
+    );
+    assert_eq!(
+        witness_entries(runner.state(), witness),
+        0,
+        "nothing triggers mid-cast"
+    );
+    assert_eq!(pool(&runner, ManaType::Blue), 2);
+    assert_eq!(pool(&runner, ManaType::Green), 1);
+
+    runner
+        .act(GameAction::PassPriority)
+        .expect("the payment completes");
+    let stack = &runner.state().stack;
+    assert_eq!(
+        stack.len(),
+        2,
+        "Divination and one trigger: {:?}",
+        stack
+            .iter()
+            .map(|entry| entry.source_id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(stack[0].id, divination, "Divination is below the trigger");
+    assert_eq!(
+        witness_entries(runner.state(), witness),
+        1,
+        "collected once"
+    );
+    assert_eq!(stack[1].source_id, witness);
+}
+
+/// Synthetic control: a creature whose death triggers.
+const DIES_GAIN: &str = "When this creature dies, you gain 1 life.";
+
+/// Site 1 (C5): the child marks lethal damage, then asks for a colour (and
+/// loses 1 life, the rider that retires the child). The creature dies to the
+/// state-based actions checked after the activation is on the stack (CR 704.3 +
+/// CR 117.5), so its trigger goes above the activation.
+#[test]
+fn an_sba_trigger_from_the_childs_payment_goes_above_the_activation() {
+    let mut scenario = replacement_board();
+    let victim = scenario
+        .add_creature_from_oracle(P0, "Victim", 1, 1, DIES_GAIN)
+        .id();
+    let child = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::DamageAll {
+            amount: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::SpecificObject { id: victim },
+            player_filter: None,
+            damage_source: None,
+        },
+    )
+    .sub_ability(mana_choice_child());
+    let (mut runner, bottle, _) = bottle_at_child_mana_choice(scenario, child);
+    assert_eq!(
+        damage(&runner, victim),
+        1,
+        "reach: the Victim has lethal damage marked"
+    );
+    assert_eq!(runner.state().objects[&victim].zone, Zone::Battlefield);
+
+    choose_green(&mut runner);
+    assert_eq!(runner.state().objects[&victim].zone, Zone::Graveyard);
+    assert_activation_then_one_trigger(&runner, bottle, victim);
+}
+
+/// F3, gate (a): a "for each player" clause paused on P0's seat parks P1's leg
+/// as a continuation frame below P0's unless prompt. When the Cove paying it
+/// finishes its child, the Cove resumes and P0's prompt is offered again; P1's
+/// leg does not start first.
+#[test]
+#[ignore = "Phase D T10f blocked: P1's parked player_scope leg is gone after the Cove's child finishes (P1 never asked, a PostReplacement frame left behind); returned to the plan"]
+fn an_outer_player_scope_seat_waits_for_the_mana_root() {
+    let mut scenario = replacement_board();
+    let taxer = scenario.add_artifact_from_oracle(P0, "Taxer", "").id();
+    let cove = scenario
+        .add_land_from_oracle(P0, "Saprazzan Cove", SAPRAZZAN_COVE)
+        .id();
+    scenario.with_counter(cove, counter("storage"), 3);
+    let battery = add_battery(&mut scenario);
+    let mut runner = scenario.build();
+    assert_eq!(
+        runner.state().active_player,
+        P0,
+        "reach: P0's seat is first"
+    );
+    let mut each_player = lose_unless_two(1);
+    each_player.player_scope = Some(PlayerFilter::All);
+    install_taxer_ability(&mut runner, taxer, each_player);
+    install_replacement_on_steward(
+        &mut runner,
+        optional_replacement(
+            ReplacementEvent::RemoveCounter,
+            Some(t10_child_execute(battery)),
+        ),
+    );
+    activate(&mut runner, taxer, 0);
+    drive(
+        &mut runner,
+        |state| matches!(state.waiting_for, WaitingFor::UnlessPayment { .. }),
         &mut Answers::default(),
     );
-    let stack = &runner.state().stack;
     assert!(
-        matches!(stack[1].kind, StackEntryKind::TriggeredAbility { .. })
-            && stack[1].source_id == witness,
-        "the trigger is on top: {:?}",
-        stack[1].kind
+        matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { player, .. } if player == P0),
+        "reach: P0's seat asks first: {:?}",
+        runner.state().waiting_for
     );
-    match &stack[0].kind {
-        StackEntryKind::ActivatedAbility { ability, .. } => {
-            assert_eq!(stack[0].source_id, bottle);
-            assert_eq!(ability.context.cost_removed_counter_amount, Some(3));
-        }
-        other => panic!("the activation is below the trigger: {other:?}"),
-    }
+    assert!(
+        parked_child_rider(runner.state()),
+        "reach: P1's leg is parked as a continuation frame"
+    );
+
+    cove_to_first_child_entry(&mut runner, cove);
+    assert!(cove_removal_enclosing(&runner).is_none());
+    choose_replacement(&mut runner, DECLINE);
+    assert_mana_root_waits_with_child_rider(&runner);
+
+    let events = choose_replacement_events(&mut runner, DECLINE);
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { player, .. } if player == P0),
+        "P0's unless payment is offered again: {:?}",
+        runner.state().waiting_for
+    );
+    assert!(
+        parked_child_rider(runner.state()),
+        "P1's leg is still parked"
+    );
+    assert!(events.iter().any(is_cove_mana(cove)));
 }
 
 // ---------------------------------------------------------------------------
