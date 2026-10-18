@@ -64,6 +64,14 @@
 //!   and `release_juno_any_of_gate_is_an_entry_replacement` fails: the entry gate
 //!   stays empty and the rider survives as a later `PutCounter`, so Elemental
 //!   Bond draws nothing for Memnite.
+//! * Drop the pin's `GrantStaticAbility` arm (`EntryPopulationPin::grants`) and
+//!   `release_juno_granted_shrine_condition_counts_pre_entry_shrines` gets 2
+//!   counters with Sanctum as the only Shrine (expected 0), and
+//!   `release_juno_granted_condition_binds_each_recipients_controller` gets 2 in
+//!   its P1-Shrine-only and no-Shrine rows (expected 0). Pin the granted inner
+//!   with the host's controller instead of each recipient's and the
+//!   P1-Shrine-only row gets 2 (expected 0) and the P0-Shrine-only row gets 0
+//!   (expected 2).
 
 use engine::game::scenario::{CastOutcome, GameRunner, GameScenario, P0, P1};
 use engine::parser::oracle_ir::diagnostic::OracleDiagnostic;
@@ -1014,4 +1022,107 @@ fn release_juno_any_of_gate_is_an_entry_replacement() {
     let outcome = cast_release_juno_gated(runner, spell, sanctum, any_of_gate());
     outcome.assert_zone(&[sanctum], Zone::Battlefield);
     outcome.assert_counters(sanctum, CounterType::Plus1Plus1, 0);
+}
+
+/// Synthetic (no printed card): a host granting every enchantment a
+/// population-conditioned static. Sedge Sliver is the only printed grant of this
+/// shape and it changes only power/toughness, which no entry gate observes.
+const SHRINE_GRANT_HOST: &str = "Each enchantment has \"As long as you control a Shrine, this \
+     enchantment is a 1/1 creature in addition to its other types.\"";
+
+/// Release Juno returning P0's Sanctum of Tranquil Light (a Shrine) with
+/// [`SHRINE_GRANT_HOST`] under `host_controller`, plus a Shrine anchor for P0
+/// and/or P1.
+fn release_juno_under_shrine_grant(
+    host_controller: PlayerId,
+    p0_shrine: bool,
+    p1_shrine: bool,
+) -> (CastOutcome, ObjectId, ObjectId) {
+    let mut scenario = board();
+    let spell = add_what_must_be_done(&mut scenario);
+    let sanctum = add_graveyard_sanctum(&mut scenario);
+    let host = scenario
+        .add_enchantment_from_oracle(host_controller, "Shrine Grant Host", SHRINE_GRANT_HOST)
+        .id();
+    for (player, present) in [(P0, p0_shrine), (P1, p1_shrine)] {
+        if present {
+            scenario
+                .add_enchantment_from_oracle(player, &format!("{player:?} Shrine"), "")
+                .with_subtypes(vec!["Shrine"]);
+        }
+    }
+    let mut runner = scenario.build();
+    set_core_types(&mut runner, sanctum, &[CoreType::Enchantment]);
+    // Premise: the host grants a static whose inner condition is population-reading.
+    assert!(
+        runner.state().objects[&host]
+            .static_definitions
+            .as_slice()
+            .iter()
+            .any(|def| def.modifications.iter().any(|m| matches!(
+                m,
+                ContinuousModification::GrantStaticAbility { definition }
+                    if definition.condition.is_some()
+            ))),
+        "premise: the host carries a conditioned GrantStaticAbility"
+    );
+
+    let outcome = cast_release_juno(runner, spell, sanctum);
+    (outcome, sanctum, host)
+}
+
+/// CR 614.12 + CR 700.5 + CR 109.5: a granted static's population condition is
+/// read before the entry, with the recipient's controller as "you". P0's host
+/// grants every enchantment "As long as you control a Shrine, this enchantment
+/// is a 1/1 creature". With Sanctum as P0's only Shrine, P0 controls no Shrine
+/// before it enters, so it is not a creature as it would enter: no counters.
+/// After entry Sanctum is P0's Shrine, so the live pass makes it and the host
+/// 1/1 creatures. With another P0 Shrine the condition already holds: two
+/// counters, 3/3.
+#[test]
+fn release_juno_granted_shrine_condition_counts_pre_entry_shrines() {
+    for (other_shrine, counters, pt) in [(false, 0, (1, 1)), (true, 2, (3, 3))] {
+        let (outcome, sanctum, host) = release_juno_under_shrine_grant(P0, other_shrine, false);
+        outcome.assert_zone(&[sanctum], Zone::Battlefield);
+        outcome.assert_counters(sanctum, CounterType::Plus1Plus1, counters);
+        assert!(
+            is_creature(&outcome, sanctum),
+            "reach (other Shrine: {other_shrine}): P0 controls a Shrine after entry"
+        );
+        assert!(
+            is_creature(&outcome, host),
+            "live pass (other Shrine: {other_shrine}): the host is a creature too"
+        );
+        outcome.assert_power_toughness(sanctum, pt.0, pt.1);
+        assert!(!put_counter_resolved(outcome.events()));
+    }
+}
+
+/// CR 614.12 + CR 109.5: "you" in a granted static is the controller of the
+/// object it is on, not the granting host's. P1's host grants the static to
+/// P0's Sanctum, so Sanctum's condition counts P0's Shrines before entry:
+/// * only P1 controls a Shrine → no counters (a pin keyed to the host's
+///   controller would give two), and Sanctum is a 1/1 creature after entry;
+/// * only P0 controls a Shrine → two counters, 3/3 (a host-keyed pin would give
+///   none);
+/// * no Shrines → no counters, and Sanctum is a 1/1 creature after entry.
+#[test]
+fn release_juno_granted_condition_binds_each_recipients_controller() {
+    for (p0_shrine, p1_shrine, counters, pt) in [
+        (false, true, 0, (1, 1)),
+        (true, false, 2, (3, 3)),
+        (false, false, 0, (1, 1)),
+    ] {
+        let (outcome, sanctum, _host) = release_juno_under_shrine_grant(P1, p0_shrine, p1_shrine);
+        outcome.assert_zone(&[sanctum], Zone::Battlefield);
+        assert_eq!(outcome.state().objects[&sanctum].controller, P0);
+        outcome.assert_counters(sanctum, CounterType::Plus1Plus1, counters);
+        assert!(
+            is_creature(&outcome, sanctum),
+            "reach (P0 Shrine: {p0_shrine}, P1 Shrine: {p1_shrine}): \
+             P0 controls a Shrine after entry"
+        );
+        outcome.assert_power_toughness(sanctum, pt.0, pt.1);
+        assert!(!put_counter_resolved(outcome.events()));
+    }
 }

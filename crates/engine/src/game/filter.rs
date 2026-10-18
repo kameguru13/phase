@@ -4830,8 +4830,9 @@ impl EntryProjection {
 /// and every continuous effect that already exists both apply. Only this entrant
 /// is placed. Nothing reaches the live game: the input is `&GameState`.
 /// Population- and origin-zone-reading condition leaves of every static the
-/// scratch can apply (printed on any object, copied by a layer-1 copy effect)
-/// and of every transient are evaluated against the pre-entry state
+/// scratch can apply (printed on any object, copied by a layer-1 copy effect,
+/// or granted by a `GrantStaticAbility`, per recipient) and of every transient
+/// are evaluated against the pre-entry state
 /// (`layers::pin_entry_population_conditions`); the live game, triggers and
 /// entry observations keep the realized battlefield. `state` must be the board
 /// before the entry event's first member moved (CR 603.6a); multi-object callers
