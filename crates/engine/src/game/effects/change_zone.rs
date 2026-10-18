@@ -5407,8 +5407,9 @@ mod tests {
     /// through both the raw and the trusted envelope. The current writer declares
     /// `RESOLUTION_STATE_WIRE_VERSION` and round-trips the member records.
     /// REVERT: removing the `migrate_legacy_change_zone_member_entries` call in
-    /// `ResolutionStateWire::from_value` makes every legacy row fail with serde
-    /// `invalid type: integer`; keeping the writer at 6 makes the migration read
+    /// `ResolutionStateWire::from_value` makes every v2–v6 row fail, and removing
+    /// the v1 reader arm's `migrate_legacy_change_zone_carrier` call makes the v1
+    /// rows fail, each with serde `invalid type: integer`; keeping the writer at 6 makes the migration read
     /// the current member records as bare ids and the current round-trip fails.
     #[test]
     fn legacy_ungated_parked_change_zone_migrates_through_both_readers() {

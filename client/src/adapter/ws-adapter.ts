@@ -215,11 +215,22 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
- * 150 — PendingChangeZoneIteration members carry their pre-event entry modifications
+ * 152 — PendingChangeZoneIteration members carry their pre-event entry modifications
  *      (ChangeZoneMemberEntry, CR 603.6a + CR 614.12), and the persisted resolution
- *      state moves from version 6 to 7 — see PROTOCOL_VERSION's own `/// 150` entry
- *      in crates/lobby-broker/src/protocol.rs. A v149 peer cannot parse a parked
- *      ChangeZone frame. Wire 132 moves with it.
+ *      state moves from version 6 to 7 — see PROTOCOL_VERSION's own `/// 152` entry
+ *      in crates/lobby-broker/src/protocol.rs. A v151 peer cannot parse a parked
+ *      ChangeZone frame. Wire 134 moves with it.
+ * 151: Populated GameObject.bestow_form carries the removed creature subtypes
+ *      as an object instead of a boolean. Old native readers cannot decode it.
+ *      Wire 133 moves with it.
+ * 150 — The cast-this-way gains rider's serialized payload is reshaped: the
+ *      ExileWithAltCost permission's enters_with_modifications becomes a
+ *      PendingEntersModifications object (was a ContinuousModification array) and
+ *      Effect.AddPendingEntersModifications carries its rider object in place of
+ *      the required modifications array — a v149 server or client cannot parse
+ *      either new shape. Full-game peers and P2P move in lockstep (wire 132); see
+ *      PROTOCOL_VERSION's own `/// 150` entry in
+ *      crates/lobby-broker/src/protocol.rs.
  * 149 — The CR 608.2n final part of a spell's resolution is owed on the
  *      resolution carrier: `GameState::deferred_spell_delivery` (v110) is removed
  *      and `GameState::resolving_spell_final_part` (`{ spell }`) marks an instant
@@ -913,7 +924,8 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 150;
+export const PROTOCOL_VERSION = 152;
+
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

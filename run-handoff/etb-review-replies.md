@@ -1,4 +1,4 @@
-# Draft replies for PR #10036 at head 3012091c4 (not posted; awaiting Jakob's OK)
+# Draft replies for PR #10036 at head 8a4618688 (not posted; awaiting Jakob's OK)
 
 Each reply ends with the footer:
 
@@ -7,7 +7,15 @@ Each reply ends with the footer:
 
 ## A. Top-level PR comment (`gh pr comment 10036 --repo phase-rs/phase --body-file ...`)
 
-@matthewevans thanks for both reviews. Head is now `3012091c4`.
+@matthewevans thanks for the reviews and the HELD note. Head is now `8a4618688`.
+
+**HELD conditions (08:14Z)**
+- **Boundary guard:** the v1 parked-carrier migration now runs as the first step of the `GameStateDecodeMode::ResolutionWireV1` arm (1037028ca). The v2–v6 frame carriers stay in the shared helper, and both go through `migrate_legacy_change_zone_carrier`. `./scripts/check-resolution-frame-boundaries.sh` passes, and the guard is unchanged.
+- **Integration with main d3f002dae (b02673eac):**
+  - **Protocol:** this change now takes 152 / wire 134. Main's 150/132 and 151/133 history entries, readers and assertions are kept.
+  - **Hello-gate pin:** the phase-server hello-gate pin from #9953 moves to "151 refused, 152 accepted" (8a4618688), the same edit main made for 151.
+  - **Instruction boundary:** at the sub-ability transition, #9477's `cast_metadata_continuation` runs first and selects the next written instruction. Entries are then settled before that instruction (CR 603.10 + CR 608.2c). A pure-metadata chain returns its progress without settling, because the consumed riders only shape the cast spell's own later entry (CR 614.1c) and no later written instruction can change an entrant.
+  - **Tests:** the new `cast_metadata_rider_boundary_is_the_next_written_instruction` fails if settlement moves above the splice. #9477's gains-rider tests and the entry-observation tests both pass.
 
 **Earlier blockers (de01d1e8)**
 - **B1, pre-entry population:** `BattlefieldEntrantProjection` pins every population-dependent condition to its truth on the board before the entry (`layers::pin_entry_population_conditions`). Recommission on Heliod gives 0 counters at four pre-entry devotion and 1 at five. A separate observer row checks that Heliod is still a 5/5 creature after entry.
@@ -32,27 +40,30 @@ Each reply ends with the footer:
      - conditional and rider gates return the exact diagnostic at v1, v3 and v6;
      - inert-gate and empty-tail rows migrate;
      - current round-trips and an unaffected old state also restore.
-3. **Integration.**
-   - Merged main 39fb1eb74. Main's 148/130 and 149/131 are kept; this change takes 150/132.
+3. **Integration.** See the HELD section above.
    - The CR733 authority matrix equals main's (`deferred_spell_delivery` stays removed) plus the new observation field.
-   - The CR 611.2e deferral predicate covers main's new `TopCardContestRoundComplete` completion.
+   - The CR 611.2e deferral predicate covers main's `TopCardContestRoundComplete` completion.
 
 **Evidence on the merged head**
-- workspace clippy is clean;
-- workspace tests pass (one stale version-list pin was fixed in 3012091c4);
-- the parse diff vs 39fb1eb74 is What Must Be Done only, with 0 regressions;
-- the semantic audit has 0 new findings.
+- A batched run mirroring every CI "Rust lint" step passed, including the frame-boundary guard.
+- Workspace clippy is clean.
+- Workspace tests pass. The phase-server pin above was the only failure, and it is fixed.
+- The parse diff vs d3f002dae is What Must Be Done only, with 0 regressions.
+- The semantic audit has 0 new findings.
 
 **Also addressed:** the face-down and `is_permanent_type` items you reconciled are answered on their threads. The onset deferral for "gains/gets/becomes" (CR 611.2e) moves to a follow-up PR, as noted in the description.
 
 **@coderabbitai, items without an inline thread**
-- **Parser-test nitpicks (tests.rs ~87956 / ~88002), not applied.** On the current parse, the later `PutCounter` carries `RevealedHasCardType`, not `TargetMatchesFilter`, and the token rider is `Unimplemented`, so both suggested assertions would fail. Neither shape comes from this PR, and both tests already have positive reach guards.
+- **Parser-test nitpicks (tests.rs ~87956 / ~88002).**
+  - The first wording didn't fit the current parse: the later `PutCounter` carries `RevealedHasCardType`, not `TargetMatchesFilter`, and the token rider is `Unimplemented`.
+  - Per your re-review on 3012091c4, `put_counter_if_its_a_type_stays_later_instruction` now asserts that exact `RevealedHasCardType { [Creature] }` condition as a positive reach guard (1037028ca).
+  - The token-rider guard isn't added, because the rider is `Unimplemented` today and that shape doesn't come from this PR.
 - **Double projection (change_zone.rs), kept as documented.** Two projections happen only for an entrant carrying both gates, which no printed card does.
 
 ## B. Inline thread replies (`gh api -X POST repos/phase-rs/phase/pulls/10036/comments/<id>/replies -f body=...`)
 
 **4305262297 — server-core protocol.rs:3479 (persisted saves)**
-Fixed in 034fd1748. Persisted resolution state is now version 7, and v1–v6 readers convert the parked carrier before the typed decode:
+Fixed in 034fd1748, with the v1 path moved into the v1 reader arm in 1037028ca. Persisted resolution state is now version 7, and v1–v6 readers convert the parked carrier before the typed decode:
 - An ungated carrier migrates exactly. A gate over default riders cannot change any member, so it counts as ungated.
 - A gated carrier with unprocessed members is refused with `LEGACY_GATED_CHANGE_ZONE_ENTRY_RESTORE_ERROR`, because its pre-event board isn't in the save. Defaulting it would fabricate entries.
 
