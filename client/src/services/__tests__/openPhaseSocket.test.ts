@@ -378,7 +378,7 @@ describe("openPhaseSocket", () => {
     expect(ws.close).toHaveBeenCalled();
   });
 
-  it("rejects Full v149 before it can read number-quality conditions", async () => {
+  it("rejects Full v149 before it can read the gains rider's reshaped payload", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
     ws.deliverMessage(helloFrame({ protocol_version: 149 }));
@@ -389,10 +389,21 @@ describe("openPhaseSocket", () => {
     expect(ws.close).toHaveBeenCalled();
   });
 
-  it("accepts the literal Full v150 number-quality condition protocol", async () => {
+  it("rejects Full v150 before it can read number-quality conditions", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
     ws.deliverMessage(helloFrame({ protocol_version: 150 }));
+
+    await expect(promise).rejects.toMatchObject({
+      kind: "protocol_mismatch",
+    });
+    expect(ws.close).toHaveBeenCalled();
+  });
+
+  it("accepts the literal Full v151 number-quality condition protocol", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: 151 }));
 
     await expect(promise).resolves.toBeDefined();
     expect(ws.close).not.toHaveBeenCalled();

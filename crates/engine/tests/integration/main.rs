@@ -2015,6 +2015,7 @@ mod declared_player_object_controller;
 mod decline_branch_not_graveyard_rider;
 mod event_source_lift_referent_stops;
 mod exile_origin_target_acquisition;
+mod issue_9886_dralnus_pet;
 mod keyword_activation_cancel;
 mod rally_the_righteous_radiance_pump;
 mod starting_intensity_keyword;
@@ -2022,3 +2023,8 @@ mod tidebinder_source_type_gate;
 
 mod resolution_progress_contract;
 mod search_result_missing_referent;
+
+mod celes_kotis_graveyard_origin_batch;
+mod squall_attack_batch_chosen_number;
+mod strago_cast_this_way_rider;
+mod tifa_additional_combat;
