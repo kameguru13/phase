@@ -285,6 +285,22 @@ pub(crate) fn disown_events_through(state: &mut GameState, end: usize) {
     state.announcement_event_scope = state.announcement_event_scope.advanced_to(end);
 }
 
+/// CR 602.2a + CR 602.2b + CR 700.2a: whether an announcement is already live
+/// when an action begins. A live `PendingCastOwner` holds one; so does an
+/// activated ability's mode prompt, because its modes are chosen as part of
+/// activating it (CR 700.2a) and its `PendingCast` is built only once they are
+/// known. A triggered ability's mode prompt is not an announcement.
+fn announcement_live_at_action_entry(state: &GameState) -> bool {
+    !state.live_pending_cast_owners().is_empty()
+        || matches!(
+            state.waiting_for,
+            WaitingFor::AbilityModeChoice {
+                is_activated: true,
+                ..
+            }
+        )
+}
+
 /// Action entry: an announcement already live owns the action's buffer from
 /// its start; otherwise none does until an announcement begins
 /// ([`begin_announcement`]). A spell announcement's carrier also leaves its
@@ -296,10 +312,10 @@ pub(crate) fn begin_action(state: &mut GameState) {
         state.in_flight_spell_trigger_carrier.is_none(),
         "a spell trigger carrier outlived its action"
     );
-    state.announcement_event_scope = if state.live_pending_cast_owners().is_empty() {
-        AnnouncementEventScope::Unowned
-    } else {
+    state.announcement_event_scope = if announcement_live_at_action_entry(state) {
         AnnouncementEventScope::From { start: 0 }
+    } else {
+        AnnouncementEventScope::Unowned
     };
     let Some(object_id) = live_spell_announcement(state) else {
         return;

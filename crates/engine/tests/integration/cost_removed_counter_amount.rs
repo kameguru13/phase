@@ -1788,6 +1788,84 @@ fn a_stood_down_cost_park_inside_a_resumed_counter_root_keeps_one_activation_bat
     );
 }
 
+const PROFESSOR_HOJO: &str = "The first activated ability you activate during your turn that targets a creature you control costs {2} less to activate.\nWhenever one or more creatures you control become the target of an activated ability, draw a card. This ability triggers only once each turn.";
+/// Synthetic control: a modal activated ability whose mode targets and whose
+/// cost asks which artifact to sacrifice.
+const MODAL_SACRIFICE_ABILITY: &str = "{2}, Sacrifice an artifact: Choose one \u{2014}\n\u{2022} Tap target creature you control.\n\u{2022} You gain 1 life.";
+
+/// CR 602.2a + CR 602.2b + CR 700.2a: an activated ability's modes are chosen as
+/// part of activating it, so its announcement is live while the mode prompt is
+/// answered. Choosing the targeting mode makes Hojo a target, and the activation
+/// then waits on its sacrifice choice; Hojo's trigger waits with the
+/// announcement and goes on the stack once, above the activation (CR 603.2 +
+/// CR 603.3).
+#[test]
+fn a_target_trigger_from_an_activated_mode_choice_survives_its_cost_prompt() {
+    let mut scenario = main_phase();
+    let hojo = scenario
+        .add_creature_from_oracle(P0, "Professor Hojo", 2, 2, PROFESSOR_HOJO)
+        .id();
+    let modal = scenario
+        .add_artifact_from_oracle(P0, "Modal Engine", MODAL_SACRIFICE_ABILITY)
+        .id();
+    let fodder = scenario.add_artifact_from_oracle(P0, "Fodder", "").id();
+    scenario.add_artifact_from_oracle(P0, "Spare", "");
+    add_mana(&mut scenario, &colorless(2));
+    let mut runner = scenario.build();
+    assert_eq!(
+        runner.state().objects[&hojo].trigger_definitions.len(),
+        1,
+        "reach: Hojo has its trigger"
+    );
+
+    activate(&mut runner, modal, 0);
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::AbilityModeChoice {
+                is_activated: true,
+                ..
+            }
+        ),
+        "reach: the activation asks for its mode: {:?}",
+        runner.state().waiting_for
+    );
+    runner
+        .act(GameAction::SelectModes { indices: vec![0] })
+        .expect("the targeting mode is chosen");
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::PayCost { .. }),
+        "reach: the activation waits on its sacrifice choice: {:?}",
+        runner.state().waiting_for
+    );
+    assert!(
+        runner.state().stack.is_empty(),
+        "nothing is on the stack mid-activation"
+    );
+
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![fodder],
+        })
+        .expect("the artifact is sacrificed");
+    assert_eq!(runner.state().objects[&fodder].zone, Zone::Graveyard);
+    let stack = &runner.state().stack;
+    assert!(
+        matches!(stack[0].kind, StackEntryKind::ActivatedAbility { .. })
+            && stack[0].source_id == modal,
+        "the activation is at the bottom: {:?}",
+        stack
+            .iter()
+            .map(|entry| entry.source_id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        witness_entries(runner.state(), hojo),
+        1,
+        "Hojo triggers once"
+    );
+}
+
 /// Stage a full prevention of the parked counter removal. No RemoveCounter
 /// applier yields `Prevented` today (`remove_counter_applier` always modifies
 /// the event), so the parked choice is re-pointed at a skip-turn definition on
