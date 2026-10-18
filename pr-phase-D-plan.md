@@ -1165,3 +1165,22 @@ The source is pr-phase-D-impl-review-r3.md, section "Findings" F1–F6. Its sugg
    - No workspace clippy/tests, coverage, audits or parser comparison.
 
 Note (r3 fix F2): the action-boundary authority now runs the D5 loop for ANY parked counter-cost root under a Priority result, which narrows residual 2: a Prevented-arm child block that returns Priority with an advanceable subtree is now resumed in the same action. Residual 2 remains only for subtrees the loop cannot advance (residual 3's no-progress case).
+
+---
+
+## Phase D impl-review r4 fixes (Jakob approved expansion case "Fix all four", 2026-10-18)
+
+The brief is pr-phase-D-impl-review-r4.md (findings R4-F1 to R4-F5 and their suggested fixes). Constraints:
+
+1. **R4-F1 (resume-before-collect duplicate).** Use the ledger filter, not collect-before-resume. In the `batch_or_drain_observer_triggers` body (~769-793), filter the slice with `filter_consumed_trigger_events_from(&events[..end], start, Ordinary, ledger)`, the idiom `collect_search_observer_triggers` already uses. That one change covers its callers (~6365, 6630, 7542/7566, 7991/7995, 8024/8029, 6016, 7423). Apply the same filter to the DiscardChoice pair loop (~6047-6066) and the keeper-choice B2 arms (~8622, ~8719). Rows:
+   - un-ignore the sacrifice row (exactly one W, above B);
+   - add a discard-child row (a "discard a card" child with a discard observer such as a "whenever a player discards" trigger). It must go red with the filter removed.
+2. **R4-F2 (second promote caller).** Move the F3 guard into one `GameState` helper and call it from both `take_completed_multi_draw_frame` and `finish_active_paused_post_replacement_dispatch`. Add a row only if a reachable fixture exists. If not, say so: the shared helper makes the existing T10f revert check cover both callers.
+3. **R4-F3 (T10f fixture payer).** Switch the T10f / T10f′ fixtures' unless payer to `ScopedPlayer` (the real "unless that player pays" class) and assert `UnlessPayment.player == P1` for P1's leg.
+4. **R4-F4 (orphaned events on partial progress).** When the action-boundary authority returns `None` after the loop appended events, stage the appended span, as the review specifies. A row is optional; it lives inside residual 3.
+5. **R4-F5 (text).** Rename `resume_due_counter_cost_root_at_action_boundary` / `resumed_due_root`, and fix the comments at engine.rs ~1659 and ~16411, using the review's replacement wording.
+6. **Verification (deferred policy).**
+   - fmt, CR grep, scope check, targeted red/green (base 384bb92 plus the new tests).
+   - One-revert columns: −ledger filter in batch_or_drain, −discard-loop filter, −shared promote guard (both callers), −F4 staging.
+   - Run the whole cost_removed_counter_amount file at head.
+   - Run engine clippy before committing.
