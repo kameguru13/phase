@@ -686,3 +686,132 @@ That is 8 production paths plus 1 test path = 9. The protocol comment surfaces a
 | **T-C** (nested configuration has only U2) | **Flow named and row added:** **T10**. A synthetic `Draw` replacement's post-effect with `unless_pay` pauses at `UnlessPayment`, and P0 activates Saprazzan Cove there (mana abilities are legal at `UnlessPayment`, `engine.rs` 13424–13456, CR 118.12), so the Cove's removal parks nested in that frame. Its first assertion is the P6 reach guard. T10 is red at the base via the T3 mechanism. It shows the configuration is reachable (supporting D1's rejection of option (b)) and that the flow settles in order. It is not claimed to discriminate exactness against `len`-only: retiring a completed paused dispatch emits no event, so U2/U3 are the discriminating evidence at helper level, per check 9's helper-only rule. If P6's reach fails, the executor drops T10 and records U2/U3 as the accepted evidence for that reason (Verification step 3). |
 | **T-E** (header coordinates) | The header now says every anchor, including `game_state.rs` and `resolution.rs`, is cited at 4483f4b, with no offset rule. It lists `perpetual.rs` (and the end-phase files) as changed under `effects/`. |
 | **T-F** (#9728 final-part interaction) | **Added to residual 3.** At the action boundary, `owed_spell_final_part_is_due` → `resolution_instructions_are_done` (`engine.rs` 9022–9029) does not consult `pending_cost_move_resume`, so a mid-resolution mana root left parked by a no-progress stop could see a resolving instant's final part run under it. The cast route is protected by `pending_cast`. T-D narrows this to the no-progress case but does not close it. Follow-up named: gate `resolution_instructions_are_done` on `withholds_priority`. |
+
+---
+
+## Phase D amendment (post-implementation)
+
+Implemented as 59247b7 on `engine/cost-removed-counters`; every anchor below is cited at 59247b7. Read-only planning, no builds. Implementation deviations accepted as recorded by the coordinator:
+- T5 uses `Effect::DamageAll { target: SpecificObject(walker) }`, because a template `DealDamage` binds no target.
+- `removal_queue(state)` iterates the whole stack (`cost_removed_counter_amount.rs` 1801).
+- T10's `Draw` replacement carries `DrawReplacementScope::InstructionCount`.
+
+### A. T4: a batch parked above the child's queue
+
+**Diagnosis (traced at 59247b7):**
+1. The mill cost proposes `ProposedEvent::Mill` (`casting_costs.rs` 6481–6533). The optional Mill replacement's ACCEPT goes through the Execute arm's Mill arm (`engine_replacement.rs` 767–775) → `apply_mill_after_replacement` (`effects/mill.rs` 110–186) → `move_objects_simultaneously_then` (`zone_pipeline.rs` 1223) → `deliver_batch` (1344).
+2. The milled card's move drains the mill replacement's post-effect in its **delivery tail** (`zone_pipeline.rs` 2133–2180, `PostReplacementDrainOwner::DeliveryTail`). That post-effect is the child `RemoveCounter`. It pushes `CounterRemovals` and pauses on the Steward's RemoveCounter choice.
+3. `move_object_with_terminal` returns `NeedsChoice`. `deliver_batch` then stashes the batch owner with `BatchDeliveryParking::NewChild` (`stash_batch_tail`, 1493–1497), **after** the child pushed its queue. `move_objects_simultaneously_then` hangs the `MilledDeliveryComplete` completion on that frame (1265–1275). The result is `[PostReplacement, CounterRemovals, BatchDelivery]`.
+4. That is the engine's established shape for a batch whose member's delivery tail paused in a post-effect child. `resume_resolution_frames`' `BatchDelivery` arm (`effects/mod.rs` 1685–1695) drains the batch first and then "continue[s] that child" it exposes.
+5. The Prevented arm's counter-removal block (`engine_replacement.rs` 1650–1694) always returns. Its queue drain is top-only (`counters.rs` 3447), so it is a no-op under the batch. The Absent arm then resumes the mill root over both frames. The arm's own batch block (1707–1713), which would have settled the batch, is **shadowed** by that early return. At the base the counter-removal condition fell through to the batch block, which drained the batch and returned Priority with the root parked, so T4 was red there too.
+6. The Execute arm has the same order hazard. The queue drain (1153–1160) runs before the batch drain (1187–1194), so a DECLINE of the child entry settles the batch, exposes the queue, and the delivery cost drain (1345) resumes the mill root before the exposed queue finishes (row T4b).
+
+**P3 correction.** P3 assumed the child queue is the top frame when its removal is prevented. That holds for counter-cost roots (the payer proposes the removal directly, not inside a move). It fails when the removal is proposed inside a batch member's delivery tail, as under the mill root.
+
+**CR order (decided):**
+- CR 614.6 (verified): "If an event is replaced, it never happens. A modified event occurs instead." The accepted Mill replacement's modified event is the mill plus its post-effect, the child removal. The child removal, including its prevented entry (CR 616.1 / 614.6) and its queue finalization, is therefore part of the mill cost's payment.
+- CR 601.2h + CR 602.2b (verified): the activation continues only after that cost is paid. So the root resumes only after **both** the batch (`Milled` events, logical zone-change trigger collection) and the child queue have settled.
+- Between the batch and the child, the engine's existing convention applies: the batch settles first and exposes the child (`effects/mod.rs` 1685–1695). This changes no rules outcome, because settlement only collects triggers, and CR 603.2/603.3 (verified) put triggered abilities on the stack the next time a player would receive priority, after both.
+- T4/T4b assert root-after-both. They deliberately do not pin `Milled` against `EffectResolved{RemoveCounter}`.
+
+**D7. The fix (two edits, `crates/engine/src/game/engine_replacement.rs` only):**
+
+(a) Prevented arm. In the `if pending_was_counter_removal {` block (1658), immediately after the `state.waiting_for = WaitingFor::Priority { .. }` reset and **before** `match state.counter_cost_root_subtree()`, insert:
+```rust
+// CR 614.6 + CR 616.1: a batch zone move whose member's delivery-tail
+// post-effect proposed this removal was parked above the removal's own work on
+// the way out of that pause (`zone_pipeline::deliver_batch`, `NewChild`). It is
+// part of the same modified event: settle it first, as `resume_resolution_frames`'
+// BatchDelivery arm does, which exposes the removal's queue for the owner below.
+if state.active_batch_delivery().is_some() {
+    crate::game::zone_pipeline::drain_pending_batch_deliveries(state, events);
+    if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+        return Ok(state.waiting_for.clone());
+    }
+}
+```
+- **Why a top `BatchDelivery` here is always this removal's enclosing batch.** The live prompt was this `RemoveCounter` choice. A batch frame is pushed only on the way out of the pause that raised the live prompt: `stash_batch_tail` in `deliver_batch`'s `NeedsChoice` arm, or `defer_completion_on_pause` for a single-object pause. A batch parked on an earlier, different prompt would have that prompt as the live one. So no gate on queue presence is needed. The same reasoning covers a delivery-tail child whose removal is not queued (damage, a resolution-time cost): the batch is still that child's enclosing owner. This restores what the shadowed batch block (1707–1713) did at the base.
+- The three subtree arms are unchanged after it:
+  - **Absent** (T4): queue → continuation → root.
+  - **Unfinished:** queue → common boundary.
+  - **Retired:** cannot see a batch, because a counter-cost removal is proposed by the payer, not inside a move.
+
+(b) Execute arm. Directly after the batch block (1187–1194), insert:
+```rust
+// CR 614.6 + CR 616.1: settling a batch parked above its member's delivery-tail
+// child exposes that child's counter-removal queue. Finish it here, in the same
+// order as the queue drain above, before any parked cost root resumes below.
+if matches!(waiting_for, WaitingFor::Priority { .. })
+    && state.active_counter_removals().is_some()
+{
+    effects::counters::drain_pending_counter_removals(state, events);
+    if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+        waiting_for = state.waiting_for.clone();
+    }
+}
+```
+This only fires when a queue is the top frame after the batch drain. Every flow where the queue was already drained at 1153–1160, or where none exists, is unchanged.
+
+**Rejected alternatives:**
+- *Locate the child queue by identity under the batch and drain it first.* That finishes the child while the batch is still parked, which inverts `resume_resolution_frames`' shipped order for the same shape. `ResolutionStack` also deliberately exposes no positional mutation (`resolution.rs` 757–767), so it would need a new buried-frame mutator.
+- *Insert the batch below the child in `deliver_batch`* (`insert_parent_at_child_boundary`, the ChangeZone precedent at `resolution.rs` 1382). That changes the parking of every batch whose delivery-tail post-effect pauses, against the `BatchDelivery` arm's shipped convention and its existing rows. Not minimal, and no rules outcome requires it.
+- *Is the batch the root's own work, to wait until after the root?* No. The batch is the mill event itself, which is the cost being paid (CR 601.2h). It must settle before the root, not after it.
+
+**Residual 1, refined.** Non-counter roots still carry no subtree boundary. After D7 they resume once the batch, the queue and the continuation drain have run. A paused `PostReplacement` dispatch of their own replacement may still retire after the root (unchanged, follow-up).
+
+**Test edits (`crates/engine/tests/integration/cost_removed_counter_amount.rs`):**
+- **T4** (`a_prevented_child_removal_under_a_mill_cost_root_resumes_that_root`, 2067): remove the `#[ignore]`.
+  - Add a reach at the child prompt: `runner.state().resolution_stack.last()` is `ResolutionFrame::BatchDelivery(_)` (the shape D7(a) handles). Keep the existing `removal_queue(..).in_flight` reach.
+  - In the prevention action's events, add `event_index(.., Milled)` < `activated` beside the existing `resolved < activated`. Do not order `Milled` against `resolved`.
+  - After the existing `drive(.., priority_with_empty_stack, ..)`, add `assert!(runner.state().resolution_stack.is_empty())` paired with the existing life +1.
+  - Expected: red at 59247b7, green with D7(a). Revert-check: delete D7(a) → red.
+- **T4b** (new) `a_declined_child_removal_under_a_mill_cost_root_resumes_that_root`: T4's setup, but answer the child prompt with `ChooseReplacement(DECLINE)` (index 1, as in T3).
+  - Same reach as T4.
+  - After the decline: battery charge 0 (the removal happened), `removal_queue` none, stack 1, `resolved < activated`, `Milled < activated`, ownership clear.
+  - After driving to an empty stack: life +1 and `resolution_stack.is_empty()`.
+  - Expected: **(unprobed)** red at 59247b7 (1345 resumes the mill root before the exposed queue drains at 1415, so `resolved < activated` fails), green with D7(b).
+
+### B. T10 panics on a paired multi-draw child (pre-existing)
+
+**Confirmed out of scope as a defect.** The validator (`debug_assert_runtime_resolution_invariants`, `resolution.rs` 4876–4882, run after every public action) rejects a `MultiDraw` child of a draw's `PostReplacement` drain that is buried below frames other than the active direct-choice owner. Activating a mana ability whose cost raises frames (the Cove's child queue and rider) at a draw post-effect's `UnlessPayment` buries it. That reproduces at 4483f4b and at 59247b7, independent of D1–D7.
+
+**Residual 8 (new).** A mana ability whose payment raises resolution frames, activated at an `UnlessPayment` raised by a draw replacement's post-effect, buries the paired `MultiDraw` child and trips the CR 616.1g pairing invariant. Only a synthetic counter-removal replacement gets a mana payment to raise frames; a plain land tap raises none. Follow-up: owner of the draw-sequence pairing (`effects/draw.rs` / `resolution.rs` pairing validation).
+
+**T10 re-flow (proposed), same nested configuration without a draw:**
+- Rename to `a_child_under_a_mana_root_paying_inside_a_paused_life_gain_post_effect_settles_first`.
+- Replace `DRAW_CONTROL` with a labelled synthetic `GAIN_CONTROL = "{T}: You gain 1 life."` on artifact "Gainer".
+- Replace the Draw replacement with `optional_replacement(ReplacementEvent::GainLife, Some(lose))`, where `lose = AbilityDefinition::new(AbilityKind::Spell, Effect::LoseLife { amount: Fixed 1, target: None }).unless_pay(UnlessPayModifier { cost: AbilityCost::Mana { cost: ManaCost::generic(2) }, payer: TargetFilter::Controller })`. The post-effect is a life loss, so the GainLife replacement cannot re-apply to it.
+- The RemoveCounter replacement with `t3_child_execute(battery)`, the Cove, the Battery and every remaining step and assertion are unchanged from the 59247b7 row, including both P6 reaches (`UnlessPayment`, and the resident drain `Paused` in the active frame).
+- Final assertions: life is `life_at_unless` + rider (+1) and no −1 (the unless cost was paid). `resolution_stack.is_empty()` after paying.
+- **(unprobed)** A life-gain post-effect has no paired `MultiDraw` child, so the T3-shaped `[PostReplacement(P, nested child), rider, queue]` stack is the one T3 already validates. If the re-flow still trips validation, or P6 fails, keep the row `#[ignore]`d citing residual 8 and record U2/U3 as the accepted nested-configuration evidence (T-C).
+
+### C. U3: a case that discriminates identity from position
+
+U3 as written cannot catch the "positional fallback for `Some(id)`" mutation: once C is consumed, P is the top again, so the positional read finds the same frame. Add **U3b** in the same module (`types/game_state.rs` `#[cfg(test)]`): `a_nested_child_is_read_in_its_own_frame_not_the_active_one`.
+1. Build U3's state up to "consume C": P (stamped, one `Paused` drain), C pushed, `b` recorded (`enclosing == Some { frame: Some(P.id), drains: 1 }`, depth N), nested child drain begun in P (P count 2), C taken (len N−1).
+2. Push a fresh, unstamped `PostReplacement` frame P2 directly through `ResolutionStack::push_post_replacement` (`resolution.rs` 3091), holding one `Ready` drain. The length is N again, and P2 is now the active frame.
+3. Assert:
+   - reach: `resolution_stack.len() == b.resolution_depth`, `active_post_replacement_or_paired_parent().map(len) == Some(1)`, and P's count by id is 2;
+   - `!b.is_retired(..)`.
+
+   The positional mutation reads P2's 1 ≤ 1 → retired, so it fails here. The identity read sees P's 2 > 1.
+4. Pop P2 (`ResolutionStack::take_active_post_replacement`, `resolution.rs` 3080) and finish the nested dispatch. Then `b.is_retired(..)` (the paired positive).
+5. This test exercises `ResolutionStack` directly, so the public-action validator does not run. The adjacent-frame shape is a type-level contract fixture, not a claimed production shape.
+
+Revert-check: `EnclosingPostReplacementFrame::is_retired` with `Some(id)` routed to the positional read → U3b red, U3 green.
+
+### Scope and sizing after the amendment
+
+- Production: `engine_replacement.rs` only (already counted).
+- Tests: T4 un-ignored and tightened; T4b new; T10 re-flowed (or left ignored under residual 8); U3b new.
+- Paths stay at 9; units stay at 1.
+
+### Verification for the amendment
+
+- `cargo fmt --all`.
+- Then, through Tilt or the isolated target: `cost_removed_counter_amount` (T4, T4b, T10 re-flow) and the lib tests holding U2/U3/U3b.
+- Run full `test-engine` because the Execute arm changed. The existing batch rows (`cost_zone_pipeline`, the mill/RIP double-pause rows) are the regression net for D7(b)'s "inert unless a queue is exposed" claim.
+- Red evidence:
+  - T4 red at 59247b7 and green with D7(a);
+  - T4b red at 59247b7 and green with D7(b);
+  - U3b red under the positional mutation.
