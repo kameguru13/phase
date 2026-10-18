@@ -1139,3 +1139,27 @@ Sources: pr-phase-D-impl-review-r2.md (F1 MED, F2 MED, F3 LOW, T1 text) and pr-p
    - fmt, CR grep, and targeted red/green only. The base for red/green is 618fb57 plus the new tests; one-revert columns: −item 1, −item 2, −site 1, −gate (a).
    - Rows: T12b, T12c, T12d, T12e, T10f, plus the existing cost_removed_counter_amount file.
    - The regression suites the fix-design review lists (activation/announcement, delayed triggers, Treasure/sacrifice costs, search dedup, engine_tests, triggers_dedup_regression_tests) are deferred to the final batched check after the upstream-main merge, where they are covered by the engine integration and lib runs.
+
+---
+
+## Phase D impl-review r3 fixes (Jakob approved the expansion case "Fix all three", 2026-10-18)
+
+The source is pr-phase-D-impl-review-r3.md, section "Findings" F1–F6. Its suggested fixes are the brief. Use these constraints:
+
+1. **F1 (missed custody collectors).**
+   - Route `park_observer_triggers_if_paused` (triggers.rs ~8400) and `collect_and_drain_observer_triggers_if_settled` (~8437) through `take_inline_trigger_span`, changing signatures to `&mut Vec<GameEvent>` as needed. Their callers are Scry continuation, OptionalEffectChoice, morph, and OpponentMayChoice ×2.
+   - Route `park_discard_batch` (effects/discard.rs ~204) by passing the action buffer and `events_before_self`, then calling `defer_observer_triggers_for_paused_choice`. Fold `defer_observer_triggers_from` back in (its premise was false), and fix or remove its doc comment.
+2. **F2 (rider-free mana child strands the root).** At the action-boundary authority (`resume_due_counter_cost_root_at_action_boundary`, engine.rs ~1746), run the D5 resume loop for ANY parked counter-cost root under a Priority result, not only `is_due`. Return `Some` only on progress. Annotate with CR 602.2b + 601.2h / 117.3c / 704.3 (grep-verify). Note in the plan's residual 2 text that this narrows it; do NOT widen to the other Prevented-arm blocks.
+3. **F3 (draw-pair promote lifts an outer continuation).** In `take_completed_multi_draw_frame` / `promote_ability_continuation_after_post_replacement_draw` (draw.rs ~858, resolution.rs ~3295-3316), do not promote when a counter-cost root is parked and the continuation below the PR sits below the root's boundary (`index < paused_counter_removal().replacement_subtree.resolution_depth`). Prefer passing a predicate or boundary from the caller over reading root state inside resolution.rs, if that keeps the layering clean. CR 101.4 / 608.2e / 118.12a — grep-verify.
+4. **Rows.**
+   - T10f un-ignored (Draw rider) as F3's row, with F4's real assertions: exactly one AbilityContinuation whose chain is P1's bound LoseLife, and/or `UnlessPayment{player: P1}` after P0 declines.
+   - T10f′ (GainLife rider via `t3_child_execute`, no draw) as gate (a)'s row, with the same F4 assertions.
+   - T12f: the rider-free mana child. The activation is on the stack in the same action, counter count 3. Red with the `is_due` precondition restored.
+   - Double-Scry row: `scry_one().sub_ability(lose(1)).sub_ability(scry_one())` + Witness; stack == [B, W] with exactly one W. Red with triggers.rs ~8400 unrouted. It replaces T12c (delete T12c, or keep it only if it adds something the double-Scry row doesn't).
+   - Sacrifice-child row (F5): a child "sacrifice a creature" (EffectZoneChoice) → `batch_or_drain_observer_triggers` B1, with a dies-Witness; [B, W] once. Red with that site unrouted. If the fixture cannot reach that site, stop and report rather than improvise.
+5. **F6.** In the B1 returns of `batch_or_drain_observer_triggers`, `collect_search_observer_triggers` and the discard pair loop, return plain `WaitingFor` only when `owned.is_empty() && owned.end < events.len()`, matching the mana arm.
+6. **Verification (deferred policy).**
+   - fmt, CR grep, scope/diff check, and targeted red/green only. Base is 8f18b5e plus the new tests.
+   - One-revert columns: −F1 routing (triggers.rs 8400), −F2 (restore `is_due`), −F3 guard, −gate (a), −sacrifice-site routing.
+   - Run the whole cost_removed_counter_amount file at head.
+   - No workspace clippy/tests, coverage, audits or parser comparison.
