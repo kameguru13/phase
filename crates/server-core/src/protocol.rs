@@ -3475,7 +3475,7 @@ mod tests {
 
     /// v156: `StaticCondition`, `TriggerCondition` and `AbilityCondition` gain
     /// `QuantityQuality { quantity, quality }` with the new `NumberQuality`
-    /// (CR 107.1, CR 603.4), carried in `GameState` ability definitions; a v153
+    /// (CR 107.1, CR 603.4), carried in `GameState` ability definitions; a v155
     /// peer cannot decode the new tag, so it must be refused before it receives
     /// v156 state.
     /// The same bump adds the optional per-seat `created_tokens` channel (each
@@ -3486,7 +3486,19 @@ mod tests {
     /// tokens …" tail); it is serde-defaulted, so a sidecar without it decodes
     /// as the linked-exile-only sidecar.
     ///
-    /// v154 and v155 are reserved for #10039 and #10036 and are not on main.
+    /// v155: `PendingChangeZoneIteration.remaining` carries each member's
+    /// pre-event entry modifications (`ChangeZoneMemberEntry`, CR 603.6a +
+    /// CR 614.12) and drops the raw gate fields, and the persisted resolution
+    /// state moves from version 6 to 7; a v154 peer cannot parse a parked
+    /// ChangeZone frame, so it must be refused before it receives v155 state.
+    ///
+    /// v154: `PendingCostMoveResume` gains `CounterCostRemovalPayment` (a
+    /// counter-removal cost paused on a CR 616.1 replacement choice, whose
+    /// settled count the activation reads, CR 118.11) and
+    /// `ManaAbilityCostCursor` gains `counter_removal`, both carried in
+    /// `GameState::pending_cost_move_resume`; a v153 peer cannot parse the new
+    /// tag, so it must be refused before it receives v154 state;
+    /// `PausedCounterCostRemoval` carries its `replacement_subtree` boundary.
     ///
     /// v153: `GrantAllActivatedAbilitiesOf` gains the optional `kind` selector
     /// and the loyalty-grant sibling variant is removed. A v152 peer

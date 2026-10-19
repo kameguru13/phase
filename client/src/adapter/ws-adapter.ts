@@ -229,7 +229,21 @@ export class NativeEngineVersionMismatchError extends Error {
  *      tokens every seat created, for a paused "each player creates … The
  *      tokens …" tail); it is serde-defaulted, so a sidecar without it decodes
  *      as the linked-exile-only sidecar. Wire 138 moves with it.
- * 154, 155 — reserved for #10039 and #10036 (wire 136 / 137); not on main.
+ * 155 — PendingChangeZoneIteration members carry their pre-event entry modifications
+ *      (ChangeZoneMemberEntry, CR 603.6a + CR 614.12), and the persisted resolution
+ *      state moves from version 6 to 7 — see PROTOCOL_VERSION's own `/// 155` entry
+ *      in crates/lobby-broker/src/protocol.rs. A v154 peer cannot parse a parked
+ *      ChangeZone frame and refuses the version-7 resolution state. Wire 137 moves
+ *      with it.
+ * 154 — PendingCostMoveResume gains CounterCostRemovalPayment (a counter-removal
+ *       cost paused on a CR 616.1 replacement choice; the activation reads the
+ *       settled count, CR 118.11) and ManaAbilityCostCursor gains
+ *       counter_removal, carried in GameState.pending_cost_move_resume — see
+ *       PROTOCOL_VERSION's own `/// 154` entry in
+ *       crates/lobby-broker/src/protocol.rs. A v153 peer cannot parse the tag;
+ *       the exact-match version check at connect refuses the pairing. Wire 136
+ *       moves with it. PausedCounterCostRemoval carries its replacement_subtree
+ *       boundary.
  * 153 — GrantAllActivatedAbilitiesOf gains the optional kind selector
  *       (Nicol Bolas, Dragon-God's loyalty grant is kind Loyalty on the
  *       activated authority; the loyalty-grant sibling variant is

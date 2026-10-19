@@ -2715,50 +2715,74 @@ fn try_parse_lose_control_delayed_trigger(
     ))
 }
 
-/// CR 122.1 + CR 608.2c: "it enters with an additional +1/+1 counter on it" rider
-/// after a zone-change-this-way gate (Winter Soldier, Reborn Avenger). Valid only
-/// under its battlefield-mover producer: reached solely through
-/// `entry_counter_rider_clause`, so its `ParentTarget` always names the object
-/// the preceding `ChangeZone` moved (and is folded into that move).
-fn try_parse_enters_this_way_additional_counter(lower: &str) -> Option<Effect> {
-    let (rest, _) = alt((
-        tag::<_, _, OracleError<'_>>("that creature enters with "),
-        tag("it enters with "),
-    ))
-    .parse(lower.trim())
-    .ok()?;
+/// CR 614.1c + CR 122.1: the rider payload after "<subject> enters with " — "<an
+/// additional | N additional> <+1/+1 | -1/-1> counter(s) on it".
+fn parse_entry_counter_rider_payload(input: &str) -> OracleResult<'_, (CounterType, u32)> {
+    (
+        alt((
+            value(1u32, tag("an additional ")),
+            terminated(nom_primitives::parse_number, tag(" additional ")),
+        )),
+        alt((
+            value(CounterType::Plus1Plus1, tag("+1/+1")),
+            value(CounterType::Minus1Minus1, tag("-1/-1")),
+        )),
+        alt((tag(" counter on it"), tag(" counters on it"))),
+    )
+        .map(|(count, counter_type, _)| (counter_type, count))
+        .parse(input)
+}
 
-    let (rest, count) =
-        if let Ok((r, _)) = tag::<_, _, OracleError<'_>>("an additional ").parse(rest) {
-            (r, 1u32)
-        } else if let Ok((r, n)) = nom_primitives::parse_number(rest) {
-            let (r, _) = tag::<_, _, OracleError<'_>>(" additional ").parse(r).ok()?;
-            (r, n)
-        } else {
-            return None;
-        };
-
-    let (rest, counter_type) = alt((
-        value(
-            CounterType::Plus1Plus1,
-            tag::<_, _, OracleError<'_>>("+1/+1"),
+/// CR 614.1c + CR 122.1: "<it | that creature | each of them> enters with <an
+/// additional | N additional> <+1/+1 | -1/-1> counter(s) on it" — an entry-replacement
+/// rider naming the object(s) an earlier instruction moved. Single authority for this
+/// rider grammar: the effect producer (`try_parse_enters_this_way_additional_counter`)
+/// calls it, and the guard conversion in `parse_effect_chain_ir_body` and the
+/// sequence-level swallow recognizer call its singular-subject form
+/// (`parse_single_moved_object_enters_with_counters`).
+pub(crate) fn parse_moved_object_enters_with_counters(
+    input: &str,
+) -> OracleResult<'_, (CounterType, u32)> {
+    alt((
+        parse_single_moved_object_enters_with_counters,
+        // CR 608.2c: the distributive plural anaphor after a multi-object mover
+        // ("Each of them enters with …" — Aberrant Return) names every object that
+        // mover put onto the battlefield.
+        preceded(
+            tag("each of them enters with "),
+            parse_entry_counter_rider_payload,
         ),
-        value(CounterType::Minus1Minus1, tag("-1/-1")),
     ))
-    .parse(rest)
-    .ok()?;
+    .parse(input)
+}
 
-    let (rest, _) = alt((
-        tag::<_, _, OracleError<'_>>(" counter on it"),
-        tag(" counters on it"),
-    ))
-    .parse(rest)
-    .ok()?;
+/// CR 614.1c + CR 122.1: the rider with a singular subject ("it" / "that creature") —
+/// the voice an anaphoric "if it's a <type>" gate binds to one moved object.
+pub(crate) fn parse_single_moved_object_enters_with_counters(
+    input: &str,
+) -> OracleResult<'_, (CounterType, u32)> {
+    preceded(
+        alt((tag("that creature enters with "), tag("it enters with "))),
+        parse_entry_counter_rider_payload,
+    )
+    .parse(input)
+}
 
-    if !rest.trim_end_matches('.').trim().is_empty() {
-        return None;
-    }
-
+/// CR 122.1 + CR 608.2c + CR 614.12: an additional entry-counter rider bound to
+/// its battlefield-mover producer. `entry_counter_rider_clause` reads a gated
+/// rider (Winter Soldier, Reborn Avenger), whose `ParentTarget` is folded into
+/// the move by `lower::fold_enters_this_way_counter_rider`.
+/// `sequence::parse_moved_object_entry_counters_continuation` reads an unconditional
+/// rider after a battlefield mover, using only its counter type and count to
+/// modify how each moved object enters.
+fn try_parse_enters_this_way_additional_counter(lower: &str) -> Option<Effect> {
+    let (counter_type, count) = super::oracle_nom::bridge::nom_parse_lower(lower.trim(), |i| {
+        all_consuming(terminated(
+            parse_moved_object_enters_with_counters,
+            opt(tag(".")),
+        ))
+        .parse(i)
+    })?;
     Some(Effect::PutCounter {
         counter_type,
         count: QuantityExpr::Fixed {
@@ -4389,8 +4413,15 @@ fn try_parse_cast_this_way_enters_rider(lower: &str) -> Option<ParsedEffectClaus
 ///    future cast (`cast_from_zone::grant_lingering_permissions`, the only
 ///    extractor of the rider);
 /// 2. a battlefield mover whose rider is gated on an object entering this way
-///    (Heroic Return, Recommission) — `lower::entry_rider_folds_into`, the
-///    predicate the fold into `ChangeZone.conditional_enter_with_counters` uses.
+///    (Heroic Return, Recommission, and What Must Be Done's anaphoric "if it's a
+///    <type>" gate, which `parse_effect_chain_ir_body` converts to that shape
+///    via `conditions::anaphoric_entry_counter_gate`) — `lower::entry_rider_folds_into`,
+///    the predicate the fold into `ChangeZone.conditional_enter_with_counters` uses.
+/// 3. (not dispatched here) an UNCONDITIONAL rider directly after a battlefield
+///    `ChangeZone` is read as a followup continuation
+///    (`sequence::parse_moved_object_entry_counters_continuation` →
+///    `TokenEntersWithCounters`), patching the mover's `enter_with_counters`;
+///    this function returns `None` for it (no condition).
 ///
 /// The first arm whose producer holds owns the clause; when its recognizer
 /// declines, the clause falls to the generic path rather than to a later arm
@@ -17153,6 +17184,15 @@ fn clause_is_additional_land_permission(clause: &ParsedEffectClause) -> bool {
     )
 }
 
+/// CR 606.3 + CR 101.1: "You may activate [recipient]'s loyalty ability N more
+/// times this turn" grants the permission to make the activations later. Its
+/// "may" is that later activation (CR 608.2d), not a choice made while the grant
+/// resolves, so the grant lowers as mandatory. The parsed effect is the detector,
+/// so no clause text is inspected.
+fn clause_is_extra_loyalty_activation_grant(clause: &ParsedEffectClause) -> bool {
+    matches!(&clause.effect, Effect::GrantExtraLoyaltyActivations { .. })
+}
+
 /// CR 116.2c: no longer the PRIMARY path for the mana-cost shape — that clause is
 /// now absorbed into `Effect::GenericEffect.end_cost` by the `EndEffectCost`
 /// continuation. Kept as defense-in-depth for the non-mana shape (a hypothetical
@@ -22445,6 +22485,7 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
         sub_text,
         continuation_ctx.declared_target_choice_timing,
         sub_clause.multi_target.is_some(),
+        continuation_ctx.target_selection_mode,
     );
     let mut sub_ability = AbilityDefinition::new(AbilityKind::Spell, sub_clause.effect);
     sub_ability.target_choice_timing = continuation_timing;
@@ -27206,6 +27247,22 @@ fn refuse_target_pt_threshold_rider_with_own_target(clause: &mut ClauseIr) {
     if clause_announces_own_target(clause) {
         clause.replace_with_gap("target_pt_threshold_rider_declares_target");
     }
+}
+
+/// CR 614.1c + CR 608.2c: whether the chain's latest clause is a bare battlefield
+/// move — a `ChangeZone` to the battlefield with no compound sub of its own — the
+/// only parent under which `lower::fold_enters_this_way_counter_rider` represents a
+/// following "enters with … counters" rider as the move's entry gate.
+fn previous_clause_moves_to_battlefield(clauses: &[ClauseIr]) -> bool {
+    clauses.last().is_some_and(|clause| {
+        matches!(
+            clause.parsed.effect,
+            Effect::ChangeZone {
+                destination: Zone::Battlefield,
+                ..
+            }
+        ) && clause.parsed.sub_ability.is_none()
+    })
 }
 
 /// [`chain_declared_object_target`], also naming WHICH clause declared the
@@ -43993,6 +44050,15 @@ fn parse_effect_chain_ir_body(
             .or(turn_cond)
             .or(target_has_cond)
             .or(suffix_cond);
+        // CR 614.1c + CR 614.12 + CR 608.2c: "it enters with N additional counters on it
+        // if it's a <type>" (either voice), after a battlefield move, gates an entry
+        // replacement on the moved permanent, not a later instruction.
+        let guard_condition = match guard_condition {
+            Some(cond) if previous_clause_moves_to_battlefield(builder.clauses()) => {
+                Some(conditions::anaphoric_entry_counter_gate(&cond, &text).unwrap_or(cond))
+            }
+            other => other,
+        };
         // CR 603.12 + CR 603.4 + CR 608.2a: A `When you do, if <guard>, ...` rider is
         // not equivalent to a bare reflexive trigger. The shared leading
         // conditional parser deferred this guard so the specialized guard
@@ -46230,6 +46296,11 @@ fn parse_effect_chain_ir_body(
         // CR 601.3: a granted graveyard cast permission ("you may cast <type>
         // spells from your graveyard this turn") lets the player cast later; its
         // "may" is that later cast, not a choice made at resolution (CR 608.2d).
+        //
+        // CR 606.3 + CR 101.1: the same holds for an extra loyalty-activation
+        // grant ("you may activate ~'s loyalty ability two more times this turn"):
+        // the "may" is the later activation, and the grant itself is mandatory
+        // (`clause_is_extra_loyalty_activation_grant`).
         let is_optional = if matches!(&clause.effect, Effect::FreeCastFromZones { .. })
             || crate::parser::oracle_ir::ast::is_graveyard_permission_grant(&clause.effect)
             || matches!(
@@ -46248,6 +46319,7 @@ fn parse_effect_chain_ir_body(
                 }
             )
             || clause_is_additional_land_permission(&clause)
+            || clause_is_extra_loyalty_activation_grant(&clause)
             || clause_is_pay_to_end_effect_termination(normalized_text)
         {
             false
@@ -48323,7 +48395,9 @@ fn parse_unless_discard_hand_cost(after_unless: &str) -> Option<AbilityCost> {
     Some(AbilityCost::Discard {
         count: QuantityExpr::Ref {
             qty: QuantityRef::HandSize {
-                player: PlayerScope::ParentObjectTargetController,
+                player: PlayerScope::ParentObjectTarget {
+                    possession: crate::types::ability::PossessionAxis::Controller,
+                },
             },
         },
         filter: None,

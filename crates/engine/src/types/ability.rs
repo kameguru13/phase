@@ -4741,7 +4741,7 @@ pub enum RestrictionPlayerScope {
     /// `ParentTargetedPlayer` ("that player", CR 608.2c — a reused *player* target):
     /// this derives a player from an *object* target's controller (CR 109.4).
     /// Mirrors `PlayerFilter::ParentObjectTargetController` /
-    /// `PlayerScope::ParentObjectTargetController` on the sibling enums.
+    /// `PlayerScope::ParentObjectTarget` on the sibling enums.
     ParentObjectTargetController,
     OpponentsOfSourceController,
     /// CR 508.5 / CR 508.5a: The defending player for the source's attack
@@ -8804,12 +8804,22 @@ pub enum PlayerScope {
     /// intervening-if quantities such as "no opponent has more life than that
     /// player."
     DefendingPlayer,
-    /// CR 109.4 + CR 608.2c: The controller of the first object target of
-    /// the resolving ability ("that opponent" anaphoring the controller of
-    /// a bounced/destroyed creature). The player-scalar-axis analogue of
-    /// `ControllerRef::ParentTargetController`. Resolved via
-    /// `ability_utils::parent_target_controller`.
-    ParentObjectTargetController,
+    /// CR 109.4 + CR 108.3 + CR 608.2c: The controller or owner (per
+    /// `possession`) of the first object target of the resolving ability —
+    /// "that opponent" anaphoring the controller of a bounced creature, or
+    /// "that graveyard" anaphoring the owner of a targeted card in a graveyard
+    /// or exile. The player-scalar-axis analogue of
+    /// `ControllerRef::ParentTargetController` / `ParentTargetOwner`. Resolved
+    /// via `ability_utils::parent_target_controller` / `parent_target_owner`.
+    ///
+    /// Backward-compat: deserializes from the legacy tag
+    /// `ParentObjectTargetController` (no fields) via `#[serde(alias)]`,
+    /// defaulting `possession = PossessionAxis::Controller`.
+    #[serde(alias = "ParentObjectTargetController")]
+    ParentObjectTarget {
+        #[serde(default = "default_parent_object_target_possession")]
+        possession: PossessionAxis,
+    },
     /// CR 613.1 + CR 109.4: The player PERSISTED on the source via
     /// `ChosenAttribute::Player` (an "as ~ enters the battlefield, choose a
     /// player" replacement). The player-scalar-axis analogue of
@@ -12086,7 +12096,7 @@ pub enum PlayerFilter {
     /// CR 109.4 + CR 608.2c: The controller of the first object target of
     /// the resolving ability ("reduce that opponent's speed" anaphoring the
     /// controller of a bounced creature). The `PlayerFilter`-axis analogue
-    /// of `PlayerScope::ParentObjectTargetController` and
+    /// of `PlayerScope::ParentObjectTarget` and
     /// `ControllerRef::ParentTargetController`. Resolved via
     /// `ability_utils::parent_target_controller`.
     ParentObjectTargetController,
@@ -12976,7 +12986,7 @@ impl StaticMode {
             | PlayerScope::Target
             | PlayerScope::Opponent { .. }
             | PlayerScope::AllPlayers { .. }
-            | PlayerScope::ParentObjectTargetController
+            | PlayerScope::ParentObjectTarget { .. }
             | PlayerScope::SourceChosenPlayer
             | PlayerScope::AnyTurn
             | PlayerScope::SpecificPlayer { .. } => false,
@@ -21397,16 +21407,28 @@ pub enum Effect {
         )]
         count: QuantityExpr,
     },
-    /// CR 606.3: Grant the resolved target player the right to activate each of
-    /// their planeswalkers' loyalty abilities `amount` additional times this
-    /// turn. Class lift of The Chain Veil's "{4}, {T}: You may activate each
-    /// planeswalker's loyalty ability an additional time this turn." Stored as
-    /// a per-player counter on `GameState::extra_loyalty_activations_this_turn`,
-    /// read by `planeswalker::can_activate_loyalty_ability` as a +N bump to the
-    /// per-permanent CR 606.3 cap. The counter is cleared at turn start.
-    /// `target` defaults to `Controller` (printed wording is "you may
-    /// activate..."); parameterized for future cards that grant the bonus to a
-    /// different player.
+    /// CR 606.3 + CR 101.1: Grant extra loyalty-ability activations for the rest
+    /// of this turn. The card's text overrides CR 606.3's once-per-permanent
+    /// limit (CR 101.1) by raising the cap by `amount`; both recipient axes feed
+    /// the one gate, `planeswalker::loyalty_activation_cap`.
+    ///
+    /// `target` is the recipient axis (absent in serialized data means `Controller`):
+    /// - `Controller` — every planeswalker the controller controls (The Chain
+    ///   Veil: "For each planeswalker you control, you may activate one of its
+    ///   loyalty abilities once this turn as though none of its loyalty abilities
+    ///   have been activated this turn."). Stored in the per-player map
+    ///   `GameState::extra_loyalty_activations_this_turn`.
+    /// - `SelfRef` — only the resolving permanent ("You may activate ~'s loyalty
+    ///   ability two more times this turn"). Stored in
+    ///   `GameObject::extra_loyalty_activations_this_turn` and usable only for that
+    ///   permanent's own characteristic loyalty abilities; a loyalty ability it
+    ///   gained in layer 6 (CR 613.1f) is not covered. That ability-level scope is
+    ///   the card's ruling, not CR text.
+    ///
+    /// The "may" is the later activation permission, not a choice made while
+    /// applying the effect (CR 608.2d), so the grant itself is mandatory. Both
+    /// stores are cleared at turn start (CR 514.2); the per-permanent store is
+    /// also cleared when the permanent enters the battlefield (CR 400.7).
     GrantExtraLoyaltyActivations {
         #[serde(default = "default_quantity_one")]
         amount: QuantityExpr,
@@ -21976,6 +21998,12 @@ fn default_counter_transfer_mode() -> CounterTransferMode {
 
 fn default_sum_aggregate() -> AggregateFunction {
     AggregateFunction::Sum
+}
+
+/// Backward-compat default for the legacy `PlayerScope::ParentObjectTargetController` unit tag.
+/// Old saves carried no `possession` field; the tag itself meant the controller.
+fn default_parent_object_target_possession() -> PossessionAxis {
+    PossessionAxis::Controller
 }
 
 /// Backward-compat default for the legacy
@@ -31497,6 +31525,20 @@ pub struct SpellContext {
     /// stays with a paused payment's continuation until that cost completes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pay_cost_paid_life_amount: Option<u32>,
+    /// CR 602.2b + CR 601.2h + CR 608.2h: counters actually removed while paying
+    /// THIS activated ability's cost (summed over its counter leaves), written by the
+    /// activation's own cost payment as each counter leg completes (a removal that
+    /// waits on a replacement choice is credited once it settles, CR 118.11); the
+    /// mana route binds it at production (CR 605.3b). Taken off the
+    /// root at the chain's depth-0 entry and seeded into `last_effect_amount`, so
+    /// "… removed this way" / "that much" read it. `None` = no counter cost;
+    /// `Some(0)` = a counter cost that removed none. CR 707.10: a copy of the
+    /// ability copies all decisions made for it and can't pay the cost again, so a
+    /// copy keeps the original's count (the official copier rulings: "If the activated
+    /// ability's cost contains a choice, such as … a number of counters to remove,
+    /// the copy uses that same information").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_removed_counter_amount: Option<u32>,
     /// CR 701.9a + CR 608.2c: The result of the immediately preceding discard
     /// instruction. `apply_parent_chain_context` copies this only to that
     /// discard's direct child and clears it on every other hand-off.
@@ -42783,6 +42825,18 @@ mod tests {
                 filter: TargetFilter::Any,
                 comparator: Comparator::GE,
                 count: Box::new(QuantityExpr::Fixed { value: 1 }),
+            }
+        );
+    }
+
+    #[test]
+    fn player_scope_legacy_parent_object_target_controller_alias_defaults_to_controller() {
+        let json = r#"{"type": "ParentObjectTargetController"}"#;
+        let deserialized: PlayerScope = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            deserialized,
+            PlayerScope::ParentObjectTarget {
+                possession: PossessionAxis::Controller,
             }
         );
     }

@@ -74,7 +74,27 @@ pub struct TournamentRequestId(pub u64);
 ///      tokens …" tail); it is serde-defaulted, so a sidecar without it decodes
 ///      as the linked-exile-only sidecar.
 ///
-/// 154, 155 — reserved for #10039 and #10036 (wire 136 / 137); not on main.
+/// 155 — `PendingChangeZoneIteration` members carry their pre-event entry
+///      modifications (CR 603.6a + CR 614.12): `remaining` becomes
+///      `ChangeZoneMemberEntry` records and the raw gate fields are removed; old
+///      peers cannot parse a parked ChangeZone frame. `RESOLUTION_STATE_WIRE_VERSION`
+///      moves from 6 to 7 with it: a v154 peer refuses the version-7 resolution
+///      state. Full-game peers and P2P move in lockstep (wire 137); no lobby
+///      carrier names it.
+///
+/// 154 — `PendingCostMoveResume` gains `CounterCostRemovalPayment`, a
+///      counter-removal cost paused while a replacement choice settles its
+///      current removal (CR 616.1; the settled count is credited to the
+///      activation, CR 118.11), with its `PausedCounterCostRemoval` record
+///      (which carries its `replacement_subtree` boundary);
+///      `ManaAbilityCostCursor` gains the optional `counter_removal` record.
+///      Serialized in `GameState.pending_cost_move_resume`: a v153 peer cannot
+///      parse the new tag. The same version carries the activation-owned
+///      removed-counter count (`SpellContext.cost_removed_counter_amount`,
+///      `ManaAbilityCostCursor.cost_removed_counters`,
+///      `PendingManaAbility.cost_removed_counters`; optional, skipped when
+///      unset), which a v153 peer re-encoding state would drop. Full-game
+///      peers and P2P move in lockstep (wire 136); no lobby carrier names it.
 ///
 /// 153 — `ContinuousModification::GrantAllActivatedAbilitiesOf` gains the
 ///      optional kind selector `kind: Option<ActivatedAbilityKind>`, and the
@@ -2442,10 +2462,6 @@ mod tests {
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
         assert_eq!(MIN_SUPPORTED_PROTOCOL, 155);
-        // 154 and 155 are reserved by #10039 / #10036 and never shipped on main, so
-        // the previous main version (153) sits below the one-version window and is
-        // refused on the legacy lobby path too.
-        const { assert!(153 < MIN_SUPPORTED_PROTOCOL) };
     }
 
     #[test]

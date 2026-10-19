@@ -87,6 +87,8 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // permission's `enters_with_modifications` becomes a `PendingEntersModifications` object
 // (was a `ContinuousModification` array) and `Effect::AddPendingEntersModifications`
 // carries its `rider` object in place of the required `modifications` array.
+// v154 (after v153, #10006's kind-selected activated grant) adds `PendingCostMoveResume::CounterCostRemovalPayment`
+// (CR 616.1 deferred counter-cost removal) and `ManaAbilityCostCursor.counter_removal` to GameState.
 // v134 adds `GameEvent::AbilityActivated.stack_entry` (the activation's stack object).
 // v147 adds the Eye to Eye / Mouth to Mouth physical contest.
 // v148 adds Timesifter's top-card exile contest (`Effect::ExileTopCardContest`,
@@ -97,7 +99,8 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // `ShortcutProposal.leading_aims`.
 // v153 adds the optional kind selector to GrantAllActivatedAbilitiesOf and removes the
 // loyalty-grant sibling variant.
-// v154 and v155 are reserved for #10039 and #10036.
+// v155 carries each parked ChangeZone member's pre-event entry modifications
+// (`ChangeZoneMemberEntry`, CR 603.6a + CR 614.12) in GameState.
 // v156 adds QuantityQuality/NumberQuality (CR 107.1, CR 603.4) to GameState ability conditions,
 // and the optional per-seat created_tokens channel (each seat's pinned creation result) on
 // PendingContinuation's player-scope tail sidecar.
@@ -201,8 +204,10 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 //      and `ShortcutProposal.leading_aims`.
 // +82: v153 adds the optional kind selector to GrantAllActivatedAbilitiesOf
 // and removes the loyalty-grant sibling variant.
-// (+83, v154, is reserved for #10039.)
-// (+84, v155, is reserved for #10036.)
+// +83: v154 adds `PendingCostMoveResume::CounterCostRemovalPayment` and
+//      `ManaAbilityCostCursor.counter_removal` to GameState.
+// +84: v155 retypes `PendingChangeZoneIteration.remaining` to `ChangeZoneMemberEntry`
+//      (pre-event entry modifications) and drops the raw gate fields.
 // +85: v156 adds `QuantityQuality` / `NumberQuality` to GameState ability conditions,
 // and the optional per-seat `created_tokens` player-scope sidecar channel (each seat's
 // pinned creation result).
@@ -314,8 +319,8 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 // +79: wire 133 moves with full-game v151 for populated Bestow payloads.
 // +80: wire 134 moves with full-game v152 for the shortcut suggestion fields.
 // +81: wire 135 moves with full-game v153 for the kind-selected activated grant.
-// (+82, wire 136, is reserved for #10039.)
-// (+83, wire 137, is reserved for #10036.)
+// +82: wire 136 moves with full-game v154 for the deferred counter-cost removal root.
+// +83: wire 137 moves with full-game v155 for the pre-event ChangeZone member entries.
 // +84: wire 138 moves with full-game v156 for QuantityQuality and the per-seat created_tokens sidecar channel.
 const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 84;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
