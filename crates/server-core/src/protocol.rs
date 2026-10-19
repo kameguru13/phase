@@ -3473,11 +3473,11 @@ mod tests {
         }
     }
 
-    /// v153: `StaticCondition`, `TriggerCondition` and `AbilityCondition` gain
+    /// v156: `StaticCondition`, `TriggerCondition` and `AbilityCondition` gain
     /// `QuantityQuality { quantity, quality }` with the new `NumberQuality`
-    /// (CR 107.1, CR 603.4), carried in `GameState` ability definitions; a v152
+    /// (CR 107.1, CR 603.4), carried in `GameState` ability definitions; a v153
     /// peer cannot decode the new tag, so it must be refused before it receives
-    /// v153 state.
+    /// v156 state.
     /// The same bump adds the optional per-seat `created_tokens` channel (each
     /// seat's pinned creation result) to the private
     /// player-scope tail sidecar that `PendingContinuation` carries under its
@@ -3485,6 +3485,13 @@ mod tests {
     /// tokens every seat created, for a paused "each player creates … The
     /// tokens …" tail); it is serde-defaulted, so a sidecar without it decodes
     /// as the linked-exile-only sidecar.
+    ///
+    /// v154 and v155 are reserved for #10039 and #10036 and are not on main.
+    ///
+    /// v153: `GrantAllActivatedAbilitiesOf` gains the optional `kind` selector
+    /// and the loyalty-grant sibling variant is removed. A v152 peer
+    /// drops the defaulted field silently and over-grants, so it must be
+    /// refused before it receives v153 state.
     ///
     /// v152: `ShortcutDecisionSchema` gains `suggested_declaration` and
     /// `leading_aims`, and `ShortcutProposal` gains `leading_aims`; a v151 peer
@@ -3736,8 +3743,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_153_for_number_quality_conditions() {
-        assert_eq!(PROTOCOL_VERSION, 153);
+    fn protocol_version_is_156_for_number_quality_conditions() {
+        assert_eq!(PROTOCOL_VERSION, 156);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3748,7 +3755,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_153_for_number_quality_conditions` stays
+    /// `protocol_version_is_156_for_number_quality_conditions` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

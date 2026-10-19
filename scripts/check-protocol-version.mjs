@@ -95,7 +95,10 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // carrier (`GameState.resolving_spell_final_part`; `deferred_spell_delivery` removed).
 // v152 adds `ShortcutDecisionSchema.suggested_declaration` and `.leading_aims`, and
 // `ShortcutProposal.leading_aims`.
-// v153 adds QuantityQuality/NumberQuality (CR 107.1, CR 603.4) to GameState ability conditions,
+// v153 adds the optional kind selector to GrantAllActivatedAbilitiesOf and removes the
+// loyalty-grant sibling variant.
+// v154 and v155 are reserved for #10039 and #10036.
+// v156 adds QuantityQuality/NumberQuality (CR 107.1, CR 603.4) to GameState ability conditions,
 // and the optional per-seat created_tokens channel (each seat's pinned creation result) on
 // PendingContinuation's player-scope tail sidecar.
 // Keep the measured base so a future merge cannot collapse independent wire
@@ -196,10 +199,14 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +80: v151 carries populated Bestow restoration payloads.
 // +81: v152 adds `ShortcutDecisionSchema.suggested_declaration` and `.leading_aims`,
 //      and `ShortcutProposal.leading_aims`.
-// +82: v153 adds `QuantityQuality` / `NumberQuality` to GameState ability conditions,
+// +82: v153 adds the optional kind selector to GrantAllActivatedAbilitiesOf
+// and removes the loyalty-grant sibling variant.
+// (+83, v154, is reserved for #10039.)
+// (+84, v155, is reserved for #10036.)
+// +85: v156 adds `QuantityQuality` / `NumberQuality` to GameState ability conditions,
 // and the optional per-seat `created_tokens` player-scope sidecar channel (each seat's
 // pinned creation result).
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 82;
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 85;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
@@ -306,8 +313,11 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 //      effect's `rider` key).
 // +79: wire 133 moves with full-game v151 for populated Bestow payloads.
 // +80: wire 134 moves with full-game v152 for the shortcut suggestion fields.
-// +81: wire 135 moves with full-game v153 for QuantityQuality and the per-seat created_tokens sidecar channel.
-const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 81;
+// +81: wire 135 moves with full-game v153 for the kind-selected activated grant.
+// (+82, wire 136, is reserved for #10039.)
+// (+83, wire 137, is reserved for #10036.)
+// +84: wire 138 moves with full-game v156 for QuantityQuality and the per-seat created_tokens sidecar channel.
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 84;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
 // EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse

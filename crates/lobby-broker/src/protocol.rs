@@ -60,12 +60,12 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
-/// 153 — `StaticCondition`, `TriggerCondition` and `AbilityCondition` gain
+/// 156 — `StaticCondition`, `TriggerCondition` and `AbilityCondition` gain
 ///      `QuantityQuality { quantity, quality }`, with new `NumberQuality`
 ///      (`{"type":"Prime"}` / `{"type":"Parity","value":"Odd"|"Even"}`), carried
-///      in ability definitions inside `GameState` (CR 107.1, CR 603.4). A v152
+///      in ability definitions inside `GameState` (CR 107.1, CR 603.4). A pre-v156
 ///      peer cannot parse the tag. Full-game peers and P2P move in lockstep
-///      (wire 135); no lobby carrier names it.
+///      (wire 138); no lobby carrier names it.
 ///      The same bump adds the optional per-seat `created_tokens` channel (each
 ///      seat's pinned creation result) to the private
 ///      player-scope tail sidecar that `PendingContinuation` carries under its
@@ -73,6 +73,23 @@ pub struct TournamentRequestId(pub u64);
 ///      tokens every seat created, for a paused "each player creates … The
 ///      tokens …" tail); it is serde-defaulted, so a sidecar without it decodes
 ///      as the linked-exile-only sidecar.
+///
+/// 154, 155 — reserved for #10039 and #10036 (wire 136 / 137); not on main.
+///
+/// 153 — `ContinuousModification::GrantAllActivatedAbilitiesOf` gains the
+///      optional kind selector `kind: Option<ActivatedAbilityKind>`, and the
+///      loyalty-grant sibling variant is removed (Nicol Bolas,
+///      Dragon-God's loyalty grant is `kind: Some(Loyalty)` on the activated
+///      authority — the same parameterization shape as entry 127's FilterProp
+///      merge). The field rides in `GameState`'s transient continuous effects
+///      with `#[serde(default)]`, and the enum has no `deny_unknown_fields`,
+///      so a v152 peer reading kind-bearing Bolas state drops `kind` SILENTLY
+///      and over-grants every activated ability of every other planeswalker —
+///      the silent-skew class entry 129 refuses to tolerate without a
+///      handshake-refusable bump. The removed tag never shipped (no committed
+///      export names it), so no migration shim exists; branch-era saved states
+///      fail loudly on the unknown variant. P2P moves in lockstep (wire 135);
+///      lobby messages are unchanged.
 ///
 /// 152 — `ShortcutDecisionSchema` gains `suggested_declaration` (the offer's
 ///      eliminating suggestion) and `leading_aims` (published slots a trigger on
@@ -1162,7 +1179,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 153;
+pub const PROTOCOL_VERSION: u32 = 156;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2419,12 +2436,16 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 153);
+        assert_eq!(PROTOCOL_VERSION, 156);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 152);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 155);
+        // 154 and 155 are reserved by #10039 / #10036 and never shipped on main, so
+        // the previous main version (153) sits below the one-version window and is
+        // refused on the legacy lobby path too.
+        const { assert!(153 < MIN_SUPPORTED_PROTOCOL) };
     }
 
     #[test]

@@ -9366,9 +9366,12 @@ fn continuous_modification_reads_filter_population(
     match modification {
         ContinuousModification::AddKeyword { keyword } => has_keyword(keyword),
         ContinuousModification::RemoveKeyword { keyword } => has_keyword(keyword),
-        ContinuousModification::GrantAllActivatedAbilitiesOf { source, cap } => {
-            has_filter(source) || cap.as_ref().is_some_and(has_restriction)
-        }
+        // `kind` is a closed ActivatedAbilityKind selector: it names no population.
+        ContinuousModification::GrantAllActivatedAbilitiesOf {
+            source,
+            cap,
+            kind: _,
+        } => has_filter(source) || cap.as_ref().is_some_and(has_restriction),
         ContinuousModification::GrantAllTriggeredAbilitiesOf { source } => has_filter(source),
         ContinuousModification::SetDynamicPower { value } => has_quantity(value),
         ContinuousModification::SetDynamicToughness { value } => has_quantity(value),

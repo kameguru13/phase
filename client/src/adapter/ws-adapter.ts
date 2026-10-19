@@ -215,12 +215,12 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
- * 153 — StaticCondition, TriggerCondition and AbilityCondition gain
+ * 156 — StaticCondition, TriggerCondition and AbilityCondition gain
  *      QuantityQuality { quantity, quality } with the new NumberQuality
  *      ({"type":"Prime"} / {"type":"Parity","value":"Odd"|"Even"}), carried
  *      in GameState ability definitions (CR 107.1, CR 603.4) — see
- *      PROTOCOL_VERSION's own `/// 153` entry in
- *      crates/lobby-broker/src/protocol.rs. A v152 peer cannot parse the
+ *      PROTOCOL_VERSION's own `/// 156` entry in
+ *      crates/lobby-broker/src/protocol.rs. A pre-v156 peer cannot parse the
  *      tag; the exact-match version check at connect refuses the pairing.
  *      The same bump adds the optional per-seat `created_tokens` channel (each
  *      seat's pinned creation result) to the private
@@ -228,7 +228,15 @@ export class NativeEngineVersionMismatchError extends Error {
  *      existing `player_scope_linked_exile` key (CR 608.2c + CR 608.2f: the
  *      tokens every seat created, for a paused "each player creates … The
  *      tokens …" tail); it is serde-defaulted, so a sidecar without it decodes
- *      as the linked-exile-only sidecar. Wire 135 moves with it.
+ *      as the linked-exile-only sidecar. Wire 138 moves with it.
+ * 154, 155 — reserved for #10039 and #10036 (wire 136 / 137); not on main.
+ * 153 — GrantAllActivatedAbilitiesOf gains the optional kind selector
+ *       (Nicol Bolas, Dragon-God's loyalty grant is kind Loyalty on the
+ *       activated authority; the loyalty-grant sibling variant is
+ *       removed). A v152 peer drops the defaulted field silently and
+ *       over-grants every activated ability of every other planeswalker,
+ *       so the exact-match handshake refuses the pairing. P2P moves in
+ *       lockstep (wire 135).
  * 152 — ShortcutDecisionSchema gains suggested_declaration and leading_aims, and
  *      ShortcutProposal gains leading_aims; a v151 peer drops them. Wire 134 moves
  *      with it.
@@ -936,7 +944,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 153;
+export const PROTOCOL_VERSION = 156;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
