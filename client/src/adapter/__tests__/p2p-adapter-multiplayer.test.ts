@@ -5705,10 +5705,10 @@ describe("P2P wire-protocol version gate", () => {
     );
   });
 
-  it("refuses old reconnect acknowledgement before adopting populated Bestow state", async () => {
+  it.each([132, 133, 134, 135, 136])("refuses old reconnect acknowledgement v%s before adopting populated Bestow state", async (version) => {
     const refusing = makeGuest(new FakeDataConnection(), undefined, "prior-token");
     await refusing.adapter.initialize();
-    await refusing.conn.simulateData({ ...setupFrameAt(136), type: "reconnect_ack" });
+    await refusing.conn.simulateData({ ...setupFrameAt(version), type: "reconnect_ack" });
     await expect(refusing.adapter.initializeGame()).rejects.toMatchObject({
       code: "P2P_REJECTED", message: expect.stringContaining("Wire protocol mismatch"),
     });
@@ -5728,12 +5728,12 @@ describe("P2P wire-protocol version gate", () => {
     admitting.adapter.dispose();
   });
 
-  it("host rejects previous Bestow peers before seat or reconnect adoption", async () => {
+  it.each([132, 133, 134, 135, 136])("host rejects previous peers v%s before seat or reconnect adoption", async (version) => {
     const { adapter, emitConnection } = makeHost(2);
     await adapter.initialize();
     const oldJoin = await joinGuest(emitConnection, {
       type: "guest_deck", deckData: { player: { main_deck: [], sideboard: [] } },
-      wireProtocolVersion: 136,
+      wireProtocolVersion: version,
     });
     expect(await sentOfType(oldJoin, "reconnect_rejected")).toBeDefined();
     expect(oldJoin.open).toBe(false);
@@ -5753,7 +5753,7 @@ describe("P2P wire-protocol version gate", () => {
     expect(await sentOfType(current, "reconnect_rejected")).toBeUndefined();
     current.simulateClose();
     const oldReconnect = await joinGuest(emitConnection, {
-      type: "reconnect", playerToken: setup!.playerToken, wireProtocolVersion: 136,
+      type: "reconnect", playerToken: setup!.playerToken, wireProtocolVersion: version,
     });
     expect(await sentOfType(oldReconnect, "reconnect_rejected")).toBeDefined();
     expect(oldReconnect.open).toBe(false);

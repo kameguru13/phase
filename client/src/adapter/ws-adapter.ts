@@ -221,6 +221,22 @@ export class NativeEngineVersionMismatchError extends Error {
  *      in crates/lobby-broker/src/protocol.rs. A v154 peer cannot parse a parked
  *      ChangeZone frame and refuses the version-7 resolution state. Wire 137 moves
  *      with it.
+ * 154 — PendingCostMoveResume gains CounterCostRemovalPayment (a counter-removal
+ *       cost paused on a CR 616.1 replacement choice; the activation reads the
+ *       settled count, CR 118.11) and ManaAbilityCostCursor gains
+ *       counter_removal, carried in GameState.pending_cost_move_resume — see
+ *       PROTOCOL_VERSION's own `/// 154` entry in
+ *       crates/lobby-broker/src/protocol.rs. A v153 peer cannot parse the tag;
+ *       the exact-match version check at connect refuses the pairing. Wire 136
+ *       moves with it. PausedCounterCostRemoval carries its replacement_subtree
+ *       boundary.
+ * 153 — GrantAllActivatedAbilitiesOf gains the optional kind selector
+ *       (Nicol Bolas, Dragon-God's loyalty grant is kind Loyalty on the
+ *       activated authority; the loyalty-grant sibling variant is
+ *       removed). A v152 peer drops the defaulted field silently and
+ *       over-grants every activated ability of every other planeswalker,
+ *       so the exact-match handshake refuses the pairing. P2P moves in
+ *       lockstep (wire 135).
  * 152 — ShortcutDecisionSchema gains suggested_declaration and leading_aims, and
  *      ShortcutProposal gains leading_aims; a v151 peer drops them. Wire 134 moves
  *      with it.

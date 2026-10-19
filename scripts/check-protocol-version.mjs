@@ -85,6 +85,8 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // permission's `enters_with_modifications` becomes a `PendingEntersModifications` object
 // (was a `ContinuousModification` array) and `Effect::AddPendingEntersModifications`
 // carries its `rider` object in place of the required `modifications` array.
+// v154 (after v153, #10006's kind-selected activated grant) adds `PendingCostMoveResume::CounterCostRemovalPayment`
+// (CR 616.1 deferred counter-cost removal) and `ManaAbilityCostCursor.counter_removal` to GameState.
 // v134 adds `GameEvent::AbilityActivated.stack_entry` (the activation's stack object).
 // v147 adds the Eye to Eye / Mouth to Mouth physical contest.
 // v148 adds Timesifter's top-card exile contest (`Effect::ExileTopCardContest`,
@@ -193,7 +195,10 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +80: v151 carries populated Bestow restoration payloads.
 // +81: v152 adds `ShortcutDecisionSchema.suggested_declaration` and `.leading_aims`,
 //      and `ShortcutProposal.leading_aims`.
-// +82, +83: v153 and v154 are claimed by open PRs #10004 and #10039.
+// +82: v153 adds the optional kind selector to GrantAllActivatedAbilitiesOf
+// and removes the loyalty-grant sibling variant.
+// +83: v154 adds `PendingCostMoveResume::CounterCostRemovalPayment` and
+//      `ManaAbilityCostCursor.counter_removal` to GameState.
 // +84: v155 retypes `PendingChangeZoneIteration.remaining` to `ChangeZoneMemberEntry`
 //      (pre-event entry modifications) and drops the raw gate fields.
 const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 84;
@@ -303,7 +308,8 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 //      effect's `rider` key).
 // +79: wire 133 moves with full-game v151 for populated Bestow payloads.
 // +80: wire 134 moves with full-game v152 for the shortcut suggestion fields.
-// +81, +82: wires 135 and 136 are claimed by open PRs #10004 and #10039.
+// +81: wire 135 moves with full-game v153 for the kind-selected activated grant.
+// +82: wire 136 moves with full-game v154 for the deferred counter-cost removal root.
 // +83: wire 137 moves with full-game v155 for the pre-event ChangeZone member entries.
 const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 83;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this

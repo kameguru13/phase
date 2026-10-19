@@ -1257,7 +1257,8 @@ fn redact_activation_records(filtered: &mut GameState) {
     if let Some(resume) = filtered.pending_cost_move_resume.as_mut() {
         match resume {
             PendingCostMoveResume::Cast { pending, .. }
-            | PendingCostMoveResume::SacrificeForCost { pending, .. } => {
+            | PendingCostMoveResume::SacrificeForCost { pending, .. }
+            | PendingCostMoveResume::CounterCostRemovalPayment { pending, .. } => {
                 if let Some(pending) = pending.as_deref_mut() {
                     clear(pending);
                 }
@@ -7137,6 +7138,8 @@ mod tests {
                 next_exiled: 0,
                 next_sacrificed: 0,
                 next_counter_choice: 0,
+                cost_removed_counters: None,
+                counter_removal: None,
                 selected_exile_remaining: None,
                 selected_sacrifice_remaining: None,
                 deferred_cost_events: Vec::new(),
@@ -7491,6 +7494,7 @@ mod tests {
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
+            cost_removed_counters: None,
             batch_siblings: Vec::new(),
         })
     }
@@ -11660,6 +11664,8 @@ mod tests {
                 next_exiled: 0,
                 next_sacrificed: 0,
                 next_counter_choice: 0,
+                cost_removed_counters: None,
+                counter_removal: None,
                 selected_exile_remaining: Some(vec![hidden]),
                 selected_sacrifice_remaining: None,
                 deferred_cost_events: Vec::new(),
@@ -11675,6 +11681,8 @@ mod tests {
                 paused_at_index: 0,
                 destination: Zone::Exile,
                 completion: PendingCostMoveCompletion::FinishPending,
+                deferred_cost_events: Vec::new(),
+                departure_record_indices: Vec::new(),
             },
             PendingCostMoveResume::Foretell {
                 player: PlayerId(0),
@@ -11692,6 +11700,8 @@ mod tests {
                     phyrexian_choices: None,
                     pre_payment_checks: None,
                 },
+                deferred_cost_events: Vec::new(),
+                departure_record_indices: Vec::new(),
             },
             PendingCostMoveResume::SacrificeForCost {
                 player: PlayerId(0),

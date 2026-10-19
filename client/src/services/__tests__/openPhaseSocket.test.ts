@@ -421,6 +421,17 @@ describe("openPhaseSocket", () => {
     expect(ws.close).toHaveBeenCalled();
   });
 
+  it("rejects Full v152 before it can read a deferred counter-cost removal", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: 152 }));
+
+    await expect(promise).rejects.toMatchObject({
+      kind: "protocol_mismatch",
+    });
+    expect(ws.close).toHaveBeenCalled();
+  });
+
   it("rejects Full v151 before it can read the shortcut suggestion", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
@@ -443,7 +454,7 @@ describe("openPhaseSocket", () => {
     expect(ws.close).toHaveBeenCalled();
   });
 
-  it("accepts the literal Full v155 pre-event change-zone entry protocol", async () => {
+  it("accepts the literal Full v155 pre-event change-zone entry, deferred counter-cost removal, kind-selected grant, shortcut-suggestion and populated Bestow protocol", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
     ws.deliverMessage(helloFrame({ protocol_version: 155 }));

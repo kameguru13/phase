@@ -3478,6 +3478,20 @@ mod tests {
     /// CR 614.12) and drops the raw gate fields, and the persisted resolution
     /// state moves from version 6 to 7; a v154 peer cannot parse a parked
     /// ChangeZone frame, so it must be refused before it receives v155 state.
+    ///
+    /// v154: `PendingCostMoveResume` gains `CounterCostRemovalPayment` (a
+    /// counter-removal cost paused on a CR 616.1 replacement choice, whose
+    /// settled count the activation reads, CR 118.11) and
+    /// `ManaAbilityCostCursor` gains `counter_removal`, both carried in
+    /// `GameState::pending_cost_move_resume`; a v153 peer cannot parse the new
+    /// tag, so it must be refused before it receives v154 state;
+    /// `PausedCounterCostRemoval` carries its `replacement_subtree` boundary.
+    ///
+    /// v153: `GrantAllActivatedAbilitiesOf` gains the optional `kind` selector
+    /// and the loyalty-grant sibling variant is removed. A v152 peer
+    /// drops the defaulted field silently and over-grants, so it must be
+    /// refused before it receives v153 state.
+    ///
     /// v152: `ShortcutDecisionSchema` gains `suggested_declaration` and
     /// `leading_aims`, and `ShortcutProposal` gains `leading_aims`; a v151 peer
     /// drops them, so it must be refused before it receives v152 state.
