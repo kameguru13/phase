@@ -1652,15 +1652,18 @@ pub(super) fn card_type_condition_as_entry_this_way(
 }
 
 /// CR 614.1c + CR 614.12: the typed entry gate for an anaphoric entry-counter rider —
-/// `Some` exactly when `body` is the rider (all-consuming, optional final ".") and `cond`
-/// converts through `card_type_condition_as_entry_this_way`.
+/// `Some` exactly when `body` is the singular-subject rider (all-consuming, optional
+/// final ".") and `cond` converts through `card_type_condition_as_entry_this_way`.
+/// The distributive plural subject ("each of them enters with …") is not admitted:
+/// no printed rider gates it in a form this conversion represents (Semester's End's
+/// compound creature/planeswalker rider is not consumed whole), so it stays a later gate.
 pub(super) fn anaphoric_entry_counter_gate(
     cond: &AbilityCondition,
     body: &str,
 ) -> Option<AbilityCondition> {
     nom_parse_lower(&body.trim().to_lowercase(), |i| {
         all_consuming(terminated(
-            super::parse_moved_object_enters_with_counters,
+            super::parse_single_moved_object_enters_with_counters,
             opt(tag(".")),
         ))
         .parse(i)

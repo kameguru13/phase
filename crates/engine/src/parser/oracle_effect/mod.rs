@@ -2702,38 +2702,66 @@ fn try_parse_lose_control_delayed_trigger(
     ))
 }
 
-/// CR 614.1c + CR 122.1: "<it | that creature> enters with <an additional | N additional>
-/// <+1/+1 | -1/-1> counter(s) on it" — an entry-replacement rider naming the object an
-/// earlier instruction moved. Single authority for this rider grammar: the effect
-/// producer (`try_parse_enters_this_way_additional_counter`, reached through
-/// `entry_counter_rider_clause`), the guard conversion in `parse_effect_chain_ir_body`,
-/// and the sequence-level swallow recognizer all call it.
+/// CR 614.1c + CR 122.1: the rider payload after "<subject> enters with " — "<an
+/// additional | N additional> <+1/+1 | -1/-1> counter(s) on it".
+fn parse_entry_counter_rider_payload(input: &str) -> OracleResult<'_, (CounterType, u32)> {
+    (
+        alt((
+            value(1u32, tag("an additional ")),
+            terminated(nom_primitives::parse_number, tag(" additional ")),
+        )),
+        alt((
+            value(CounterType::Plus1Plus1, tag("+1/+1")),
+            value(CounterType::Minus1Minus1, tag("-1/-1")),
+        )),
+        alt((tag(" counter on it"), tag(" counters on it"))),
+    )
+        .map(|(count, counter_type, _)| (counter_type, count))
+        .parse(input)
+}
+
+/// CR 614.1c + CR 122.1: "<it | that creature | each of them> enters with <an
+/// additional | N additional> <+1/+1 | -1/-1> counter(s) on it" — an entry-replacement
+/// rider naming the object(s) an earlier instruction moved. Single authority for this
+/// rider grammar: the effect producer (`try_parse_enters_this_way_additional_counter`)
+/// calls it, and the guard conversion in `parse_effect_chain_ir_body` and the
+/// sequence-level swallow recognizer call its singular-subject form
+/// (`parse_single_moved_object_enters_with_counters`).
 pub(crate) fn parse_moved_object_enters_with_counters(
+    input: &str,
+) -> OracleResult<'_, (CounterType, u32)> {
+    alt((
+        parse_single_moved_object_enters_with_counters,
+        // CR 608.2c: the distributive plural anaphor after a multi-object mover
+        // ("Each of them enters with …" — Aberrant Return) names every object that
+        // mover put onto the battlefield.
+        preceded(
+            tag("each of them enters with "),
+            parse_entry_counter_rider_payload,
+        ),
+    ))
+    .parse(input)
+}
+
+/// CR 614.1c + CR 122.1: the rider with a singular subject ("it" / "that creature") —
+/// the voice an anaphoric "if it's a <type>" gate binds to one moved object.
+pub(crate) fn parse_single_moved_object_enters_with_counters(
     input: &str,
 ) -> OracleResult<'_, (CounterType, u32)> {
     preceded(
         alt((tag("that creature enters with "), tag("it enters with "))),
-        (
-            alt((
-                value(1u32, tag("an additional ")),
-                terminated(nom_primitives::parse_number, tag(" additional ")),
-            )),
-            alt((
-                value(CounterType::Plus1Plus1, tag("+1/+1")),
-                value(CounterType::Minus1Minus1, tag("-1/-1")),
-            )),
-            alt((tag(" counter on it"), tag(" counters on it"))),
-        ),
+        parse_entry_counter_rider_payload,
     )
-    .map(|(count, counter_type, _)| (counter_type, count))
     .parse(input)
 }
 
-/// CR 122.1 + CR 608.2c: "it enters with an additional +1/+1 counter on it" rider
-/// after a zone-change-this-way gate (Winter Soldier, Reborn Avenger). Valid only
-/// under its battlefield-mover producer: reached solely through
-/// `entry_counter_rider_clause`, so its `ParentTarget` always names the object
-/// the preceding `ChangeZone` moved (and is folded into that move).
+/// CR 122.1 + CR 608.2c + CR 614.12: an additional entry-counter rider bound to
+/// its battlefield-mover producer. `entry_counter_rider_clause` reads a gated
+/// rider (Winter Soldier, Reborn Avenger), whose `ParentTarget` is folded into
+/// the move by `lower::fold_enters_this_way_counter_rider`.
+/// `sequence::parse_moved_object_entry_counters_continuation` reads an unconditional
+/// rider after a battlefield mover, using only its counter type and count to
+/// modify how each moved object enters.
 fn try_parse_enters_this_way_additional_counter(lower: &str) -> Option<Effect> {
     let (counter_type, count) = super::oracle_nom::bridge::nom_parse_lower(lower.trim(), |i| {
         all_consuming(terminated(
@@ -4376,6 +4404,11 @@ fn try_parse_cast_this_way_enters_rider(lower: &str) -> Option<ParsedEffectClaus
 ///    <type>" gate, which `parse_effect_chain_ir_body` converts to that shape
 ///    via `conditions::anaphoric_entry_counter_gate`) — `lower::entry_rider_folds_into`,
 ///    the predicate the fold into `ChangeZone.conditional_enter_with_counters` uses.
+/// 3. (not dispatched here) an UNCONDITIONAL rider directly after a battlefield
+///    `ChangeZone` is read as a followup continuation
+///    (`sequence::parse_moved_object_entry_counters_continuation` →
+///    `TokenEntersWithCounters`), patching the mover's `enter_with_counters`;
+///    this function returns `None` for it (no condition).
 ///
 /// The first arm whose producer holds owns the clause; when its recognizer
 /// declines, the clause falls to the generic path rather than to a later arm
