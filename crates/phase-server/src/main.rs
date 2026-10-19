@@ -20359,14 +20359,14 @@ mod handshake_tests {
             )
         };
         assert_eq!(
-            classify(151),
+            classify(154),
             HelloGateOutcome::RejectProtocol {
-                client: 151,
-                server: 152
+                client: 154,
+                server: 155
             }
         );
         assert_eq!(
-            classify(152),
+            classify(155),
             HelloGateOutcome::Accept(ClientHelloInfo {
                 client_version: "bestow-peer".into(),
                 build_commit: "bestow-build".into(),

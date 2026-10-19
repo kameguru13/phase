@@ -421,7 +421,7 @@ describe("openPhaseSocket", () => {
     expect(ws.close).toHaveBeenCalled();
   });
 
-  it("rejects Full v151 before it can read a parked ChangeZone frame's pre-event member entries", async () => {
+  it("rejects Full v151 before it can read the shortcut suggestion", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
     ws.deliverMessage(helloFrame({ protocol_version: 151 }));
@@ -432,10 +432,21 @@ describe("openPhaseSocket", () => {
     expect(ws.close).toHaveBeenCalled();
   });
 
-  it("accepts the literal Full v152 pre-event change-zone entry protocol", async () => {
+  it.each([152, 153, 154])("rejects Full v%s before it can read a parked ChangeZone frame's pre-event member entries", async (version) => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
-    ws.deliverMessage(helloFrame({ protocol_version: 152 }));
+    ws.deliverMessage(helloFrame({ protocol_version: version }));
+
+    await expect(promise).rejects.toMatchObject({
+      kind: "protocol_mismatch",
+    });
+    expect(ws.close).toHaveBeenCalled();
+  });
+
+  it("accepts the literal Full v155 pre-event change-zone entry protocol", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: 155 }));
 
     await expect(promise).resolves.toBeDefined();
     expect(ws.close).not.toHaveBeenCalled();

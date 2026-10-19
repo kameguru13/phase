@@ -106,11 +106,14 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
- *  134 — game_setup and state_update carry GameState whose parked ChangeZone
+ *  137 — game_setup and state_update carry GameState whose parked ChangeZone
  *       frame stores each remaining member with its pre-event entry
  *       modifications (CR 603.6a + CR 614.12) and whose resolution state moves
- *       from version 6 to 7; a v133 peer cannot parse it. Bumped in lockstep
- *       with full-game protocol 152.
+ *       from version 6 to 7; a v136 peer cannot parse it. Bumped in lockstep
+ *       with full-game protocol 155.
+ *  134 — game_setup and state_update carry GameState whose loop offers may carry
+ *       ShortcutDecisionSchema suggested_declaration and leading_aims, and
+ *       ShortcutProposal leading_aims. Bumped in lockstep with full-game protocol 152.
  *  133: Populated GameObject.bestow_form carries removed creature subtypes
  *       as an object instead of the legacy boolean; full-game protocol 151.
  *  132 — game_setup and state_update carry GameState whose casting permissions may
@@ -716,7 +719,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 134 as const;
+export const WIRE_PROTOCOL_VERSION = 137 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

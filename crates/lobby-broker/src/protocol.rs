@@ -60,13 +60,21 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
-/// 152 — `PendingChangeZoneIteration` members carry their pre-event entry
+/// 155 — `PendingChangeZoneIteration` members carry their pre-event entry
 ///      modifications (CR 603.6a + CR 614.12): `remaining` becomes
 ///      `ChangeZoneMemberEntry` records and the raw gate fields are removed; old
 ///      peers cannot parse a parked ChangeZone frame. `RESOLUTION_STATE_WIRE_VERSION`
-///      moves from 6 to 7 with it: a v151 peer refuses the version-7 resolution
-///      state. Full-game peers and P2P move in lockstep (wire 134); no lobby
-///      carrier names it.
+///      moves from 6 to 7 with it: a v154 peer refuses the version-7 resolution
+///      state. Full-game peers and P2P move in lockstep (wire 137); no lobby
+///      carrier names it. (153/135 and 154/136 are reserved for open PRs #10004
+///      and #10039.)
+///
+/// 152 — `ShortcutDecisionSchema` gains `suggested_declaration` (the offer's
+///      eliminating suggestion) and `leading_aims` (published slots a trigger on
+///      the stack already targets), and `ShortcutProposal` gains `leading_aims`.
+///      A v151 peer drops them. Full-game peers and P2P move in lockstep
+///      (wire 134).
+///
 /// 151: Populated `GameObject.bestow_form` carries removed creature subtypes as
 ///      an object instead of the legacy boolean. Old readers cannot decode it;
 ///      full-game and P2P (wire 133) refuse them before state delivery.
@@ -1149,7 +1157,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 152;
+pub const PROTOCOL_VERSION: u32 = 155;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2406,12 +2414,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 152);
+        assert_eq!(PROTOCOL_VERSION, 155);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 151);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 154);
     }
 
     #[test]
