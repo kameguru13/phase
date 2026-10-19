@@ -11,9 +11,9 @@ How: the activation owns a removed-counter ledger. `pay_ability_cost_for_activat
 
 Review round 2 (maintainer F1 / F2 at 2d20628): a counter-cost root now resumes only when its whole replacement subtree has retired, wherever that subtree finishes (CR 616.1 + CR 601.2h + CR 602.2b). The replacement records a typed subtree boundary on the root; `counter_cost_root_subtree()` reports it `Absent`, `Unfinished` or `Retired`, and one action-boundary authority, `resume_parked_counter_cost_root_at_action_boundary`, advances an unfinished subtree and resumes a retired root. So answering an interactive child (Scry, a mana-colour choice, a discard, a sacrifice, an unless payment, an SBA) resumes the activation on every route, not only the replacement boundary (F1). The Prevented arm classifies a prevented removal by that subtree, so a prevented child removal finishes its own `CounterRemovals` queue and its rider before the root resumes, and only the root's own removal settles the payment (F2, and CodeRabbit's owner finding). The activation's announcement owns the trigger events its payment produces: one custody authority in `announcement_triggers` stages, commits and claims them (CR 603.2c: one trigger per occurrence; CR 603.3b: they go on the stack with the activation's batch), and paused observer parks filter already-claimed occurrences, so a dies or discard trigger from a child is put on the stack once, above the activation.
 
-Upstream sync: merges main d3f002d, including #9941's activation cost-span custodian. The two designs were reconciled to one authority: the push commits through `commit_activation_announcement`, and #9941's park stand-down, paid-cost commit flag and sacrifice-settle carrier write are kept. An activated mode prompt now counts as a live announcement at action entry (`announcement_live_at_action_entry`; CR 602.2a + CR 700.2a), so a modal activation's targeting and cost triggers survive a later cost prompt (Professor Hojo row).
+Upstream sync: merges main d3f002d, including #9941's activation cost-span custodian, and then main b6a83a8 (protocol renumber only). The two designs were reconciled to one authority: the push commits through `commit_activation_announcement`, and #9941's park stand-down, paid-cost commit flag and sacrifice-settle carrier write are kept. An activated mode prompt now counts as a live announcement at action entry (`announcement_live_at_action_entry`; CR 602.2a + CR 700.2a), so a modal activation's targeting and cost triggers survive a later cost prompt (Professor Hojo row).
 
-Protocol: the new cost-move root and fields are serialized, so this bumps the full-game protocol to 153 and the P2P wire protocol to 135. Upstream main is at 151 / 133; 152 / 134 are reserved for #10004, which is meant to land first (if this one lands first, or #10004 takes other numbers, every surface is renumbered). Surfaces: `lobby-broker`, `server-core`, `check-protocol-version.mjs`, the client constants and their handshake tests.
+Protocol: the new cost-move root and fields are serialized, so this bumps the full-game protocol to 154 and the P2P wire protocol to 136. Upstream main is at 152 / 134; 153 / 135 are reserved for #10004, which is meant to land first (if this one lands first, or #10004 takes other numbers, every surface is renumbered). Surfaces: `lobby-broker`, `server-core`, `check-protocol-version.mjs`, the client constants and their handshake tests, and the phase-server Bestow handshake test literals.
 
 ## Files changed
 
@@ -42,7 +42,7 @@ Protocol: the new cost-move root and fields are serialized, so this bumps the fu
 - `crates/engine/tests/integration/main.rs`
 - `crates/engine/tests/integration/mana_payment_class_rows.rs` (Mage-Ring Network row re-derived: castable `true`, reading `ff/H` by parity with Rasputin)
 - `crates/engine/tests/integration/activation_cost_work_census.rs`, `activation_cost_target_settlement.rs` (new `CounterCostTail` guard site), `issue_2862_teferi_loyalty.rs`, `ai_multi_target_selection.rs`
-- Protocol 153 / wire 135: `crates/lobby-broker/src/protocol.rs`, `crates/server-core/src/protocol.rs`, `scripts/check-protocol-version.mjs`, `client/src/network/protocol.ts`, `client/src/adapter/ws-adapter.ts`, and the client tests `protocol.test.ts`, `p2p-adapter-multiplayer.test.ts`, `openPhaseSocket.test.ts`
+- Protocol 154 / wire 136: `crates/lobby-broker/src/protocol.rs`, `crates/server-core/src/protocol.rs`, `scripts/check-protocol-version.mjs`, `client/src/network/protocol.ts`, `client/src/adapter/ws-adapter.ts`, the client tests `protocol.test.ts`, `p2p-adapter-multiplayer.test.ts`, `openPhaseSocket.test.ts`, and the handshake test in `crates/phase-server/src/main.rs`
 
 ## Track
 
@@ -69,16 +69,16 @@ CR 602.2b, CR 601.2f, CR 608.2d, CR 601.2g, CR 601.2h, CR 605.3a, CR 605.3b, CR 
 - [x] Final review-impl below is clean for the current committed head.
 - [x] Both anchors cite existing analogous code at the same seam.
 
-Head 375a58f merges upstream main d3f002d (b133e67). Run on a clean worktree, no Tilt, `CARGO_INCREMENTAL=0`, at 375a58f:
-- `cargo fmt --all --check`; `node scripts/check-protocol-version.mjs`; `./scripts/check-parser-combinators.sh d3f002d` (Gate A PASS, Gate G PASS); `cargo clippy -D warnings` on phase-engine (`--all-targets --features engine/proptest`), server-core and lobby-broker (0 warnings).
-- Tests: engine lib 24379 passed / 0 failed / 8 ignored; engine integration 12022 / 0 / 5 (including `cost_removed_counter_amount` 74 / 0 / 0, `announcement_trigger_collection`, `activation_cost_target_settlement`, `delayed_trigger_continuation`, `integration_bending`); phase-ai 2943 / 0 / 21; server-core 564 / 0; lobby-broker 292 / 0.
-- Client: `pnpm run type-check`; `pnpm lint` (0 errors); `pnpm vitest run` (9838 passed), which covers the protocol, P2P and socket handshake tests.
-- Parser output vs d3f002d with the same pinned MTGJSON data: card data differs only in `sage of hours` (`Ref(PreviousEffectAmount)` → `DivideRounded{Ref(PreviousEffectAmount), 5, Down}`).
+Head de714c7 merges upstream main b6a83a8 (341a17f) on top of the d3f002d sync (b133e67). Run on a clean worktree, no Tilt, `CARGO_INCREMENTAL=0`, at de714c7:
+- `cargo fmt --all --check`; `node scripts/check-protocol-version.mjs`; `./scripts/check-parser-combinators.sh b6a83a8` (Gate A PASS, Gate G PASS); `cargo clippy -D warnings --all-targets` on phase-engine (`--features engine/proptest`), phase-server, server-core and lobby-broker (0 warnings).
+- Tests: `cargo test --workspace --no-fail-fast`, 41576 passed / 0 failed / 60 ignored across 61 binaries: engine lib 24385 / 0 / 8; engine integration 12053 / 0 / 6 (including `cost_removed_counter_amount` 74 / 0 / 0, `announcement_trigger_collection`, `activation_cost_target_settlement`, `delayed_trigger_continuation`, `integration_bending`); phase-ai 2737 / 0 / 10; phase-server 429 / 0 (including the Bestow handshake test at 153 / 154); server-core 532 / 0; lobby-broker 292 / 0.
+- Client: `pnpm run type-check`; `pnpm lint` (0 errors); `pnpm vitest run` (9843 passed), which covers the protocol, P2P and socket handshake tests.
+- Parser output vs b6a83a8 with the same pinned MTGJSON data: 35925 cards each side; card data differs only in `sage of hours` (`Ref(PreviousEffectAmount)` → `DivideRounded{Ref(PreviousEffectAmount), 5, Down}`).
 - Review round 2 rows (each fix has a row that goes red with that fix reverted, except latent arms noted in the plan): Scry child on the stack and mana routes (F1); a two-entry prevented child with a trailing rider, an unrelated mill root parked, a same-subject child, and the root's own prevented removal (F2); mana-colour, discard, sacrifice, unless-payment (both players' legs) and SBA children; a dies trigger and a discard trigger from a child put on the stack once above the activation; and a modal activation's target trigger surviving its sacrifice prompt (Professor Hojo). The #9941 stand-down row pins where the trigger waits during the pause (custody); the trigger batch is the same either way.
 
 ## Gate A
 
-Gate A PASS head=375a58f8189652b46da5a503bfd0f1aa755d90f5 base=d3f002dae86dc6207486331b6e8b7a221fcbe584
+Gate A PASS head=de714c72f29a3de0fa0dac8f3eab5e3c6a0f5608 base=b6a83a84c1a6a0354026a02d3e2b5c16e285e784
 
 ## Anchored on
 
@@ -87,7 +87,7 @@ Gate A PASS head=375a58f8189652b46da5a503bfd0f1aa755d90f5 base=d3f002dae86dc6207
 
 ## Final review-impl
 
-Final review-impl PASS head=375a58f8189652b46da5a503bfd0f1aa755d90f5
+Final review-impl PASS head=de714c72f29a3de0fa0dac8f3eab5e3c6a0f5608
 
 ## Claimed parse impact
 
