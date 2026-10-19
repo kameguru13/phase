@@ -41,9 +41,15 @@ const HARDENED_SCALES: &str = "If one or more +1/+1 counters would be put on a c
 
 const BRANCHING_EVOLUTION: &str = "If one or more +1/+1 counters would be put on a creature you control, twice that many +1/+1 counters are put on that creature instead.";
 
-/// A board for P0: Zimone, `forests` Forests already in play, and (when
-/// `land_in_hand`) one land in hand. Returns the runner and the hand land.
-fn board(forests: usize, land_in_hand: bool) -> (GameRunner, Option<ObjectId>) {
+const CHATTERFANG: &str = "Forestwalk (This creature can't be blocked as long as defending player controls a Forest.)\nIf one or more tokens would be created under your control, those tokens plus that many 1/1 green Squirrel creature tokens are created instead.\n{B}, Sacrifice X Squirrels: Target creature gets +X/-X until end of turn.";
+
+const PARALLEL_LIVES: &str = "If an effect would create one or more tokens under your control, it creates twice that many of those tokens instead.";
+
+const HALVING_SEASON: &str = "If an opponent would create one or more tokens, they create half that many of each of those kinds of tokens instead, rounded down.\nIf an opponent would put one or more counters on a permanent or player, they put half that many of each of those kinds of counters on that permanent or player instead, rounded down.";
+
+/// The unbuilt board for P0: Zimone, `forests` Forests already in play, and
+/// (when `land_in_hand`) one land in hand. Returns the scenario and the hand land.
+fn board_scenario(forests: usize, land_in_hand: bool) -> (GameScenario, Option<ObjectId>) {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     scenario.add_creature_from_oracle(P0, "Zimone, All-Questioning", 1, 1, ZIMONE);
@@ -51,7 +57,21 @@ fn board(forests: usize, land_in_hand: bool) -> (GameRunner, Option<ObjectId>) {
         scenario.add_basic_land(P0, ManaColor::Green);
     }
     let hand_land = land_in_hand.then(|| scenario.add_land_to_hand(P0, "Wastes").id());
+    (scenario, hand_land)
+}
+
+/// A board for P0: Zimone, `forests` Forests already in play, and (when
+/// `land_in_hand`) one land in hand. Returns the runner and the hand land.
+fn board(forests: usize, land_in_hand: bool) -> (GameRunner, Option<ObjectId>) {
+    let (scenario, hand_land) = board_scenario(forests, land_in_hand);
     (scenario.build(), hand_land)
+}
+
+/// `board_scenario` plus Chatterfang, Squirrel General under P0.
+fn chatterfang_board(forests: usize, land_in_hand: bool) -> (GameScenario, Option<ObjectId>) {
+    let (mut scenario, hand_land) = board_scenario(forests, land_in_hand);
+    scenario.add_creature_from_oracle(P0, "Chatterfang, Squirrel General", 3, 3, CHATTERFANG);
+    (scenario, hand_land)
 }
 
 /// Play `land` from hand through the real `PlayLand` action (which records the
@@ -83,15 +103,20 @@ fn put_land(runner: &mut GameRunner, player: PlayerId) -> ObjectId {
     id
 }
 
-/// Every battlefield token named Primo, the Indivisible.
-fn primos(runner: &GameRunner) -> Vec<&GameObject> {
+/// Every battlefield token named `name`.
+fn tokens_named<'a>(runner: &'a GameRunner, name: &str) -> Vec<&'a GameObject> {
     let state = runner.state();
     state
         .battlefield
         .iter()
         .filter_map(|id| state.objects.get(id))
-        .filter(|o| o.is_token && o.name == PRIMO)
+        .filter(|o| o.is_token && o.name == name)
         .collect()
+}
+
+/// Every battlefield token named Primo, the Indivisible.
+fn primos(runner: &GameRunner) -> Vec<&GameObject> {
+    tokens_named(runner, PRIMO)
 }
 
 fn plus_counters(obj: &GameObject) -> u32 {
@@ -192,6 +217,8 @@ fn two_lands_create_primo_with_two_counters() {
     assert!(primo.color.contains(&ManaColor::Blue));
     // CR 704.5f: with its counters the 0/0 survives state-based actions.
     assert_eq!(plus_counters(primo), 2);
+    // With no replacement appending tokens, the created referent is Primo alone.
+    assert_eq!(runner.state().last_created_token_ids, vec![primo.id]);
 }
 
 /// CR 603.4 (ruling 1): no land entered this turn — no trigger, even with a
@@ -455,4 +482,120 @@ fn only_your_lands_and_your_entries_count() {
     record_battlefield_entry(runner.state_mut(), opponent_land);
     play_and_finish_turn(&mut runner, None);
     assert!(primos(&runner).is_empty());
+}
+
+/// The one battlefield token named `name`.
+fn the_token<'a>(runner: &'a GameRunner, name: &str) -> &'a GameObject {
+    let found = tokens_named(runner, name);
+    assert_eq!(found.len(), 1, "exactly one {name} token");
+    found[0]
+}
+
+/// CR 614.1a + CR 608.2c: Chatterfang replaces Primo's creation, so its
+/// Squirrel is created by Zimone's own "create" instruction, and "put that many
+/// +1/+1 counters on it" is a later instruction of the same effect. Chatterfang's
+/// ruling: anything else the creating effect specifies applies to both the
+/// original tokens and the Squirrels. 1 Forest + 1 played = 2 lands (prime):
+/// Primo becomes a 2/2 and the 1/1 Squirrel a 3/3.
+#[test]
+fn chatterfang_squirrel_gets_primos_counters() {
+    let (scenario, land) = chatterfang_board(1, true);
+    let mut runner = scenario.build();
+    play_and_finish_turn(&mut runner, land);
+
+    // Reach-guards: the trigger resolved (Primo has its counters) and
+    // Chatterfang's replacement applied (exactly one Squirrel).
+    let primo = the_token(&runner, PRIMO);
+    assert_eq!(plus_counters(primo), 2);
+    let squirrel = the_token(&runner, "Squirrel");
+    assert_eq!(
+        plus_counters(squirrel),
+        2,
+        "the Squirrel gets Primo's counters"
+    );
+    assert_eq!((squirrel.power, squirrel.toughness), (Some(3), Some(3)));
+    // The instruction's own token comes first, then the appended one.
+    assert_eq!(
+        runner.state().last_created_token_ids,
+        vec![primo.id, squirrel.id]
+    );
+}
+
+/// CR 603.4: with Chatterfang out but no land entered this turn (3 lands,
+/// prime), Zimone does not trigger: no Primo and no Squirrel. Paired with the
+/// same board plus a played land.
+#[test]
+fn chatterfang_no_trigger_no_squirrel() {
+    let (scenario, _) = chatterfang_board(3, false);
+    let mut runner = scenario.build();
+    play_and_finish_turn(&mut runner, None);
+    assert!(primos(&runner).is_empty());
+    assert!(tokens_named(&runner, "Squirrel").is_empty());
+
+    // Reach-guard: 2 Forests + 1 played = 3 lands (prime).
+    let (scenario, land) = chatterfang_board(2, true);
+    let mut runner = scenario.build();
+    play_and_finish_turn(&mut runner, land);
+    assert_eq!(plus_counters(the_token(&runner, PRIMO)), 3);
+    assert_eq!(plus_counters(the_token(&runner, "Squirrel")), 3);
+}
+
+/// CR 616.1 + CR 616.1e + CR 616.1f: Chatterfang and Parallel Lives (P0) and
+/// Halving Season (P1) all apply to Primo's creation, so P0 orders them; P0
+/// applies Parallel Lives first. The created batch is one Primo and one
+/// Squirrel. Halving Season's second ability halves the counters P0 (its
+/// opponent) puts on each: "that many" (2) becomes 1, on Primo and on the
+/// Squirrel alike (Chatterfang's ruling).
+#[test]
+fn chatterfang_squirrel_gets_counters_after_replacement_choice() {
+    let (mut scenario, land) = chatterfang_board(1, true);
+    scenario.add_enchantment_from_oracle(P0, "Parallel Lives", PARALLEL_LIVES);
+    scenario.add_enchantment_from_oracle(P1, "Halving Season", HALVING_SEASON);
+    let mut runner = scenario.build();
+    play_land(&mut runner, land.expect("a land in hand"));
+    advance_to_end_step(&mut runner);
+
+    let mut choices = 0;
+    for _ in 0..60 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::ReplacementChoice { candidates, .. } => {
+                let index = candidates
+                    .iter()
+                    .position(|candidate| candidate.description.contains("twice"))
+                    .expect("Parallel Lives is a candidate");
+                runner
+                    .act(GameAction::ChooseReplacement { index })
+                    .expect("choosing a replacement is legal");
+                choices += 1;
+            }
+            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => break,
+            WaitingFor::Priority { .. } => {
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("passing priority is legal");
+            }
+            other => panic!("unexpected prompt: {other:?}"),
+        }
+    }
+    // Reach-guard: the creation paused for exactly one ordering choice, so the
+    // tokens were created on the replacement-choice resume.
+    assert_eq!(choices, 1, "one replacement-order choice");
+    assert!(runner.state().stack.is_empty());
+
+    let primo = the_token(&runner, PRIMO);
+    assert_eq!(
+        plus_counters(primo),
+        1,
+        "Halving Season halves Primo's counters"
+    );
+    let squirrel = the_token(&runner, "Squirrel");
+    assert_eq!(
+        plus_counters(squirrel),
+        1,
+        "the Squirrel gets Primo's counters"
+    );
+    assert_eq!(
+        runner.state().last_created_token_ids,
+        vec![primo.id, squirrel.id]
+    );
 }
