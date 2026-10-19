@@ -117,6 +117,7 @@ mod block_trigger_cardinality;
 mod blocked_history_primitive;
 mod blocked_status_filter;
 mod bolas_citadel_regression;
+mod bolas_dragon_god_grants;
 mod bombur_gentle_dreamer_conditional_untap;
 mod boneyard_parley_pile_separation;
 mod boon_reflection_gain_life_drain;
@@ -567,6 +568,7 @@ mod ir_spell_node_readers;
 mod ironsoul_enforcer_commander_attacks_alone;
 mod issue_1005_suffer_the_past;
 mod issue_1007_fractal_harness_attach;
+mod issue_10088_opponents_graveyard_whole_phrase;
 mod issue_1008_korvold_sacrifice_triggers;
 mod issue_1010_magus_lucea_kane;
 mod issue_1011_vexing_puzzlebox_roll;
@@ -2028,6 +2030,7 @@ mod starting_intensity_keyword;
 mod tidebinder_source_type_gate;
 
 mod resolution_progress_contract;
+mod search_result_conditional_destination;
 mod search_result_missing_referent;
 
 mod celes_kotis_graveyard_origin_batch;

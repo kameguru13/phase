@@ -85,7 +85,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 // permission's `enters_with_modifications` becomes a `PendingEntersModifications` object
 // (was a `ContinuousModification` array) and `Effect::AddPendingEntersModifications`
 // carries its `rider` object in place of the required `modifications` array.
-// v154 (after v153, reserved for #10004) adds `PendingCostMoveResume::CounterCostRemovalPayment`
+// v154 (after v153, #10006's kind-selected activated grant) adds `PendingCostMoveResume::CounterCostRemovalPayment`
 // (CR 616.1 deferred counter-cost removal) and `ManaAbilityCostCursor.counter_removal` to GameState.
 // v134 adds `GameEvent::AbilityActivated.stack_entry` (the activation's stack object).
 // v147 adds the Eye to Eye / Mouth to Mouth physical contest.
@@ -193,7 +193,8 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +80: v151 carries populated Bestow restoration payloads.
 // +81: v152 adds `ShortcutDecisionSchema.suggested_declaration` and `.leading_aims`,
 //      and `ShortcutProposal.leading_aims`.
-// (+82, v153, is reserved for the Zimone PR, #10004.)
+// +82: v153 adds the optional kind selector to GrantAllActivatedAbilitiesOf
+// and removes the loyalty-grant sibling variant.
 // +83: v154 adds `PendingCostMoveResume::CounterCostRemovalPayment` and
 //      `ManaAbilityCostCursor.counter_removal` to GameState.
 const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 83;
@@ -303,7 +304,7 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 //      effect's `rider` key).
 // +79: wire 133 moves with full-game v151 for populated Bestow payloads.
 // +80: wire 134 moves with full-game v152 for the shortcut suggestion fields.
-// (+81, wire 135, is reserved for the Zimone PR, #10004.)
+// +81: wire 135 moves with full-game v153 for the kind-selected activated grant.
 // +82: wire 136 moves with full-game v154 for the deferred counter-cost removal root.
 const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 82;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this

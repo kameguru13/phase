@@ -223,7 +223,14 @@ export class NativeEngineVersionMismatchError extends Error {
  *       crates/lobby-broker/src/protocol.rs. A v153 peer cannot parse the tag;
  *       the exact-match version check at connect refuses the pairing. Wire 136
  *       moves with it. PausedCounterCostRemoval carries its replacement_subtree
- *       boundary. (153 is reserved for the Zimone PR, #10004.)
+ *       boundary.
+ * 153 — GrantAllActivatedAbilitiesOf gains the optional kind selector
+ *       (Nicol Bolas, Dragon-God's loyalty grant is kind Loyalty on the
+ *       activated authority; the loyalty-grant sibling variant is
+ *       removed). A v152 peer drops the defaulted field silently and
+ *       over-grants every activated ability of every other planeswalker,
+ *       so the exact-match handshake refuses the pairing. P2P moves in
+ *       lockstep (wire 135).
  * 152 — ShortcutDecisionSchema gains suggested_declaration and leading_aims, and
  *      ShortcutProposal gains leading_aims; a v151 peer drops them. Wire 134 moves
  *      with it.

@@ -3480,7 +3480,11 @@ mod tests {
     /// `GameState::pending_cost_move_resume`; a v153 peer cannot parse the new
     /// tag, so it must be refused before it receives v154 state;
     /// `PausedCounterCostRemoval` carries its `replacement_subtree` boundary.
-    /// (v153 is reserved for the Zimone PR, #10004.)
+    ///
+    /// v153: `GrantAllActivatedAbilitiesOf` gains the optional `kind` selector
+    /// and the loyalty-grant sibling variant is removed. A v152 peer
+    /// drops the defaulted field silently and over-grants, so it must be
+    /// refused before it receives v153 state.
     ///
     /// v152: `ShortcutDecisionSchema` gains `suggested_declaration` and
     /// `leading_aims`, and `ShortcutProposal` gains `leading_aims`; a v151 peer

@@ -20359,6 +20359,27 @@ mod handshake_tests {
             )
         };
         assert_eq!(
+            classify(150),
+            HelloGateOutcome::RejectProtocol {
+                client: 150,
+                server: 154
+            }
+        );
+        assert_eq!(
+            classify(151),
+            HelloGateOutcome::RejectProtocol {
+                client: 151,
+                server: 154
+            }
+        );
+        assert_eq!(
+            classify(152),
+            HelloGateOutcome::RejectProtocol {
+                client: 152,
+                server: 154
+            }
+        );
+        assert_eq!(
             classify(153),
             HelloGateOutcome::RejectProtocol {
                 client: 153,
