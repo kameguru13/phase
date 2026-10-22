@@ -1924,7 +1924,7 @@ pub(crate) fn process_one_zone_move_with_terminal(
 
 /// CR 401.4: Group object ids by owner in APNAP order for per-owner library
 /// arrangement prompts.
-fn group_object_ids_by_owner_apnap(
+pub(crate) fn group_object_ids_by_owner_apnap(
     state: &GameState,
     object_ids: &[ObjectId],
 ) -> Vec<(PlayerId, Vec<ObjectId>)> {
@@ -2004,6 +2004,48 @@ fn snapshot_mass_library_order_batch(
             })
             .collect(),
     }
+}
+
+/// CR 401.4 + CR 101.4: open the owners' arrangement of cards an effect puts
+/// into one library position at the same time — one EffectZoneChoice per owner
+/// in APNAP order; each owner orders only their own cards.
+pub(crate) fn open_owner_library_arrangement(
+    state: &mut GameState,
+    owner_batches: Vec<(PlayerId, Vec<ObjectId>)>,
+    source_id: ObjectId,
+    library_position: crate::types::ability::LibraryPosition,
+    track_exiled_by_source: bool,
+    duration: Option<crate::types::ability::Duration>,
+) {
+    let (first_owner, first_cards) = owner_batches
+        .first()
+        .expect("an owner library arrangement requires at least one owner batch")
+        .clone();
+    let remaining_batches: Vec<_> = owner_batches
+        .into_iter()
+        .skip(1)
+        .map(|(owner, cards)| snapshot_mass_library_order_batch(state, owner, cards))
+        .collect();
+    if !remaining_batches.is_empty() {
+        state.pending_mass_library_order_choice = Some(Box::new(
+            crate::types::game_state::PendingMassLibraryOrderChoice {
+                source_id,
+                library_position: library_position.clone(),
+                track_exiled_by_source,
+                duration: duration.clone(),
+                remaining_batches: crate::types::game_state::PendingMassLibraryOrderBatches::Typed(
+                    remaining_batches,
+                ),
+            },
+        ));
+    }
+    state.waiting_for = mass_library_order_effect_zone_choice(
+        snapshot_mass_library_order_batch(state, first_owner, first_cards),
+        source_id,
+        library_position,
+        track_exiled_by_source,
+        duration,
+    );
 }
 
 /// CR 401.4: After one owner batch of a mass library-order prompt completes,
@@ -2354,34 +2396,11 @@ pub fn resolve_all(
         && !random_order
         && matching.len() > 1
     {
+        // `matching.len() > 1` guarantees at least one owner batch.
         let owner_batches = group_object_ids_by_owner_apnap(state, &matching);
-        let (first_owner, first_cards) = owner_batches
-            .first()
-            .expect("matching.len() > 1 guarantees at least one owner batch")
-            .clone();
-        let remaining_batches: Vec<_> = owner_batches
-            .into_iter()
-            .skip(1)
-            .map(|(owner, cards)| snapshot_mass_library_order_batch(state, owner, cards))
-            .collect();
-        if !remaining_batches.is_empty() {
-            state.pending_mass_library_order_choice = Some(Box::new(
-                crate::types::game_state::PendingMassLibraryOrderChoice {
-                    source_id: ability.source_id,
-                    library_position: effect_library_position
-                        .clone()
-                        .expect("library-order branch requires an explicit library position"),
-                    track_exiled_by_source,
-                    duration: ability.duration.clone(),
-                    remaining_batches:
-                        crate::types::game_state::PendingMassLibraryOrderBatches::Typed(
-                            remaining_batches,
-                        ),
-                },
-            ));
-        }
-        state.waiting_for = mass_library_order_effect_zone_choice(
-            snapshot_mass_library_order_batch(state, first_owner, first_cards),
+        open_owner_library_arrangement(
+            state,
+            owner_batches,
             ability.source_id,
             effect_library_position
                 .clone()

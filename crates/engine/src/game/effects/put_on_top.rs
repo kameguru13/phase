@@ -341,9 +341,9 @@ pub fn resolve(
     // conjuncts are a strict superset of these two, so the fanout behaviour is
     // preserved rather than changed. That helper is left in place for its other
     // callers (`grep -rn is_per_opponent_target_fanout crates/engine/src/`).
-    let expected = if ability.multi_target.is_some()
-        && ability.target_choice_timing == TargetChoiceTiming::Stack
-    {
+    let announced_target_set =
+        ability.multi_target.is_some() && ability.target_choice_timing == TargetChoiceTiming::Stack;
+    let expected = if announced_target_set {
         collected_targets.len()
     } else {
         expected
@@ -493,10 +493,11 @@ pub fn resolve(
         return Ok(());
     }
 
-    // `count` carries the cardinality of the placement. For multi-card
-    // placement, CR 401.4 lets the owner arrange cards put into the same
-    // library position. The runtime uses target/selection order for "in any
-    // order" effects; linked-exile bottom cleanup randomizes separately below.
+    // `count` carries the cardinality of the placement. CR 401.4 lets the owner
+    // arrange cards put into the same library position: a forwarded selection
+    // (a resolution-time pick or an ordered search) is placed in its chooser's
+    // order, an announced target set opens its owners' arrangement below, and
+    // linked-exile bottom cleanup is randomized here.
     let mut randomized_targets;
     let to_place = if expected == 0 {
         // CR 701.13a: Both the bare (`ExiledBySource`) and And-composed (Jodah's
@@ -530,6 +531,40 @@ pub fn resolve(
         },
         other => other,
     };
+    // Whether the owner can arrange a group placed at this position.
+    // `BeneathTop` is not: `EffectZoneChoice` delivery normalizes it to `Top`
+    // and no announced multi-target `BeneathTop` producer exists (Unexpectedly
+    // Absent is single-target). `RandomWithinTop` is a random placement, not an
+    // arrangement.
+    let position_can_be_arranged = match &position {
+        LibraryPosition::Top | LibraryPosition::Bottom | LibraryPosition::NthFromTop { .. } => true,
+        LibraryPosition::BeneathTop { .. } | LibraryPosition::RandomWithinTop { .. } => false,
+    };
+    // CR 401.4 + CR 601.2c + CR 608.2d: an announced target set arrives in the
+    // caster's announcement order, which is not an arrangement; the owner of two
+    // or more cards put into one position of their library orders them as the
+    // effect is applied (CR 101.4 APNAP across owners). One card per owner has
+    // nothing to arrange and is delivered below. A linked-exile pool is a
+    // resolution-time scan, not the announcement. Resolution-time selections and
+    // ordered searches already carry the chooser's own arrangement and never
+    // announce a target set.
+    if announced_target_set
+        && !target_filter.references_exiled_by_source()
+        && position_can_be_arranged
+    {
+        let owner_batches = super::change_zone::group_object_ids_by_owner_apnap(state, to_place);
+        if owner_batches.iter().any(|(_, cards)| cards.len() >= 2) {
+            super::change_zone::open_owner_library_arrangement(
+                state,
+                owner_batches,
+                ability.source_id,
+                position,
+                false,
+                ability.duration.clone(),
+            );
+            return Ok(());
+        }
+    }
     // CR 701.24a + CR 401.4: Top placement is reversed at request construction so the
     // selected order remains top-to-bottom after sequential delivery; every
     // other position preserves selection order. `move_objects_simultaneously`

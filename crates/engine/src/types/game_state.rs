@@ -5144,7 +5144,7 @@ pub struct PendingPerPlayerZoneChoice {
 pub struct MassLibraryOrderMember {
     /// The exact object incarnation that was selected for this ordered move.
     pub identity: ObjectIncarnationRef,
-    /// The zone this member occupied when the mass move created the prompt.
+    /// The zone this member occupied when the library-order prompt was created.
     pub origin: Zone,
 }
 
@@ -16400,9 +16400,11 @@ pub enum WaitingFor {
         /// preserves bottom/nth placement across the choice round-trip.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         library_position: Option<LibraryPosition>,
-        /// Exact origin/identity snapshot for a fresh
-        /// mass `ChangeZoneAll` library-order prompt. Generic zone choices leave
-        /// this absent and therefore retain their ordinary strict zone check.
+        /// Exact origin/identity snapshot for a fresh CR 401.4 owner
+        /// library-order prompt: a `ChangeZoneAll` mass placement or an
+        /// announced target set placed by `PutAtLibraryPosition`. Generic zone
+        /// choices leave this absent and therefore retain their ordinary strict
+        /// zone check.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mass_library_order: Option<MassLibraryOrderBatch>,
         /// CR 118.3: When true, this choice is for a cost payment (e.g., exile cost)
