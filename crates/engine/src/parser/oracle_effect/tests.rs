@@ -25225,10 +25225,10 @@ fn put_one_two_or_three_target_creature_cards_is_bounded_multi_target() {
 
 /// CR 601.2c + CR 115.1a: "Put two target <permanents> on top of their owners'
 /// libraries" (Rebuking Ceremony, Plow Under) announces exactly two targets.
-/// SHAPE; the runtime proof for Rebuking Ceremony is
-/// `put_target_count_entry_counters.rs`. The destination assertion is only a
-/// reach guard that the clause parsed to a library move (the separate
-/// "libraries" plural routing defect is not asserted here).
+/// SHAPE; the runtime proof is `put_target_count_entry_counters.rs`. The clause
+/// routes to the positional placement — each card goes on top of its owner's
+/// library (CR 400.3) — and the announced count rides on `multi_target`
+/// (CR 601.2c + CR 115.1a).
 ///
 /// Paired control on the same entry points: a resource count on a target
 /// ("Put two +1/+1 counters on target creature") is not an announced target
@@ -25236,22 +25236,29 @@ fn put_one_two_or_three_target_creature_cards_is_bounded_multi_target() {
 #[test]
 fn put_two_target_permanents_is_exact_multi_target() {
     let two = MultiTargetSpec::exact(QuantityExpr::Fixed { value: 2 });
-    for text in [
-        "Put two target artifacts on top of their owners' libraries.",
-        "Put two target lands on top of their owners' libraries.",
+    for (text, expected_type) in [
+        (
+            "Put two target artifacts on top of their owners' libraries.",
+            TypeFilter::Artifact,
+        ),
+        (
+            "Put two target lands on top of their owners' libraries.",
+            TypeFilter::Land,
+        ),
     ] {
         let def = parse_effect_chain(text, AbilityKind::Spell);
-        assert!(
-            matches!(
-                def.effect.as_ref(),
-                Effect::ChangeZone {
-                    destination: Zone::Library,
-                    ..
-                }
-            ),
-            "{text:?}: reach guard: expected a library ChangeZone, got {:?}",
-            def.effect
-        );
+        let Effect::PutAtLibraryPosition {
+            position: LibraryPosition::Top,
+            target: TargetFilter::Typed(f),
+            ..
+        } = def.effect.as_ref()
+        else {
+            panic!(
+                "{text:?}: expected a top-of-library PutAtLibraryPosition, got {:?}",
+                def.effect
+            );
+        };
+        assert_eq!(f.type_filters, vec![expected_type], "{text:?}");
         assert_eq!(def.multi_target, Some(two.clone()), "{text:?}");
     }
 
@@ -25266,6 +25273,210 @@ fn put_two_target_permanents_is_exact_multi_target() {
     let clause = parse_effect_clause(counters, &mut ParseContext::default());
     assert!(matches!(clause.effect, Effect::PutCounter { .. }));
     assert_eq!(clause.multi_target, None, "{counters:?}");
+}
+
+/// Verbatim Oracle text of Vault 13: Dweller's Journey (Enchantment — Saga).
+const VAULT_13_ORACLE: &str = "(As this Saga enters and after your draw step, add a lore counter. Sacrifice after III.)\nI — For each player, exile up to one other target enchantment or creature that player controls until this Saga leaves the battlefield.\nII — You gain 2 life and scry 2.\nIII — Return two cards exiled with this Saga to the battlefield under their owners' control and put the rest on the bottom of their owners' libraries.";
+
+/// CR 400.3 + CR 401.4: "on top of / on the bottom of their owners' libraries"
+/// sends each moved object to its own owner's library at the stated position.
+/// Only a subject that begins with a target cardinality or the target article
+/// is a positional placement (`PutAtLibraryPosition`); an "all"/"each" mass
+/// subject is the `ChangeZoneAll` move that carries the position itself, and
+/// anaphoric ("the rest") or compound ("this creature and target creature")
+/// subjects keep their own routes. The singular "its owner's library" form is
+/// unchanged.
+#[test]
+fn plural_owners_libraries_placement_routes_by_subject_shape() {
+    fn typed_types(filter: &TargetFilter) -> &[TypeFilter] {
+        match filter {
+            TargetFilter::Typed(f) => &f.type_filters,
+            other => panic!("expected a typed target filter, got {other:?}"),
+        }
+    }
+
+    // R2 — grammar-axis row (no printed card): the bottom form is symmetric.
+    let text = "Put two target creatures on the bottom of their owners' libraries.";
+    let def = parse_effect_chain(text, AbilityKind::Spell);
+    let Effect::PutAtLibraryPosition {
+        position: LibraryPosition::Bottom,
+        target,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!(
+            "{text:?}: expected a bottom PutAtLibraryPosition, got {:?}",
+            def.effect
+        );
+    };
+    assert_eq!(typed_types(target), [TypeFilter::Creature], "{text:?}");
+    assert_eq!(
+        def.multi_target,
+        Some(MultiTargetSpec::exact(QuantityExpr::Fixed { value: 2 })),
+        "{text:?}"
+    );
+
+    // R2b — grammar-axis row (no printed card): "up to N target" admits the plural.
+    let text = "Put up to two target creatures on top of their owners' libraries.";
+    let def = parse_effect_chain(text, AbilityKind::Spell);
+    let Effect::PutAtLibraryPosition {
+        position: LibraryPosition::Top,
+        target,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!(
+            "{text:?}: expected a top PutAtLibraryPosition, got {:?}",
+            def.effect
+        );
+    };
+    assert_eq!(typed_types(target), [TypeFilter::Creature], "{text:?}");
+    assert_eq!(
+        def.multi_target,
+        Some(MultiTargetSpec::up_to(QuantityExpr::Fixed { value: 2 })),
+        "{text:?}"
+    );
+
+    // R2c — grammar-axis row (no printed card): the bare target article admits
+    // the plural; one target, no count.
+    let text = "Put target creature on the bottom of their owners' libraries.";
+    let def = parse_effect_chain(text, AbilityKind::Spell);
+    let Effect::PutAtLibraryPosition {
+        position: LibraryPosition::Bottom,
+        target,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!(
+            "{text:?}: expected a bottom PutAtLibraryPosition, got {:?}",
+            def.effect
+        );
+    };
+    assert_eq!(typed_types(target), [TypeFilter::Creature], "{text:?}");
+    assert_eq!(def.multi_target, None, "{text:?}");
+
+    // R3 — mass subjects (Terminus / Hallowed Burial; Harmonic Convergence) keep
+    // the `ChangeZoneAll` move with its own library position.
+    for (text, expected_type, expected_position) in [
+        (
+            "Put all creatures on the bottom of their owners' libraries.",
+            TypeFilter::Creature,
+            LibraryPosition::Bottom,
+        ),
+        (
+            "Put all enchantments on top of their owners' libraries.",
+            TypeFilter::Enchantment,
+            LibraryPosition::Top,
+        ),
+    ] {
+        let def = parse_effect_chain(text, AbilityKind::Spell);
+        let Effect::ChangeZoneAll {
+            destination: Zone::Library,
+            target,
+            library_position,
+            ..
+        } = def.effect.as_ref()
+        else {
+            panic!(
+                "{text:?}: expected a library ChangeZoneAll, got {:?}",
+                def.effect
+            );
+        };
+        assert_eq!(typed_types(target), [expected_type], "{text:?}");
+        assert_eq!(*library_position, Some(expected_position), "{text:?}");
+    }
+
+    // R8 — singular-library sibling (Griptide) is unchanged.
+    let text = "Put target creature on top of its owner's library.";
+    let def = parse_effect_chain(text, AbilityKind::Spell);
+    let Effect::PutAtLibraryPosition {
+        position: LibraryPosition::Top,
+        target,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!(
+            "{text:?}: expected a top PutAtLibraryPosition, got {:?}",
+            def.effect
+        );
+    };
+    assert_eq!(typed_types(target), [TypeFilter::Creature], "{text:?}");
+    assert_eq!(def.multi_target, None, "{text:?}");
+
+    // R10 — Vault 13 chapter III: the tracked remainder "the rest" stays off the
+    // positional route. `library_position` and `target` are deliberately NOT
+    // asserted: they are known pre-existing defects, deferred ("the rest" binds
+    // to the returned/latest tracked set rather than the Saga's remaining
+    // exiles, and the bottom placement is lost). This row must not be read as
+    // locking either in.
+    let parsed = parse_oracle_text(
+        VAULT_13_ORACLE,
+        "Vault 13: Dweller's Journey",
+        &[],
+        &["Enchantment".to_string()],
+        &["Saga".to_string()],
+    );
+    let chapter_iii = parsed
+        .triggers
+        .iter()
+        .find(|t| t.saga_chapter == Some(3))
+        .expect("chapter III trigger must parse");
+    let rest_move = chapter_iii
+        .execute
+        .as_deref()
+        .and_then(|execute| execute.sub_ability.as_deref())
+        .expect("chapter III has a rest-move sub-ability");
+    assert!(
+        matches!(
+            rest_move.effect.as_ref(),
+            Effect::ChangeZoneAll {
+                origin: Some(Zone::Exile),
+                destination: Zone::Library,
+                ..
+            }
+        ),
+        "Vault 13 chapter III rest move: expected an exile-to-library ChangeZoneAll, got {:?}",
+        rest_move.effect
+    );
+
+    // R11 — Void Stalker: a compound subject with an interior "target" stays off
+    // the positional route. `target` is deliberately NOT asserted (the second
+    // object is dropped — pre-existing; the card stays unsupported).
+    let parsed = parse_oracle_text(
+        "{2}{U}, {T}: Put this creature and target creature on top of their owners' libraries, then those players shuffle their libraries.",
+        "Void Stalker",
+        &[],
+        &["Creature".to_string()],
+        &["Eldrazi".to_string()],
+    );
+    let ability = parsed
+        .abilities
+        .first()
+        .expect("Void Stalker has an activated ability");
+    assert!(
+        matches!(
+            ability.effect.as_ref(),
+            Effect::ChangeZone {
+                destination: Zone::Library,
+                ..
+            }
+        ),
+        "Void Stalker: expected a library ChangeZone, got {:?}",
+        ability.effect
+    );
+    let mut effects = Vec::new();
+    for def in &parsed.abilities {
+        let _ = crate::types::ability_visit::visit_ability_def(def, &mut |effect| {
+            effects.push(effect.clone());
+            std::ops::ControlFlow::Continue(())
+        });
+    }
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PutAtLibraryPosition { .. })),
+        "Void Stalker must not route to PutAtLibraryPosition: {effects:?}"
+    );
 }
 
 /// The entry counters of a battlefield mover (single or mass), `None` for any
@@ -74532,8 +74743,29 @@ fn peel_library_placement_cardinality_discriminates_placement_shapes() {
     );
     assert_eq!(rest, "target cards from your graveyard");
 
-    // A concrete numeral is a count on the effect, never a target set
-    // (Brainstorm / Cavalier of Gales class).
+    // CR 601.2c + CR 115.1a: an exact "<N> target" count is an announced target set
+    let (got, rest) = peel_library_placement_cardinality("two target lands");
+    assert_eq!(
+        got,
+        LibraryPlacementCardinality::TargetSet(MultiTargetSpec::exact(QuantityExpr::Fixed {
+            value: 2
+        }))
+    );
+    assert_eq!(rest, "target lands");
+
+    let (got, rest) = peel_library_placement_cardinality("x target creatures");
+    assert_eq!(
+        got,
+        LibraryPlacementCardinality::TargetSet(MultiTargetSpec::exact(QuantityExpr::Ref {
+            qty: QuantityRef::Variable {
+                name: "X".to_string(),
+            },
+        }))
+    );
+    assert_eq!(rest, "target creatures");
+
+    // An article-less concrete numeral is a count on the effect, never a target
+    // set (Brainstorm / Cavalier of Gales class).
     let (got, rest) = peel_library_placement_cardinality("two cards from your hand");
     assert_eq!(
         got,
@@ -74558,6 +74790,37 @@ fn peel_library_placement_cardinality_discriminates_placement_shapes() {
         !matches!(got, LibraryPlacementCardinality::TargetSet(_)),
         "an article-less \"any number of\" is not a target set"
     );
+}
+
+/// CR 115.1 + CR 601.2c: `placement_noun_phrase_is_targeted` discriminates by
+/// structure, not vocabulary — only a noun phrase that BEGINS with a target
+/// cardinality or the target article is targeted. A "target" inside a
+/// compound subject ("~ and target creature") does not count.
+#[test]
+fn placement_noun_phrase_is_targeted_requires_a_leading_target_phrase() {
+    for input in [
+        "two target lands on top of their owners' libraries.",
+        "up to two target creatures on top of their owners' libraries.",
+        "any number of target cards on top of their owners' libraries.",
+        "target creature on the bottom of their owners' libraries.",
+    ] {
+        assert!(
+            placement_noun_phrase_is_targeted(input),
+            "{input:?} must be a targeted placement noun phrase"
+        );
+    }
+    for input in [
+        "the rest on the bottom of their owners' libraries.",
+        "all creatures on the bottom of their owners' libraries.",
+        "~ and target creature on top of their owners' libraries.",
+        "this creature and each creature it's blocking on top of their owners' libraries.",
+        "two cards from your hand on top of their owners' libraries.",
+    ] {
+        assert!(
+            !placement_noun_phrase_is_targeted(input),
+            "{input:?} must not be a targeted placement noun phrase"
+        );
+    }
 }
 
 /// A-13 — exact-count placement must not move. Brainstorm's placement clause

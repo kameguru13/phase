@@ -20323,9 +20323,9 @@ fn parse_clause_ast(text: &str, ctx: &mut ParseContext) -> ClauseAst {
 ///     so the lowering default of `count: Fixed(1)` stands.
 ///   * `Exact`     — "two cards", "x cards": a concrete count on the effect.
 ///   * `TargetSet` — "any number of [other|another] target …" / "up to N target
-///     …": an ANNOUNCED target set (CR 601.2c). The number of targets is fixed
-///     at announcement, so the placement set is the chosen targets and `count`
-///     is deliberately left alone.
+///     …" / "<N> target …": an ANNOUNCED target set (CR 601.2c). The number of
+///     targets is fixed at announcement, so the placement set is the chosen
+///     targets and `count` is deliberately left alone.
 #[derive(Debug, PartialEq)]
 enum LibraryPlacementCardinality {
     Unstated,
@@ -20350,6 +20350,18 @@ fn peel_library_placement_cardinality(input: &str) -> (LibraryPlacementCardinali
     // they start with a word rather than a numeral.
     if let (rest, Some(spec)) = strip_optional_target_prefix(input) {
         return (LibraryPlacementCardinality::TargetSet(spec), rest);
+    }
+    // CR 601.2c + CR 115.1a: an exact "<N> target …" / "x target …" count is
+    // an ANNOUNCED target set whose size the spell's text defines — not an
+    // effect count. `strip_exact_target_prefix` is the single authority for
+    // that grammar (article guard included) and leaves the article for
+    // `parse_target`. Tried before the bare-numeral arms below so "two target
+    // lands" can never be read as `Exact(2)`.
+    if let Some((count, rest)) = strip_exact_target_prefix(input) {
+        return (
+            LibraryPlacementCardinality::TargetSet(MultiTargetSpec::exact(count)),
+            rest,
+        );
     }
     // CR 107.1c + CR 115.10: untargeted "any number of <noun phrase>". Tried only
     // AFTER the target-set authority above has declined, so "any number of target
@@ -20381,6 +20393,24 @@ fn peel_library_placement_cardinality(input: &str) -> (LibraryPlacementCardinali
         }
     }
     (LibraryPlacementCardinality::Unstated, input)
+}
+
+/// CR 115.1 + CR 601.2c: does a positional placement's noun phrase name its
+/// objects as TARGETS — a target cardinality ("two target …", "up to N
+/// target …", "any number of target …") or the bare target article? Decided
+/// by the cardinality authority above, so the placement router and the
+/// lowering (`refine_put_at_library_position`) can never disagree. Every peel
+/// arm is a prefix parser, so the input may run past the placement terminator.
+fn placement_noun_phrase_is_targeted(input: &str) -> bool {
+    match peel_library_placement_cardinality(input) {
+        (LibraryPlacementCardinality::TargetSet(_), _) => true,
+        (LibraryPlacementCardinality::Unstated, rest) => {
+            tag::<_, _, OracleError<'_>>("target ").parse(rest).is_ok()
+        }
+        (LibraryPlacementCardinality::Exact(_) | LibraryPlacementCardinality::AnyNumber, _) => {
+            false
+        }
+    }
 }
 
 fn parse_exiled_cards_not_cast_cleanup(input: &str) -> Option<()> {
