@@ -3641,6 +3641,7 @@ fn filter_prop_recipient_read(prop: &FilterProp) -> RecipientRead {
         | FilterProp::NotColor { .. }
         | FilterProp::NotSupertype { .. }
         | FilterProp::Suspected
+        | FilterProp::Prepared
         | FilterProp::Renowned
         | FilterProp::Goaded
         | FilterProp::ToughnessGTPower
@@ -11247,6 +11248,7 @@ mod tests {
             counters: HashMap::new(),
             tapped: false,
             is_suspected: false,
+            was_prepared: false,
             attachments: Vec::new(),
         };
 
@@ -22104,6 +22106,7 @@ mod tests {
                 counters: HashMap::new(),
                 tapped: false,
                 is_suspected: false,
+                was_prepared: false,
                 attachments: Vec::new(),
             },
         );
@@ -22170,6 +22173,7 @@ mod tests {
                 counters: HashMap::new(),
                 tapped: false,
                 is_suspected: false,
+                was_prepared: false,
                 attachments: Vec::new(),
             },
             incarnation: 0,
@@ -22321,6 +22325,7 @@ mod tests {
                 counters: HashMap::new(),
                 tapped: false,
                 is_suspected: false,
+                was_prepared: false,
                 attachments: Vec::new(),
             },
             incarnation: 0,
@@ -22403,6 +22408,7 @@ mod tests {
                 counters: HashMap::new(),
                 tapped: false,
                 is_suspected: false,
+                was_prepared: false,
                 attachments: Vec::new(),
             },
             incarnation: 0,
@@ -22483,6 +22489,7 @@ mod tests {
                 counters: HashMap::new(),
                 tapped: false,
                 is_suspected: false,
+                was_prepared: false,
                 attachments: Vec::new(),
             },
             incarnation: 0,
@@ -22549,6 +22556,7 @@ mod tests {
                 counters: HashMap::new(),
                 tapped: false,
                 is_suspected: false,
+                was_prepared: false,
                 attachments: Vec::new(),
             },
             incarnation: 0,
@@ -22612,6 +22620,7 @@ mod tests {
                 counters: HashMap::new(),
                 tapped: false,
                 is_suspected: false,
+                was_prepared: false,
                 attachments: Vec::new(),
             },
             incarnation: 0,
@@ -22668,6 +22677,7 @@ mod tests {
                 counters: HashMap::new(),
                 tapped: false,
                 is_suspected: false,
+                was_prepared: false,
                 attachments: Vec::new(),
             },
             incarnation: 0,
@@ -22747,6 +22757,7 @@ mod tests {
                 counters: HashMap::new(),
                 tapped: false,
                 is_suspected: false,
+                was_prepared: false,
                 attachments: Vec::new(),
             },
             incarnation: 0,
@@ -23456,6 +23467,7 @@ mod tests {
                 counters: HashMap::new(),
                 tapped: false,
                 is_suspected: false,
+                was_prepared: false,
                 attachments: Vec::new(),
             },
         );
@@ -24278,6 +24290,7 @@ mod tests {
                     chosen_attributes: vec![],
                     tapped: false,
                     is_suspected: false,
+                    was_prepared: false,
                     attachments: Vec::new(),
                 },
             );
