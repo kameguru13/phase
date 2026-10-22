@@ -25280,8 +25280,8 @@ const VAULT_13_ORACLE: &str = "(As this Saga enters and after your draw step, ad
 
 /// CR 400.3 + CR 401.4: "on top of / on the bottom of their owners' libraries"
 /// sends each moved object to its own owner's library at the stated position.
-/// Only a subject that begins with a target cardinality or the target article
-/// is a positional placement (`PutAtLibraryPosition`); an "all"/"each" mass
+/// Only a subject that begins with a target cardinality or a declared-target
+/// prefix ("target", "another target", "other target") is a positional placement (`PutAtLibraryPosition`); an "all"/"each" mass
 /// subject is the `ChangeZoneAll` move that carries the position itself, and
 /// anaphoric ("the rest") or compound ("this creature and target creature")
 /// subjects keep their own routes. The singular "its owner's library" form is
@@ -74821,7 +74821,8 @@ fn peel_library_placement_cardinality_discriminates_placement_shapes() {
 
 /// CR 115.1 + CR 601.2c: `placement_noun_phrase_is_targeted` discriminates by
 /// structure, not vocabulary — only a noun phrase that BEGINS with a target
-/// cardinality or the target article is targeted. A "target" inside a
+/// cardinality or a declared-target prefix ("target" / "another target" /
+/// "other target") is targeted. A "target" inside a
 /// compound subject ("~ and target creature") does not count.
 #[test]
 fn placement_noun_phrase_is_targeted_requires_a_leading_target_phrase() {
