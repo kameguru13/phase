@@ -1243,9 +1243,10 @@ fn drive_token_event_delivery(
                     super::token_copy::CopyTokenApplyCompletion::Paused => {
                         // CR 614.1a + CR 616.2: batches remain behind this copy
                         // pause. Its finished copies are in `delivered`; the rest
-                        // of the batch accumulates into the emptied ledger when
-                        // its pause resumes (a liminal entry's commit, an entry
-                        // counter or Aura host answer, or a direct choice).
+                        // of the batch reaches the ledger when its pause resumes
+                        // (a liminal entry's commit, an entry counter or Aura host
+                        // answer, or a direct choice), and the resume drops the
+                        // ids the event already holds.
                         state.last_created_token_ids.clear();
                         cursor.resumed = Some(position);
                         let primary_ids = primary_token_ids(&cursor.delivered);
