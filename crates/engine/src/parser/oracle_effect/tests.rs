@@ -25355,6 +25355,33 @@ fn plural_owners_libraries_placement_routes_by_subject_shape() {
     assert_eq!(typed_types(target), [TypeFilter::Creature], "{text:?}");
     assert_eq!(def.multi_target, None, "{text:?}");
 
+    // R2d — grammar-axis row (no printed card): the "another target" member of
+    // the declared-target family admits the plural; one target, no count, and
+    // the target keeps its "another" restriction.
+    let text = "Put another target creature on the bottom of their owners' libraries.";
+    let def = parse_effect_chain(text, AbilityKind::Spell);
+    let Effect::PutAtLibraryPosition {
+        position: LibraryPosition::Bottom,
+        target,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!(
+            "{text:?}: expected a bottom PutAtLibraryPosition, got {:?}",
+            def.effect
+        );
+    };
+    assert_eq!(typed_types(target), [TypeFilter::Creature], "{text:?}");
+    let TargetFilter::Typed(typed) = target else {
+        unreachable!("typed_types already required a typed filter");
+    };
+    assert!(
+        typed.properties.contains(&FilterProp::Another),
+        "{text:?}: expected the Another restriction, got {:?}",
+        typed.properties
+    );
+    assert_eq!(def.multi_target, None, "{text:?}");
+
     // R3 — mass subjects (Terminus / Hallowed Burial; Harmonic Convergence) keep
     // the `ChangeZoneAll` move with its own library position.
     for (text, expected_type, expected_position) in [
@@ -74803,6 +74830,8 @@ fn placement_noun_phrase_is_targeted_requires_a_leading_target_phrase() {
         "up to two target creatures on top of their owners' libraries.",
         "any number of target cards on top of their owners' libraries.",
         "target creature on the bottom of their owners' libraries.",
+        "another target creature on top of their owners' libraries.",
+        "other target creature on the bottom of their owners' libraries.",
     ] {
         assert!(
             placement_noun_phrase_is_targeted(input),

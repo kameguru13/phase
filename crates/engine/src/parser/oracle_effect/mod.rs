@@ -20397,15 +20397,17 @@ fn peel_library_placement_cardinality(input: &str) -> (LibraryPlacementCardinali
 
 /// CR 115.1 + CR 601.2c: does a positional placement's noun phrase name its
 /// objects as TARGETS — a target cardinality ("two target …", "up to N
-/// target …", "any number of target …") or the bare target article? Decided
-/// by the cardinality authority above, so the placement router and the
-/// lowering (`refine_put_at_library_position`) can never disagree. Every peel
-/// arm is a prefix parser, so the input may run past the placement terminator.
+/// target …", "any number of target …") or a bare declared-target prefix
+/// ("target …", "another target …", "other target …", read by the shared
+/// `parse_declared_target_prefix` authority)? Decided by the cardinality
+/// authority above, so the placement router and the lowering
+/// (`refine_put_at_library_position`) can never disagree. Every peel arm is a
+/// prefix parser, so the input may run past the placement terminator.
 fn placement_noun_phrase_is_targeted(input: &str) -> bool {
     match peel_library_placement_cardinality(input) {
         (LibraryPlacementCardinality::TargetSet(_), _) => true,
         (LibraryPlacementCardinality::Unstated, rest) => {
-            tag::<_, _, OracleError<'_>>("target ").parse(rest).is_ok()
+            nom_target::parse_declared_target_prefix(rest).is_ok()
         }
         (LibraryPlacementCardinality::Exact(_) | LibraryPlacementCardinality::AnyNumber, _) => {
             false
