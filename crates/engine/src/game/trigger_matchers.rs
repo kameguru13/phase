@@ -6,7 +6,7 @@ use crate::types::ability::{
     DieResultFilter, EffectKind, ManaAbilityProducedFilter, OriginConstraint, TargetFilter,
     TargetRef, TriggerDefinition, TypedFilter,
 };
-use crate::types::events::{GameEvent, PlayerActionKind};
+use crate::types::events::{BoundActivationCost, GameEvent, PlayerActionKind};
 use crate::types::game_state::{GameState, TriggerSourceContext};
 use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
@@ -5247,6 +5247,7 @@ pub(super) fn match_ability_activated(
         source_id: activated_id,
         departed_source_lki,
         trigger_state,
+        activation_cost,
         ..
     } = event
     else {
@@ -5267,6 +5268,7 @@ pub(super) fn match_ability_activated(
         *activated_id,
         *player_id,
         departed_source_lki.as_deref(),
+        activation_cost,
         source_context,
     )
 }
@@ -5286,18 +5288,30 @@ pub(super) fn match_ability_activated(
 ///   of equipped creature" trigger does not fire when the creature was
 ///   sacrificed to pay the cost (Illusionist's Bracers ruling). The snapshot is
 ///   copied, so the event itself keeps its full record.
+/// * "an ability with {X} in its activation cost" is a fact of THIS activation
+///   (CR 602.1a), answered from the cost the event carries — bound before
+///   payment, never re-read from the source, the stack or
+///   `pending_activations`. It is bound into the filter identically before both
+///   branches (live and departed), so a source a cost moved still answers from
+///   its own activation. CR 605.3: mana activations are answered alike; CR
+///   107.3k: each activation's own cost answers for it.
 fn activated_source_matches(
     trigger: &TriggerDefinition,
     state: &GameState,
     activated_id: ObjectId,
     activator: PlayerId,
     departed_source_lki: Option<&crate::types::game_state::LKISnapshot>,
+    activation_cost: &BoundActivationCost,
     source_context: &TriggerSourceContext,
 ) -> bool {
     let Some(filter) = &trigger.valid_card else {
         return true;
     };
-    let filter = bind_triggering_player_controller(filter, activator);
+    let mut filter = bind_triggering_player_controller(filter, activator);
+    super::filter::bind_activation_cost_x(
+        &mut filter,
+        super::casting_costs::bound_activation_cost_has_x(activation_cost),
+    );
     match departed_source_lki {
         Some(lki) => {
             let mut post_cost = lki.clone();
@@ -5361,6 +5375,7 @@ pub(super) fn match_loyalty_ability_activated(
         source_id: activated_id,
         kind: crate::types::events::ActivatedAbilityKind::Loyalty,
         trigger_state,
+        activation_cost,
         ..
     } = event
     else {
@@ -5376,7 +5391,17 @@ pub(super) fn match_loyalty_ability_activated(
     if !actor_matches {
         return false;
     }
-    valid_card_matches(trigger, state, *activated_id, source_context)
+    // CR 602.1a: an activation-cost property reads this activation's own cost
+    // from the event, as in `activated_source_matches`.
+    let Some(filter) = &trigger.valid_card else {
+        return true;
+    };
+    let mut filter = filter.clone();
+    super::filter::bind_activation_cost_x(
+        &mut filter,
+        super::casting_costs::bound_activation_cost_has_x(activation_cost),
+    );
+    target_filter_matches_object(state, *activated_id, &filter, source_context)
 }
 
 /// CR 702.26c: Matches when a permanent phases in.
@@ -7694,6 +7719,7 @@ mod tests {
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
                 stack_entry: None,
+                activation_cost: crate::types::events::BoundActivationCost::Unknown,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
@@ -7708,6 +7734,7 @@ mod tests {
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
                 stack_entry: None,
+                activation_cost: crate::types::events::BoundActivationCost::Unknown,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
@@ -7749,6 +7776,7 @@ mod tests {
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
                 stack_entry: None,
+                activation_cost: crate::types::events::BoundActivationCost::Unknown,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
@@ -7763,6 +7791,7 @@ mod tests {
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
                 stack_entry: None,
+                activation_cost: crate::types::events::BoundActivationCost::Unknown,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
@@ -7806,6 +7835,7 @@ mod tests {
                         observers,
                     },
                 stack_entry: None,
+                activation_cost: crate::types::events::BoundActivationCost::Unknown,
             };
             assert!(!match_ability_activated(
                 &collected, &trigger, &context, &state
@@ -7903,6 +7933,7 @@ mod tests {
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
                 stack_entry: None,
+                activation_cost: crate::types::events::BoundActivationCost::Unknown,
             },
             &trigger,
             &test_trigger_source_context(&state, regulator),
@@ -7935,6 +7966,7 @@ mod tests {
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
                 stack_entry: None,
+                activation_cost: crate::types::events::BoundActivationCost::Unknown,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
@@ -7948,6 +7980,7 @@ mod tests {
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
                 stack_entry: None,
+                activation_cost: crate::types::events::BoundActivationCost::Unknown,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
@@ -7980,6 +8013,7 @@ mod tests {
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
                 stack_entry: None,
+                activation_cost: crate::types::events::BoundActivationCost::Unknown,
             },
             &trigger,
             &test_trigger_source_context(&state, regulator),
@@ -8014,6 +8048,7 @@ mod tests {
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
                 stack_entry: None,
+                activation_cost: crate::types::events::BoundActivationCost::Unknown,
             },
             &trigger,
             &test_trigger_source_context(&state, regulator),
@@ -8049,6 +8084,7 @@ mod tests {
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
                 stack_entry: None,
+                activation_cost: crate::types::events::BoundActivationCost::Unknown,
             },
             &trigger,
             &test_trigger_source_context(&state, regulator),
@@ -8099,6 +8135,7 @@ mod tests {
                     departed_source_lki: None,
                     trigger_state: crate::types::events::ActivationTriggerState::Pending,
                     stack_entry: None,
+                    activation_cost: crate::types::events::BoundActivationCost::Unknown,
                 };
                 assert_eq!(
                     match_loyalty_ability_activated(&event, &trigger, &context, state),
@@ -8186,6 +8223,7 @@ mod tests {
                 departed_source_lki: None,
                 trigger_state: crate::types::events::ActivationTriggerState::Pending,
                 stack_entry: None,
+                activation_cost: crate::types::events::BoundActivationCost::Unknown,
             };
             let matches = |state: &GameState, player, source| {
                 match_loyalty_ability_activated(

@@ -1,0 +1,7 @@
+{
+  "surfaces": [
+    "full",
+    "wire"
+  ],
+  "reason": "GameEvent::AbilityActivated and AbilityActivationRecord gain activation_cost (BoundActivationCost: Unknown | Costless | Cost(AbilityCost)), the activation's own cost bound before payment (CR 602.1a, CR 605.3). Both ride in GameState (pending and current trigger events, deferred event queues, the turn activation journal, the CR733 ledger). An older full-game or P2P peer drops the field on decode and re-encode, so activation triggers reading it ('activate an ability with {X} in its activation cost') silently answer false (silent capability loss under the protocol policy)."
+}

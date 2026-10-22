@@ -1281,6 +1281,15 @@ pub struct AbilityActivationRecord {
     pub ability_tag: Option<crate::types::ability::AbilityTag>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_loyalty_ability: bool,
+    /// CR 602.1a + CR 602.2b: the activation cost of the announcement-bound
+    /// definition, captured with the record's other facts before payment. The
+    /// placement publishes it on the activation's event; the record is its
+    /// transport, never a read site. `Unknown` for a record predating the field.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::types::events::BoundActivationCost::is_unknown"
+    )]
+    pub activation_cost: crate::types::events::BoundActivationCost,
     /// CR 115.1: the committed targets of the whole chain, empty for an
     /// untargeted ability.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -34945,6 +34954,52 @@ mod tests {
     use crate::types::phase::PhaseGroup;
     use crate::types::resolved_commands::ResolvedDelayedTriggerCommand;
     use crate::types::triggers::TriggerMode;
+
+    /// CR 602.1a + CR 602.2b: the record's bound activation cost survives
+    /// serialization, and a record predating the field decodes as `Unknown`
+    /// (no binding), never as a cost-less activation.
+    #[test]
+    fn ability_activation_record_activation_cost_round_trips_and_defaults_to_unknown() {
+        use crate::types::events::BoundActivationCost;
+        use crate::types::mana::{ManaCost, ManaCostShard};
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Record Source".to_string(),
+            Zone::Battlefield,
+        );
+        let mut record = AbilityActivationRecord {
+            activator: PlayerId(0),
+            source,
+            source_lki: state.objects[&source].snapshot_public_characteristics(),
+            source_zone: Zone::Battlefield,
+            ability_tag: None,
+            is_loyalty_ability: false,
+            activation_cost: BoundActivationCost::Cost(crate::types::ability::AbilityCost::Mana {
+                cost: ManaCost::Cost {
+                    shards: vec![ManaCostShard::X],
+                    generic: 0,
+                },
+            }),
+            targets: Vec::new(),
+        };
+        let json = serde_json::to_value(&record).unwrap();
+        assert!(json.get("activation_cost").is_some(), "{json}");
+        let back: AbilityActivationRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back, record);
+
+        record.activation_cost = BoundActivationCost::Unknown;
+        // The record without the key is exactly a record predating the field.
+        let legacy = serde_json::to_value(&record).unwrap();
+        assert!(
+            legacy.get("activation_cost").is_none(),
+            "an unknown cost is omitted: {legacy}"
+        );
+        let decoded: AbilityActivationRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.activation_cost, BoundActivationCost::Unknown);
+    }
 
     fn state_with_recorded_exploit() -> (GameState, GameEvent) {
         let mut state = GameState::new_two_player(42);

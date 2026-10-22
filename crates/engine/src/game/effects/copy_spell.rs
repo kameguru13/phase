@@ -1,7 +1,7 @@
 use crate::game::ability_utils::build_resolved_from_def;
 use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::game_object::GameObject;
-use crate::game::targeting::TriggeringSpell;
+use crate::game::targeting::{TriggeringActivation, TriggeringSpell};
 use crate::types::ability::{
     AbilityDefinition, AbilityKind, ContinuousModification, ControllerRef, CopyRetargetPermission,
     Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter, TargetRef,
@@ -607,6 +607,18 @@ fn copy_source_from_triggering_spell(source: TriggeringSpell<'_>) -> CopySourceL
     }
 }
 
+/// CR 602.2a + CR 113.7a: Adapt `targeting::triggering_activation`'s answer to a
+/// [`CopySourceLookup`]. `Gone` means the activation event named a stack
+/// object that has left the stack; it differs from no source.
+fn copy_source_from_triggering_activation(source: TriggeringActivation<'_>) -> CopySourceLookup {
+    match source {
+        TriggeringActivation::OnStack(entry) => {
+            CopySourceLookup::Source(Box::new(CopySource::on_stack(entry.clone())))
+        }
+        TriggeringActivation::Gone => CopySourceLookup::Gone,
+    }
+}
+
 fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> CopySourceLookup {
     if let Effect::CopySpell {
         target, retarget, ..
@@ -627,8 +639,8 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> CopySource
             if let Some(source) = crate::game::targeting::triggering_spell(state) {
                 return copy_source_from_triggering_spell(source);
             }
-            if let Some(lookup) = triggering_activation(state) {
-                return lookup;
+            if let Some(source) = crate::game::targeting::triggering_activation(state) {
+                return copy_source_from_triggering_activation(source);
             }
             if let Some(entry) = triggering_spell_stack_entry(state) {
                 return CopySourceLookup::Source(Box::new(CopySource::on_stack(entry)));
@@ -756,8 +768,8 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> CopySource
     if let Some(source) = crate::game::targeting::triggering_spell(state) {
         return copy_source_from_triggering_spell(source);
     }
-    if let Some(lookup) = triggering_activation(state) {
-        return lookup;
+    if let Some(source) = crate::game::targeting::triggering_activation(state) {
+        return copy_source_from_triggering_activation(source);
     }
     if let Some(entry) = triggering_spell_stack_entry(state) {
         return CopySourceLookup::Source(Box::new(CopySource::on_stack(entry)));
@@ -899,33 +911,6 @@ fn spell_ability_definition(abilities: &[AbilityDefinition]) -> Option<AbilityDe
         .cloned()
 }
 
-/// CR 602.2a + CR 113.7a + CR 707.10: an activation trigger's "that ability" /
-/// "it" is the stack object the activation created, which the event names.
-/// Authoritative whenever the event names one: once that object has left the
-/// stack (countered, CR 701.6a) the answer is `Gone` — never another object of
-/// the same source, which may be another activation of it, a copy of one
-/// (CR 707.10b), or a triggered ability the activation caused. `None` when the
-/// trigger event is not an activation that used the stack.
-fn triggering_activation(state: &GameState) -> Option<CopySourceLookup> {
-    let Some(GameEvent::AbilityActivated {
-        stack_entry: Some(entry_id),
-        ..
-    }) = state.current_trigger_event.as_ref()
-    else {
-        return None;
-    };
-    Some(
-        state
-            .stack
-            .iter()
-            .find(|entry| entry.id == *entry_id)
-            .cloned()
-            .map_or(CopySourceLookup::Gone, |entry| {
-                CopySourceLookup::Source(Box::new(CopySource::on_stack(entry)))
-            }),
-    )
-}
-
 /// CR 601.2i + CR 603.2 + CR 707.10: "Copy that spell" / `Trigger_ThatSpell`
 /// on a `SpellCast` trigger (Mendicant Core, Guidelight; Twincast-style copies
 /// gated on optional costs). When another triggered ability sits above the cast
@@ -934,7 +919,7 @@ fn triggering_activation(state: &GameState) -> Option<CopySourceLookup> {
 fn triggering_spell_stack_entry(state: &GameState) -> Option<StackEntry> {
     let event = state.current_trigger_event.as_ref()?;
     // CR 602.2a + CR 605.3b: an activation names its stack entry on the event,
-    // which `triggering_activation` resolves; a mana ability never uses the
+    // which `targeting::triggering_activation` resolves; a mana ability never uses the
     // stack. A `source_id` match here would bind another activation of the same
     // source or a triggered ability it caused.
     if matches!(event, GameEvent::AbilityActivated { .. }) {
@@ -3011,6 +2996,7 @@ mod tests {
             departed_source_lki: None,
             trigger_state: crate::types::events::ActivationTriggerState::Pending,
             stack_entry: Some(ObjectId(100)),
+            activation_cost: crate::types::events::BoundActivationCost::Unknown,
         });
 
         let copy_effect = ResolvedAbility::new(
@@ -3166,6 +3152,7 @@ mod tests {
             departed_source_lki: None,
             trigger_state: crate::types::events::ActivationTriggerState::Pending,
             stack_entry: Some(ObjectId(100)),
+            activation_cost: crate::types::events::BoundActivationCost::Unknown,
         });
 
         let copy_effect = ResolvedAbility::new(
@@ -3242,6 +3229,7 @@ mod tests {
             departed_source_lki: None,
             trigger_state: crate::types::events::ActivationTriggerState::Pending,
             stack_entry: Some(ObjectId(100)),
+            activation_cost: crate::types::events::BoundActivationCost::Unknown,
         });
 
         let copy_effect = ResolvedAbility::new(
@@ -3320,6 +3308,7 @@ mod tests {
             departed_source_lki: None,
             trigger_state: crate::types::events::ActivationTriggerState::Pending,
             stack_entry,
+            activation_cost: crate::types::events::BoundActivationCost::Unknown,
         };
         let copy_that_ability = ResolvedAbility::new(
             Effect::CopySpell {
@@ -3354,7 +3343,7 @@ mod tests {
 
         state.current_trigger_event = Some(activation(None));
         assert!(
-            triggering_activation(&state).is_none(),
+            crate::game::targeting::triggering_activation(&state).is_none(),
             "an activation that used no stack names no entry"
         );
 
@@ -3365,7 +3354,7 @@ mod tests {
             cast_mana_value: None,
         });
         assert!(
-            triggering_activation(&state).is_none(),
+            crate::game::targeting::triggering_activation(&state).is_none(),
             "a spell-cast event is not an activation"
         );
     }

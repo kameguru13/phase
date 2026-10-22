@@ -8,13 +8,13 @@ use engine::game::dungeon::DungeonProgress;
 use engine::game::game_object::{BackFaceData, GameObject, ProtectionStartSnapshot};
 use engine::game::printed_cards::intrinsic_copiable_values;
 use engine::types::ability::{
-    ControllerRef, CopyTargetPurpose, Effect, KeywordAction, ReplacementCondition, ResolvedAbility,
-    ThisWayCause,
+    AbilityCost, ControllerRef, CopyTargetPurpose, Effect, KeywordAction, ReplacementCondition,
+    ResolvedAbility, ThisWayCause,
 };
 use engine::types::attribution::ObjectAttribution;
 use engine::types::card_type::CardType;
 use engine::types::definitions::Definitions;
-use engine::types::events::{GameEvent, PlayerActionKind};
+use engine::types::events::{BoundActivationCost, GameEvent, PlayerActionKind};
 use engine::types::game_state::{
     AbilityActivationRecord, ActivationTargetFact, AutoPassMode, DepartedStackSpell,
     LandPlayRecord, LiminalEntrant, LiminalEntry, LinkedExileLki, LinkedExileSnapshot,
@@ -1766,6 +1766,7 @@ fn build_all_direct_numeric_maps_state() -> GameState {
                 source_zone: engine::types::zones::Zone::Battlefield,
                 ability_tag: None,
                 is_loyalty_ability: false,
+                activation_cost: BoundActivationCost::Cost(AbilityCost::Tap),
                 targets: vec![ActivationTargetFact::Object {
                     id: ObjectId(2),
                     lki: Box::new(second_lki.clone()),
@@ -1781,6 +1782,7 @@ fn build_all_direct_numeric_maps_state() -> GameState {
                 source_zone: engine::types::zones::Zone::Battlefield,
                 ability_tag: None,
                 is_loyalty_ability: true,
+                activation_cost: BoundActivationCost::Cost(AbilityCost::Loyalty { amount: 1 }),
                 targets: vec![ActivationTargetFact::Player(PlayerId(0))],
             }]),
         ),

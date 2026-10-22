@@ -4465,9 +4465,22 @@ fn bind_absent_search_node(filter: &mut TargetFilter) {
     }
 }
 
+/// The constant property a bound predicate folds to: the empty disjunction
+/// (`AnyOf { [] }`) is false, and its negation is true.
+fn filter_prop_truth(value: bool) -> FilterProp {
+    let never = FilterProp::AnyOf { props: vec![] };
+    if value {
+        FilterProp::Not {
+            prop: Box::new(never),
+        }
+    } else {
+        never
+    }
+}
+
 fn bind_absent_search_property(prop: &mut FilterProp) {
     if matches!(prop, FilterProp::InTrackedSet { id } if id.0 == 0) {
-        *prop = FilterProp::AnyOf { props: vec![] };
+        *prop = filter_prop_truth(false);
     }
 }
 
@@ -4475,10 +4488,33 @@ fn bind_absent_search_property_after_children(prop: &mut FilterProp) {
     if matches!(prop, FilterProp::DistinctFrom { reference }
         if absent_search_predicate_truth(reference) == Some(false))
     {
-        *prop = FilterProp::Not {
-            prop: Box::new(FilterProp::AnyOf { props: vec![] }),
-        };
+        *prop = filter_prop_truth(true);
     }
+}
+
+/// CR 602.1a + CR 603.2 + CR 603.10: bind every `HasXInActivationCost` in an
+/// activation trigger's filter to the answer of the `AbilityActivated` event
+/// it is matching — the activation's own cost, bound before payment — before
+/// the filter is evaluated against the source. CR 113.7a: the answer is the
+/// same whether the source is evaluated live or from its departed last known
+/// information, so both branches see the one bound fact.
+pub(crate) fn bind_activation_cost_x(filter: &mut TargetFilter, has_x: bool) {
+    // This rewrite walks no object population, so completeness is not
+    // consulted: every reachable property is rewritten.
+    let mut complete = true;
+    rewrite_filter_props(
+        filter,
+        &mut |_, _, _| {},
+        &mut |prop| {
+            if matches!(prop, FilterProp::HasXInActivationCost) {
+                *prop = filter_prop_truth(has_x);
+            }
+        },
+        &mut |_| {},
+        &mut complete,
+        false,
+        None,
+    );
 }
 
 // This summary reads Boolean composition only. It never replaces a descriptor
@@ -9533,6 +9569,10 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         FilterProp::FaceDown => {
             record.cast_variant == crate::types::game_state::CastingVariant::FaceDown
         }
+        // CR 602.1a: a fact of an activation, not of a spell. An activation
+        // trigger's matcher binds it from its `AbilityActivated` event before
+        // evaluation (`bind_activation_cost_x`), so a spell record never
+        // answers it.
         FilterProp::HasXInActivationCost => false,
         // CR 605.1: Spell-cast records snapshot the spell object, not the
         // object's ability list. Fail closed for history predicates.
@@ -10627,12 +10667,11 @@ fn matches_filter_prop(
         // printed mana cost for an `{X}` shard. Applies to spells on the stack
         // and to any live-object evaluation path (e.g. static-ability filters).
         FilterProp::HasXInManaCost => crate::game::casting_costs::cost_has_x(&obj.mana_cost),
-        // CR 107.3 + CR 601.2f: "{X} in its activation cost" — consult the
-        // pending activation record for the matched source object. Composes with
-        // typed type/controller filters via `TargetFilter::And`/`Or`.
-        FilterProp::HasXInActivationCost => {
-            crate::game::casting_costs::pending_activation_cost_has_x(state, object_id)
-        }
+        // CR 602.1a: "{X} in its activation cost" is a fact of an activation,
+        // not a characteristic of an object. It is answered only from the
+        // `AbilityActivated` event the trigger matches (`bind_activation_cost_x`,
+        // bound before evaluation); an unbound read names no activation.
+        FilterProp::HasXInActivationCost => false,
         FilterProp::WasKicked => {
             if let Some(pending) = state.pending_cast.as_ref() {
                 if pending.object_id == object_id {
@@ -11910,6 +11949,10 @@ fn zone_change_record_matches_property(
         // or never was a spell). Fail closed — the snapshot carries no such info.
         | FilterProp::HasXInManaCost
         | FilterProp::WasKicked
+        // CR 602.1a: a fact of an activation, not of an object. An activation
+        // trigger's matcher binds it from its `AbilityActivated` event before
+        // the departed-source branch (`bind_activation_cost_x`), so this record
+        // path never answers it.
         | FilterProp::HasXInActivationCost
         // CR 605.1: Zone-change records do not snapshot ability lists.
         | FilterProp::HasManaAbility
@@ -16144,10 +16187,12 @@ mod tests {
         );
     }
 
-    /// CR 107.3 + CR 601.2f: `FilterProp::HasXInActivationCost` consults the
-    /// pending activation record and composes with typed filters via `And`.
+    /// CR 602.1a + CR 603.2: `FilterProp::HasXInActivationCost` is answered only
+    /// by the activation event's bound cost (`bind_activation_cost_x`), composes
+    /// with typed filters via `And` and inside `AnyOf`, and an unbound read never
+    /// consults `pending_activations` (an AI guard, not a rules input).
     #[test]
-    fn pending_activation_has_x_in_activation_cost_composes_with_type_filter() {
+    fn bound_activation_cost_x_composes_with_type_filter_and_ignores_pending_activations() {
         use crate::types::ability::{
             AbilityCost, AbilityDefinition, AbilityKind, Effect, QuantityExpr, TargetFilter as Tf,
             TypedFilter,
@@ -16181,14 +16226,43 @@ mod tests {
                 ),
             ],
         };
+
+        let mut bound_true = filter.clone();
+        bind_activation_cost_x(&mut bound_true, true);
         assert!(
-            matches_target_filter(&state, source, &filter, source),
-            "creature source with pending X activation must match composed filter"
+            matches_target_filter(&state, source, &bound_true, source),
+            "a creature source whose activation carried {{X}} matches the composed filter"
         );
-        state.pending_activations.clear();
+        let mut bound_false = filter.clone();
+        bind_activation_cost_x(&mut bound_false, false);
+        assert!(
+            !matches_target_filter(&state, source, &bound_false, source),
+            "an activation whose cost carried no {{X}} fails the composed filter"
+        );
+
+        let nested =
+            TargetFilter::Typed(TypedFilter::creature().properties(vec![FilterProp::AnyOf {
+                props: vec![FilterProp::HasXInActivationCost],
+            }]));
+        let mut nested_true = nested.clone();
+        bind_activation_cost_x(&mut nested_true, true);
+        assert!(
+            matches_target_filter(&state, source, &nested_true, source),
+            "a property nested in AnyOf is bound too"
+        );
+        let mut nested_false = nested;
+        bind_activation_cost_x(&mut nested_false, false);
+        assert!(!matches_target_filter(
+            &state,
+            source,
+            &nested_false,
+            source
+        ));
+
         assert!(
             !matches_target_filter(&state, source, &filter, source),
-            "without pending activation, HasXInActivationCost must fail"
+            "an unbound HasXInActivationCost names no activation, whatever \
+             pending_activations holds"
         );
     }
 

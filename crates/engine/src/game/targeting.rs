@@ -725,6 +725,42 @@ pub(crate) fn triggering_spell(state: &GameState) -> Option<TriggeringSpell<'_>>
     }
 }
 
+/// CR 602.2a + CR 113.7a: What an activation trigger's "that ability" / "it"
+/// currently names, per [`triggering_activation`]. `Gone` is distinct from "no
+/// stack-using activation event at all" (that case is `None` on the function's
+/// own return type) — it means the event names a stack object that has left
+/// the stack.
+pub(crate) enum TriggeringActivation<'a> {
+    OnStack(&'a StackEntry),
+    Gone,
+}
+
+/// CR 602.2a + CR 113.7a + CR 605.3b: an activation trigger's "that ability" /
+/// "it" is the stack object the activation created, which the event names.
+/// Authoritative whenever the event names one: once that object has left the
+/// stack (countered, CR 701.6a) the answer is `Gone` — never another object of
+/// the same source, which may be another activation of it, a copy of one
+/// (CR 707.10b), or a triggered ability the activation caused. `None` when the
+/// trigger event is not an activation that used the stack (a mana ability's
+/// activation names no stack object, CR 605.3b). The single lookup of the
+/// named activation, beside its spell analog [`triggering_spell`].
+pub(crate) fn triggering_activation(state: &GameState) -> Option<TriggeringActivation<'_>> {
+    let Some(GameEvent::AbilityActivated {
+        stack_entry: Some(entry_id),
+        ..
+    }) = state.current_trigger_event.as_ref()
+    else {
+        return None;
+    };
+    Some(
+        state
+            .stack
+            .iter()
+            .find(|entry| entry.id == *entry_id)
+            .map_or(TriggeringActivation::Gone, TriggeringActivation::OnStack),
+    )
+}
+
 /// CR 707.10a: Resolve the triggering spell's `ResolvedAbility` for legality
 /// checks. Prefer the live stack entry; fall back to `resolving_stack_entry`
 /// (spell mid-resolution) or reconstruct from the spell object when the stack
@@ -8321,6 +8357,77 @@ mod tests {
         assert_eq!(extract_amount_from_event(&event), None);
     }
 
+    /// CR 602.2a + CR 113.7a + CR 605.3b: the named-activation lookup answers
+    /// exactly as the copy path did — the entry the event names (not the top,
+    /// not a later same-source entry), `Gone` once it left the stack, and
+    /// `None` for an activation that used no stack or a non-activation event.
+    #[test]
+    fn triggering_activation_answers_the_named_entry_gone_or_none() {
+        use crate::types::ability::{Effect, ResolvedAbility};
+        use crate::types::game_state::{StackEntry, StackEntryKind};
+        let mut state = GameState::new_two_player(42);
+        let source = ObjectId(10);
+        let activated = |id| StackEntry {
+            id: ObjectId(id),
+            source_id: source,
+            controller: PlayerId(0),
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: source,
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::NoOp,
+                    vec![],
+                    source,
+                    PlayerId(0),
+                )),
+            },
+        };
+        state.stack.push_back(activated(100));
+        state.stack.push_back(activated(102));
+        let activation = |stack_entry| GameEvent::AbilityActivated {
+            player_id: PlayerId(0),
+            source_id: source,
+            kind: crate::types::events::ActivatedAbilityKind::Normal,
+            departed_source_lki: None,
+            trigger_state: crate::types::events::ActivationTriggerState::Pending,
+            stack_entry,
+            activation_cost: crate::types::events::BoundActivationCost::Unknown,
+        };
+
+        state.current_trigger_event = Some(activation(Some(ObjectId(100))));
+        assert!(
+            matches!(
+                triggering_activation(&state),
+                Some(TriggeringActivation::OnStack(entry)) if entry.id == ObjectId(100)
+            ),
+            "the named entry, not the top or a later same-source entry"
+        );
+
+        // Today's answer for an entry that left the stack (phase 4 replaces it
+        // with the departed answer).
+        state.current_trigger_event = Some(activation(Some(ObjectId(103))));
+        assert!(matches!(
+            triggering_activation(&state),
+            Some(TriggeringActivation::Gone)
+        ));
+
+        state.current_trigger_event = Some(activation(None));
+        assert!(
+            triggering_activation(&state).is_none(),
+            "an activation that used no stack (a mana ability) names no entry"
+        );
+
+        state.current_trigger_event = Some(GameEvent::SpellCast {
+            controller: PlayerId(0),
+            object_id: ObjectId(100),
+            card_id: CardId(1),
+            cast_mana_value: None,
+        });
+        assert!(
+            triggering_activation(&state).is_none(),
+            "a spell-cast event is not an activation"
+        );
+    }
+
     /// CR 602.2a: For Burning-Tree Shaman / Flamescroll Celebrant's "deals 1
     /// damage to that player" effect, `TriggeringPlayer` must resolve to the
     /// player who activated the ability — carried directly on the event, not
@@ -8336,6 +8443,7 @@ mod tests {
             departed_source_lki: None,
             trigger_state: crate::types::events::ActivationTriggerState::Pending,
             stack_entry: None,
+            activation_cost: crate::types::events::BoundActivationCost::Unknown,
         };
         assert_eq!(extract_player_from_event(&event, &state), Some(PlayerId(1)));
     }
