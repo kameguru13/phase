@@ -721,8 +721,9 @@ fn remove_stack_entry_at_unobserved(
 /// cast was never finalized and has no CR 707.2 choices to remember. Called
 /// from the zone-exit path
 /// (`zones.rs::apply_zone_exit_cleanup`, before the `cast_occurrence` clear
-/// that would make this guard vacuous) and `remove_nonresolving_stack_entry_at`
-/// below — a resolution pop (`pop_top_stack_entry`) calls neither.
+/// that would make this guard vacuous) and, through `record_departed_stack_entry`,
+/// `remove_nonresolving_stack_entry_at` below — a resolution pop
+/// (`pop_top_stack_entry`) calls neither.
 pub(crate) fn record_departed_stack_spell(state: &mut GameState, entry: &StackEntry) {
     let StackEntryKind::Spell { .. } = &entry.kind else {
         return;
@@ -745,6 +746,34 @@ pub(crate) fn record_departed_stack_spell(state: &mut GameState, entry: &StackEn
         .insert(incarnation, record);
 }
 
+/// CR 701.6a + CR 113.3b + CR 608.2h: record a stack object removed without
+/// resolving (countered, or removed with its controller under CR 800.4a), as it last
+/// existed on the stack, for a trigger that still names it. The single writer of both
+/// departed-stack tables, called only from `remove_nonresolving_stack_entry_at`. A
+/// resolution pop records nothing: the object resolved. An end-the-turn exile
+/// (CR 724.1b, `pop_nonresolving_top_stack_entry`) records nothing either, because
+/// every trigger that could name the object is exiled in the same pass.
+fn record_departed_stack_entry(state: &mut GameState, entry: &StackEntry) {
+    match &entry.kind {
+        StackEntryKind::Spell { .. } => record_departed_stack_spell(state, entry),
+        // CR 113.1c + CR 113.7a: an activated ability on the stack is an object that
+        // exists independently of its source; its whole last-known state is its entry,
+        // kept under the id its activation event names (CR 602.2a).
+        StackEntryKind::ActivatedAbility { .. } => {
+            state
+                .departed_activated_abilities
+                .insert(entry.id, entry.clone());
+        }
+        // No trigger event names these as "that spell or ability": a spell-cast event
+        // names a spell, an activation event names an activated ability's entry, a
+        // keyword-action entry is named by no activation event, and combat damage is
+        // not an ability.
+        StackEntryKind::TriggeredAbility { .. }
+        | StackEntryKind::KeywordAction { .. }
+        | StackEntryKind::CombatDamage { .. } => {}
+    }
+}
+
 /// Removes a stack entry for a non-resolution reason and observes the exact
 /// firing only after the entry and side tables have been settled.
 pub(super) fn remove_nonresolving_stack_entry_at(
@@ -754,7 +783,7 @@ pub(super) fn remove_nonresolving_stack_entry_at(
 ) -> Option<PoppedStackEntry> {
     let popped = remove_stack_entry_at_unobserved(state, index)?;
     release_departed_entry_reveals(state, &popped);
-    record_departed_stack_spell(state, &popped.entry);
+    record_departed_stack_entry(state, &popped.entry);
     if let Some(firing) = popped.trigger_firing {
         super::lifecycle::record_delayed_terminal(firing, disposition);
     }
@@ -6377,6 +6406,107 @@ mod tests {
             panic!("the spell entry keeps its chain");
         };
         assert_eq!(chain.chosen_x, None);
+    }
+
+    /// S-1 (CR 701.6a + CR 113.7a + CR 608.2h): a non-resolving removal of an
+    /// activated ability records its entry whole under the entry's id; a
+    /// non-resolving removal of a triggered ability records nothing, and neither
+    /// does the CR 405.5 resolution pop of an activated ability.
+    #[test]
+    fn a_nonresolving_removal_records_an_activated_ability_whole_and_no_trigger() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let push_entry = |state: &mut GameState, kind: StackEntryKind| {
+            let id = ObjectId(state.next_object_id);
+            state.next_object_id += 1;
+            let entry = StackEntry {
+                id,
+                source_id: source,
+                controller: PlayerId(0),
+                kind,
+            };
+            state.stack.push_back(entry.clone());
+            entry
+        };
+        let ability = |x: Option<u32>| {
+            let mut ability = ResolvedAbility::new(Effect::NoOp, Vec::new(), source, PlayerId(0));
+            ability.chosen_x = x;
+            Box::new(ability)
+        };
+
+        // (1) A countered activated ability is recorded exactly as it was.
+        let activated = push_entry(
+            &mut state,
+            StackEntryKind::ActivatedAbility {
+                source_id: source,
+                ability: ability(Some(2)),
+            },
+        );
+        let popped = remove_nonresolving_stack_entry_at(
+            &mut state,
+            0,
+            super::super::lifecycle::DelayedTerminalDisposition::Countered,
+        )
+        .expect("reach guard: the activated entry was removed");
+        assert_eq!(popped.entry.id, activated.id, "reach guard: that entry");
+        assert_eq!(
+            state.departed_activated_abilities.get(&activated.id),
+            Some(&activated),
+            "the countered activated ability is recorded whole"
+        );
+
+        // (2) A countered triggered ability is not recorded.
+        let triggered = push_entry(
+            &mut state,
+            StackEntryKind::TriggeredAbility {
+                source_id: source,
+                ability: ability(None),
+                condition: None,
+                trigger_event: None,
+                description: None,
+                source_name: String::new(),
+                subject_match_count: None,
+                die_result: None,
+                provenance: None,
+            },
+        );
+        remove_nonresolving_stack_entry_at(
+            &mut state,
+            0,
+            super::super::lifecycle::DelayedTerminalDisposition::Countered,
+        )
+        .expect("reach guard: the triggered entry was removed");
+        assert!(
+            !state
+                .departed_activated_abilities
+                .contains_key(&triggered.id),
+            "a triggered ability is never recorded"
+        );
+        assert_eq!(state.departed_activated_abilities.len(), 1);
+
+        // (3) The resolution pop of an activated ability records nothing.
+        let resolving = push_entry(
+            &mut state,
+            StackEntryKind::ActivatedAbility {
+                source_id: source,
+                ability: ability(Some(1)),
+            },
+        );
+        let popped = pop_top_stack_entry(&mut state).expect("reach guard: popped");
+        assert_eq!(popped.entry.id, resolving.id, "reach guard: that entry");
+        assert!(
+            !state
+                .departed_activated_abilities
+                .contains_key(&resolving.id),
+            "a resolving ability is not departed"
+        );
+        assert_eq!(state.departed_activated_abilities.len(), 1);
     }
 
     /// CR 608.2b (typed composition, not printed Oracle): an unjudged

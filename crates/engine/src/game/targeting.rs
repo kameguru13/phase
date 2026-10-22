@@ -725,21 +725,25 @@ pub(crate) fn triggering_spell(state: &GameState) -> Option<TriggeringSpell<'_>>
     }
 }
 
-/// CR 602.2a + CR 113.7a: What an activation trigger's "that ability" / "it"
-/// currently names, per [`triggering_activation`]. `Gone` is distinct from "no
-/// stack-using activation event at all" (that case is `None` on the function's
-/// own return type) — it means the event names a stack object that has left
-/// the stack.
+/// CR 602.2a + CR 113.7a + CR 608.2h: what an activation trigger's "that ability" /
+/// "it" currently names, per [`triggering_activation`]. `Departed` is the activated
+/// ability as it last existed on the stack once it was removed without resolving
+/// (countered, CR 701.6a). `Gone` is distinct from "no stack-using activation event at
+/// all" (that case is `None` on the function's own return type): the event names a
+/// stack object with neither a live entry nor a departed record (it resolved, or the
+/// record ended with its step).
 pub(crate) enum TriggeringActivation<'a> {
     OnStack(&'a StackEntry),
+    Departed(&'a StackEntry),
     Gone,
 }
 
 /// CR 602.2a + CR 113.7a + CR 605.3b: an activation trigger's "that ability" /
 /// "it" is the stack object the activation created, which the event names.
 /// Authoritative whenever the event names one: once that object has left the
-/// stack (countered, CR 701.6a) the answer is `Gone` — never another object of
-/// the same source, which may be another activation of it, a copy of one
+/// stack without resolving (countered, CR 701.6a) the answer is its departed record
+/// (CR 113.7a + CR 608.2h), and `Gone` only when no record exists — never another
+/// object of the same source, which may be another activation of it, a copy of one
 /// (CR 707.10b), or a triggered ability the activation caused. `None` when the
 /// trigger event is not an activation that used the stack (a mana ability's
 /// activation names no stack object, CR 605.3b). The single lookup of the
@@ -752,12 +756,14 @@ pub(crate) fn triggering_activation(state: &GameState) -> Option<TriggeringActiv
     else {
         return None;
     };
+    if let Some(entry) = state.stack.iter().find(|entry| entry.id == *entry_id) {
+        return Some(TriggeringActivation::OnStack(entry));
+    }
     Some(
         state
-            .stack
-            .iter()
-            .find(|entry| entry.id == *entry_id)
-            .map_or(TriggeringActivation::Gone, TriggeringActivation::OnStack),
+            .departed_activated_abilities
+            .get(entry_id)
+            .map_or(TriggeringActivation::Gone, TriggeringActivation::Departed),
     )
 }
 
@@ -8357,12 +8363,13 @@ mod tests {
         assert_eq!(extract_amount_from_event(&event), None);
     }
 
-    /// CR 602.2a + CR 113.7a + CR 605.3b: the named-activation lookup answers
-    /// exactly as the copy path did — the entry the event names (not the top,
-    /// not a later same-source entry), `Gone` once it left the stack, and
-    /// `None` for an activation that used no stack or a non-activation event.
+    /// CR 602.2a + CR 113.7a + CR 605.3b + CR 608.2h: the named-activation lookup
+    /// answers the entry the event names (not the top, not a later same-source
+    /// entry), `Departed` once it left the stack without resolving, `Gone` with no
+    /// record, and `None` for an activation that used no stack or a
+    /// non-activation event.
     #[test]
-    fn triggering_activation_answers_the_named_entry_gone_or_none() {
+    fn triggering_activation_answers_the_named_entry_departed_gone_or_none() {
         use crate::types::ability::{Effect, ResolvedAbility};
         use crate::types::game_state::{StackEntry, StackEntryKind};
         let mut state = GameState::new_two_player(42);
@@ -8402,16 +8409,26 @@ mod tests {
             "the named entry, not the top or a later same-source entry"
         );
 
-        // Today's answer for an entry that left the stack: a defective
-        // reference kept unchanged in phase 1. A countered ability is still
-        // copied as it last existed (Unbound Flourishing ruling 1; Magus Lucea
-        // Kane and Rings of Brighthearth rulings), so phase 4 replaces this
-        // assertion with the departed answer.
+        state
+            .departed_activated_abilities
+            .insert(ObjectId(103), activated(103));
         state.current_trigger_event = Some(activation(Some(ObjectId(103))));
-        assert!(matches!(
-            triggering_activation(&state),
-            Some(TriggeringActivation::Gone)
-        ));
+        assert!(
+            matches!(
+                triggering_activation(&state),
+                Some(TriggeringActivation::Departed(entry)) if entry.id == ObjectId(103)
+            ),
+            "a countered activation is still that ability (CR 113.7a + 608.2h), never the live same-source entries 100 or 102"
+        );
+
+        state.current_trigger_event = Some(activation(Some(ObjectId(104))));
+        assert!(
+            matches!(
+                triggering_activation(&state),
+                Some(TriggeringActivation::Gone)
+            ),
+            "an entry with neither a live entry nor a record is gone"
+        );
 
         state.current_trigger_event = Some(activation(None));
         assert!(

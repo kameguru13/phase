@@ -995,3 +995,94 @@ fn wizards_rockets_x_mana_ability_uses_up_magus_and_copies_nothing() {
     );
     assert_eq!(library_before - runner.state().players[0].library.len(), 2);
 }
+
+/// Helix Pinnacle, verbatim (MTGJSON), reminder text included.
+const HELIX_PINNACLE: &str = "Shroud (This enchantment can't be the target of spells or abilities.)\n{X}: Put X tower counters on this enchantment.\nAt the beginning of your upkeep, if there are 100 or more tower counters on this enchantment, you win the game.";
+/// Stifle, verbatim (MTGJSON).
+const STIFLE: &str =
+    "Counter target activated or triggered ability. (Mana abilities can't be targeted.)";
+
+fn tower_counters(runner: &GameRunner, id: ObjectId) -> u32 {
+    runner.state().objects[&id]
+        .counters
+        .get(&engine::types::counter::CounterType::Generic(
+            "tower".to_string(),
+        ))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// M-9 (ruling 2022-10-07: "A copy is created even if the spell or ability
+/// that caused the delayed triggered ability to trigger has been countered by
+/// the time that delayed triggered ability resolves"; CR 701.6a + CR 113.7a +
+/// CR 608.2h + CR 707.10): Stifle counters Helix Pinnacle's `{X}` activation
+/// (X = 2) while Magus's delayed trigger waits above it. The trigger is used up
+/// by the activation and still copies it with the same X, so only the copy puts
+/// counters.
+#[test]
+fn magus_copies_an_x_activation_countered_before_its_delayed_trigger_resolves() {
+    let mut scenario = copy_scenario();
+    let magus = add_magus(&mut scenario);
+    let pinnacle = scenario
+        .add_enchantment_from_oracle(P0, "Helix Pinnacle", HELIX_PINNACLE)
+        .from_oracle_text_with_keywords(&["Shroud"], HELIX_PINNACLE)
+        .with_mana_cost(mana(&[ManaCostShard::Green], 0))
+        .id();
+    let stifle = scenario
+        .add_spell_to_hand_from_oracle(P0, "Stifle", true, STIFLE)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    assert!(
+        is_x_mana(&runner.state().objects[&pinnacle].abilities[0].cost),
+        "reach: Helix Pinnacle's ability 0 is its {{X}} ability"
+    );
+    stimulate(&mut runner, magus);
+
+    // Magus's {C}{C} pays X = 2.
+    activate_with_x(&mut runner, pinnacle, 2);
+    assert!(
+        runner.state().delayed_triggers.is_empty(),
+        "CR 602.1a: the {{X}} activation uses up Magus's trigger"
+    );
+    assert_eq!(activated_entries_of(&runner, pinnacle), 1);
+    assert_eq!(magus_trigger_count(&runner, magus), 1);
+    let activation = runner.state().stack[0].id;
+
+    drop(runner.cast(stifle).target_objects(&[activation]).commit());
+    pass_both(&mut runner);
+    assert_eq!(
+        activated_entries_of(&runner, pinnacle),
+        0,
+        "reach: Stifle countered the activation"
+    );
+    assert_eq!(
+        magus_trigger_count(&runner, magus),
+        1,
+        "reach: Magus's delayed trigger still waits"
+    );
+
+    pass_both(&mut runner);
+    let copies: Vec<Option<u32>> = runner
+        .state()
+        .stack
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            StackEntryKind::ActivatedAbility { source_id, ability } if *source_id == pinnacle => {
+                Some(ability.chosen_x)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        copies,
+        vec![Some(2)],
+        "CR 707.10: the countered activation is copied with its X"
+    );
+    drain_stack(&mut runner);
+    assert_eq!(
+        tower_counters(&runner, pinnacle),
+        2,
+        "only the copy resolves"
+    );
+}

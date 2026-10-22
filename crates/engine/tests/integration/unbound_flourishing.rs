@@ -10,7 +10,8 @@
 //! `{X}`-in-mana-cost qualifier and line 2's copy, which lowers to a spell-cast
 //! trigger and an activation trigger, each answering its own half of the
 //! intervening-if from its event (CR 603.4). Rulings exercised: the copy is made
-//! even if the original was countered; activated abilities are copied; X
+//! even if the original was countered; activated abilities are copied (also
+//! after Stifle counters one, U-24); X
 //! without the mana symbol {X} does not count; X = 0 is still
 //! copied; two Unbounds copy twice; the copy has the same X; the copy is not
 //! cast or activated; you may choose new targets; any {X} instant, sorcery or
@@ -19,9 +20,7 @@
 //! Line 1's "double the value of X" is covered from U-16 on: Walking Ballista
 //! X=2 entering with 4 counters, two Unbounds giving 8, X = 0, Hydroid
 //! Krasis's order choice, and a spell-cast trigger reading the doubled mana
-//! value. Deferred to a later phase of this change: an activated ability still
-//! copied after Stifle counters it (phase 4; here every ability copy is made
-//! while the original is still on the stack).
+//! value.
 //!
 //! `X Draw Engine` ("{X}: Draw X cards.\n{1}: Draw a card.") is the one
 //! synthetic fixture: it isolates an `{X}` activation and a non-`{X}`
@@ -66,6 +65,10 @@ const NISSA: &str = "[+2]: Scry 2.\n[0]: Look at the top card of your library. I
 const TEVAL: &str = "Flying, lifelink\nSpells you cast have delve. (Each card you exile from your graveyard while casting those spells pays for {1}.)\nWhenever you cast a spell, you lose life equal to its mana value.";
 const ENDLESS_ONE: &str = "This creature enters with X +1/+1 counters on it.";
 const FATED_FIREPOWER: &str = "Flash\nThis enchantment enters with X fire counters on it.\nIf a source you control would deal damage to an opponent or a permanent an opponent controls, it deals that much damage plus an amount of damage equal to the number of fire counters on this enchantment instead.";
+/// Helix Pinnacle, verbatim (MTGJSON), reminder text included.
+const HELIX_PINNACLE: &str = "Shroud (This enchantment can't be the target of spells or abilities.)\n{X}: Put X tower counters on this enchantment.\nAt the beginning of your upkeep, if there are 100 or more tower counters on this enchantment, you win the game.";
+const STIFLE: &str =
+    "Counter target activated or triggered ability. (Mana abilities can't be targeted.)";
 
 /// A stack entry, summarized for exact stack assertions (bottom first).
 #[derive(Debug, PartialEq, Eq)]
@@ -1692,4 +1695,183 @@ fn teval_reads_the_announced_mana_value_of_a_spell_countered_without_unbound() {
     drain_stack(&mut runner);
     assert_settled(&runner);
     assert_eq!(life_before - life(&runner, P0), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Line 2 after a counter: "copy that spell or ability" names the activated
+// ability as it last existed on the stack (CR 113.7a + CR 608.2h).
+// ---------------------------------------------------------------------------
+
+/// Stifle, at no cost, in P0's hand.
+fn add_stifle(scenario: &mut GameScenario) -> ObjectId {
+    scenario
+        .add_spell_to_hand_from_oracle(P0, "Stifle", true, STIFLE)
+        .with_mana_cost(ManaCost::zero())
+        .id()
+}
+
+/// The topmost activated-ability entry of `source` on the stack whose
+/// announced X is `x`.
+fn activated_entry(runner: &GameRunner, source: ObjectId, x: Option<u32>) -> ObjectId {
+    runner
+        .state()
+        .stack
+        .iter()
+        .rev()
+        .find(|entry| {
+            matches!(
+                &entry.kind,
+                StackEntryKind::ActivatedAbility { source_id, ability }
+                    if *source_id == source && ability.chosen_x == x
+            )
+        })
+        .map(|entry| entry.id)
+        .expect("reach: the activation is on the stack")
+}
+
+/// U-24 (rulings: a copy is created even if the original was countered; the
+/// copy has the same X; CR 701.6a + CR 113.7a + CR 608.2h + CR 707.10): Stifle
+/// counters Helix Pinnacle's `{X}` activation (X = 2) before Unbound's trigger
+/// resolves; the trigger still copies it, and only the copy puts counters.
+#[test]
+fn copies_an_x_activated_ability_countered_before_the_trigger_resolves() {
+    let mut scenario = unbound_scenario();
+    let unbound = unbound(&mut scenario);
+    let pinnacle = scenario
+        .add_enchantment_from_oracle(P0, "Helix Pinnacle", HELIX_PINNACLE)
+        .from_oracle_text_with_keywords(&["Shroud"], HELIX_PINNACLE)
+        .with_mana_cost(mana(&[ManaCostShard::Green], 0))
+        .id();
+    let stifle = add_stifle(&mut scenario);
+    let mut runner = scenario.build();
+    let pinnacle_x = runner.state().objects[&pinnacle]
+        .abilities
+        .iter()
+        .position(|ability| is_x_mana(&ability.cost))
+        .expect("reach: Helix Pinnacle has its {X} ability");
+    let towers = || CounterType::Generic("tower".to_string());
+    add_mana(&mut runner, ManaType::Colorless, 2);
+
+    activate_with_x(&mut runner, pinnacle, pinnacle_x, 2);
+    assert_eq!(
+        stack_entries(runner.state()),
+        vec![
+            Entry::Activated(pinnacle, Some(2)),
+            Entry::Triggered(unbound)
+        ]
+    );
+    let activation = activated_entry(&runner, pinnacle, Some(2));
+
+    drop(runner.cast(stifle).target_objects(&[activation]).commit());
+    pass_both(&mut runner);
+    assert_eq!(
+        stack_entries(runner.state()),
+        vec![Entry::Triggered(unbound)],
+        "reach: Stifle countered the activation; Unbound's trigger still waits"
+    );
+
+    pass_both(&mut runner);
+    assert_eq!(
+        stack_entries(runner.state()),
+        vec![Entry::Activated(pinnacle, Some(2))],
+        "CR 707.10: the countered activation is copied with its X"
+    );
+    assert!(
+        runner
+            .state()
+            .departed_activated_abilities
+            .contains_key(&activation),
+        "the countered activation is recorded while its step lasts"
+    );
+
+    drain_stack(&mut runner);
+    assert_settled(&runner);
+    assert_eq!(
+        counters(&runner, pinnacle, towers()),
+        2,
+        "only the copy resolves"
+    );
+
+    // CR 500.2: the step ends on an empty stack, and its departed records end
+    // with it.
+    assert_eq!(runner.state().phase, Phase::PreCombatMain);
+    pass_both(&mut runner);
+    assert_eq!(runner.state().phase, Phase::BeginCombat);
+    assert!(
+        runner.state().departed_activated_abilities.is_empty(),
+        "the departed record is cleared when the step ends"
+    );
+}
+
+/// U-25 (CR 602.2a + CR 707.10b; hostile): X Draw Engine's first `{X}`
+/// activation (X = 1) is copied while it waits; a second activation (X = 2) is
+/// then Stifled. Its own trigger copies the countered second activation
+/// (X = 2), never the earlier activation or its copy, both live below with the
+/// same source.
+#[test]
+fn a_countered_x_activation_is_copied_not_an_earlier_one_or_its_copy() {
+    let mut scenario = unbound_scenario();
+    let unbound = unbound(&mut scenario);
+    let engine = add_x_draw_engine(&mut scenario);
+    let stifle = add_stifle(&mut scenario);
+    let mut runner = scenario.build();
+    let library_before = library_len(&runner, 0);
+    add_mana(&mut runner, ManaType::Colorless, 3);
+
+    activate_with_x(&mut runner, engine, 0, 1);
+    pass_both(&mut runner);
+    assert_eq!(
+        stack_entries(runner.state()),
+        vec![
+            Entry::Activated(engine, Some(1)),
+            Entry::Activated(engine, Some(1))
+        ],
+        "reach: the first activation and its copy wait"
+    );
+
+    activate_with_x(&mut runner, engine, 0, 2);
+    assert_eq!(
+        stack_entries(runner.state()),
+        vec![
+            Entry::Activated(engine, Some(1)),
+            Entry::Activated(engine, Some(1)),
+            Entry::Activated(engine, Some(2)),
+            Entry::Triggered(unbound)
+        ]
+    );
+    let second = activated_entry(&runner, engine, Some(2));
+
+    drop(runner.cast(stifle).target_objects(&[second]).commit());
+    pass_both(&mut runner);
+    assert!(
+        runner.state().stack.iter().all(|entry| entry.id != second),
+        "reach: Stifle countered the second activation"
+    );
+    assert_eq!(
+        stack_entries(runner.state()),
+        vec![
+            Entry::Activated(engine, Some(1)),
+            Entry::Activated(engine, Some(1)),
+            Entry::Triggered(unbound)
+        ]
+    );
+
+    pass_both(&mut runner);
+    assert_eq!(
+        stack_entries(runner.state()),
+        vec![
+            Entry::Activated(engine, Some(1)),
+            Entry::Activated(engine, Some(1)),
+            Entry::Activated(engine, Some(2))
+        ],
+        "the trigger copies the countered second activation (X = 2), not the first or its copy"
+    );
+
+    drain_stack(&mut runner);
+    assert_settled(&runner);
+    assert_eq!(
+        library_before - library_len(&runner, 0),
+        4,
+        "the first activation and its copy draw 1 each; the copy of the second draws 2"
+    );
 }
