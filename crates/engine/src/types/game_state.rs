@@ -10138,7 +10138,7 @@ pub struct PendingManaAbility {
     /// `chosen_counter_counts_missing_field_wire_shape_is_rejected` in this
     /// file's test module.
     pub chosen_counter_counts: Vec<u32>,
-    /// CR 107.3a + CR 601.2b: Announced value of X for this mana ability. Three
+    /// CR 107.3a + CR 601.2b: Announced value of X for this mana ability. Four
     /// writers, all binding the same CR 107.3a announcement:
     ///
     /// * CR 702.179e/f: a `Pay X speed` cost (Chicago Loop's `Pay X speed: Add
@@ -10150,6 +10150,10 @@ pub struct PendingManaAbility {
     ///   `PayableResource::ManaGeneric` before cost payment; the activation pays
     ///   the leg with X concretized and the produced-mana count reads the same
     ///   value;
+    /// * a literal `Remove X counters` cost (Saltcrusted Steppe class), where
+    ///   the `SubmitPayAmount` handler binds X from the `PayableResource::Counters`
+    ///   answer for the leaf `next_chosen_counter_leaf_is_literal_x` identifies
+    ///   (CR 107.3i: every X on the object shares that value);
     /// * the X-sentinel `TapCreatures` form (Hazel of the Rootbloom's
     ///   `Tap X untapped tokens you control`), where
     ///   `handle_tap_creatures_for_mana_ability` binds X to the size of the

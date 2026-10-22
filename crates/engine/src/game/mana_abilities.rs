@@ -2355,13 +2355,17 @@ fn announced_x_leg(leg: &AbilityCost) -> Option<AnnouncedXLeg<'_>> {
 }
 
 /// CR 107.3a: true iff any leg of this mana ability's cost (at any `Composite`
-/// depth, via the flatten authority the cost cursor pays) announces X.
+/// depth — the legs `mana_ability_cost_components` flattens for the cost
+/// cursor) announces X. Borrows rather than flattening: this runs on the
+/// readiness hot path.
 fn mana_ability_announces_x(cost: &Option<AbilityCost>) -> bool {
-    cost.as_ref().is_some_and(|cost| {
-        mana_ability_cost_components(cost)
-            .iter()
-            .any(|leg| announced_x_leg(leg).is_some())
-    })
+    fn any_announced_x_leg(cost: &AbilityCost) -> bool {
+        match cost {
+            AbilityCost::Composite { costs } => costs.iter().any(any_announced_x_leg),
+            leg => announced_x_leg(leg).is_some(),
+        }
+    }
+    cost.as_ref().is_some_and(any_announced_x_leg)
 }
 
 /// CR 107.3a + CR 107.3i: the X-announcement prompt for a mana ability's cost —

@@ -32,6 +32,9 @@ When this artifact is put into a graveyard from the battlefield, draw a card.";
 
 const PHYREXIAN_ALTAR: &str = "Sacrifice a creature: Add one mana of any color.";
 const AZORIUS_SIGNET: &str = "{1}, {T}: Add {W}{U}.";
+const MORBID_CURIOSITY: &str =
+    "As an additional cost to cast this spell, sacrifice an artifact or creature.\n\
+Draw cards equal to the mana value of the sacrificed permanent.";
 
 fn scenario() -> GameScenario {
     let mut scenario = GameScenario::new_n_player(2, 7);
@@ -292,6 +295,49 @@ fn rockets_x_leg_paid_from_pool_and_land() {
     assert_eq!(count(state, ManaType::Black), 1);
 }
 
+/// T9: when the floating mana alone covers the announced X, the pool pays the
+/// whole `{X}` leg and no land is tapped.
+#[test]
+fn rockets_x_leg_paid_entirely_from_pool() {
+    let mut scenario = scenario();
+    let rockets = add_rockets(&mut scenario);
+    let mountain = scenario.add_basic_land(P0, ManaColor::Red);
+    scenario.with_mana_pool(
+        P0,
+        (0..2)
+            .map(|_| ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]))
+            .collect(),
+    );
+    let mut runner = scenario.build();
+    untap(&mut runner, rockets);
+
+    activate(&mut runner, rockets);
+    assert_eq!(
+        expect_announcement(runner.state(), rockets),
+        3,
+        "pool 2 + Mountain 1"
+    );
+    act(&mut runner, GameAction::SubmitPayAmount { amount: 2 });
+
+    assert_eq!(expect_any_combination(runner.state()), 2);
+    let state = runner.state();
+    assert_eq!(pool_total(state), 0, "the two floating mana paid {{2}}");
+    assert!(!tapped(state, mountain), "no land was needed");
+    assert_eq!(zone(state, rockets), Zone::Graveyard, "Rockets sacrificed");
+
+    choose_colors(&mut runner, vec![ManaType::Green, ManaType::Green]);
+    let state = runner.state();
+    assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+    assert_eq!(pool_total(state), 2);
+    assert_eq!(count(state, ManaType::Green), 2);
+    assert_eq!(
+        count(state, ManaType::Colorless),
+        0,
+        "the pooled mana was spent"
+    );
+    assert!(!tapped(state, mountain));
+}
+
 /// T4: with the pool empty and no auto-tappable source, the `{X}` leg opens the
 /// mana ability's payment window with X bound; Phyrexian Altar pays it there,
 /// and Rockets is not offered again while it is suspended (CR 605.3c).
@@ -549,4 +595,104 @@ fn rockets_activated_inside_spell_mana_payment_returns_to_it() {
     let state = runner.state();
     assert_eq!(zone(state, sliver), Zone::Stack, "Metallic Sliver was cast");
     assert_eq!(pool_total(state), 0, "Rockets' mana paid for it");
+}
+
+/// T10: a Rockets already chosen for a pending spell's sacrifice cost, whose
+/// zone move waits for the spell's mana payment, can't also be sacrificed for
+/// its own mana ability (CR 601.2g + CR 118.3): it is not offered, and
+/// activating it is refused before X is announced. A second, unreserved
+/// Rockets is still offered.
+#[test]
+fn rockets_reserved_for_a_spell_sacrifice_is_neither_listed_nor_announced() {
+    let mut scenario = scenario();
+    let reserved = add_rockets(&mut scenario);
+    let sibling = add_rockets(&mut scenario);
+    for _ in 0..3 {
+        scenario.add_basic_land(P0, ManaColor::Black);
+    }
+    let curiosity = scenario
+        .add_spell_to_hand_from_oracle(P0, "Morbid Curiosity", false, MORBID_CURIOSITY)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Black, ManaCostShard::Black],
+            generic: 1,
+        })
+        .id();
+    let mut runner = scenario.build();
+    untap(&mut runner, reserved);
+    untap(&mut runner, sibling);
+
+    let card_id = runner.state().objects[&curiosity].card_id;
+    act(
+        &mut runner,
+        GameAction::CastSpell {
+            object_id: curiosity,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Manual,
+        },
+    );
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::PayCost {
+                kind: PayCostKind::Sacrifice,
+                ..
+            }
+        ),
+        "the sacrifice additional cost is chosen first: {:?}",
+        runner.state().waiting_for
+    );
+    act(
+        &mut runner,
+        GameAction::SelectCards {
+            cards: vec![reserved],
+        },
+    );
+
+    let state = runner.state();
+    assert!(
+        matches!(state.waiting_for, WaitingFor::ManaPayment { .. }),
+        "the spell's mana payment opens: {:?}",
+        state.waiting_for
+    );
+    // Reach guard: the reservation is really installed, and the chosen Rockets
+    // is still on the battlefield waiting for the payment commit.
+    assert!(
+        state.pending_cast.as_ref().is_some_and(|pending| pending
+            .deferred_sacrificed_permanents
+            .iter()
+            .any(|selection| selection.object_id == reserved)),
+        "Rockets is reserved as the spell's deferred sacrifice"
+    );
+    assert_eq!(zone(state, reserved), Zone::Battlefield);
+    assert!(
+        lists_activation(state, sibling),
+        "the unreserved Rockets is offered in the payment window"
+    );
+    assert!(
+        !lists_activation(state, reserved),
+        "CR 601.2g: the reserved Rockets is not offered"
+    );
+
+    let error = runner
+        .act(activate_action(runner.state(), reserved))
+        .expect_err("one permanent can't pay both sacrifices");
+    assert!(
+        error
+            .to_string()
+            .contains("already committed to a spell sacrifice cost"),
+        "refused for the reservation: {error}"
+    );
+    let state = runner.state();
+    assert!(
+        !matches!(state.waiting_for, WaitingFor::PayAmountChoice { .. }),
+        "no X announcement for a refused activation"
+    );
+    assert!(
+        matches!(state.waiting_for, WaitingFor::ManaPayment { .. }),
+        "still in the spell's payment: {:?}",
+        state.waiting_for
+    );
+    assert_eq!(zone(state, reserved), Zone::Battlefield);
+    assert!(!tapped(state, reserved));
 }
