@@ -10,8 +10,8 @@
 //! `{X}`-in-mana-cost qualifier and line 2's copy, which lowers to a spell-cast
 //! trigger and an activation trigger, each answering its own half of the
 //! intervening-if from its event (CR 603.4). Rulings exercised: the copy is made
-//! even if the original was countered; activated abilities, not triggered ones,
-//! are copied; X without the mana symbol {X} does not count; X = 0 is still
+//! even if the original was countered; activated abilities are copied; X
+//! without the mana symbol {X} does not count; X = 0 is still
 //! copied; two Unbounds copy twice; the copy has the same X; the copy is not
 //! cast or activated; you may choose new targets; any {X} instant, sorcery or
 //! activated ability is copied, targeted or not.

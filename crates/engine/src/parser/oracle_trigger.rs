@@ -4181,8 +4181,8 @@ fn constrain_triggering_spell_with_nth_filter(def: &mut TriggerDefinition) {
 
 /// Narrow a trigger's event filter by conjoining `filter` onto its
 /// `valid_card`: an absent or `Any` filter is replaced, an equal filter is
-/// kept, and any other filter is composed with `And`. The single fold shared by
-/// every parser step that adds a predicate on the triggering object.
+/// kept, and any other filter is composed with `And`. Shared by the
+/// nth-spell constraint fold and the cast-or-activate split's `{X}`-in-cost fold.
 fn conjoin_valid_card(def: &mut TriggerDefinition, filter: TargetFilter) {
     def.valid_card = Some(match def.valid_card.take() {
         None | Some(TargetFilter::Any) => filter,
@@ -4197,7 +4197,7 @@ fn conjoin_valid_card(def: &mut TriggerDefinition, filter: TargetFilter) {
 /// trigger text takes precedence, then the condition parser's constraint, then
 /// the "for the first time ..." event limit. The single authority for "which
 /// constraint does this trigger end up with", shared by `lower_trigger_ir` and
-/// the compound splitters that must inspect a half before it is lowered.
+/// the cast-or-activate split, which must inspect a half before it is lowered.
 fn lowered_trigger_constraint(
     modifiers: &TriggerModifiers,
     condition_constraint: Option<TriggerConstraint>,
