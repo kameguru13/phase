@@ -448,7 +448,7 @@ fn the_copy_of_an_x_instant_may_take_a_new_target() {
 
 /// U-5 (ruling: a copy is created even if the original was countered; CR 701.6a
 /// + CR 608.2h): Cancel counters Sphinx's Revelation before Unbound's trigger
-/// resolves; the trigger still copies it.
+///   resolves; the trigger still copies it.
 #[test]
 fn copies_an_x_instant_countered_before_the_trigger_resolves() {
     let mut scenario = unbound_scenario();
