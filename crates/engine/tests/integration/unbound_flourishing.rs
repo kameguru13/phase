@@ -456,7 +456,7 @@ fn assert_settled(runner: &GameRunner) {
 
 /// U-1: line 1 watches only permanent spells whose mana cost contains {X}.
 /// Grizzly Bears ({1}{G}) does not trigger it; Walking Ballista ({X}{X}) does.
-/// Line 1's doubling is asserted by the phase-3 rows (U-16 onward); this row
+/// Line 1's doubling is asserted by the doubling rows (U-16 onward); this row
 /// asserts only the trigger filter.
 #[test]
 fn line_one_ignores_a_permanent_spell_without_x_in_its_mana_cost() {

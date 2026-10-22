@@ -27390,7 +27390,7 @@ fn activate_with_cost_carrier(
     record_activation_announcement(state, player, source_id, ability_index, &mut resolved);
     // CR 602.1a + CR 601.2f: one capture — the latch on the record and the fold's
     // base cost are one fact, read from the same announcement-bound definition
-    // before any modifier or payment (charter D1.7).
+    // before any modifier or payment.
     debug_assert!(
         resolved.activation_record.as_deref().is_none_or(|record| {
             record.activation_cost

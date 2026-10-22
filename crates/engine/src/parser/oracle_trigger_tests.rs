@@ -39489,7 +39489,7 @@ fn x_in_cost_qualifier_accepts_both_grammars_for_each_slot() {
 /// Unbound Flourishing line 1 keeps "with a mana cost that contains {X}": the
 /// trigger watches only permanent spells whose mana cost contains {X}. Its
 /// effect ("double the value of X") lowers to
-/// `Effect::ModifyAnnouncedX { modification: XModification::Double }` (phase 3).
+/// `Effect::ModifyAnnouncedX { modification: XModification::Double }`.
 #[test]
 fn unbound_line_one_requires_x_in_its_mana_cost() {
     let triggers =
