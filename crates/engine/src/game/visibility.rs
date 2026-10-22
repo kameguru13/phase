@@ -4819,6 +4819,12 @@ fn redact_hidden_library_identity_carriers(
         .stack
         .iter_mut()
         .chain(filtered.resolving_stack_entry.iter_mut())
+        .chain(
+            filtered
+                .departed_activated_abilities
+                .iter_mut()
+                .map(|(_, entry)| entry),
+        )
     {
         match &mut entry.kind {
             StackEntryKind::Spell {
@@ -14404,6 +14410,28 @@ mod tests {
             });
             state.current_trigger_events.push(event);
         }
+        // A departed activation record of a public source gets the per-entry
+        // redaction a live stack entry gets.
+        for (id, object) in [(ObjectId(810), library_card), (ObjectId(811), permanent)] {
+            state.departed_activated_abilities.insert(
+                id,
+                StackEntry {
+                    id,
+                    source_id: permanent,
+                    controller: PlayerId(0),
+                    kind: StackEntryKind::ActivatedAbility {
+                        source_id: permanent,
+                        ability: Box::new(with_context(object, &state)),
+                    },
+                },
+            );
+        }
+        let departed_context = |state: &GameState, id: ObjectId| {
+            state.departed_activated_abilities[&id]
+                .ability()
+                .and_then(|ability| ability.effect_context_object.as_ref())
+                .map(|snapshot| snapshot.object_id)
+        };
         state.last_revealed_ids = vec![library_card];
 
         let stripped = |event: &GameEvent| match event {
@@ -14455,6 +14483,14 @@ mod tests {
                 ],
                 "stack carriers, viewer {viewer:?}"
             );
+            assert_eq!(
+                (
+                    departed_context(&projected, ObjectId(810)),
+                    departed_context(&projected, ObjectId(811)),
+                ),
+                (None, Some(permanent)),
+                "departed activation carriers, viewer {viewer:?}"
+            );
         }
         let projected = filter_state_for_unseated_viewer(&state);
         assert!(projected.last_revealed_ids.is_empty());
@@ -14462,7 +14498,13 @@ mod tests {
             projected.current_trigger_events,
             vec![stripped(&library_event), permanent_event.clone()]
         );
+        assert_eq!(departed_context(&projected, ObjectId(810)), None);
         assert_eq!(state.last_revealed_ids, vec![library_card]);
+        assert_eq!(
+            departed_context(&state, ObjectId(810)),
+            Some(library_card),
+            "the rules state keeps the departed record's context"
+        );
         assert!(matches!(
             &state.current_trigger_events[0],
             GameEvent::EffectResolved {

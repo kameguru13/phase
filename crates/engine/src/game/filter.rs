@@ -4504,16 +4504,23 @@ fn bind_absent_search_property_after_children(prop: &mut FilterProp) {
 /// (`BoundActivationCost`, captured before payment) before the filter is
 /// evaluated against the source. CR 113.7a: live and departed-LKI evaluation
 /// both see the one bound fact.
+///
+/// Transactional, like the other binders over this walk: the rewrite runs on a
+/// copy and is published only when the bounded walk reached every property. An
+/// incomplete walk (a `CardTypeSetSource::AnyOf` population nested past
+/// `UNION_DEPTH_BUDGET`) leaves `filter` unchanged and returns `false`, so the
+/// caller fails closed instead of evaluating a filter with an occurrence left
+/// unbound.
+#[must_use]
 pub(crate) fn bind_activation_cost_x(
     filter: &mut TargetFilter,
     cost: &crate::types::events::BoundActivationCost,
-) {
+) -> bool {
     let has_x = crate::game::casting_costs::bound_activation_cost_has_x(cost);
-    // This rewrite walks no object population, so completeness is not
-    // consulted: every reachable property is rewritten.
+    let mut rewritten = filter.clone();
     let mut complete = true;
     rewrite_filter_props(
-        filter,
+        &mut rewritten,
         &mut |_, _, _| {},
         &mut |prop| {
             if matches!(prop, FilterProp::HasXInActivationCost) {
@@ -4525,6 +4532,10 @@ pub(crate) fn bind_activation_cost_x(
         false,
         None,
     );
+    if complete {
+        *filter = rewritten;
+    }
+    complete
 }
 
 // This summary reads Boolean composition only. It never replaces a descriptor
@@ -16378,13 +16389,13 @@ mod tests {
         };
 
         let mut bound_true = filter.clone();
-        bind_activation_cost_x(&mut bound_true, &x_cost);
+        assert!(bind_activation_cost_x(&mut bound_true, &x_cost));
         assert!(
             matches_target_filter(&state, source, &bound_true, source),
             "a creature source whose activation carried {{X}} matches the composed filter"
         );
         let mut bound_false = filter.clone();
-        bind_activation_cost_x(&mut bound_false, &non_x_cost);
+        assert!(bind_activation_cost_x(&mut bound_false, &non_x_cost));
         assert!(
             !matches_target_filter(&state, source, &bound_false, source),
             "an activation whose cost carried no {{X}} fails the composed filter"
@@ -16395,13 +16406,13 @@ mod tests {
                 props: vec![FilterProp::HasXInActivationCost],
             }]));
         let mut nested_true = nested.clone();
-        bind_activation_cost_x(&mut nested_true, &x_cost);
+        assert!(bind_activation_cost_x(&mut nested_true, &x_cost));
         assert!(
             matches_target_filter(&state, source, &nested_true, source),
             "a property nested in AnyOf is bound too"
         );
         let mut nested_false = nested;
-        bind_activation_cost_x(&mut nested_false, &non_x_cost);
+        assert!(bind_activation_cost_x(&mut nested_false, &non_x_cost));
         assert!(!matches_target_filter(
             &state,
             source,
@@ -16414,6 +16425,59 @@ mod tests {
             "an unbound HasXInActivationCost names no activation, whatever \
              pending_activations holds"
         );
+    }
+
+    /// CR 602.1a + CR 603.2: binding an activation's cost into a filter is
+    /// transactional. Within the union budget every occurrence is bound; past
+    /// it nothing is published (not even the visible top-level occurrence the
+    /// walk did reach) and the binder reports the incomplete walk.
+    #[test]
+    fn activation_cost_x_binding_is_transactional_at_population_budget() {
+        use crate::types::ability::{AbilityCost, CardTypeSetSource, UNION_DEPTH_BUDGET};
+        use crate::types::events::BoundActivationCost;
+
+        let not_x = |x: FilterProp| FilterProp::Not { prop: Box::new(x) };
+        let population = |depth: u32, x: FilterProp| {
+            let member = || CardTypeSetSource::Objects {
+                filter: TargetFilter::Typed(
+                    TypedFilter::creature().properties(vec![not_x(x.clone())]),
+                ),
+            };
+            let mut source = member();
+            for _ in 0..depth {
+                source = CardTypeSetSource::any_of(vec![source, member()]).unwrap();
+            }
+            TargetFilter::Typed(TypedFilter::creature().properties(vec![
+                not_x(x.clone()),
+                FilterProp::Cmc {
+                    comparator: Comparator::LE,
+                    value: QuantityExpr::Ref {
+                        qty: QuantityRef::DistinctCardTypes { source },
+                    },
+                },
+            ]))
+        };
+        let non_x_cost = BoundActivationCost::Cost(Box::new(AbilityCost::Tap));
+
+        let mut within = population(2, FilterProp::HasXInActivationCost);
+        assert!(bind_activation_cost_x(&mut within, &non_x_cost));
+        assert_eq!(
+            within,
+            population(2, filter_prop_truth(false)),
+            "every occurrence, nested population members included, is bound"
+        );
+
+        let mut rejected = population(UNION_DEPTH_BUDGET, FilterProp::HasXInActivationCost);
+        let before = rejected.clone();
+        assert!(
+            filter_contains_filter_prop(&rejected, &|prop| matches!(
+                prop,
+                FilterProp::HasXInActivationCost
+            )),
+            "visible rewritable occurrence guards rejection reach"
+        );
+        assert!(!bind_activation_cost_x(&mut rejected, &non_x_cost));
+        assert_eq!(rejected, before, "no reachable prefix is published");
     }
 
     #[test]
