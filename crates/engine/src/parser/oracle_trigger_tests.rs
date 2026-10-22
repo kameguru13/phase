@@ -20,7 +20,7 @@ use crate::types::ability::{
     ObjectProperty, ObjectScope, PerPlayerScope, PerpetualModification, PlayerFilter, PlayerScope,
     PropertyAggregate, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef, RoundingMode,
     SeatDirection, SharedQuality, SiblingCondition, SubAbilityLink, TapStateChange, TargetFilter,
-    TriggerCondition, TriggerDefinition, TurnJournalKind, TypeFilter, TypedFilter,
+    TriggerCondition, TriggerDefinition, TurnJournalKind, TypeFilter, TypedFilter, XModification,
     ZoneChoiceCandidateSource, ZoneChoiceChooser, ZoneOwner, ZoneRef,
 };
 use crate::types::ability::{
@@ -39488,7 +39488,8 @@ fn x_in_cost_qualifier_accepts_both_grammars_for_each_slot() {
 
 /// Unbound Flourishing line 1 keeps "with a mana cost that contains {X}": the
 /// trigger watches only permanent spells whose mana cost contains {X}. Its
-/// effect ("double the value of X") stays honestly unimplemented.
+/// effect ("double the value of X") lowers to
+/// `Effect::ModifyAnnouncedX { modification: XModification::Double }` (phase 3).
 #[test]
 fn unbound_line_one_requires_x_in_its_mana_cost() {
     let triggers =
@@ -39505,10 +39506,79 @@ fn unbound_line_one_requires_x_in_its_mana_cost() {
         })
     );
     let execute = line_one.execute.as_deref().expect("line 1 body");
-    assert!(
-        has_unimplemented(execute),
-        "line 1's doubling stays a strict failure: {execute:?}"
+    assert_eq!(
+        *execute.effect,
+        Effect::ModifyAnnouncedX {
+            modification: XModification::Double
+        }
     );
+    assert!(!has_unimplemented(execute), "{execute:?}");
+}
+
+/// The strict-failure gap "double the value of X" lowers to outside a
+/// spell-cast trigger body.
+fn is_double_value_of_x_gap(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::Unimplemented { name, .. } if name == "double_value_of_x_without_triggering_spell"
+    )
+}
+
+/// CR 107.3e: "the value of X" names the X of the spell that caused a
+/// spell-cast trigger. In an ETB trigger body or bare spell text nothing names
+/// whose X it is, so the clause stays a strict failure. SYNTHETIC: no printed
+/// card exercises the gate's negative branch.
+#[test]
+fn double_the_value_of_x_needs_a_triggering_spell() {
+    let etb = parse_oracle_text(
+        "When this creature enters, double the value of X.",
+        "Synthetic Doubler",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+    let etb_body = etb.triggers[0].execute.as_deref().expect("ETB body");
+    assert!(
+        is_double_value_of_x_gap(&etb_body.effect),
+        "{:?}",
+        etb_body.effect
+    );
+
+    let spell = parse_oracle_text(
+        "Double the value of X.",
+        "Synthetic Doubling",
+        &[],
+        &["Sorcery".to_string()],
+        &[],
+    );
+    assert!(
+        is_double_value_of_x_gap(&spell.abilities[0].effect),
+        "{:?}",
+        spell.abilities[0].effect
+    );
+}
+
+/// CR 107.3e: an intervening-if that pins the body's anaphor to the card itself
+/// ("if this card is in your graveyard") leaves no triggering spell for "the
+/// value of X" to name, so the clause stays a strict failure. SYNTHETIC: no
+/// printed card exercises the gate's negative branch.
+#[test]
+fn double_the_value_of_x_under_a_self_pinning_if_is_strict() {
+    let parsed = parse_oracle_text(
+        "Whenever you cast a spell, if this card is in your graveyard, double the value of X.",
+        "Synthetic Doubler",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+    let trigger = &parsed.triggers[0];
+    assert_eq!(
+        trigger.mode,
+        TriggerMode::SpellCast,
+        "reach: a spell-cast head"
+    );
+    let body = trigger.execute.as_deref().expect("trigger body");
+    assert!(is_double_value_of_x_gap(&body.effect), "{:?}", body.effect);
 }
 
 /// CR 603.2 + CR 603.4: Unbound Flourishing line 2 lowers to one spell-cast

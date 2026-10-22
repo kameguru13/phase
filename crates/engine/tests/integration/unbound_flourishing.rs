@@ -16,9 +16,10 @@
 //! cast or activated; you may choose new targets; any {X} instant, sorcery or
 //! activated ability is copied, targeted or not.
 //!
-//! Deferred to later phases of this change: line 1's "double the value of X"
-//! (Walking Ballista X=2 entering with 4 counters, two Unbounds giving 8, and
-//! Hydroid Krasis's order choice: phase 3), and an activated ability still
+//! Line 1's "double the value of X" is covered from U-16 on: Walking Ballista
+//! X=2 entering with 4 counters, two Unbounds giving 8, X = 0, Hydroid
+//! Krasis's order choice, and a spell-cast trigger reading the doubled mana
+//! value. Deferred to a later phase of this change: an activated ability still
 //! copied after Stifle counters it (phase 4; here every ability copy is made
 //! while the original is still on the stack).
 //!
@@ -28,13 +29,20 @@
 //! gives (the Magus Lucea Kane rows use the same shape).
 
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::ability::{AbilityCost, SacrificeRequirement, TargetFilter, TargetRef};
+use engine::types::ability::{
+    AbilityCost, EffectKind, SacrificeRequirement, TargetFilter, TargetRef,
+};
 use engine::types::actions::GameAction;
+use engine::types::card::PrintedLoyalty;
+use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
-use engine::types::game_state::{ConvokeMode, GameState, PayCostKind, StackEntryKind, WaitingFor};
+use engine::types::game_state::{
+    CastPaymentMode, ConvokeMode, GameState, PayCostKind, StackEntryKind, WaitingFor,
+};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
+use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 
 const UNBOUND: &str = "Whenever you cast a permanent spell with a mana cost that contains {X}, double the value of X.\nWhenever you cast an instant or sorcery spell or activate an ability, if that spell's mana cost or that ability's activation cost contains {X}, copy that spell or ability. You may choose new targets for the copy.";
@@ -53,6 +61,11 @@ const KRAV_ACTIVATED: &str =
     "{B}, Sacrifice X creatures: Target player draws X cards and gains X life. Put X +1/+1 counters on Krav.";
 /// SYNTHETIC: an `{X}` and a non-`{X}` activation of one source.
 const X_DRAW_ENGINE: &str = "{X}: Draw X cards.\n{1}: Draw a card.";
+const KRASIS: &str = "When you cast this spell, you gain half X life and draw half X cards. Round down each time.\nFlying, trample\nThis creature enters with X +1/+1 counters on it.";
+const NISSA: &str = "[+2]: Scry 2.\n[0]: Look at the top card of your library. If it's a land card or a creature card with mana value less than or equal to the number of loyalty counters on Nissa, you may put that card onto the battlefield.\n[\u{2212}6]: Untap up to two target lands you control. They become 5/5 Elemental creatures with flying and haste until end of turn. They're still lands.";
+const TEVAL: &str = "Flying, lifelink\nSpells you cast have delve. (Each card you exile from your graveyard while casting those spells pays for {1}.)\nWhenever you cast a spell, you lose life equal to its mana value.";
+const ENDLESS_ONE: &str = "This creature enters with X +1/+1 counters on it.";
+const FATED_FIREPOWER: &str = "Flash\nThis enchantment enters with X fire counters on it.\nIf a source you control would deal damage to an opponent or a permanent an opponent controls, it deals that much damage plus an amount of damage equal to the number of fire counters on this enchantment instead.";
 
 /// A stack entry, summarized for exact stack assertions (bottom first).
 #[derive(Debug, PartialEq, Eq)]
@@ -85,15 +98,16 @@ fn mana(shards: &[ManaCostShard], generic: u32) -> ManaCost {
     }
 }
 
-fn add_mana(runner: &mut GameRunner, mana_type: ManaType, count: usize) {
+fn add_player_mana(runner: &mut GameRunner, player: PlayerId, mana_type: ManaType, count: usize) {
     for _ in 0..count {
-        runner.state_mut().players[0].mana_pool.add(ManaUnit::new(
-            mana_type,
-            ObjectId(0),
-            false,
-            vec![],
-        ));
+        runner.state_mut().players[usize::from(player.0)]
+            .mana_pool
+            .add(ManaUnit::new(mana_type, ObjectId(0), false, vec![]));
     }
+}
+
+fn add_mana(runner: &mut GameRunner, mana_type: ManaType, count: usize) {
+    add_player_mana(runner, P0, mana_type, count);
 }
 
 fn unbound_scenario() -> GameScenario {
@@ -139,6 +153,15 @@ fn unbound(scenario: &mut GameScenario) -> ObjectId {
     scenario
         .add_enchantment_from_oracle(P0, "Unbound Flourishing", UNBOUND)
         .with_mana_cost(mana(&[ManaCostShard::Green], 2))
+        .id()
+}
+
+/// Walking Ballista ({X}{X}) in P0's hand.
+fn add_ballista(scenario: &mut GameScenario) -> ObjectId {
+    scenario
+        .add_creature_to_hand_from_oracle(P0, "Walking Ballista", 0, 0, WALKING_BALLISTA)
+        .as_artifact_creature()
+        .with_mana_cost(mana(&[ManaCostShard::X, ManaCostShard::X], 0))
         .id()
 }
 
@@ -209,11 +232,17 @@ fn spell_copies_of(events: &[GameEvent], original: ObjectId) -> usize {
         .count()
 }
 
-fn act(runner: &mut GameRunner, action: GameAction) {
+/// Submit `action`, which must be accepted, and return the events it produced.
+fn act_events(runner: &mut GameRunner, action: GameAction) -> Vec<GameEvent> {
     let label = format!("{action:?}");
     runner
         .act(action)
-        .unwrap_or_else(|error| panic!("{label} must be accepted: {error:?}"));
+        .unwrap_or_else(|error| panic!("{label} must be accepted: {error:?}"))
+        .events
+}
+
+fn act(runner: &mut GameRunner, action: GameAction) {
+    act_events(runner, action);
 }
 
 fn pay_until_priority(runner: &mut GameRunner) {
@@ -248,36 +277,165 @@ fn activate_with_x(runner: &mut GameRunner, source: ObjectId, ability_index: usi
     pay_until_priority(runner);
 }
 
+/// Both players pass once, resolving the top of the stack; returns the events.
+fn pass_both_events(runner: &mut GameRunner) -> Vec<GameEvent> {
+    let mut events = act_events(runner, GameAction::PassPriority);
+    events.extend(act_events(runner, GameAction::PassPriority));
+    events
+}
+
 /// Both players pass once, resolving the top of the stack.
 fn pass_both(runner: &mut GameRunner) {
-    act(runner, GameAction::PassPriority);
-    act(runner, GameAction::PassPriority);
+    pass_both_events(runner);
 }
 
 /// Pass priority until the stack is empty, answering trigger ordering with the
-/// printed order. Any other prompt is a failure: a row that needs one answered
-/// drives it explicitly.
-fn drain_stack(runner: &mut GameRunner) {
+/// printed order, and return every event produced on the way. Any other prompt
+/// is a failure: a row that needs one answered drives it explicitly.
+fn drain_stack_events(runner: &mut GameRunner) -> Vec<GameEvent> {
+    let mut events = Vec::new();
     for _ in 0..48 {
         if runner.state().stack.is_empty()
             && matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
         {
-            return;
+            return events;
         }
-        match &runner.state().waiting_for {
-            WaitingFor::Priority { .. } => act(runner, GameAction::PassPriority),
-            WaitingFor::OrderTriggers { triggers, .. } => {
-                let order = (0..triggers.len()).collect();
-                act(runner, GameAction::OrderTriggers { order });
-            }
+        let action = match &runner.state().waiting_for {
+            WaitingFor::Priority { .. } => GameAction::PassPriority,
+            WaitingFor::OrderTriggers { triggers, .. } => GameAction::OrderTriggers {
+                order: (0..triggers.len()).collect(),
+            },
             other => panic!("the stack drains through priority passes: {other:?}"),
-        }
+        };
+        events.extend(act_events(runner, action));
     }
     panic!(
         "the stack must drain: {:?} / {:?}",
         stack_entries(runner.state()),
         runner.state().waiting_for
     );
+}
+
+/// Pass priority until the stack is empty (see [`drain_stack_events`]).
+fn drain_stack(runner: &mut GameRunner) {
+    drain_stack_events(runner);
+}
+
+/// Cast `spell` through the public actions with the given X, answering the X
+/// announcement, the target prompt (with `targets`) and the payment window, and
+/// stop at the first prompt after payment (`Priority` or `OrderTriggers`).
+fn cast_with_x_until_prompt(
+    runner: &mut GameRunner,
+    spell: ObjectId,
+    x: u32,
+    targets: &[ObjectId],
+) {
+    let card_id = runner.state().objects[&spell].card_id;
+    act(
+        runner,
+        GameAction::CastSpell {
+            object_id: spell,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        },
+    );
+    let mut targets_chosen = targets.is_empty();
+    for _ in 0..8 {
+        match &runner.state().waiting_for {
+            WaitingFor::ChooseXValue { .. } => act(runner, GameAction::ChooseX { value: x }),
+            WaitingFor::TargetSelection { .. } if !targets_chosen => {
+                targets_chosen = true;
+                act(
+                    runner,
+                    GameAction::SelectTargets {
+                        targets: targets.iter().copied().map(TargetRef::Object).collect(),
+                    },
+                );
+            }
+            WaitingFor::ManaPayment { .. } => act(runner, GameAction::PassPriority),
+            _ => {
+                assert!(targets_chosen, "the cast never asked for its targets");
+                return;
+            }
+        }
+    }
+    panic!("the cast must finish: {:?}", runner.state().waiting_for);
+}
+
+/// `EffectResolved { ModifyAnnouncedX }` events emitted by `source`.
+fn modify_x_events(events: &[GameEvent], source: ObjectId) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                GameEvent::EffectResolved {
+                    kind: EffectKind::ModifyAnnouncedX,
+                    source_id,
+                    ..
+                } if *source_id == source
+            )
+        })
+        .count()
+}
+
+fn counters(runner: &GameRunner, object: ObjectId, kind: CounterType) -> u32 {
+    runner.state().objects[&object]
+        .counters
+        .get(&kind)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn pool_total(runner: &GameRunner, player: PlayerId) -> usize {
+    runner.state().players[usize::from(player.0)]
+        .mana_pool
+        .total()
+}
+
+fn life(runner: &GameRunner, player: PlayerId) -> i32 {
+    runner.state().players[usize::from(player.0)].life
+}
+
+/// The sources of the triggers an `OrderTriggers` prompt for `player` offers,
+/// in prompt order. Panics unless that prompt is pending.
+fn order_prompt_sources(runner: &GameRunner, player: PlayerId) -> Vec<ObjectId> {
+    let WaitingFor::OrderTriggers {
+        player: chooser,
+        triggers,
+    } = &runner.state().waiting_for
+    else {
+        panic!(
+            "the triggers wait for an order choice: {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(*chooser, player);
+    triggers.iter().map(|trigger| trigger.source_id).collect()
+}
+
+/// Assert P0's pending order prompt offers exactly the triggers of `below` and
+/// `on_top` (in either prompt order), then answer it placing `on_top`'s trigger
+/// last, so it is on top and resolves first (CR 603.3b + CR 405.2).
+fn order_with_on_top(runner: &mut GameRunner, below: ObjectId, on_top: ObjectId) {
+    let sources = order_prompt_sources(runner, P0);
+    let mut offered = sources.clone();
+    offered.sort();
+    let mut expected = vec![below, on_top];
+    expected.sort();
+    assert_eq!(
+        offered, expected,
+        "the prompt offers exactly these two triggers"
+    );
+    let index = |source: ObjectId| {
+        sources
+            .iter()
+            .position(|candidate| *candidate == source)
+            .expect("the source is offered")
+    };
+    let order = vec![index(below), index(on_top)];
+    act(runner, GameAction::OrderTriggers { order });
 }
 
 fn assert_settled(runner: &GameRunner) {
@@ -295,7 +453,8 @@ fn assert_settled(runner: &GameRunner) {
 
 /// U-1: line 1 watches only permanent spells whose mana cost contains {X}.
 /// Grizzly Bears ({1}{G}) does not trigger it; Walking Ballista ({X}{X}) does.
-/// Line 1's effect itself is deferred (phase 3), so only the trigger is asserted.
+/// Line 1's doubling is asserted by the phase-3 rows (U-16 onward); this row
+/// asserts only the trigger filter.
 #[test]
 fn line_one_ignores_a_permanent_spell_without_x_in_its_mana_cost() {
     let mut scenario = unbound_scenario();
@@ -304,11 +463,7 @@ fn line_one_ignores_a_permanent_spell_without_x_in_its_mana_cost() {
         .add_creature_to_hand(P0, "Grizzly Bears", 2, 2)
         .with_mana_cost(mana(&[ManaCostShard::Green], 1))
         .id();
-    let ballista = scenario
-        .add_creature_to_hand_from_oracle(P0, "Walking Ballista", 0, 0, WALKING_BALLISTA)
-        .as_artifact_creature()
-        .with_mana_cost(mana(&[ManaCostShard::X, ManaCostShard::X], 0))
-        .id();
+    let ballista = add_ballista(&mut scenario);
     let mut runner = scenario.build();
 
     add_mana(&mut runner, ManaType::Green, 1);
@@ -963,4 +1118,562 @@ fn two_unbounds_copy_an_x_activated_ability_twice() {
         "the original and two copies each draw 1"
     );
     assert_settled(&runner);
+}
+
+// ---------------------------------------------------------------------------
+// Line 1: "double the value of X" (CR 107.3e; CR 107.3c's note: the value of X
+// may change while the spell is on the stack).
+// ---------------------------------------------------------------------------
+
+/// Walking Ballista cast with the given X from 8 colorless mana, with or
+/// without Unbound; returns the runner at the post-cast `Priority`.
+fn ballista_cast(with_unbound: bool, x: u32) -> (GameRunner, Option<ObjectId>, ObjectId) {
+    let mut scenario = unbound_scenario();
+    let unbound = with_unbound.then(|| unbound(&mut scenario));
+    let ballista = add_ballista(&mut scenario);
+    let mut runner = scenario.build();
+    add_mana(&mut runner, ManaType::Colorless, 8);
+    cast_with_x_until_prompt(&mut runner, ballista, x, &[]);
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { player: P0 }
+        ),
+        "{:?}",
+        runner.state().waiting_for
+    );
+    (runner, unbound, ballista)
+}
+
+/// U-16 (rulings: Unbound raises X for permanent spells, but you don't pay any
+/// more mana; CR 107.3m + CR 601.2h): Walking Ballista X=2 enters with 4
+/// counters, and only the 4 mana of X=2 is spent.
+#[test]
+fn unbound_doubles_walking_ballistas_x_without_more_mana() {
+    let (mut runner, unbound, ballista) = ballista_cast(true, 2);
+    let unbound = unbound.unwrap();
+    assert_eq!(
+        stack_entries(runner.state()),
+        vec![Entry::Spell(ballista), Entry::Triggered(unbound)]
+    );
+
+    pass_both(&mut runner);
+    assert_eq!(
+        stack_entries(runner.state()),
+        vec![Entry::Spell(ballista)],
+        "Unbound's trigger resolved above Ballista"
+    );
+    let state = runner.state();
+    assert_eq!(state.objects[&ballista].cost_x_paid, Some(4));
+    let paid = &state.stack_paid_facts[&ballista];
+    assert_eq!(
+        (paid.x_value, paid.actual_mana_spent),
+        (Some(4), 4),
+        "the paid snapshot carries the doubled X and the mana actually spent"
+    );
+    assert_eq!(pool_total(&runner, P0), 4);
+
+    drain_stack(&mut runner);
+    assert_settled(&runner);
+    assert_eq!(runner.state().objects[&ballista].zone, Zone::Battlefield);
+    assert_eq!(counters(&runner, ballista, CounterType::Plus1Plus1), 4);
+    assert_eq!(pool_total(&runner, P0), 4, "doubling X costs no more mana");
+}
+
+/// U-16 control: without Unbound, Walking Ballista X=2 enters with 2 counters.
+#[test]
+fn walking_ballista_without_unbound_enters_with_x_counters() {
+    let (mut runner, _, ballista) = ballista_cast(false, 2);
+    assert_eq!(stack_entries(runner.state()), vec![Entry::Spell(ballista)]);
+    drain_stack(&mut runner);
+    assert_settled(&runner);
+    assert_eq!(counters(&runner, ballista, CounterType::Plus1Plus1), 2);
+    assert_eq!(pool_total(&runner, P0), 4);
+}
+
+/// U-17 (ruling: two Unbounds multiply X by four): each doubling reads the X
+/// as it is when it resolves. The two identical doublings commute, so they go
+/// on the stack without an order prompt (CR 603.3b).
+#[test]
+fn two_unbounds_quadruple_walking_ballistas_x() {
+    let mut scenario = unbound_scenario();
+    let first = unbound(&mut scenario);
+    let second = unbound(&mut scenario);
+    let ballista = add_ballista(&mut scenario);
+    let mut runner = scenario.build();
+    add_mana(&mut runner, ManaType::Colorless, 8);
+
+    cast_with_x_until_prompt(&mut runner, ballista, 2, &[]);
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { player: P0 }
+        ),
+        "identical doublings need no order choice: {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(
+        stack_entries(runner.state()),
+        vec![
+            Entry::Spell(ballista),
+            Entry::Triggered(first),
+            Entry::Triggered(second)
+        ]
+    );
+
+    let events = drain_stack_events(&mut runner);
+    assert_settled(&runner);
+    assert_eq!(modify_x_events(&events, first), 1);
+    assert_eq!(modify_x_events(&events, second), 1);
+    assert_eq!(counters(&runner, ballista, CounterType::Plus1Plus1), 8);
+    assert_eq!(pool_total(&runner, P0), 4);
+}
+
+/// U-18 (ruling: X = 0 doubles to 0 for permanent spells): Walking Ballista
+/// X=0 stays at X=0 and dies as a 0/0 (CR 704.5f).
+#[test]
+fn unbound_doubles_x_of_zero_to_zero() {
+    let (mut runner, unbound, ballista) = ballista_cast(true, 0);
+    let unbound = unbound.unwrap();
+    assert_eq!(
+        stack_entries(runner.state()),
+        vec![Entry::Spell(ballista), Entry::Triggered(unbound)]
+    );
+
+    let events = pass_both_events(&mut runner);
+    assert_eq!(
+        modify_x_events(&events, unbound),
+        1,
+        "the doubling resolved"
+    );
+    assert_eq!(runner.state().objects[&ballista].cost_x_paid, Some(0));
+    assert_eq!(runner.state().stack_paid_facts[&ballista].x_value, Some(0));
+
+    drain_stack(&mut runner);
+    assert_settled(&runner);
+    assert_eq!(runner.state().objects[&ballista].zone, Zone::Graveyard);
+    assert_eq!(counters(&runner, ballista, CounterType::Plus1Plus1), 0);
+}
+
+/// Hydroid Krasis ({X}{G}{U}) cast with X=4 under Unbound: the cast trigger and
+/// the doubling wait for P0's order choice.
+fn krasis_cast_with_unbound() -> (GameRunner, ObjectId, ObjectId) {
+    let mut scenario = unbound_scenario();
+    let unbound = unbound(&mut scenario);
+    let krasis = scenario
+        .add_creature_to_hand_from_oracle(P0, "Hydroid Krasis", 0, 0, KRASIS)
+        .with_mana_cost(mana(
+            &[ManaCostShard::X, ManaCostShard::Green, ManaCostShard::Blue],
+            0,
+        ))
+        .id();
+    let mut runner = scenario.build();
+    add_mana(&mut runner, ManaType::Green, 1);
+    add_mana(&mut runner, ManaType::Blue, 1);
+    add_mana(&mut runner, ManaType::Colorless, 8);
+    cast_with_x_until_prompt(&mut runner, krasis, 4, &[]);
+    (runner, unbound, krasis)
+}
+
+/// U-19a (ruling: you choose whether to double X before or after a cast
+/// trigger that reads X; CR 603.3b + CR 202.3e): with the doubling on top,
+/// Krasis's cast trigger sees X=8.
+#[test]
+fn unbound_doubling_before_krasis_cast_trigger_feeds_it() {
+    let (mut runner, unbound, krasis) = krasis_cast_with_unbound();
+    let life_before = life(&runner, P0);
+    let library_before = library_len(&runner, 0);
+    order_with_on_top(&mut runner, krasis, unbound);
+
+    pass_both(&mut runner);
+    let state = runner.state();
+    assert_eq!(state.objects[&krasis].zone, Zone::Stack);
+    assert_eq!(state.objects[&krasis].cost_x_paid, Some(8));
+    assert_eq!(
+        state.objects[&krasis].spell_mana_value(),
+        10,
+        "CR 202.3e: X counts as its doubled value on the stack"
+    );
+
+    drain_stack(&mut runner);
+    assert_settled(&runner);
+    assert_eq!(life(&runner, P0) - life_before, 4);
+    assert_eq!(library_before - library_len(&runner, 0), 4);
+    assert_eq!(counters(&runner, krasis, CounterType::Plus1Plus1), 8);
+    assert_eq!(pool_total(&runner, P0), 4);
+}
+
+/// U-19b: with Krasis's cast trigger on top, it resolves before the doubling
+/// and sees X=4; Krasis still enters with the doubled 8 counters.
+#[test]
+fn krasis_cast_trigger_before_unbound_reads_announced_x() {
+    let (mut runner, unbound, krasis) = krasis_cast_with_unbound();
+    let life_before = life(&runner, P0);
+    let library_before = library_len(&runner, 0);
+    order_with_on_top(&mut runner, unbound, krasis);
+
+    drain_stack(&mut runner);
+    assert_settled(&runner);
+    assert_eq!(life(&runner, P0) - life_before, 2);
+    assert_eq!(library_before - library_len(&runner, 0), 2);
+    assert_eq!(counters(&runner, krasis, CounterType::Plus1Plus1), 8);
+}
+
+/// Nissa, Steward of Elements (loyalty X) cast with X=2; returns its loyalty
+/// counters once the stack has drained.
+fn nissa_loyalty(with_unbound: bool) -> u32 {
+    let mut scenario = unbound_scenario();
+    if with_unbound {
+        unbound(&mut scenario);
+    }
+    let nissa = scenario
+        .add_spell_to_hand_from_oracle(P0, "Nissa, Steward of Elements", false, NISSA)
+        .as_planeswalker_with_loyalty("Nissa", 0)
+        .with_mana_cost(mana(
+            &[ManaCostShard::X, ManaCostShard::Green, ManaCostShard::Blue],
+            0,
+        ))
+        .id();
+    let mut runner = scenario.build();
+    // The printed loyalty "X" (MTGJSON `loyalty: "X"`), which the builder lacks.
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&nissa)
+        .unwrap()
+        .printed_loyalty = Some(PrintedLoyalty::X);
+    add_mana(&mut runner, ManaType::Green, 1);
+    add_mana(&mut runner, ManaType::Blue, 1);
+    add_mana(&mut runner, ManaType::Colorless, 2);
+
+    cast_with_x_until_prompt(&mut runner, nissa, 2, &[]);
+    drain_stack(&mut runner);
+    assert_settled(&runner);
+    assert_eq!(runner.state().objects[&nissa].zone, Zone::Battlefield);
+    counters(&runner, nissa, CounterType::Loyalty)
+}
+
+/// U-20 (CR 306.5b + CR 107.3m): a planeswalker whose printed loyalty is X
+/// enters with the doubled X, read from the paid snapshot at resolution.
+#[test]
+fn unbound_doubles_x_loyalty_planeswalker() {
+    assert_eq!(nissa_loyalty(true), 4);
+}
+
+/// U-20 control: without Unbound, Nissa X=2 enters with loyalty 2.
+#[test]
+fn x_loyalty_planeswalker_without_unbound_enters_with_x_loyalty() {
+    assert_eq!(nissa_loyalty(false), 2);
+}
+
+/// U-21 (CR 107.3e + CR 400.7 + CR 107.3g; CR 701.6a): each doubling binds the
+/// spell its own cast event names. Walking Ballista X=1 and then Fated
+/// Firepower X=1 (flash) each put an Unbound trigger above themselves; Cancel
+/// counters Fated Firepower. Its doubling finds its spell gone and changes
+/// nothing, and Ballista's doubling doubles Ballista once.
+#[test]
+fn unbound_doubles_only_the_spell_its_own_trigger_names() {
+    let mut scenario = unbound_scenario();
+    let unbound = unbound(&mut scenario);
+    let ballista = add_ballista(&mut scenario);
+    let firepower = scenario
+        .add_spell_to_hand_from_oracle(P0, "Fated Firepower", true, FATED_FIREPOWER)
+        .as_enchantment()
+        .with_mana_cost(mana(
+            &[
+                ManaCostShard::X,
+                ManaCostShard::Red,
+                ManaCostShard::Red,
+                ManaCostShard::Red,
+            ],
+            0,
+        ))
+        .id();
+    let cancel = scenario
+        .add_spell_to_hand_from_oracle(P0, "Cancel", true, CANCEL)
+        .with_mana_cost(mana(&[ManaCostShard::Blue, ManaCostShard::Blue], 1))
+        .id();
+    let mut runner = scenario.build();
+
+    add_mana(&mut runner, ManaType::Colorless, 2);
+    cast_with_x_until_prompt(&mut runner, ballista, 1, &[]);
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { player: P0 }
+        ),
+        "{:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(
+        stack_entries(runner.state()),
+        vec![Entry::Spell(ballista), Entry::Triggered(unbound)]
+    );
+
+    add_mana(&mut runner, ManaType::Red, 3);
+    add_mana(&mut runner, ManaType::Colorless, 1);
+    cast_with_x_until_prompt(&mut runner, firepower, 1, &[]);
+    assert_eq!(
+        stack_entries(runner.state()),
+        vec![
+            Entry::Spell(ballista),
+            Entry::Triggered(unbound),
+            Entry::Spell(firepower),
+            Entry::Triggered(unbound)
+        ]
+    );
+
+    add_mana(&mut runner, ManaType::Blue, 2);
+    add_mana(&mut runner, ManaType::Colorless, 1);
+    cast_with_x_until_prompt(&mut runner, cancel, 0, &[firepower]);
+    assert_eq!(
+        stack_entries(runner.state()),
+        vec![
+            Entry::Spell(ballista),
+            Entry::Triggered(unbound),
+            Entry::Spell(firepower),
+            Entry::Triggered(unbound),
+            Entry::Spell(cancel)
+        ]
+    );
+
+    let events = drain_stack_events(&mut runner);
+    assert_settled(&runner);
+    assert_eq!(
+        modify_x_events(&events, unbound),
+        2,
+        "reach: both doublings resolved, the second after Fated Firepower left the stack"
+    );
+    assert_eq!(runner.state().objects[&firepower].zone, Zone::Graveyard);
+    assert_eq!(runner.state().objects[&cancel].zone, Zone::Graveyard);
+    assert_eq!(runner.state().objects[&ballista].zone, Zone::Battlefield);
+    assert_eq!(
+        counters(&runner, ballista, CounterType::Plus1Plus1),
+        2,
+        "Ballista is doubled once, by its own trigger"
+    );
+    // Internal channel: the countered spell's stored X was not rewritten.
+    assert_eq!(runner.state().objects[&firepower].cost_x_paid, Some(1));
+}
+
+/// Teval, Arbiter of Virtue on P0's battlefield, Endless One ({X}) in P0's
+/// hand with 2 colorless mana, Cancel in P1's hand, and Unbound if asked.
+struct TevalBoard {
+    runner: GameRunner,
+    unbound: Option<ObjectId>,
+    teval: ObjectId,
+    endless_one: ObjectId,
+    cancel: ObjectId,
+}
+
+fn teval_scenario(with_unbound: bool) -> TevalBoard {
+    let mut scenario = unbound_scenario();
+    let unbound = with_unbound.then(|| unbound(&mut scenario));
+    let teval = scenario
+        .add_creature_from_oracle(P0, "Teval, Arbiter of Virtue", 6, 6, TEVAL)
+        .with_mana_cost(mana(
+            &[
+                ManaCostShard::Black,
+                ManaCostShard::Green,
+                ManaCostShard::Blue,
+            ],
+            2,
+        ))
+        .id();
+    let endless_one = scenario
+        .add_creature_to_hand_from_oracle(P0, "Endless One", 0, 0, ENDLESS_ONE)
+        .with_mana_cost(mana(&[ManaCostShard::X], 0))
+        .id();
+    let cancel = scenario
+        .add_spell_to_hand_from_oracle(P1, "Cancel", true, CANCEL)
+        .with_mana_cost(mana(&[ManaCostShard::Blue, ManaCostShard::Blue], 1))
+        .id();
+    let mut runner = scenario.build();
+    add_mana(&mut runner, ManaType::Colorless, 2);
+    TevalBoard {
+        runner,
+        unbound,
+        teval,
+        endless_one,
+        cancel,
+    }
+}
+
+/// U-22 (CR 608.2h + CR 202.3e; CR 603.3b): Teval's "you lose life equal to
+/// its mana value" reads Endless One as it is on the stack when the trigger
+/// resolves, so with the doubling on top P0 loses the doubled 4.
+#[test]
+fn teval_ordered_after_unbound_loses_the_doubled_mana_value() {
+    let TevalBoard {
+        mut runner,
+        unbound,
+        teval,
+        endless_one,
+        ..
+    } = teval_scenario(true);
+    let life_before = life(&runner, P0);
+    cast_with_x_until_prompt(&mut runner, endless_one, 2, &[]);
+    order_with_on_top(&mut runner, teval, unbound.unwrap());
+
+    drain_stack(&mut runner);
+    assert_settled(&runner);
+    assert_eq!(life_before - life(&runner, P0), 4);
+    assert_eq!(counters(&runner, endless_one, CounterType::Plus1Plus1), 4);
+}
+
+/// U-22b: with Teval's trigger on top, it resolves while X is still 2.
+#[test]
+fn teval_ordered_before_unbound_loses_the_announced_mana_value() {
+    let TevalBoard {
+        mut runner,
+        unbound,
+        teval,
+        endless_one,
+        ..
+    } = teval_scenario(true);
+    let life_before = life(&runner, P0);
+    cast_with_x_until_prompt(&mut runner, endless_one, 2, &[]);
+    order_with_on_top(&mut runner, unbound.unwrap(), teval);
+
+    drain_stack(&mut runner);
+    assert_settled(&runner);
+    assert_eq!(life_before - life(&runner, P0), 2);
+    assert_eq!(counters(&runner, endless_one, CounterType::Plus1Plus1), 4);
+}
+
+/// U-22 control: without Unbound there is no order choice, and P0 loses 2.
+#[test]
+fn teval_without_unbound_loses_the_announced_mana_value() {
+    let TevalBoard {
+        mut runner,
+        teval,
+        endless_one,
+        ..
+    } = teval_scenario(false);
+    let life_before = life(&runner, P0);
+    cast_with_x_until_prompt(&mut runner, endless_one, 2, &[]);
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { player: P0 }
+        ),
+        "{:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(
+        stack_entries(runner.state()),
+        vec![Entry::Spell(endless_one), Entry::Triggered(teval)]
+    );
+
+    drain_stack(&mut runner);
+    assert_settled(&runner);
+    assert_eq!(life_before - life(&runner, P0), 2);
+    assert_eq!(counters(&runner, endless_one, CounterType::Plus1Plus1), 2);
+}
+
+/// From P0's priority with stack `[Endless One, Teval's trigger]`: P0 passes,
+/// P1 counters Endless One with Cancel, and Cancel resolves (CR 701.6a),
+/// leaving Teval's trigger alone on the stack.
+fn p1_cancels_endless_one(
+    runner: &mut GameRunner,
+    teval: ObjectId,
+    endless_one: ObjectId,
+    cancel: ObjectId,
+) {
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { player: P0 }
+        ),
+        "{:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(
+        stack_entries(runner.state()),
+        vec![Entry::Spell(endless_one), Entry::Triggered(teval)]
+    );
+    act(runner, GameAction::PassPriority);
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { player: P1 }
+        ),
+        "{:?}",
+        runner.state().waiting_for
+    );
+    add_player_mana(runner, P1, ManaType::Blue, 2);
+    add_player_mana(runner, P1, ManaType::Colorless, 1);
+    cast_with_x_until_prompt(runner, cancel, 0, &[endless_one]);
+    assert_eq!(
+        stack_entries(runner.state()),
+        vec![
+            Entry::Spell(endless_one),
+            Entry::Triggered(teval),
+            Entry::Spell(cancel)
+        ]
+    );
+    pass_both(runner);
+    assert_eq!(runner.state().objects[&endless_one].zone, Zone::Graveyard);
+    assert_eq!(
+        stack_entries(runner.state()),
+        vec![Entry::Triggered(teval)],
+        "reach: Teval's trigger resolves after Endless One left the stack"
+    );
+}
+
+/// U-23 (CR 608.2h + CR 202.3e; CR 701.6a): Endless One X=2 is doubled to
+/// X=4, then countered before Teval's trigger resolves. "Its mana value" is
+/// then last-known information: Endless One as it last existed on the stack,
+/// with X=4, so P0 loses 4.
+#[test]
+fn teval_reads_the_doubled_mana_value_of_a_spell_countered_after_the_doubling() {
+    let TevalBoard {
+        mut runner,
+        unbound,
+        teval,
+        endless_one,
+        cancel,
+    } = teval_scenario(true);
+    let life_before = life(&runner, P0);
+    cast_with_x_until_prompt(&mut runner, endless_one, 2, &[]);
+    order_with_on_top(&mut runner, teval, unbound.unwrap());
+    pass_both(&mut runner);
+    assert_eq!(runner.state().objects[&endless_one].cost_x_paid, Some(4));
+
+    p1_cancels_endless_one(&mut runner, teval, endless_one, cancel);
+    assert_eq!(
+        life(&runner, P0),
+        life_before,
+        "Teval's trigger has not resolved"
+    );
+
+    drain_stack(&mut runner);
+    assert_settled(&runner);
+    assert_eq!(life_before - life(&runner, P0), 4);
+}
+
+/// U-23 control: without Unbound, the countered Endless One last existed on
+/// the stack with X=2, so P0 loses 2.
+#[test]
+fn teval_reads_the_announced_mana_value_of_a_spell_countered_without_unbound() {
+    let TevalBoard {
+        mut runner,
+        teval,
+        endless_one,
+        cancel,
+        ..
+    } = teval_scenario(false);
+    let life_before = life(&runner, P0);
+    cast_with_x_until_prompt(&mut runner, endless_one, 2, &[]);
+
+    p1_cancels_endless_one(&mut runner, teval, endless_one, cancel);
+    assert_eq!(
+        life(&runner, P0),
+        life_before,
+        "Teval's trigger has not resolved"
+    );
+
+    drain_stack(&mut runner);
+    assert_settled(&runner);
+    assert_eq!(life_before - life(&runner, P0), 2);
 }
