@@ -25,8 +25,9 @@ use crate::types::events::GameEvent;
 use crate::types::game_state::{
     DelayedTrigger, GameState, LiminalEntry, LiminalTokenAbilityInjection,
     PendingCopyTokenResolution, PendingCounterAddition, PendingCounterPostAction,
-    PendingEffectResolutionEvent, PendingTokenBattlefieldEntry, PendingTokenEventDelivery,
-    PositionedTokenBatch, PositionedTokenIds, TokenEntryEventEmission, WaitingFor,
+    PendingEffectResolutionEvent, PendingEffectResolved, PendingTokenBattlefieldEntry,
+    PendingTokenEventDelivery, PositionedTokenBatch, PositionedTokenIds, TokenEntryEventEmission,
+    WaitingFor,
 };
 use crate::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef, TrackedSetId};
 use crate::types::keywords::{Keyword, WardCost};
@@ -1011,6 +1012,10 @@ impl CreateTokenDelivery {
 /// A non-compound event takes the single-batch path unchanged. A compound one
 /// is driven by [`drive_token_event_delivery`], which can pause on a batch and
 /// resume the rest through `PendingCounterPostAction::ContinueTokenEventDelivery`.
+///
+/// `pause_completion_event` is what the event's first pause owes: the caller's
+/// terminal event, or `Suppress` when the caller is a CopyToken owner whose
+/// drain emits the effect's terminal `EffectResolved{CopyTokenOf}` itself.
 pub(crate) fn deliver_create_token_event(
     state: &mut GameState,
     event: ProposedEvent,
@@ -1019,40 +1024,23 @@ pub(crate) fn deliver_create_token_event(
     events: &mut Vec<GameEvent>,
 ) -> CreateTokenDelivery {
     if !event.has_appended_token_batches() {
-        let completed = apply_create_token_batch(
+        return apply_create_token_batch(
             state,
             event,
             initial_created_ids,
             pause_completion_event,
             events,
         );
-        let primary_ids = state.last_created_token_ids.clone();
-        return if completed {
-            CreateTokenDelivery::Completed { primary_ids }
-        } else {
-            CreateTokenDelivery::Paused { primary_ids }
-        };
     }
 
-    // CR 608.2c: the first pause any batch delivered directly here takes owes
-    // the caller's terminal event, whatever the batch's position. When the
-    // event's own batch is a copy batch, the CopyToken owner's drain emits the
-    // effect's terminal `EffectResolved{CopyTokenOf}`, so a plain batch pausing
-    // inside the copy event must not owe a second `EffectResolved{Token}`.
-    let first_pause_event = match &event {
-        ProposedEvent::CreateToken { copy: Some(_), .. } => PendingEffectResolutionEvent::Suppress,
-        _ => pause_completion_event,
-    };
     let batches = event
         .into_token_batches()
         .expect("a compound token event is a CreateToken");
     // Delivery order: plain batches (event order), then copy batches (event
-    // order). A plain batch can pause only at its entry-counter site, and that
-    // pause always stashes a counter-additions completion that the rest of the
-    // event can ride behind. A copy batch can also pause through a liminal entry
-    // or an as-enters choice that leaves no such completion, so delivering
-    // copies last leaves nothing but publication after a copy pause. For a copy
-    // primary this also keeps the physical order the appended plain batch had.
+    // order). For a copy primary this keeps the physical order the appended
+    // plain batch had. Batches can remain behind any batch's pause: a CR 616.2
+    // copy replacement (Mystic Reflection) can make an appended batch a copy
+    // batch too, so a copy batch can pause with another batch still to come.
     let (plain, copies): (Vec<_>, Vec<_>) = batches
         .into_iter()
         .zip(0u32..)
@@ -1064,13 +1052,14 @@ pub(crate) fn deliver_create_token_event(
         resumed: None,
         prefix: initial_created_ids,
     };
-    drive_token_event_delivery(state, cursor, first_pause_event, events)
+    drive_token_event_delivery(state, cursor, pause_completion_event, events)
 }
 
 /// CR 614.1a + CR 616.1f + CR 608.2c: resume a compound CreateToken event after
-/// the batch it paused on finished. The paused batch's own remainder
-/// (`FinalizeTokenEntry` + `ContinueTokenCreation`) ran just before this, into
-/// the ledger, so its ids join that batch's entry first.
+/// the batch it paused on finished. The paused batch's own remainder ran just
+/// before this, into the ledger, so its ids join that batch's entry first. A
+/// paused copy batch's remainder publishes after the ids the event had already
+/// created (its `initial_created_ids` prefix contract), so those are dropped.
 ///
 /// `Suppress`: the completion this runs from already owes the caller's terminal
 /// event, and a nested pause keeps it
@@ -1081,7 +1070,17 @@ pub(crate) fn continue_token_event_delivery(
     events: &mut Vec<GameEvent>,
 ) -> bool {
     if let Some(position) = delivery.resumed.take() {
-        let resumed_ids = std::mem::take(&mut state.last_created_token_ids);
+        let published = std::mem::take(&mut state.last_created_token_ids);
+        let resumed_ids: Vec<ObjectId> = published
+            .into_iter()
+            .filter(|id| {
+                !delivery.prefix.contains(id)
+                    && !delivery
+                        .delivered
+                        .iter()
+                        .any(|entry| entry.ids.contains(id))
+            })
+            .collect();
         match delivery
             .delivered
             .iter_mut()
@@ -1130,7 +1129,7 @@ fn drive_token_event_delivery(
     pause_event: PendingEffectResolutionEvent,
     events: &mut Vec<GameEvent>,
 ) -> CreateTokenDelivery {
-    // CR 707.2 + CR 608.2c: the active CopyToken owner belongs to this event —
+    // CR 608.2c: the active CopyToken owner belongs to this event —
     // the frame the replacement-choice resume parked, or the one the copy drive
     // or this cursor parked under this event's own pause. Detaching it gives
     // the event's batches the copy drive's environment (no inline frame drain
@@ -1150,6 +1149,14 @@ fn drive_token_event_delivery(
     } else {
         None
     };
+    // CR 608.2c: the CopyToken owner this event detached emits the effect's
+    // terminal `EffectResolved{CopyTokenOf}` when it drains, so a pause here
+    // must not owe a second terminal event.
+    let pause_event = if held_frame.is_some() {
+        PendingEffectResolutionEvent::Suppress
+    } else {
+        pause_event
+    };
 
     while !cursor.remaining.is_empty() {
         let PositionedTokenBatch {
@@ -1160,7 +1167,8 @@ fn drive_token_event_delivery(
             None => {
                 let event = batch.into_event(HashSet::new());
                 let completed =
-                    apply_create_token_batch(state, event, Vec::new(), pause_event, events);
+                    apply_create_token_batch(state, event, Vec::new(), pause_event, events)
+                        .is_completed();
                 // The batch's tokens that finished; on a pause, the paused token
                 // and the rest of the batch accumulate into the emptied ledger
                 // through the batch's own remainder.
@@ -1192,10 +1200,17 @@ fn drive_token_event_delivery(
                 }
             }
             Some(copy) => {
-                // CR 707.2: the copy route publishes after the ids already in
+                // The copy route publishes after the ids already in
                 // the ledger (its `initial_created_ids` prefix contract), so the
                 // plain batches stay in the referent across a copy pause.
-                let initial = event_ordered_token_ids(&cursor.delivered);
+                let initial: Vec<ObjectId> = cursor
+                    .prefix
+                    .iter()
+                    .copied()
+                    .chain(event_ordered_token_ids(&cursor.delivered))
+                    .collect();
+                let source_id = batch.spec.source_id;
+                let batch_boundary = state.resolution_stack.capture_child_boundary();
                 let status = super::token_copy::apply_copy_token_after_replacement_with_created_ids(
                     state,
                     batch.owner,
@@ -1206,31 +1221,45 @@ fn drive_token_event_delivery(
                     initial.clone(),
                     events,
                 );
+                let ids = status
+                    .created_ids
+                    .into_iter()
+                    .filter(|id| !initial.contains(id))
+                    .collect();
+                cursor.delivered.push(PositionedTokenIds { position, ids });
                 match status.completion {
-                    super::token_copy::CopyTokenApplyCompletion::Completed => {
-                        let ids = status
-                            .created_ids
-                            .into_iter()
-                            .filter(|id| !initial.contains(id))
-                            .collect();
-                        cursor.delivered.push(PositionedTokenIds { position, ids });
-                    }
-                    super::token_copy::CopyTokenApplyCompletion::Paused => {
-                        // Copy batches arise only as the event's own batch
-                        // (appended batches are always plain) and are delivered
-                        // last, so nothing of the event remains behind a copy
-                        // pause. A cursor stashed here could also bury a
-                        // direct-choice owner the copy pause installed.
-                        debug_assert!(
-                            cursor.remaining.is_empty(),
-                            "no token batch is delivered after a copy batch"
-                        );
+                    super::token_copy::CopyTokenApplyCompletion::Completed => {}
+                    super::token_copy::CopyTokenApplyCompletion::Paused
+                        if cursor.remaining.is_empty() =>
+                    {
                         let primary_ids = primary_token_ids(&cursor.delivered);
                         // The copy pause published `initial ++ its finished
                         // copies` to the ledger; hand them to the frame exactly
                         // as the copy drive does at its own pause.
                         let published = state.last_created_token_ids.clone();
                         repark_event_copy_frame(state, held_frame.take(), published);
+                        return CreateTokenDelivery::Paused { primary_ids };
+                    }
+                    super::token_copy::CopyTokenApplyCompletion::Paused => {
+                        // CR 614.1a + CR 616.2: batches remain behind this copy
+                        // pause. Its finished copies are in `delivered`; the rest
+                        // of the batch accumulates into the emptied ledger when
+                        // its pause resumes (a liminal entry's commit, an entry
+                        // counter or Aura host answer, or a direct choice).
+                        state.last_created_token_ids.clear();
+                        cursor.resumed = Some(position);
+                        let primary_ids = primary_token_ids(&cursor.delivered);
+                        // The rest of the event rides below the complete child
+                        // stack the pause raised, so it runs once the copy batch
+                        // has finished and a direct-choice owner keeps the top;
+                        // the frame is re-parked below it, so it is not the
+                        // active owner while the copy batch's remainder runs.
+                        super::counters::park_pending_counter_completion_at_child_boundary(
+                            state,
+                            token_event_cursor_completion(cursor, source_id, pause_event),
+                            batch_boundary,
+                        );
+                        repark_event_copy_frame(state, held_frame.take(), Vec::new());
                         return CreateTokenDelivery::Paused { primary_ids };
                     }
                 }
@@ -1251,8 +1280,8 @@ fn drive_token_event_delivery(
     CreateTokenDelivery::Completed { primary_ids }
 }
 
-/// CR 707.2 + CR 608.2c: hand the CopyToken owner a compound token event
-/// detached the ids it owes that owner, and re-park it — on top, or below the
+/// CR 608.2c: hand the CopyToken owner that a compound token event detached
+/// the ids that event owes it, and re-park it — on top, or below the
 /// child stack a pause raised (`token_copy::park_copy_token_after_current_batch`).
 /// The owner's drain later assigns its ids to `last_created_token_ids`.
 fn repark_event_copy_frame(
@@ -1266,14 +1295,41 @@ fn repark_event_copy_frame(
     }
 }
 
+/// CR 608.2c: the completion that carries the rest of a compound CreateToken
+/// event behind a copy batch's pause; it owes the caller's terminal event when
+/// that pause is the event's first and no CopyToken owner emits it.
+fn token_event_cursor_completion(
+    cursor: PendingTokenEventDelivery,
+    source_id: ObjectId,
+    pause_event: PendingEffectResolutionEvent,
+) -> PendingEffectResolved {
+    let post_actions = vec![PendingCounterPostAction::ContinueTokenEventDelivery {
+        delivery: Box::new(cursor),
+    }];
+    match pause_event {
+        PendingEffectResolutionEvent::Emit => {
+            PendingEffectResolved::with_post_actions(EffectKind::Token, source_id, post_actions)
+        }
+        PendingEffectResolutionEvent::Suppress => {
+            PendingEffectResolved::with_post_actions_without_effect(
+                EffectKind::Token,
+                source_id,
+                post_actions,
+            )
+        }
+    }
+}
+
 /// CR 111.1 + CR 614.1a: create one batch of an accepted CreateToken event.
+/// The outcome's `primary_ids` are the ids this batch itself created, without
+/// `initial_created_ids`.
 fn apply_create_token_batch(
     state: &mut GameState,
     event: ProposedEvent,
     initial_created_ids: Vec<ObjectId>,
     pause_completion_event: PendingEffectResolutionEvent,
     events: &mut Vec<GameEvent>,
-) -> bool {
+) -> CreateTokenDelivery {
     let ProposedEvent::CreateToken {
         owner,
         spec,
@@ -1283,7 +1339,9 @@ fn apply_create_token_batch(
         ..
     } = event
     else {
-        return true;
+        return CreateTokenDelivery::Completed {
+            primary_ids: Vec::new(),
+        };
     };
 
     if let Some(copy) = copy {
@@ -1296,17 +1354,23 @@ fn apply_create_token_batch(
             final_count,
             events,
         );
+        let primary_ids = status.created_ids.clone();
         if let Some(pending) = state.active_copy_token_mut() {
             pending.created_ids.extend(status.created_ids);
         } else {
             state.last_created_token_ids = status.created_ids;
         }
         return match status.completion {
-            super::token_copy::CopyTokenApplyCompletion::Completed => true,
-            super::token_copy::CopyTokenApplyCompletion::Paused => false,
+            super::token_copy::CopyTokenApplyCompletion::Completed => {
+                CreateTokenDelivery::Completed { primary_ids }
+            }
+            super::token_copy::CopyTokenApplyCompletion::Paused => {
+                CreateTokenDelivery::Paused { primary_ids }
+            }
         };
     }
 
+    let prefix_len = initial_created_ids.len();
     let mut created_ids = initial_created_ids;
     created_ids.reserve(final_count as usize);
 
@@ -1456,7 +1520,9 @@ fn apply_create_token_batch(
                     remaining_counters,
                     completion,
                 );
-                return false;
+                return CreateTokenDelivery::Paused {
+                    primary_ids: created_ids[prefix_len..].to_vec(),
+                };
             }
         }
 
@@ -1539,8 +1605,9 @@ fn apply_create_token_batch(
 
     // CR 603.7: Record created token IDs for sub-abilities that reference
     // TargetFilter::LastCreated (e.g., Job select, suspect).
+    let primary_ids = created_ids[prefix_len..].to_vec();
     state.last_created_token_ids = created_ids;
-    true
+    CreateTokenDelivery::Completed { primary_ids }
 }
 
 /// Materializes one already-resolved CR 111.1 token creation verbatim.
@@ -1992,11 +2059,7 @@ fn continue_liminal_copy_token_batch(
         pending.created_ids = created_ids;
     }
     let Some(continuation) = continuation else {
-        if state.active_copy_token().is_some() {
-            super::token_copy::drain_pending_copy_token_resolution(state, events);
-        }
-        return !state.active_copy_token().is_some()
-            || matches!(state.waiting_for, WaitingFor::Priority { .. });
+        return finish_liminal_copy_token_batch(state, events);
     };
     if continuation.remaining_count > 0 {
         let initial_created_ids = state.last_created_token_ids.clone();
@@ -2017,6 +2080,20 @@ fn continue_liminal_copy_token_batch(
         ) {
             return false;
         }
+    }
+    finish_liminal_copy_token_batch(state, events)
+}
+
+/// CR 614.1a + CR 608.2c: a liminal copy batch whose entry paused has finished;
+/// hand over to what was parked over it — first the rest of a compound
+/// CreateToken event this batch belongs to, then the CopyToken owner, which
+/// takes the batch's ids. Returns `false` when either paused again.
+pub(crate) fn finish_liminal_copy_token_batch(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> bool {
+    if !super::counters::resume_parked_token_event_delivery(state, events) {
+        return false;
     }
     let created_ids = state.last_created_token_ids.clone();
     if let Some(pending) = state.active_copy_token_mut() {

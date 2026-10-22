@@ -7432,11 +7432,10 @@ pub struct PendingTokenEventDelivery {
     pub remaining: Vec<PositionedTokenBatch>,
     /// Ids of the batches delivered so far.
     pub delivered: Vec<PositionedTokenIds>,
-    /// The plain batch whose own remainder (`FinalizeTokenEntry` +
-    /// `ContinueTokenCreation`) runs just before this action; its ids are
-    /// `last_created_token_ids` when this runs. Set whenever the cursor is
-    /// stashed: only a plain batch's pause stashes it (a copy batch is always
-    /// delivered last, so nothing remains behind a copy pause).
+    /// The paused batch whose own remainder runs just before this action — a
+    /// plain batch's `FinalizeTokenEntry` + `ContinueTokenCreation`, or a copy
+    /// batch's resumed entry; its ids are in `last_created_token_ids` when this
+    /// runs. Set whenever the cursor is stashed; `None` before the first pause.
     pub resumed: Option<u32>,
     /// Ids the caller placed ahead of the event (`initial_created_ids`).
     pub prefix: Vec<ObjectId>,

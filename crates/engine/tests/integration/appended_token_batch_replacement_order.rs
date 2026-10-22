@@ -969,3 +969,209 @@ fn nested_counter_pause_keeps_event_order() {
         .iter()
         .all(|id| runner.state().objects[id].zone == Zone::Battlefield));
 }
+
+// ---------------------------------------------------------------------------
+// A replacement that turns an appended batch into a copy batch (CR 616.2)
+// ---------------------------------------------------------------------------
+
+const MYSTIC_REFLECTION: &str = "Choose target nonlegendary creature. The next time one or more creatures or planeswalkers enter this turn, they enter as copies of the chosen creature.\nForetell {U} (During your turn, you may pay {2} and exile this card from your hand face down. Cast it on a later turn for its foretell cost.)";
+const VANQUISHERS_BANNER: &str = "As this artifact enters, choose a creature type.\nCreatures you control of the chosen type get +1/+1.\nWhenever you cast a creature spell of the chosen type, draw a card.";
+const SERRATED_ARROWS: &str = "This artifact enters with three arrowhead counters on it.\nAt the beginning of your upkeep, if there are no arrowhead counters on this artifact, sacrifice it.\n{T}, Remove an arrowhead counter from this artifact: Put a -1/-1 counter on target creature.";
+const VORINCLEX: &str = "Trample, haste\nIf you would put one or more counters on a permanent or player, put twice that many of each of those kinds of counters on that permanent or player instead.\nIf an opponent would put one or more counters on a permanent or player, they put half that many of each of those kinds of counters on that permanent or player instead, rounded down.";
+
+/// The Cogwork board plus Grizzly Bears and Mystic Reflection, which resolves
+/// choosing the Bears, and the artifact `target` (plus `extra`). Returns the
+/// runner, the Assembler and the target.
+fn mystic_cogwork_board(
+    target: (&'static str, &'static str),
+    extra: impl FnOnce(&mut GameScenario),
+) -> (GameRunner, ObjectId, ObjectId) {
+    let mut ids = (ObjectId(0), ObjectId(0), ObjectId(0));
+    let (mut runner, assembler, _) = cogwork_board(false, |scenario| {
+        ids.0 = scenario
+            .add_artifact_from_oracle(P0, target.0, target.1)
+            .id();
+        ids.1 = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+        ids.2 = scenario
+            .add_spell_to_hand_from_oracle(P0, "Mystic Reflection", true, MYSTIC_REFLECTION)
+            .id();
+        extra(scenario);
+    });
+    let (target, bears, mystic) = ids;
+    runner.cast(mystic).target_object(bears).resolve();
+    assert!(
+        runner.state().stack.is_empty(),
+        "reach guard: Mystic Reflection resolved"
+    );
+    (runner, assembler, target)
+}
+
+/// The two copy tokens the Cogwork event created — the copy of `target_name`
+/// and the appended Squirrel batch, which entered as a copy of Grizzly Bears —
+/// asserted to be its whole referent, in event order, both hasty, with one
+/// terminal `EffectResolved{CopyTokenOf}`; then both are exiled at the next end
+/// step.
+fn assert_both_copy_batches_delivered(
+    runner: &mut GameRunner,
+    events: &[GameEvent],
+    target_name: &str,
+) {
+    let target_copies = tokens_named(runner, target_name);
+    assert_eq!(target_copies.len(), 1, "one {target_name} copy");
+    let target_copy = target_copies[0].id;
+    let bears_copies = tokens_named(runner, "Grizzly Bears");
+    assert_eq!(
+        bears_copies.len(),
+        1,
+        "the Squirrel batch enters as a copy of Grizzly Bears"
+    );
+    let bears_copy = bears_copies[0].id;
+    assert!(tokens(runner, "Squirrel").is_empty());
+    assert_eq!(ledger(runner), vec![target_copy, bears_copy]);
+    assert!(hasty(runner, target_copy) && hasty(runner, bears_copy));
+    assert_eq!(effect_resolved(events, EffectKind::CopyTokenOf), 1);
+    assert_eq!(effect_resolved(events, EffectKind::Token), 0);
+
+    finish_at_end_step(runner);
+    assert!(
+        !on_battlefield(runner, target_copy),
+        "the {target_name} copy is exiled"
+    );
+    assert!(
+        !on_battlefield(runner, bears_copy),
+        "the Bears copy is exiled"
+    );
+}
+
+/// CR 616.2 + CR 614.12a + CR 608.2c: Cogwork Assembler copies Vanquisher's
+/// Banner (a noncreature, so Mystic Reflection does not apply yet). Chatterfang
+/// adds a Squirrel, and Mystic Reflection then applies to that creature batch
+/// only, so both batches are copy batches. The Banner copy pauses for its
+/// as-enters creature-type choice with the Squirrel batch still to come; that
+/// batch, entering as a copy of Grizzly Bears, is delivered once the Banner copy
+/// enters, and "That token gains haste. Exile it at the beginning of the next
+/// end step." reaches both. On the candidate before this the copy pause
+/// panicked a debug build and dropped the later batch in release.
+#[test]
+fn copy_choice_pause_keeps_a_later_copy_batch() {
+    let (mut runner, assembler, banner) =
+        mystic_cogwork_board(("Vanquisher's Banner", VANQUISHERS_BANNER), |_| {});
+    let mut events = activate_cogwork(&mut runner, assembler, banner);
+
+    let WaitingFor::NamedChoice {
+        player, options, ..
+    } = runner.state().waiting_for.clone()
+    else {
+        panic!(
+            "the Banner copy asks for its creature type, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(player, P0);
+    assert!(
+        tokens_named(&runner, "Grizzly Bears").is_empty(),
+        "the later copy batch waits for the Banner copy's choice"
+    );
+    assert!(options.iter().any(|option| option == "Goblin"));
+    events.extend(
+        runner
+            .act(GameAction::ChooseOption {
+                choice: "Goblin".to_string(),
+            })
+            .expect("the creature type is accepted")
+            .events,
+    );
+    events.extend(settle(&mut runner, &[], Until::StackEmpty));
+
+    assert_both_copy_batches_delivered(&mut runner, &events, "Vanquisher's Banner");
+}
+
+/// The same shape through an entry-counter pause: Cogwork copies Serrated Arrows
+/// (a noncreature). Chatterfang, then Parallel Lives, then P1's Halving Season
+/// leave one Arrows copy and one Squirrel, which Mystic Reflection makes a copy
+/// of Grizzly Bears (CR 616.1c applies it without a prompt). The Arrows copy's
+/// three arrowhead counters pause for Vorinclex and Halving Season's order with
+/// the Bears copy still to come.
+fn copy_counter_pause(first: &'static str, arrowheads: u32) {
+    let (mut runner, assembler, arrows) =
+        mystic_cogwork_board(("Serrated Arrows", SERRATED_ARROWS), |scenario| {
+            add_parallel_lives_and_opposing_halving_season(scenario);
+            scenario.add_creature_from_oracle(P0, "Vorinclex, Monstrous Raider", 6, 6, VORINCLEX);
+        });
+    let mut events = activate_cogwork(&mut runner, assembler, arrows);
+    events.extend(settle(
+        &mut runner,
+        &[
+            order(3, "Chatterfang, Squirrel General"),
+            order(2, "Parallel Lives"),
+            order(2, first),
+        ],
+        Until::StackEmpty,
+    ));
+
+    let arrows_copy = tokens_named(&runner, "Serrated Arrows")[0].id;
+    assert_eq!(
+        runner.state().objects[&arrows_copy]
+            .counters
+            .get(&CounterType::Generic("arrowhead".to_string()))
+            .copied(),
+        Some(arrowheads)
+    );
+    assert_both_copy_batches_delivered(&mut runner, &events, "Serrated Arrows");
+}
+
+#[test]
+fn copy_counter_pause_keeps_a_later_copy_batch() {
+    // 3 × 2 / 2.
+    copy_counter_pause("Vorinclex, Monstrous Raider", 3);
+}
+
+#[test]
+fn copy_counter_pause_halving_season_first() {
+    // 3 / 2 × 2.
+    copy_counter_pause("Halving Season", 2);
+}
+
+/// CR 608.2c + CR 616.1c: Mystic Reflection, a copy effect, applies first, so
+/// Raise the Alarm's own batch becomes two Grizzly Bears copies on the plain
+/// Effect::Token route; no CopyToken resolution owns this event. Chatterfang
+/// then adds plain Squirrels, and Grumgully's counter on each token pauses for
+/// its ordering. The instruction still ends with exactly one
+/// `EffectResolved{Token}` (on the candidate before this, none).
+#[test]
+fn copy_own_batch_on_token_route_emits_effect_resolved_once() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_creature_from_oracle(P0, "Chatterfang, Squirrel General", 3, 3, CHATTERFANG);
+    add_grumgully_and_counter_doublers(&mut scenario);
+    let bears = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+    let mystic = scenario
+        .add_spell_to_hand_from_oracle(P0, "Mystic Reflection", true, MYSTIC_REFLECTION)
+        .id();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Raise the Alarm", true, RAISE_THE_ALARM)
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(mystic).target_object(bears).resolve();
+    let mut events = runner.cast(spell).resolve().events().to_vec();
+    // Each Squirrel, then each Bears copy, asks for its counters' order.
+    events.extend(settle(
+        &mut runner,
+        &[order(2, "Hardened Scales"); 4],
+        Until::StackEmpty,
+    ));
+
+    assert!(tokens(&runner, "Soldier").is_empty());
+    let bears_copies: Vec<ObjectId> = tokens_named(&runner, "Grizzly Bears")
+        .iter()
+        .map(|o| o.id)
+        .collect();
+    let squirrels: Vec<ObjectId> = tokens(&runner, "Squirrel").iter().map(|o| o.id).collect();
+    assert_eq!(bears_copies.len(), 2, "both Soldiers enter as Bears copies");
+    assert_eq!(squirrels.len(), 2, "Chatterfang adds two Squirrels");
+    for &id in bears_copies.iter().chain(&squirrels) {
+        // Grumgully's one counter, Hardened Scales first: (1 + 1) × 2.
+        assert_eq!(plus_counters(&runner, id), 4);
+    }
+    assert_eq!(effect_resolved(&events, EffectKind::Token), 1);
+}

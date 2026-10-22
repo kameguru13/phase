@@ -531,11 +531,19 @@ fn drain_copy_token_resolution(
                 // CR 614.1a + CR 608.2c: the frame is taken, so the delivery
                 // authority leaves the ledger as this batch's whole created
                 // referent, appended batches included: own batch first on
-                // completion, `[]` after a plain appended batch paused (it
-                // publishes to this frame when the event finishes), and the
-                // ids so far after the copy batch itself paused.
-                let completed =
-                    super::token::apply_create_token_after_replacement(state, event, events);
+                // completion, `[]` after a batch paused with more of the event
+                // still to deliver (the event publishes to this frame when it
+                // finishes), and the ids so far after its last batch, a copy
+                // batch, paused. `Suppress`: this frame's drain emits the
+                // effect's terminal `EffectResolved{CopyTokenOf}`, so no pause
+                // of the event owes one.
+                let completed = super::token::apply_create_token_after_replacement_with_created_ids(
+                    state,
+                    event,
+                    Vec::new(),
+                    crate::types::game_state::PendingEffectResolutionEvent::Suppress,
+                    events,
+                );
                 if !completed {
                     pending
                         .created_ids

@@ -9206,7 +9206,9 @@ pub(crate) fn record_proposed_events<F: FnOnce()>(f: F) -> Vec<ProposedEvent> {
 }
 
 /// The recorder hook. Called once per `pipeline_loop` entry, before any
-/// candidate is drawn, so the recorded event is the one the resolver proposed.
+/// candidate is drawn, so the recorded event is the one the resolver proposed,
+/// and once per batch a replacement appends to a CreateToken event
+/// (`push_appended_token_batch`), which never enters the pipeline on its own.
 fn record_proposed_event(event: &ProposedEvent) {
     PROPOSED_EVENT_RECORDER.with(|cell| {
         if let Some(buffer) = cell.borrow_mut().as_mut() {
@@ -12087,8 +12089,10 @@ fn pipeline_loop(
     registry: &IndexMap<ReplacementEvent, ReplacementHandlerEntry>,
     events: &mut Vec<GameEvent>,
 ) -> ReplacementResult {
-    // The single recording point (CR 614.1a). This is the pipeline BODY every one
-    // of the 9 entries runs, so an event a resolver proposes cannot avoid it.
+    // The pipeline's recording point (CR 614.1a). This is the pipeline BODY every one
+    // of the 9 entries runs, so an event a resolver proposes cannot avoid it. A
+    // batch a replacement appends to a CreateToken event is recorded where it is
+    // built (`push_appended_token_batch`).
     // Disarmed (a no-op) outside a speculative probe.
     record_proposed_event(&proposed);
 
