@@ -24309,7 +24309,9 @@ declare_game_state! {
     /// (countered, CR 701.6a). Shares every lifecycle site of `departed_stack_spells`:
     /// `clear_departed_stack_records` (step clear),
     /// `retain_trigger_referenced_departed_stack_records` (loop prune), and the viewer
-    /// projection's live-stack redaction.
+    /// projection (`visibility::redact_hidden_identity_side_tables` drops a record whose
+    /// source is hidden from the viewer; the live-stack redaction loops redact every
+    /// record it keeps).
     #[serde(default, skip_serializing_if = "im::HashMap::is_empty")]
     #[serde(serialize_with = "crate::types::deterministic_serde::im_hash_map")]
     pub departed_activated_abilities: im::HashMap<ObjectId, StackEntry>,

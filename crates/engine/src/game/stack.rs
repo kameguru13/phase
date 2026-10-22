@@ -748,9 +748,11 @@ pub(crate) fn record_departed_stack_spell(state: &mut GameState, entry: &StackEn
 
 /// CR 701.6a + CR 113.3b + CR 608.2h: record a stack object removed without
 /// resolving (countered, or removed with its controller under CR 800.4a), as it last
-/// existed on the stack, for a trigger that still names it. The single writer of both
-/// departed-stack tables, called only from `remove_nonresolving_stack_entry_at`. A
-/// resolution pop records nothing: the object resolved. An end-the-turn exile
+/// existed on the stack, for a trigger that still names it. The non-resolving-removal
+/// writer of both departed-stack tables, called only from
+/// `remove_nonresolving_stack_entry_at` (a departed spell is also recorded at its zone
+/// exit, `zones.rs::apply_zone_exit_cleanup`). A resolution pop records nothing: the
+/// object resolved. An end-the-turn exile
 /// (CR 724.1b, `pop_nonresolving_top_stack_entry`) records nothing either, because
 /// every trigger that could name the object is exiled in the same pass.
 fn record_departed_stack_entry(state: &mut GameState, entry: &StackEntry) {
