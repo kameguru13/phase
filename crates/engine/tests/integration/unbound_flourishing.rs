@@ -1603,7 +1603,10 @@ fn p1_cancels_endless_one(
     );
     add_player_mana(runner, P1, ManaType::Blue, 2);
     add_player_mana(runner, P1, ManaType::Colorless, 1);
-    cast_with_x_until_prompt(runner, cancel, 0, &[endless_one]);
+    // Endless One is Cancel's only legal target (Teval's trigger is not a
+    // spell), so the cast selects it without a target prompt
+    // (`auto_select_targets`); the stack entry below pins that target.
+    cast_with_x_until_prompt(runner, cancel, 0, &[]);
     assert_eq!(
         stack_entries(runner.state()),
         vec![
@@ -1612,6 +1615,19 @@ fn p1_cancels_endless_one(
             Entry::Spell(cancel)
         ]
     );
+    let cancel_targets = runner
+        .state()
+        .stack
+        .iter()
+        .find_map(|entry| match &entry.kind {
+            StackEntryKind::Spell {
+                ability: Some(ability),
+                ..
+            } if entry.source_id == cancel => Some(ability.targets.clone()),
+            _ => None,
+        })
+        .expect("Cancel is on the stack with its resolved ability");
+    assert_eq!(cancel_targets, vec![TargetRef::Object(endless_one)]);
     pass_both(runner);
     assert_eq!(runner.state().objects[&endless_one].zone, Zone::Graveyard);
     assert_eq!(

@@ -11153,8 +11153,10 @@ fn parse_anaphoric_cost(input: &str) -> OracleResult<'_, CostSlot> {
 /// that has left the stack answers from last-known information. So the
 /// condition is answered once, in each half's event filter. The anaphor, not
 /// the order, assigns each slot to its half; both anaphors must appear, once
-/// each. Consumes the trailing ", ".
-fn parse_distributed_x_cost_condition(input: &str) -> OracleResult<'_, ()> {
+/// each. Consumes the trailing ", ". The swallow audit recognizes the folded
+/// restatement with this same combinator
+/// (`swallow_check::distributed_x_cost_if_is_only_if_marker`).
+pub(crate) fn parse_distributed_x_cost_condition(input: &str) -> OracleResult<'_, ()> {
     value(
         (),
         verify(
