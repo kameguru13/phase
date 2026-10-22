@@ -5304,14 +5304,11 @@ fn activated_source_matches(
     activation_cost: &BoundActivationCost,
     source_context: &TriggerSourceContext,
 ) -> bool {
-    let Some(filter) = &trigger.valid_card else {
+    let Some(filter) = activation_valid_card(trigger, activation_cost, |filter| {
+        bind_triggering_player_controller(filter, activator)
+    }) else {
         return true;
     };
-    let mut filter = bind_triggering_player_controller(filter, activator);
-    super::filter::bind_activation_cost_x(
-        &mut filter,
-        super::casting_costs::bound_activation_cost_has_x(activation_cost),
-    );
     match departed_source_lki {
         Some(lki) => {
             let mut post_cost = lki.clone();
@@ -5327,6 +5324,21 @@ fn activated_source_matches(
         }
         None => target_filter_matches_object(state, activated_id, &filter, source_context),
     }
+}
+
+/// CR 602.1a + CR 603.2: an activation trigger's `valid_card` as matched against
+/// one `AbilityActivated` event — `lower` applies the matcher's own event
+/// bindings, then every `HasXInActivationCost` is bound to this activation's
+/// own cost (`bind_activation_cost_x`). `None` when the trigger names no
+/// source: every activated source matches.
+fn activation_valid_card(
+    trigger: &TriggerDefinition,
+    activation_cost: &BoundActivationCost,
+    lower: impl FnOnce(&TargetFilter) -> TargetFilter,
+) -> Option<TargetFilter> {
+    let mut filter = lower(trigger.valid_card.as_ref()?);
+    super::filter::bind_activation_cost_x(&mut filter, activation_cost);
+    Some(filter)
 }
 
 /// CR 109.4 + CR 602.2a: Lower a filter's `ControllerRef::TriggeringPlayer` to
@@ -5393,15 +5405,9 @@ pub(super) fn match_loyalty_ability_activated(
     }
     // CR 602.1a: an activation-cost property reads this activation's own cost
     // from the event, as in `activated_source_matches`.
-    let Some(filter) = &trigger.valid_card else {
-        return true;
-    };
-    let mut filter = filter.clone();
-    super::filter::bind_activation_cost_x(
-        &mut filter,
-        super::casting_costs::bound_activation_cost_has_x(activation_cost),
-    );
-    target_filter_matches_object(state, *activated_id, &filter, source_context)
+    activation_valid_card(trigger, activation_cost, TargetFilter::clone).is_none_or(|filter| {
+        target_filter_matches_object(state, *activated_id, &filter, source_context)
+    })
 }
 
 /// CR 702.26c: Matches when a permanent phases in.

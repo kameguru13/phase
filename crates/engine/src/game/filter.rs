@@ -4500,12 +4500,15 @@ fn bind_absent_search_property_after_children(prop: &mut FilterProp) {
 }
 
 /// CR 602.1a + CR 603.2 + CR 603.10: bind every `HasXInActivationCost` in an
-/// activation trigger's filter to the answer of the `AbilityActivated` event
-/// it is matching — the activation's own cost, bound before payment — before
-/// the filter is evaluated against the source. CR 113.7a: the answer is the
-/// same whether the source is evaluated live or from its departed last known
-/// information, so both branches see the one bound fact.
-pub(crate) fn bind_activation_cost_x(filter: &mut TargetFilter, has_x: bool) {
+/// activation trigger's filter to the `AbilityActivated` event's own bound cost
+/// (`BoundActivationCost`, captured before payment) before the filter is
+/// evaluated against the source. CR 113.7a: live and departed-LKI evaluation
+/// both see the one bound fact.
+pub(crate) fn bind_activation_cost_x(
+    filter: &mut TargetFilter,
+    cost: &crate::types::events::BoundActivationCost,
+) {
+    let has_x = crate::game::casting_costs::bound_activation_cost_has_x(cost);
     // This rewrite walks no object population, so completeness is not
     // consulted: every reachable property is rewritten.
     let mut complete = true;
@@ -16335,7 +16338,16 @@ mod tests {
             AbilityCost, AbilityDefinition, AbilityKind, Effect, QuantityExpr, TargetFilter as Tf,
             TypedFilter,
         };
+        use crate::types::events::BoundActivationCost;
         use crate::types::mana::{ManaCost, ManaCostShard};
+
+        let x_cost = BoundActivationCost::Cost(Box::new(AbilityCost::Mana {
+            cost: ManaCost::Cost {
+                generic: 0,
+                shards: vec![ManaCostShard::X],
+            },
+        }));
+        let non_x_cost = BoundActivationCost::Cost(Box::new(AbilityCost::Tap));
 
         let mut state = GameState::new_two_player(42);
         let source = add_creature(&mut state, PlayerId(0), "X Activator");
@@ -16366,13 +16378,13 @@ mod tests {
         };
 
         let mut bound_true = filter.clone();
-        bind_activation_cost_x(&mut bound_true, true);
+        bind_activation_cost_x(&mut bound_true, &x_cost);
         assert!(
             matches_target_filter(&state, source, &bound_true, source),
             "a creature source whose activation carried {{X}} matches the composed filter"
         );
         let mut bound_false = filter.clone();
-        bind_activation_cost_x(&mut bound_false, false);
+        bind_activation_cost_x(&mut bound_false, &non_x_cost);
         assert!(
             !matches_target_filter(&state, source, &bound_false, source),
             "an activation whose cost carried no {{X}} fails the composed filter"
@@ -16383,13 +16395,13 @@ mod tests {
                 props: vec![FilterProp::HasXInActivationCost],
             }]));
         let mut nested_true = nested.clone();
-        bind_activation_cost_x(&mut nested_true, true);
+        bind_activation_cost_x(&mut nested_true, &x_cost);
         assert!(
             matches_target_filter(&state, source, &nested_true, source),
             "a property nested in AnyOf is bound too"
         );
         let mut nested_false = nested;
-        bind_activation_cost_x(&mut nested_false, false);
+        bind_activation_cost_x(&mut nested_false, &non_x_cost);
         assert!(!matches_target_filter(
             &state,
             source,

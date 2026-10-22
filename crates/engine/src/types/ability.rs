@@ -3179,15 +3179,19 @@ pub enum DoubleTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum XModification {
-    /// CR 107.3: the printed "double the value of X".
-    Double,
+    /// CR 107.3c (note): X ← X × factor. "Double the value of X" is
+    /// `Times { factor: 2 }` (`XModification::DOUBLE`), matching
+    /// `QuantityModification::Times` / `ManaModification::Multiply`.
+    Times { factor: u32 },
 }
 
 impl XModification {
+    pub const DOUBLE: Self = Self::Times { factor: 2 };
+
     /// The new value of X given its current value.
     pub fn apply(&self, current: u32) -> u32 {
         match self {
-            Self::Double => current.saturating_mul(2),
+            Self::Times { factor } => current.saturating_mul(*factor),
         }
     }
 }
@@ -39709,9 +39713,10 @@ mod tests {
     /// of wrapping.
     #[test]
     fn x_modification_double_multiplies_and_saturates() {
-        assert_eq!(XModification::Double.apply(0), 0);
-        assert_eq!(XModification::Double.apply(2), 4);
-        assert_eq!(XModification::Double.apply(u32::MAX), u32::MAX);
+        assert_eq!(XModification::DOUBLE.apply(0), 0);
+        assert_eq!(XModification::DOUBLE.apply(2), 4);
+        assert_eq!(XModification::DOUBLE.apply(u32::MAX), u32::MAX);
+        assert_eq!(XModification::Times { factor: 3 }.apply(2), 6);
     }
 
     #[test]

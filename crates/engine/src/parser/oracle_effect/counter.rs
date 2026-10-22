@@ -1608,14 +1608,13 @@ pub(super) fn try_parse_double_effect(lower: &str, ctx: &mut ParseContext) -> Op
     // spell that caused the trigger (the body's object anaphor is pinned to
     // `TriggeringSource` only by a spell-cast head). Anywhere else nothing names
     // whose X it is, so the clause stays an honest gap.
-    if nom_on_lower(lower, lower, |i| {
-        value((), terminated(tag("double the value of x"), eof)).parse(i)
-    })
-    .is_some()
+    if all_consuming(tag::<_, _, OracleError<'_>>("double the value of x"))
+        .parse(lower)
+        .is_ok()
     {
         return Some(match ctx.object_pronoun_ref {
             Some(TargetFilter::TriggeringSource) => Effect::ModifyAnnouncedX {
-                modification: XModification::Double,
+                modification: XModification::DOUBLE,
             },
             _ => Effect::unimplemented("double_value_of_x_without_triggering_spell", lower),
         });
