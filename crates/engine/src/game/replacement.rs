@@ -35,7 +35,7 @@ use crate::types::player::PlayerId;
 use crate::types::proposed_event::{
     AppliedReplacementKey, BoundSearchFoundCandidate, BoundSearchFoundDisposition,
     BoundSearchFoundGrant, CopyTokenSpec, CounterMoveStage, CounterPlacement, DrawEventStage,
-    EtbTapState, ProposedEvent, ReplacementId, SearchFoundDisposition,
+    EtbTapState, ProposedEvent, ReplacementId, SearchFoundDisposition, TokenBatch,
 };
 use crate::types::replacements::ReplacementEvent;
 use crate::types::zones::Zone;
@@ -4742,7 +4742,7 @@ fn create_token_applier(
     event: ProposedEvent,
     rid: ReplacementId,
     state: &mut GameState,
-    events: &mut Vec<GameEvent>,
+    _events: &mut Vec<GameEvent>,
 ) -> ApplyResult {
     use crate::types::ability::QuantityModification;
     // Extract the seven fields the applier reads, given a def and the controller
@@ -4807,6 +4807,7 @@ fn create_token_applier(
         mut copy,
         enter_tapped,
         count,
+        mut appended,
         applied,
     } = event
     {
@@ -4865,6 +4866,7 @@ fn create_token_applier(
                 copy,
                 enter_tapped,
                 count: 0,
+                appended,
                 applied,
             });
         }
@@ -4886,14 +4888,16 @@ fn create_token_applier(
             }
         }
 
-        // CR 614.1a + CR 111.1: "those tokens plus ..." — emit an additional
-        // CreateToken for the appended spec class (Chatterfang Squirrels,
-        // Donatello Mutagen). The additional batch counts equal the
-        // already-modified `new_count`, so replacement-ordering choices
-        // (CR 616) applied before this replacement flow through to the
-        // appended batch. The additional batch is proposed through
-        // `replace_event` so further replacements (e.g., Doubling Season on
-        // the creating player) apply to it as a separate event per CR 614.1a.
+        // CR 614.1a + CR 616.1f + CR 616.2: "those tokens plus ..." (Chatterfang
+        // Squirrels, Donatello Mutagen) — "instead" yields ONE modified event, so
+        // the added batch joins this event rather than becoming a separate event.
+        // It is sized at the already-modified `new_count`, so a replacement the
+        // affected player ordered earlier (CR 616.1) reaches it; every replacement
+        // applied afterwards applies to it too, to each batch it matches, under
+        // the same ordering (CR 616.1f), and one the added batch newly makes
+        // applicable is offered then (CR 616.2). It shares the event's applied set
+        // (CR 614.5), which already holds this replacement, so it cannot re-fire
+        // on its own batch.
         if let Some(mut extra) = additional_spec {
             // Fill in the replacement source's runtime identity. The parser
             // stores placeholder ObjectId(0) / PlayerId(0) since these cannot
@@ -4905,53 +4909,31 @@ fn create_token_applier(
                 .unwrap_or(owner);
             extra.source_id = rid.source;
             extra.controller = source_controller;
-            // CR 614.5: Inherit the primary event's applied set to prevent
-            // replacements that already applied to the primary event from
-            // re-applying to the recursive extra event. Insert this
-            // Chatterfang-class replacement too so it cannot re-fire on its own
-            // appended batch.
-            let mut applied_on_extra = applied.clone();
-            applied_on_extra.insert(AppliedReplacementKey::object(rid.source, rid.index));
-            // CR 614.1c: The appended batch is a separate event — it does not
-            // inherit an `enter_tapped` override applied to the primary batch.
-            // The appended spec's own `tapped` field (from the parser) governs
-            // its entry state; further replacements (shock-land-style ETB-tap
-            // replacements on the appended batch itself) still compose via
-            // the recursive `replace_event` call below.
-            let extra_proposed = ProposedEvent::CreateToken {
-                owner,
-                spec: extra,
-                copy: None,
-                enter_tapped: EtbTapState::Unspecified,
-                count: new_count,
-                applied: applied_on_extra,
-            };
-            match replace_event(state, extra_proposed, events) {
-                ReplacementResult::Execute(extra_event) => {
-                    crate::game::effects::token::apply_create_token_after_replacement(
-                        state,
-                        extra_event,
-                        events,
-                    );
-                }
-                // Prevented / NeedsChoice branches on the appended batch do not
-                // affect the primary event. A NeedsChoice here would require
-                // infrastructure to queue replacement prompts inside an applier
-                // (none exists yet); the appended batch is silently dropped in
-                // that rare collision case, which is acceptable for the
-                // current class (no cards combine Chatterfang-style appends
-                // with optional ETB replacements on their targets).
-                ReplacementResult::Prevented | ReplacementResult::NeedsChoice(_) => {}
-            }
+            // CR 614.1c: the added batch has its own entry state — it does not
+            // inherit an `enter_tapped` override applied to the event's own
+            // batch. The appended spec's own `tapped` field (from the parser)
+            // governs it, and a later ETB-tap replacement that matches it still
+            // applies to it as part of the event.
+            push_appended_token_batch(
+                &mut appended,
+                &applied,
+                TokenBatch {
+                    owner,
+                    spec: extra,
+                    copy: None,
+                    enter_tapped: EtbTapState::Unspecified,
+                    count: new_count,
+                },
+            );
         }
 
-        // CR 614.1a + CR 111.1: Manufactor's "ensure one of each" — emit a
-        // recursive CreateToken event for every listed spec whose subtype is
-        // *not* already in the primary event's spec. The primary event keeps
-        // the original subtype's count (Doubling Season etc. composes via
-        // `quantity_modification` above), and each additional batch is sized
-        // at `new_count` so any post-Manufactor multiplier ordered earlier in
-        // CR 616 reaches the appended subtypes.
+        // CR 614.1a + CR 616.1f: Manufactor's "instead create one of each" — add
+        // a batch to this event for every listed spec whose subtype is *not*
+        // already the event's own batch's subtype. The own batch keeps its
+        // count (Doubling Season etc. composes via `quantity_modification`
+        // above), and each added batch is sized at `new_count` so a multiplier
+        // ordered earlier (CR 616.1) reaches the added subtypes; one ordered
+        // later applies to every batch of the event.
         if let Some(specs) = ensure_specs {
             let source_controller = state
                 .objects
@@ -4970,29 +4952,17 @@ fn create_token_applier(
                 }
                 extra.source_id = rid.source;
                 extra.controller = source_controller;
-                // CR 614.5: Inherit the primary event's applied set to prevent
-                // replacements that already applied to the primary event from
-                // re-applying to the recursive extra event.
-                let mut applied_on_extra = applied.clone();
-                applied_on_extra.insert(AppliedReplacementKey::object(rid.source, rid.index));
-                let extra_proposed = ProposedEvent::CreateToken {
-                    owner,
-                    spec: Box::new(extra),
-                    copy: None,
-                    enter_tapped: EtbTapState::Unspecified,
-                    count: new_count,
-                    applied: applied_on_extra,
-                };
-                match replace_event(state, extra_proposed, events) {
-                    ReplacementResult::Execute(extra_event) => {
-                        crate::game::effects::token::apply_create_token_after_replacement(
-                            state,
-                            extra_event,
-                            events,
-                        );
-                    }
-                    ReplacementResult::Prevented | ReplacementResult::NeedsChoice(_) => {}
-                }
+                push_appended_token_batch(
+                    &mut appended,
+                    &applied,
+                    TokenBatch {
+                        owner,
+                        spec: Box::new(extra),
+                        copy: None,
+                        enter_tapped: EtbTapState::Unspecified,
+                        count: new_count,
+                    },
+                );
             }
         }
 
@@ -5002,11 +4972,24 @@ fn create_token_applier(
             copy,
             enter_tapped,
             count: new_count,
+            appended,
             applied,
         })
     } else {
         ApplyResult::Modified(event)
     }
+}
+
+/// CR 614.1a: add a replacement-built batch to its CreateToken event, and record
+/// its single-batch view for the speculative resolution probe (it never passes
+/// through `pipeline_loop` on its own).
+fn push_appended_token_batch(
+    appended: &mut Vec<TokenBatch>,
+    applied: &HashSet<AppliedReplacementKey>,
+    batch: TokenBatch,
+) {
+    record_proposed_event(&batch.clone().into_event(applied.clone()));
+    appended.push(batch);
 }
 
 // CR 608.2h + CR 707.2: A Mystic Reflection-style entry reads the chosen
@@ -8375,6 +8358,25 @@ pub fn find_applicable_replacements(
     event: &ProposedEvent,
     registry: &IndexMap<ReplacementEvent, ReplacementHandlerEntry>,
 ) -> Vec<ReplacementId> {
+    // CR 616.1 + CR 616.1f + CR 616.2: a compound token event (a replacement
+    // added batches to it) is still one event, so its applicable replacements
+    // are those applicable to any of its batches, offered in one ordering. A
+    // candidate that applies only to part of the event — Ojer Taq's creature
+    // gate, or an entry replacement on an appended creature batch — "can become
+    // applicable … as the result of another replacement" (CR 616.2) and is
+    // offered after the appender applies.
+    if let Some(views) = event.token_batch_views() {
+        let mut union = Vec::new();
+        for view in &views {
+            for rid in find_applicable_replacements(state, view, registry) {
+                if !union.contains(&rid) {
+                    union.push(rid);
+                }
+            }
+        }
+        return union;
+    }
+
     let mut candidates = Vec::new();
 
     match event {
@@ -10465,6 +10467,107 @@ fn apply_single_replacement(
     Ok(proposed)
 }
 
+/// CR 614.5 + CR 616.1f: whether replacement `rid` applies to this batch view of
+/// a compound token event. The pipeline marks `rid` applied on the whole event
+/// before applying it, so the check reads the view as it stood just before that
+/// mark.
+fn token_batch_admits(
+    state: &GameState,
+    view: &ProposedEvent,
+    rid: ReplacementId,
+    registry: &IndexMap<ReplacementEvent, ReplacementHandlerEntry>,
+) -> bool {
+    let mut unmarked = view.clone();
+    unmarked
+        .applied_set_mut()
+        .remove(&AppliedReplacementKey::for_event(view, rid));
+    find_applicable_replacements(state, &unmarked, registry).contains(&rid)
+}
+
+/// CR 614.1a + CR 614.5 + CR 616.1f: apply one chosen replacement to a compound
+/// token event — to every batch it applies to, leaving the others unchanged.
+/// The batches are one modified event, so the replacement gets one opportunity
+/// over the whole event; it acts on each batch it matches (Parallel Lives
+/// doubles each batch, Ojer Taq triples only the creature batches).
+///
+/// Applicability is settled for every batch before anything is applied, so an
+/// earlier batch's application cannot change which later batches it reaches. A
+/// `Prevented` batch is dropped on its own (CR 614.6); the event is `Prevented`
+/// only when no batch survives.
+///
+/// Applying per batch can run the replacement's applier more than once for the
+/// one event: a mandatory rider stash keeps the resident rider
+/// (`stash_post_replacement_continuation`'s KeepResident policy), consumption
+/// marking is idempotent, and the repeated `ReplacementApplied` events are
+/// engine bookkeeping.
+#[allow(clippy::result_large_err)]
+fn apply_replacement_to_token_batches(
+    state: &mut GameState,
+    proposed: ProposedEvent,
+    rid: ReplacementId,
+    branch: ReplacementBranch,
+    registry: &IndexMap<ReplacementEvent, ReplacementHandlerEntry>,
+    events: &mut Vec<GameEvent>,
+) -> Result<ProposedEvent, ApplyResult> {
+    let views = proposed.into_token_batch_views();
+    let admits: Vec<bool> = views
+        .iter()
+        .map(|view| token_batch_admits(state, view, rid, registry))
+        .collect();
+    if !admits.contains(&true) {
+        return Ok(ProposedEvent::from_token_batch_views(views)
+            .expect("a compound token event's views reassemble"));
+    }
+    let mut survivors = Vec::with_capacity(views.len());
+    for (view, admitted) in views.into_iter().zip(admits) {
+        if !admitted {
+            survivors.push(view);
+            continue;
+        }
+        match apply_single_replacement(state, view, rid, branch, registry, events) {
+            Ok(applied) => survivors.push(applied),
+            Err(ApplyResult::Prevented) => {}
+            Err(ApplyResult::Modified(_)) => {
+                unreachable!("apply_single_replacement reports modification through Ok")
+            }
+        }
+    }
+    if survivors.is_empty() {
+        return Err(ApplyResult::Prevented);
+    }
+    Ok(
+        ProposedEvent::from_token_batch_views(survivors).unwrap_or_else(|| {
+            unreachable!("a CreateToken replacement leaves every batch a CreateToken")
+        }),
+    )
+}
+
+/// CR 614.1a: how many of this event's tokens replacement `rid` applies to —
+/// the summed `count` of the batches it matches. For a non-compound event this
+/// is the event's own `count`. The "that many" of a whole-event substitution
+/// (Moonlit Meditation's copies) is this number.
+fn token_count_affected_by(
+    state: &GameState,
+    proposed: &ProposedEvent,
+    rid: ReplacementId,
+    registry: &IndexMap<ReplacementEvent, ReplacementHandlerEntry>,
+) -> u32 {
+    let Some(views) = proposed.token_batch_views() else {
+        return match proposed {
+            ProposedEvent::CreateToken { count, .. } => *count,
+            _ => 0,
+        };
+    };
+    views
+        .iter()
+        .filter(|view| token_batch_admits(state, view, rid, registry))
+        .map(|view| match view {
+            ProposedEvent::CreateToken { count, .. } => *count,
+            _ => 0,
+        })
+        .fold(0, u32::saturating_add)
+}
+
 #[allow(clippy::result_large_err)]
 fn apply_single_replacement_and_dirty(
     state: &mut GameState,
@@ -10475,7 +10578,11 @@ fn apply_single_replacement_and_dirty(
     events: &mut Vec<GameEvent>,
 ) -> Result<ProposedEvent, ApplyResult> {
     let before = proposed.clone();
-    let mut result = apply_single_replacement(state, proposed, rid, branch, registry, events);
+    let mut result = if proposed.has_appended_token_batches() {
+        apply_replacement_to_token_batches(state, proposed, rid, branch, registry, events)
+    } else {
+        apply_single_replacement(state, proposed, rid, branch, registry, events)
+    };
     // CR 614.5 normally records a replacement once per event. CR 903.9b is the
     // express exception: after ANOTHER replacement actually modifies the event
     // back into a commander hand/library move, re-arm its virtual key for the
@@ -12627,7 +12734,7 @@ fn continue_replacement_impl(
         // re-entry, but this gate is the sole stamp site for
         // `post_replacement_token_substitution_count` (B2's "that many" count) —
         // removing it as "redundant" would silently zero the copy count.
-        if let (ProposedEvent::CreateToken { applied, count, .. }, Some(def)) =
+        if let (ProposedEvent::CreateToken { applied, .. }, Some(def)) =
             (&proposed, post_effect.as_deref())
         {
             if is_token_replacement_choice(def) {
@@ -12636,10 +12743,14 @@ fn continue_replacement_impl(
                 // CR 614.1a + CR 616.1: Moonlit-class copy substitution. The
                 // continuation inherits this event's applied set (already carries
                 // Moonlit's rid — marked at accept above) so it self-suppresses;
-                // and the replaced event's `count` is latched as the "that many"
-                // copy count read by `QuantityRef::EventContextAmount`.
+                // and the number of the event's tokens it replaces — every batch
+                // it matches, appended batches included (CR 614.1a: one modified
+                // event) — is latched as the "that many" copy count read by
+                // `QuantityRef::EventContextAmount`.
+                let replaced = token_count_affected_by(state, &proposed, rid, registry);
                 state.post_replacement_token_choice_applied = Some(applied.clone());
-                state.post_replacement_token_substitution_count = Some(*count as i32);
+                state.post_replacement_token_substitution_count =
+                    Some(u32_to_i32_saturating(replaced));
             }
         }
         // CR 614.6: install the optional branch's continuation (the replacement's
@@ -14212,6 +14323,7 @@ mod tests {
             copy: None,
             enter_tapped: EtbTapState::Unspecified,
             count: 1,
+            appended: Vec::new(),
             applied: HashSet::new(),
         };
         let cases = [
@@ -16701,6 +16813,7 @@ mod tests {
                 copy: None,
                 enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 count: 3,
+                appended: Vec::new(),
                 applied: HashSet::new(),
             };
 
@@ -18712,6 +18825,7 @@ mod tests {
             copy: None,
             enter_tapped: EtbTapState::Unspecified,
             count: 1,
+            appended: Vec::new(),
             applied: HashSet::new(),
         };
 
@@ -18945,6 +19059,7 @@ mod tests {
             )),
             copy: None,
             enter_tapped: EtbTapState::Unspecified,
+            appended: Vec::new(),
             applied: HashSet::new(),
         };
         let registry = build_replacement_registry();
@@ -18969,6 +19084,7 @@ mod tests {
             )),
             copy: None,
             enter_tapped: EtbTapState::Unspecified,
+            appended: Vec::new(),
             applied: HashSet::new(),
         };
         let registry = build_replacement_registry();
@@ -19700,6 +19816,7 @@ mod tests {
             )),
             copy: None,
             enter_tapped: EtbTapState::Unspecified,
+            appended: Vec::new(),
             applied: HashSet::new(),
         };
 
@@ -19740,6 +19857,7 @@ mod tests {
             spec: Box::new(spec),
             copy: None,
             enter_tapped: EtbTapState::Tapped,
+            appended: Vec::new(),
             applied: HashSet::new(),
         };
 
@@ -22072,9 +22190,10 @@ mod tests {
         assert_eq!(n, 2);
     }
 
-    /// CR 614.1a + CR 111.1: Chatterfang-class replacement emits additional
-    /// tokens alongside the primary CreateToken event. Two Plant tokens enter
-    /// plus two Squirrel tokens, all under the primary owner's control.
+    /// CR 614.1a + CR 111.1: Chatterfang-class replacement adds a Squirrel batch
+    /// to the primary CreateToken event (one modified event, CR 616.1f). Two
+    /// Plant tokens enter plus two Squirrel tokens, all under the primary
+    /// owner's control.
     #[test]
     fn create_token_applier_emits_additional_token_spec_batch() {
         use crate::types::proposed_event::TokenCharacteristics;
@@ -22135,6 +22254,7 @@ mod tests {
             copy: None,
             enter_tapped: EtbTapState::Unspecified,
             count: 2,
+            appended: Vec::new(),
             applied: HashSet::new(),
         };
 
@@ -22171,11 +22291,11 @@ mod tests {
     }
 
     /// CR 614.1a + CR 111.1: Manufactor's "ensure one of each" — when the
-    /// proposed event creates a Treasure, the applier emits Clue and Food
-    /// recursively, but does NOT re-emit Treasure (already present in the
-    /// primary spec). Idempotence: the spawned Clue/Food events carry the
-    /// Manufactor `ReplacementId` in `applied`, so a second Manufactor on the
-    /// battlefield does not re-fire on its own output (CR 616.1).
+    /// proposed event creates a Treasure, the applier adds Clue and Food batches
+    /// to the same event, but does NOT re-add Treasure (already present in the
+    /// primary spec). Idempotence: the added batches share the event's applied
+    /// set, which holds the Manufactor `ReplacementId`, so it does not re-fire
+    /// on its own output (CR 614.5).
     #[test]
     fn create_token_applier_ensure_specs_emits_only_missing_subtypes_cr_614_1a() {
         fn artifact_spec(name: &str) -> TokenSpec {
@@ -22229,6 +22349,7 @@ mod tests {
             copy: None,
             enter_tapped: EtbTapState::Unspecified,
             count: 1,
+            appended: Vec::new(),
             applied: HashSet::new(),
         };
 
@@ -22264,6 +22385,186 @@ mod tests {
             1,
             "missing Food emitted by ensure-all"
         );
+    }
+
+    fn compound_test_token_spec(name: &str, core: CoreType, source_id: ObjectId) -> TokenSpec {
+        use crate::types::proposed_event::TokenCharacteristics;
+        let creature = core == CoreType::Creature;
+        TokenSpec {
+            characteristics: TokenCharacteristics {
+                display_name: name.to_string(),
+                power: creature.then_some(1),
+                toughness: creature.then_some(1),
+                loyalty: None,
+                core_types: vec![core],
+                subtypes: vec![name.to_string()],
+                supertypes: Vec::new(),
+                colors: Vec::new(),
+                keywords: Vec::new(),
+            },
+            script_name: name.to_string(),
+            static_abilities: Vec::new(),
+            enter_with_counters: Vec::new(),
+            tapped: false,
+            enters_attacking: false,
+            sacrifice_at: None,
+            source_id,
+            controller: PlayerId(0),
+            attach_to: crate::types::proposed_event::TokenHostRequest::NotRequested,
+        }
+    }
+
+    /// A Treasure event with one appended 1/1 Squirrel batch, as an appender
+    /// would have left it.
+    fn treasure_plus_squirrel_event(source_id: ObjectId) -> ProposedEvent {
+        ProposedEvent::CreateToken {
+            owner: PlayerId(0),
+            spec: Box::new(compound_test_token_spec(
+                "Treasure",
+                CoreType::Artifact,
+                source_id,
+            )),
+            copy: None,
+            enter_tapped: EtbTapState::Unspecified,
+            count: 1,
+            appended: vec![TokenBatch {
+                owner: PlayerId(0),
+                spec: Box::new(compound_test_token_spec(
+                    "Squirrel",
+                    CoreType::Creature,
+                    source_id,
+                )),
+                copy: None,
+                enter_tapped: EtbTapState::Unspecified,
+                count: 1,
+            }],
+            applied: HashSet::new(),
+        }
+    }
+
+    fn token_core_type_replacement(
+        core: CoreType,
+        modification: crate::types::ability::QuantityModification,
+    ) -> ReplacementDefinition {
+        ReplacementDefinition::new(ReplacementEvent::CreateToken)
+            .condition(ReplacementCondition::TokenCoreTypeMatches {
+                core_types: vec![core],
+            })
+            .quantity_modification(modification)
+    }
+
+    fn event_batch_shape(event: &ProposedEvent) -> Vec<(String, u32)> {
+        event
+            .clone()
+            .into_token_batches()
+            .expect("CreateToken event")
+            .into_iter()
+            .map(|batch| (batch.spec.characteristics.display_name, batch.count))
+            .collect()
+    }
+
+    /// CR 616.1f + CR 616.2: a replacement that applies only to an appended
+    /// batch (Ojer Taq's creature gate on a Squirrel added to a Treasure event)
+    /// is a candidate of the whole event, and applies only to the batch it
+    /// matches.
+    #[test]
+    fn compound_create_token_unions_part_only_candidate() {
+        let ojer = ObjectId(710);
+        let state = test_state_with_object(
+            ojer,
+            Zone::Battlefield,
+            vec![token_core_type_replacement(
+                CoreType::Creature,
+                crate::types::ability::QuantityModification::Times { factor: 3 },
+            )],
+        );
+        let rid = ReplacementId {
+            source: ojer,
+            index: 0,
+        };
+        let compound = treasure_plus_squirrel_event(ojer);
+        let ProposedEvent::CreateToken { owner, spec, .. } = compound.clone() else {
+            unreachable!();
+        };
+        let treasure_only = ProposedEvent::CreateToken {
+            owner,
+            spec,
+            copy: None,
+            enter_tapped: EtbTapState::Unspecified,
+            count: 1,
+            appended: Vec::new(),
+            applied: HashSet::new(),
+        };
+        // Reach guard: the gate rejects the Treasure on its own.
+        assert!(
+            find_applicable_replacements(&state, &treasure_only, replacement_registry()).is_empty()
+        );
+        assert_eq!(
+            find_applicable_replacements(&state, &compound, replacement_registry()),
+            vec![rid]
+        );
+
+        let mut state = state;
+        let mut events = Vec::new();
+        let ReplacementResult::Execute(result) = replace_event(&mut state, compound, &mut events)
+        else {
+            panic!("a lone mandatory multiplier applies without a prompt");
+        };
+        assert_eq!(
+            event_batch_shape(&result),
+            [("Treasure".to_string(), 1), ("Squirrel".to_string(), 3)]
+        );
+    }
+
+    /// CR 614.6: a replacement that prevents one batch of a compound token event
+    /// drops that batch only; the rest of the event still happens.
+    #[test]
+    fn prevent_on_one_appended_batch_keeps_the_rest() {
+        let preventer = ObjectId(720);
+        let mut state = test_state_with_object(
+            preventer,
+            Zone::Battlefield,
+            vec![token_core_type_replacement(
+                CoreType::Creature,
+                crate::types::ability::QuantityModification::Prevent,
+            )],
+        );
+        let mut events = Vec::new();
+        let result = replace_event(
+            &mut state,
+            treasure_plus_squirrel_event(preventer),
+            &mut events,
+        );
+        let ReplacementResult::Execute(result) = result else {
+            panic!("the Treasure batch survives; got {result:?}");
+        };
+        assert_eq!(event_batch_shape(&result), [("Treasure".to_string(), 1)]);
+        assert!(!result.has_appended_token_batches());
+    }
+
+    /// CR 614.6: preventing the event's own batch leaves the appended batch,
+    /// which becomes the surviving event — the event is not `Prevented`.
+    #[test]
+    fn prevent_on_primary_batch_promotes_the_appended_batch() {
+        let preventer = ObjectId(730);
+        let mut state = test_state_with_object(
+            preventer,
+            Zone::Battlefield,
+            vec![token_core_type_replacement(
+                CoreType::Artifact,
+                crate::types::ability::QuantityModification::Prevent,
+            )],
+        );
+        let mut events = Vec::new();
+        let result = replace_event(
+            &mut state,
+            treasure_plus_squirrel_event(preventer),
+            &mut events,
+        );
+        let ReplacementResult::Execute(result) = result else {
+            panic!("the Squirrel batch survives; got {result:?}");
+        };
+        assert_eq!(event_batch_shape(&result), [("Squirrel".to_string(), 1)]);
     }
 
     /// CR 616.1: Multiple pure `Double` token doublers commute and should not
@@ -22344,6 +22645,7 @@ mod tests {
             copy: None,
             enter_tapped: EtbTapState::Unspecified,
             count: 1,
+            appended: Vec::new(),
             applied: HashSet::new(),
         };
 
@@ -22418,6 +22720,7 @@ mod tests {
             copy: None,
             enter_tapped: EtbTapState::Unspecified,
             count: 1,
+            appended: Vec::new(),
             applied: HashSet::new(),
         };
 
@@ -22504,6 +22807,7 @@ mod tests {
             copy: None,
             enter_tapped: EtbTapState::Unspecified,
             count: 1,
+            appended: Vec::new(),
             applied: HashSet::new(),
         };
         let mut events = Vec::new();
@@ -22715,6 +23019,7 @@ mod tests {
             copy: None,
             enter_tapped: EtbTapState::Unspecified,
             count,
+            appended: Vec::new(),
             applied: HashSet::new(),
         };
         let mut events = Vec::new();
@@ -22813,6 +23118,7 @@ mod tests {
             spec: Box::new(test_token_spec(PlayerId(1), CoreType::Creature)),
             copy: None,
             enter_tapped: EtbTapState::Unspecified,
+            appended: Vec::new(),
             applied: HashSet::new(),
         };
         let token_matches = find_applicable_replacements(&state, &token_event, &registry);
@@ -22911,6 +23217,7 @@ mod tests {
             copy: None,
             enter_tapped: EtbTapState::Unspecified,
             count: 5,
+            appended: Vec::new(),
             applied: HashSet::new(),
         };
 
@@ -23486,6 +23793,7 @@ mod tests {
             copy: None,
             enter_tapped: EtbTapState::Unspecified,
             count: 1,
+            appended: Vec::new(),
             applied: HashSet::new(),
         };
 
@@ -23586,6 +23894,7 @@ mod tests {
             copy: None,
             enter_tapped: EtbTapState::Unspecified,
             count: 1,
+            appended: Vec::new(),
             applied: HashSet::new(),
         };
 
@@ -23736,6 +24045,7 @@ mod tests {
             copy: None,
             enter_tapped: EtbTapState::Unspecified,
             count: 1,
+            appended: Vec::new(),
             applied: HashSet::new(),
         };
 
@@ -25184,8 +25494,12 @@ mod tests {
     ///
     /// Two conjuncts, because either alone is passable for the wrong reason:
     ///
-    /// 1. STRUCTURAL — exactly one hook call site, and its enclosing top-level
-    ///    `fn` is `pipeline_loop`. The needle is ASSEMBLED AT RUNTIME so this
+    /// 1. STRUCTURAL — exactly one hook call site in the pipeline, and its
+    ///    enclosing top-level `fn` is `pipeline_loop`. The one other site is
+    ///    `push_appended_token_batch`: a batch a replacement adds to a
+    ///    CreateToken event (CR 614.1a) is part of that event and never enters
+    ///    the pipeline on its own, so it is recorded where it is built. The
+    ///    needle is ASSEMBLED AT RUNTIME so this
     ///    test's own source text cannot be counted by its own instrument (the
     ///    self-referential-contamination shape that made the deleted
     ///    `resolution_choice_verdicts_are_exactly_pinned` census state `== 3`
@@ -25209,22 +25523,37 @@ mod tests {
             env!("CARGO_MANIFEST_DIR")
         ))
         .expect("this module's own source is readable");
+        let appended_batch_header = format!("\n{}{}", "fn push_appended_", "token_batch(");
         let sites: Vec<usize> = src.match_indices(&hook_needle).map(|(at, _)| at).collect();
-        assert_eq!(
-            sites.len(),
-            1,
-            "the recorder must have exactly ONE call site; found {}",
-            sites.len()
-        );
         // EVERY top-level visibility, not just the bare `fn `. Measured: with
         // only `"\nfn "` this scan silently passed when the hook was moved into
         // `pub fn replace_event` — the nearest preceding COLUMN-0 `fn ` was
         // `pipeline_loop`'s own header, so the wrong placement read as right.
-        let enclosing = ["\nfn ", "\npub fn ", "\npub(crate) fn "]
+        let enclosing_of = |site: usize| {
+            ["\nfn ", "\npub fn ", "\npub(crate) fn "]
+                .iter()
+                .filter_map(|header| src[..site].rfind(header))
+                .max()
+                .expect("a top-level `fn` encloses the hook")
+        };
+        let (pipeline_sites, other_sites): (Vec<usize>, Vec<usize>) = sites
             .iter()
-            .filter_map(|header| src[..sites[0]].rfind(header))
-            .max()
-            .expect("a top-level `fn` encloses the hook");
+            .copied()
+            .partition(|&site| src[enclosing_of(site)..].starts_with(fn_header.trim_end()));
+        assert!(
+            other_sites
+                .iter()
+                .all(|&site| src[enclosing_of(site)..].starts_with(&appended_batch_header)),
+            "outside `pipeline_loop`, only the appended-token-batch builder records"
+        );
+        assert_eq!(
+            (pipeline_sites.len(), other_sites.len()),
+            (1, 1),
+            "the recorder must have exactly ONE pipeline call site and the one \
+             appended-batch site; found {} call sites",
+            sites.len()
+        );
+        let enclosing = enclosing_of(pipeline_sites[0]);
         assert!(
             src[enclosing..].starts_with(fn_header.trim_end()),
             "the hook must sit in `pipeline_loop` — the pipeline BODY every entry \

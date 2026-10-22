@@ -927,25 +927,10 @@ fn handle_replacement_choice_inner(
                 // — the `spec` field carries the full self-describing token
                 // characteristics. Delegate to the shared helper.
                 create @ ProposedEvent::CreateToken { .. } => {
-                    let is_copy =
-                        matches!(create, ProposedEvent::CreateToken { copy: Some(_), .. });
+                    // CR 614.1a + CR 608.2c: the delivery authority publishes this
+                    // event's whole referent, and hands it to a resident CopyToken
+                    // frame, whose drain below assigns the ledger.
                     let completed = apply_create_token_after_replacement(state, create, events);
-                    // CR 614.1a + CR 608.2c: the created referent includes any
-                    // batch a replacement appended to this event; the window
-                    // spans the chosen replacement's application and the apply.
-                    //
-                    // Known residual: a copy event is left as is. A replacement-appended
-                    // batch is never in the CopyToken frame's created ids. On a
-                    // liminal-immediate copy the apply drains the frame and resolves the
-                    // effect's riders inside the apply, so publishing here would rewrite
-                    // the ledger after the riders read it; otherwise the frame's later
-                    // drain overwrites the ledger with the frame's ids.
-                    if !is_copy {
-                        effects::token::publish_replacement_appended_tokens(
-                            state,
-                            &events[replacement_action_event_start..],
-                        );
-                    }
                     if !completed {
                         return Ok(state.waiting_for.clone());
                     }
@@ -5453,6 +5438,7 @@ mod tests {
             copy: None,
             enter_tapped: crate::types::proposed_event::EtbTapState::Unspecified,
             count: 1,
+            appended: Vec::new(),
             applied: std::collections::HashSet::new(),
         };
         let result = replacement_mod::replace_event(&mut state, proposed, &mut events);
@@ -5579,6 +5565,7 @@ mod tests {
             copy: None,
             enter_tapped: crate::types::proposed_event::EtbTapState::Unspecified,
             count: 1,
+            appended: Vec::new(),
             applied: std::collections::HashSet::new(),
         };
         let result = replacement_mod::replace_event(&mut state, proposed, &mut events);
@@ -5740,6 +5727,7 @@ mod tests {
             copy: None,
             enter_tapped: crate::types::proposed_event::EtbTapState::Unspecified,
             count: 1,
+            appended: Vec::new(),
             applied: std::collections::HashSet::new(),
         };
         let result = replacement_mod::replace_event(&mut state, proposed, &mut events);
@@ -5917,6 +5905,7 @@ mod tests {
             copy: None,
             enter_tapped: crate::types::proposed_event::EtbTapState::Unspecified,
             count: 1,
+            appended: Vec::new(),
             applied: std::collections::HashSet::new(),
         };
         let result = replacement_mod::replace_event(&mut state, proposed, &mut events);
@@ -6073,6 +6062,7 @@ mod tests {
             copy: None,
             enter_tapped: crate::types::proposed_event::EtbTapState::Unspecified,
             count: 1,
+            appended: Vec::new(),
             applied,
         };
         assert!(
@@ -6213,6 +6203,7 @@ mod tests {
             copy: None,
             enter_tapped: crate::types::proposed_event::EtbTapState::Unspecified,
             count: 1,
+            appended: Vec::new(),
             applied: std::collections::HashSet::new(),
         };
         let result = replacement_mod::replace_event(&mut state, proposed, &mut events);

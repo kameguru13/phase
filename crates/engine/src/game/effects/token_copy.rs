@@ -519,21 +519,23 @@ fn drain_copy_token_resolution(
             // populate) → empty set → byte-identical to the prior
             // `HashSet::new()`. A *different* source's replacement (Doubling
             // Season's rid) is absent from the seed and still applies (#1511).
+            appended: Vec::new(),
             applied: state
                 .post_replacement_token_choice_applied
                 .clone()
                 .unwrap_or_default(),
         };
 
-        let window_start = events.len();
         match crate::game::replacement::replace_event(state, proposed, events) {
             crate::game::replacement::ReplacementResult::Execute(event) => {
+                // CR 614.1a + CR 608.2c: the frame is taken, so the delivery
+                // authority leaves the ledger as this batch's whole created
+                // referent, appended batches included: own batch first on
+                // completion, `[]` after a plain appended batch paused (it
+                // publishes to this frame when the event finishes), and the
+                // ids so far after the copy batch itself paused.
                 let completed =
                     super::token::apply_create_token_after_replacement(state, event, events);
-                // CR 614.1a + CR 608.2c: this batch's created referent includes
-                // any batch a replacement appended to it. The frame is taken, so
-                // the apply assigned the ledger with this batch's own ids.
-                super::token::publish_replacement_appended_tokens(state, &events[window_start..]);
                 if !completed {
                     pending
                         .created_ids
@@ -571,7 +573,12 @@ fn drain_copy_token_resolution(
 /// Park a copy-token owner as the direct paused frame, or below the complete
 /// child stack its batch raised. The captured boundary preserves the actual
 /// parent/child relationship without searching for a buried CopyToken frame.
-fn park_copy_token_after_current_batch(
+///
+/// The single authority for re-parking a CopyToken owner around a child stack,
+/// shared with the token-event delivery authority
+/// (`token::drive_token_event_delivery`), which detaches the owner while it
+/// delivers a compound CreateToken event.
+pub(crate) fn park_copy_token_after_current_batch(
     state: &mut GameState,
     pending: PendingCopyTokenResolution,
     stack_depth_before_batch: ChildStackDepth,

@@ -802,6 +802,7 @@ fn apply_pending_counter_post_action(
                 copy: None,
                 enter_tapped,
                 count: remaining_count,
+                appended: Vec::new(),
                 applied: HashSet::new(),
             };
             let created_ids = state.last_created_token_ids.clone();
@@ -812,6 +813,12 @@ fn apply_pending_counter_post_action(
                 PendingEffectResolutionEvent::Suppress,
                 events,
             )
+        }
+        // CR 614.1a + CR 616.1f: the rest of a compound CreateToken event — the
+        // batches still to deliver after the one that paused — and the single
+        // publication of its created referent.
+        PendingCounterPostAction::ContinueTokenEventDelivery { delivery } => {
+            super::token::continue_token_event_delivery(state, *delivery, events)
         }
         PendingCounterPostAction::FinalizeCopyTokenEntry {
             object_id,

@@ -1220,7 +1220,7 @@ fn every_single_id_anaphora_publish_lives_in_an_authority() {
             ambiguous_production.len(),
             ambiguous.len() - ambiguous_production.len()
         ),
-        (5, 0),
+        (6, 0),
         "the argument-ambiguous mutator surface on the two anaphora containers moved. These are \
          the calls whose SINGLE-ID-ness this census cannot read, so they are pinned instead of \
          classified. If the new call's argument is a bulk source (a `Vec`, a \
@@ -1238,16 +1238,23 @@ fn every_single_id_anaphora_publish_lives_in_an_authority() {
     // now call it. Same five calls, same bulk arguments (`status.created_ids`, a `Vec`), one
     // fewer place to write the destination-selection rule wrong. `counters.rs` therefore drops
     // out of this multiset entirely; its absence is now a claim, not an omission.
+    //
+    // The compound CreateToken event (CR 614.1a: a batch a replacement appends belongs to the one
+    // modified event) added a SIXTH, in `token.rs`: `token::repark_event_copy_frame`'s
+    // `frame.created_ids.extend(ids)`. A bulk argument (a `Vec`): the event's ordered ids at
+    // completion, or the ledger at a copy batch's pause, handed to the CopyToken owner the
+    // delivery detached. It is the ONE hand-over site for every re-park of that owner, so the
+    // pause and completion paths cannot pick different ids.
     assert_eq!(
         production_multiset(&ambiguous_production),
         vec![
-            ("engine/src/game/effects/token.rs".to_string(), 1),
+            ("engine/src/game/effects/token.rs".to_string(), 2),
             ("engine/src/game/effects/token_copy.rs".to_string(), 4),
         ],
-        "per-file argument-ambiguous mutator multiset moved. All five of these are bulk \
-         republishes today — `.extend(status.created_ids)` and `.extend(state.\
-         last_created_token_ids.clone())` — and the pin exists so that a SIXTH cannot arrive \
-         without someone reading its argument"
+        "per-file argument-ambiguous mutator multiset moved. All six of these are bulk \
+         republishes today — `.extend(status.created_ids)`, `.extend(state.\
+         last_created_token_ids.clone())` and `repark_event_copy_frame`'s `.extend(ids)` — and \
+         the pin exists so that a SEVENTH cannot arrive without someone reading its argument"
     );
 }
 

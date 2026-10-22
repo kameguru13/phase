@@ -51,7 +51,7 @@ use super::object_map::ObjectMap;
 use super::phase::{Phase, PhaseStop, TurnDirection, TurnSegment};
 use super::player::{Player, PlayerCounterKind, PlayerId};
 use super::proposed_event::{
-    AppliedReplacementKey, CopyTokenSpec, ProposedEvent, ReplacementId, TokenSpec,
+    AppliedReplacementKey, CopyTokenSpec, ProposedEvent, ReplacementId, TokenBatch, TokenSpec,
 };
 use super::replacements::ReplacementEvent;
 #[cfg(debug_assertions)]
@@ -7407,6 +7407,41 @@ pub struct CopyTokenEntryTail {
     pub remaining_count: u32,
 }
 
+/// CR 614.1a + CR 616.1f + CR 608.2c: a batch of one compound CreateToken
+/// event at its position in the event (0 = the event's own batch).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PositionedTokenBatch {
+    pub position: u32,
+    pub batch: TokenBatch,
+}
+
+/// The ids one delivered batch created, at its event position.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PositionedTokenIds {
+    pub position: u32,
+    pub ids: Vec<ObjectId>,
+}
+
+/// CR 614.1a + CR 616.1f + CR 608.2c: the rest of one compound CreateToken
+/// event's delivery after one of its batches paused. All of it is the one
+/// modified event, so its created referent ("that token", "those tokens") is
+/// published once, in event order, when the last batch lands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingTokenEventDelivery {
+    /// Batches not yet delivered, in delivery order.
+    pub remaining: Vec<PositionedTokenBatch>,
+    /// Ids of the batches delivered so far.
+    pub delivered: Vec<PositionedTokenIds>,
+    /// The plain batch whose own remainder (`FinalizeTokenEntry` +
+    /// `ContinueTokenCreation`) runs just before this action; its ids are
+    /// `last_created_token_ids` when this runs. Set whenever the cursor is
+    /// stashed: only a plain batch's pause stashes it (a copy batch is always
+    /// delivered last, so nothing remains behind a copy pause).
+    pub resumed: Option<u32>,
+    /// Ids the caller placed ahead of the event (`initial_created_ids`).
+    pub prefix: Vec<ObjectId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PendingCounterPostAction {
     EmitEffectResolved {
@@ -7456,6 +7491,11 @@ pub enum PendingCounterPostAction {
         spec: Box<TokenSpec>,
         enter_tapped: EtbTapState,
         remaining_count: u32,
+    },
+    /// CR 614.1a + CR 616.1f: deliver the rest of a compound CreateToken event
+    /// and publish its referent; see `token::continue_token_event_delivery`.
+    ContinueTokenEventDelivery {
+        delivery: Box<PendingTokenEventDelivery>,
     },
     FinalizeCopyTokenEntry {
         object_id: ObjectId,
@@ -34945,6 +34985,58 @@ mod tests {
     use crate::types::phase::PhaseGroup;
     use crate::types::resolved_commands::ResolvedDelayedTriggerCommand;
     use crate::types::triggers::TriggerMode;
+
+    /// SHAPE (serialized resume state): the compound token-event cursor rides a
+    /// counter-additions completion across a pause, so it must round-trip.
+    #[test]
+    fn continue_token_event_delivery_serde_roundtrip() {
+        let spec = TokenSpec {
+            characteristics: crate::types::proposed_event::TokenCharacteristics {
+                display_name: "Squirrel".to_string(),
+                power: Some(1),
+                toughness: Some(1),
+                loyalty: None,
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Squirrel".to_string()],
+                supertypes: Vec::new(),
+                colors: Vec::new(),
+                keywords: Vec::new(),
+            },
+            script_name: "Squirrel".to_string(),
+            static_abilities: Vec::new(),
+            enter_with_counters: Vec::new(),
+            tapped: false,
+            enters_attacking: false,
+            sacrifice_at: None,
+            source_id: ObjectId(3),
+            controller: PlayerId(0),
+            attach_to: crate::types::proposed_event::TokenHostRequest::NotRequested,
+        };
+        let action = PendingCounterPostAction::ContinueTokenEventDelivery {
+            delivery: Box::new(PendingTokenEventDelivery {
+                remaining: vec![PositionedTokenBatch {
+                    position: 1,
+                    batch: TokenBatch {
+                        owner: PlayerId(0),
+                        spec: Box::new(spec),
+                        copy: None,
+                        enter_tapped: EtbTapState::Unspecified,
+                        count: 2,
+                    },
+                }],
+                delivered: vec![PositionedTokenIds {
+                    position: 0,
+                    ids: vec![ObjectId(40), ObjectId(41)],
+                }],
+                resumed: Some(0),
+                prefix: vec![ObjectId(7)],
+            }),
+        };
+        let json = serde_json::to_string(&action).expect("cursor serializes");
+        let back: PendingCounterPostAction =
+            serde_json::from_str(&json).expect("cursor deserializes");
+        assert_eq!(action, back);
+    }
 
     fn state_with_recorded_exploit() -> (GameState, GameEvent) {
         let mut state = GameState::new_two_player(42);
