@@ -34977,12 +34977,14 @@ mod tests {
             source_zone: Zone::Battlefield,
             ability_tag: None,
             is_loyalty_ability: false,
-            activation_cost: BoundActivationCost::Cost(crate::types::ability::AbilityCost::Mana {
-                cost: ManaCost::Cost {
-                    shards: vec![ManaCostShard::X],
-                    generic: 0,
+            activation_cost: BoundActivationCost::Cost(Box::new(
+                crate::types::ability::AbilityCost::Mana {
+                    cost: ManaCost::Cost {
+                        shards: vec![ManaCostShard::X],
+                        generic: 0,
+                    },
                 },
-            }),
+            )),
             targets: Vec::new(),
         };
         let json = serde_json::to_value(&record).unwrap();

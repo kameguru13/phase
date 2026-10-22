@@ -17849,10 +17849,10 @@ mod tests {
     fn bound_activation_cost_has_x_answers_only_a_bound_x_cost() {
         use crate::types::events::BoundActivationCost;
         assert!(bound_activation_cost_has_x(&BoundActivationCost::Cost(
-            AbilityCost::Mana { cost: x_mana(&[]) }
+            Box::new(AbilityCost::Mana { cost: x_mana(&[]) })
         )));
         assert!(!bound_activation_cost_has_x(&BoundActivationCost::Cost(
-            AbilityCost::Tap
+            Box::new(AbilityCost::Tap)
         )));
         assert!(!bound_activation_cost_has_x(&BoundActivationCost::Costless));
         assert!(!bound_activation_cost_has_x(&BoundActivationCost::Unknown));
@@ -17910,9 +17910,10 @@ mod tests {
             GameEvent::AbilityActivated {
                 source_id,
                 kind: ActivatedAbilityKind::Mana,
-                activation_cost: BoundActivationCost::Cost(AbilityCost::Tap),
+                activation_cost,
                 ..
             } if *source_id == forest
+                && *activation_cost == BoundActivationCost::Cost(Box::new(AbilityCost::Tap))
         )));
     }
 

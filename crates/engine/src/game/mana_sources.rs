@@ -6478,7 +6478,7 @@ mod tests {
             activations,
             vec![(
                 ActivatedAbilityKind::Mana,
-                BoundActivationCost::Cost(AbilityCost::Tap)
+                BoundActivationCost::Cost(Box::new(AbilityCost::Tap))
             )]
         );
     }

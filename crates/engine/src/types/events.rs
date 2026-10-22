@@ -223,8 +223,9 @@ pub enum BoundActivationCost {
     /// `None`; engine-built definitions only — no printed activated ability
     /// lacks one, CR 602.1). The activation paid nothing.
     Costless,
-    /// CR 602.1a: the bound definition's activation cost.
-    Cost(AbilityCost),
+    /// CR 602.1a: the bound definition's activation cost. Boxed so the
+    /// payload does not grow every `GameEvent` (serde is transparent).
+    Cost(Box<AbilityCost>),
 }
 
 impl BoundActivationCost {
@@ -232,14 +233,17 @@ impl BoundActivationCost {
     pub fn of_definition(def: Option<&AbilityDefinition>) -> Self {
         match def {
             None => Self::Unknown,
-            Some(def) => def.cost.clone().map_or(Self::Costless, Self::Cost),
+            Some(def) => def
+                .cost
+                .clone()
+                .map_or(Self::Costless, |cost| Self::Cost(Box::new(cost))),
         }
     }
 
     /// CR 305.6: a basic land type's intrinsic "{T}: Add [mana symbol]", whose
     /// activation cost is `{T}`.
     pub fn basic_land_intrinsic() -> Self {
-        Self::Cost(AbilityCost::Tap)
+        Self::Cost(Box::new(AbilityCost::Tap))
     }
 
     pub fn is_unknown(&self) -> bool {
@@ -2274,7 +2278,7 @@ mod tests {
             ],
         };
         for cost in [
-            BoundActivationCost::Cost(x_cost),
+            BoundActivationCost::Cost(Box::new(x_cost)),
             BoundActivationCost::Costless,
         ] {
             let original = event(cost);
@@ -2317,7 +2321,7 @@ mod tests {
         let tapped = costless.clone().cost(AbilityCost::Tap);
         assert_eq!(
             BoundActivationCost::of_definition(Some(&tapped)),
-            BoundActivationCost::Cost(AbilityCost::Tap)
+            BoundActivationCost::Cost(Box::new(AbilityCost::Tap))
         );
     }
 

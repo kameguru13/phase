@@ -8402,8 +8402,11 @@ mod tests {
             "the named entry, not the top or a later same-source entry"
         );
 
-        // Today's answer for an entry that left the stack (phase 4 replaces it
-        // with the departed answer).
+        // Today's answer for an entry that left the stack: a defective
+        // reference kept unchanged in phase 1. A countered ability is still
+        // copied as it last existed (Unbound Flourishing ruling 1; Magus Lucea
+        // Kane and Rings of Brighthearth rulings), so phase 4 replaces this
+        // assertion with the departed answer.
         state.current_trigger_event = Some(activation(Some(ObjectId(103))));
         assert!(matches!(
             triggering_activation(&state),

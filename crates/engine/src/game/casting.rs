@@ -27397,7 +27397,7 @@ fn activate_with_cost_carrier(
                 == carrier
                     .as_deref()
                     .map_or(BoundActivationCost::Costless, |snapshot| {
-                        BoundActivationCost::Cost(snapshot.base_cost.clone())
+                        BoundActivationCost::Cost(Box::new(snapshot.base_cost.clone()))
                     })
         }),
         "an activation's latched cost must equal its fold's base cost at announcement"

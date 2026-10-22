@@ -1766,7 +1766,7 @@ fn build_all_direct_numeric_maps_state() -> GameState {
                 source_zone: engine::types::zones::Zone::Battlefield,
                 ability_tag: None,
                 is_loyalty_ability: false,
-                activation_cost: BoundActivationCost::Cost(AbilityCost::Tap),
+                activation_cost: BoundActivationCost::Cost(Box::new(AbilityCost::Tap)),
                 targets: vec![ActivationTargetFact::Object {
                     id: ObjectId(2),
                     lki: Box::new(second_lki.clone()),
@@ -1782,7 +1782,9 @@ fn build_all_direct_numeric_maps_state() -> GameState {
                 source_zone: engine::types::zones::Zone::Battlefield,
                 ability_tag: None,
                 is_loyalty_ability: true,
-                activation_cost: BoundActivationCost::Cost(AbilityCost::Loyalty { amount: 1 }),
+                activation_cost: BoundActivationCost::Cost(Box::new(AbilityCost::Loyalty {
+                    amount: 1,
+                })),
                 targets: vec![ActivationTargetFact::Player(PlayerId(0))],
             }]),
         ),
