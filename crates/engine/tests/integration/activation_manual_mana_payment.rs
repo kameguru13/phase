@@ -18,7 +18,7 @@ use engine::types::ability::{
 use engine::types::actions::GameAction;
 use engine::types::casting_costs::{ActivationCostLock, ActivationCostLockPoint};
 use engine::types::counter::CounterType;
-use engine::types::events::BoundActivationCost;
+use engine::types::events::{BoundActivationCost, GameEvent};
 use engine::types::game_state::{
     CastPaymentMode, CounterRemoveChoice, PayCostKind, PersistedGameState,
     PersistedRestoreFinalization, ShardChoice, ShardOptions, StackEntryKind, WaitingFor,
@@ -3225,27 +3225,35 @@ fn typed_manual_phyrexian_alternatives_preserve_the_original_cost_record() {
             &mut runner,
             GameAction::ChooseActivationCostBranch { index },
         );
-        let waiting_for = if choose_phyrexian {
+        let result = if choose_phyrexian {
             assert_announcement(&waiting_for, 1);
-            submit_phyrexian(&mut runner, &[ShardChoice::PayLife])
+            runner.act(GameAction::SubmitPhyrexianChoices {
+                choices: vec![ShardChoice::PayLife],
+            })
         } else {
             assert!(is_mana_payment(&waiting_for), "{waiting_for:?}");
             tap_land_for_mana(&mut runner, mountain);
-            pass(&mut runner)
-        };
-        assert!(is_priority(&waiting_for), "{waiting_for:?}");
+            runner.act(GameAction::PassPriority)
+        }
+        .expect("the selected activation cost is paid");
+        assert!(is_priority(&result.waiting_for), "{:?}", result.waiting_for);
         assert_eq!(runner.state().stack.len(), 1);
-        let StackEntryKind::ActivatedAbility { ability, .. } = &runner.state().stack[0].kind else {
-            panic!("the selected activation must be on the stack");
-        };
+        let activation_costs: Vec<_> = result
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                GameEvent::AbilityActivated {
+                    source_id,
+                    activation_cost,
+                    ..
+                } if *source_id == contract => Some(activation_cost),
+                _ => None,
+            })
+            .collect();
         assert_eq!(
-            ability
-                .activation_record
-                .as_deref()
-                .expect("the activation retains its announcement record")
-                .activation_cost,
-            BoundActivationCost::Cost(Box::new(original_cost)),
-            "selecting a payment branch does not replace the original cost fact"
+            activation_costs,
+            vec![&BoundActivationCost::Cost(Box::new(original_cost))],
+            "selecting a payment branch publishes the original cost exactly once"
         );
         assert_eq!(life(&runner, P0), if choose_phyrexian { 18 } else { 20 });
         assert_eq!(tapped(&runner, mountain), !choose_phyrexian);
