@@ -269,6 +269,7 @@ fn activate_with_x(runner: &mut GameRunner, source: ObjectId, ability_index: usi
         GameAction::ActivateAbility {
             source_id: source,
             ability_index,
+            payment_mode: CastPaymentMode::Auto,
         },
     );
     assert!(
@@ -711,6 +712,7 @@ fn copies_an_x_activated_ability_but_not_a_non_x_ability_of_the_same_source() {
         GameAction::ActivateAbility {
             source_id: engine,
             ability_index: 1,
+            payment_mode: CastPaymentMode::Auto,
         },
     );
     pay_until_priority(&mut runner);
@@ -792,6 +794,7 @@ fn copies_katara_waterbend_x_activation() {
         GameAction::ActivateAbility {
             source_id: katara,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     );
     assert!(
@@ -854,6 +857,7 @@ fn unbound_triggers_on_an_x_mana_ability_and_copies_nothing() {
         GameAction::ActivateAbility {
             source_id: rockets,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     );
     let WaitingFor::OrderTriggers { triggers, .. } = &runner.state().waiting_for else {
@@ -996,6 +1000,7 @@ fn a_copied_sacrifice_ability_whose_move_reveals_an_x_ability_is_not_copied() {
         GameAction::ActivateAbility {
             source_id: lazav,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     );
     pay_until_priority(&mut runner);
@@ -1052,6 +1057,7 @@ fn an_ability_announcing_x_without_the_x_symbol_is_not_copied() {
         GameAction::ActivateAbility {
             source_id: lazav,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     );
     assert!(

@@ -3287,6 +3287,7 @@ fn activate_with_target(runner: &mut GameRunner, source: ObjectId, target: Targe
         .act(GameAction::ActivateAbility {
             source_id: source,
             ability_index,
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("the activation is accepted");
     for _ in 0..8 {

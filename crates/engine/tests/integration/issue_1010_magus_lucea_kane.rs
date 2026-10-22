@@ -6,7 +6,9 @@ use engine::types::ability::{
     SacrificeRequirement, TargetFilter, TargetRef,
 };
 use engine::types::actions::GameAction;
-use engine::types::game_state::{ConvokeMode, PayCostKind, StackEntryKind, WaitingFor};
+use engine::types::game_state::{
+    CastPaymentMode, ConvokeMode, PayCostKind, StackEntryKind, WaitingFor,
+};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
@@ -402,6 +404,7 @@ fn activate_with_x(runner: &mut GameRunner, source: ObjectId, x: u32) {
         GameAction::ActivateAbility {
             source_id: source,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     );
     assert!(
@@ -613,6 +616,7 @@ fn a_mana_ability_of_a_source_with_a_waiting_x_activation_does_not_use_up_magus(
         GameAction::ActivateAbility {
             source_id: magus,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     );
     assert_eq!(runner.state().delayed_triggers.len(), 1);
@@ -623,6 +627,7 @@ fn a_mana_ability_of_a_source_with_a_waiting_x_activation_does_not_use_up_magus(
         GameAction::ActivateAbility {
             source_id: source,
             ability_index: 1,
+            payment_mode: CastPaymentMode::Auto,
         },
     );
     assert!(
@@ -732,6 +737,7 @@ fn lazav_copying_bottle_gnomes_sacrificing_itself_does_not_use_up_magus() {
         GameAction::ActivateAbility {
             source_id: lazav,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     );
     pay_until_priority(&mut runner);
@@ -789,6 +795,7 @@ fn lazav_copying_krav_sacrificing_itself_as_x_does_not_use_up_magus() {
         GameAction::ActivateAbility {
             source_id: lazav,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     );
     assert!(
@@ -860,6 +867,7 @@ fn magus_copies_katara_waterbend_x_activation() {
         GameAction::ActivateAbility {
             source_id: katara,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     );
     assert!(
@@ -938,6 +946,7 @@ fn wizards_rockets_x_mana_ability_uses_up_magus_and_copies_nothing() {
         GameAction::ActivateAbility {
             source_id: rockets,
             ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
         },
     );
     let WaitingFor::OrderTriggers { triggers, .. } = &runner.state().waiting_for else {
