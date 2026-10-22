@@ -18,6 +18,7 @@ use engine::types::ability::{
 use engine::types::actions::GameAction;
 use engine::types::casting_costs::{ActivationCostLock, ActivationCostLockPoint};
 use engine::types::counter::CounterType;
+use engine::types::events::BoundActivationCost;
 use engine::types::game_state::{
     CastPaymentMode, CounterRemoveChoice, PayCostKind, PersistedGameState,
     PersistedRestoreFinalization, ShardChoice, ShardOptions, StackEntryKind, WaitingFor,
@@ -3184,6 +3185,79 @@ fn the_phyrexian_intent_of_a_pending_activation_is_optional_on_the_wire() {
 // mixes a grant-eligible ordinary symbol with repeated Phyrexian ones. These rows
 // use clearly labelled parsed definitions to pin the two routing seams those
 // shapes reach; their prices are derived from the typed costs themselves.
+
+/// TYPED CONTRACT: a native Phyrexian alternative is selected while the manual
+/// proposal is open (CR 118.13a + CR 602.2b). Reentry keeps the original OneOf
+/// definition on the activation record even though the payment fold uses only
+/// the selected branch.
+#[test]
+fn typed_manual_phyrexian_alternatives_preserve_the_original_cost_record() {
+    for choose_phyrexian in [false, true] {
+        let mut scenario = scenario_at_main();
+        let contract = scenario
+            .add_creature_from_oracle(
+                P0,
+                "Typed Phyrexian Alternative Contract",
+                1,
+                1,
+                "{W/P} or {1}: You gain 1 life.",
+            )
+            .id();
+        let mountain = add(&mut scenario, P0, "Mountain", Zone::Battlefield);
+        let mut runner = build(scenario);
+        let original_cost = runner.state().objects[&contract].abilities[0]
+            .cost
+            .clone()
+            .expect("the parsed contract has an activation cost");
+        assert!(matches!(&original_cost, AbilityCost::OneOf { costs } if costs.len() == 2));
+
+        let waiting_for = activate_index(&mut runner, contract, 0, CastPaymentMode::Manual);
+        assert!(
+            matches!(&waiting_for, WaitingFor::ActivationCostOneOfChoice { player, .. } if *player == P0)
+        );
+        let phyrexian_index = alternative_paying(&waiting_for, ManaCostShard::PhyrexianWhite);
+        let index = if choose_phyrexian {
+            phyrexian_index
+        } else {
+            1 - phyrexian_index
+        };
+        let waiting_for = act(
+            &mut runner,
+            GameAction::ChooseActivationCostBranch { index },
+        );
+        let waiting_for = if choose_phyrexian {
+            assert_announcement(&waiting_for, 1);
+            submit_phyrexian(&mut runner, &[ShardChoice::PayLife])
+        } else {
+            assert!(is_mana_payment(&waiting_for), "{waiting_for:?}");
+            tap_land_for_mana(&mut runner, mountain);
+            pass(&mut runner)
+        };
+        assert!(is_priority(&waiting_for), "{waiting_for:?}");
+        assert_eq!(runner.state().stack.len(), 1);
+        let StackEntryKind::ActivatedAbility { ability, .. } = &runner.state().stack[0].kind else {
+            panic!("the selected activation must be on the stack");
+        };
+        assert_eq!(
+            ability
+                .activation_record
+                .as_deref()
+                .expect("the activation retains its announcement record")
+                .activation_cost,
+            BoundActivationCost::Cost(Box::new(original_cost)),
+            "selecting a payment branch does not replace the original cost fact"
+        );
+        assert_eq!(life(&runner, P0), if choose_phyrexian { 18 } else { 20 });
+        assert_eq!(tapped(&runner, mountain), !choose_phyrexian);
+
+        runner.advance_until_stack_empty();
+        assert_eq!(life(&runner, P0), if choose_phyrexian { 19 } else { 21 });
+        assert!(runner.state().stack.is_empty());
+        assert!(
+            matches!(runner.state().waiting_for, WaitingFor::Priority { player } if player == P0)
+        );
+    }
+}
 
 /// TYPED CONTRACT (mixed domain): "{B}{W/P}{W/P}{R}: You gain 1 life." under
 /// K'rrik. The announcement covers exactly the two printed Phyrexian symbols, by

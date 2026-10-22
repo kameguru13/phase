@@ -28710,20 +28710,8 @@ fn activate_with_cost_carrier(
     // captured now, before any cost is paid. Target settlement adds the
     // committed targets on every target-first route. CR 602.2a: provenance too.
     record_activation_announcement(state, player, source_id, ability_index, &mut resolved);
-    // CR 602.1a + CR 601.2f: one capture — the latch on the record and the fold's
-    // base cost are one fact, read from the same announcement-bound definition
-    // before any modifier or payment.
-    debug_assert!(
-        resolved.activation_record.as_deref().is_none_or(|record| {
-            record.activation_cost
-                == carrier
-                    .as_deref()
-                    .map_or(BoundActivationCost::Costless, |snapshot| {
-                        BoundActivationCost::Cost(Box::new(snapshot.base_cost.clone()))
-                    })
-        }),
-        "an activation's latched cost must equal its fold's base cost at announcement"
-    );
+    // The record retains the definition's original cost. A resumed proposal's
+    // fold base may already be a selected OneOf branch, a different domain.
     // CR 602.2b + CR 601.2b/c: an X announcement can determine how many
     // targets an ability has. Before X is chosen, target-slot construction may
     // reject that specific class of otherwise legal activation; defer only that
