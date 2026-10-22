@@ -1,0 +1,593 @@
+//! "Reveal X <color> cards from your hand" costs reveal exactly the announced
+//! number of matching cards, and the effect reads that same X.
+//!
+//! CR 107.3a: X in a cost the text does not define is announced by the
+//! controller while casting or activating, and every X takes that value.
+//! CR 602.2b applies the casting steps to an activated ability: X is announced
+//! (CR 601.2b) before targets are chosen (CR 601.2c) and before the total cost
+//! is paid (CR 601.2h). CR 701.20a: revealing shows the cards to every player;
+//! CR 701.20b: a revealed card stays in its zone.
+//!
+//! The class covers activation costs (the Martyr cycle: Sands, Spores and
+//! Bones are driven here; Ashes and Frost read the same `chosen_x` channel) and
+//! the same cost printed as a spell's additional cost. No printed spell carries
+//! that additional cost, so the spell rows use a synthetic card ("Ember
+//! Tithe"). CR 601.2a: the spell being cast is on the stack, so it is never a
+//! card in hand that could pay its own reveal.
+
+use std::collections::HashSet;
+
+use engine::ai_support::legal_actions;
+use engine::game::casting::can_activate_ability_now;
+use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::types::ability::TargetRef;
+use engine::types::actions::GameAction;
+use engine::types::events::GameEvent;
+use engine::types::game_state::{CastPaymentMode, PayCostKind, WaitingFor};
+use engine::types::identifiers::ObjectId;
+use engine::types::mana::{ManaColor, ManaCost, ManaType, ManaUnit};
+use engine::types::phase::Phase;
+use engine::types::player::PlayerId;
+use engine::types::zones::Zone;
+
+const MARTYR_OF_SANDS: &str = "{1}, Reveal X white cards from your hand, Sacrifice this creature: You gain three times X life.";
+const MARTYR_OF_SPORES: &str = "{1}, Reveal X green cards from your hand, Sacrifice this creature: Target creature gets +X/+X until end of turn.";
+const MARTYR_OF_BONES: &str = "{1}, Reveal X black cards from your hand, Sacrifice this creature: Exile up to X target cards from a single graveyard.";
+const EMBER_TITHE: &str = "As an additional cost to cast this spell, reveal X red cards from your hand.\nYou gain X life.";
+
+fn pool(kinds: &[ManaType]) -> Vec<ManaUnit> {
+    kinds
+        .iter()
+        .map(|&kind| ManaUnit::new(kind, ObjectId(0), false, vec![]))
+        .collect()
+}
+
+fn colored_hand_card(
+    scenario: &mut GameScenario,
+    player: PlayerId,
+    name: &str,
+    color: ManaColor,
+) -> ObjectId {
+    scenario
+        .add_creature_to_hand(player, name, 1, 1)
+        .with_color(vec![color])
+        .id()
+}
+
+fn activate(runner: &mut GameRunner, source: ObjectId) -> Vec<GameEvent> {
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: source,
+            ability_index: 0,
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("the activation must be accepted")
+        .events
+}
+
+/// Returns the announced-X bounds the engine offers, panicking unless the
+/// current prompt is the X announcement.
+fn offered_x(runner: &GameRunner) -> (u32, u32) {
+    let WaitingFor::ChooseXValue {
+        player, min, max, ..
+    } = &runner.state().waiting_for
+    else {
+        panic!(
+            "the cost must announce X, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(*player, P0, "the activator / caster announces X");
+    (*min, *max)
+}
+
+/// Answers any mana-payment prompt (auto payment) and returns the events.
+fn pay_mana(runner: &mut GameRunner, events: &mut Vec<GameEvent>) {
+    for _ in 0..4 {
+        if !matches!(runner.state().waiting_for, WaitingFor::ManaPayment { .. }) {
+            return;
+        }
+        events.extend(
+            runner
+                .act(GameAction::PassPriority)
+                .expect("auto-paying the mana must succeed")
+                .events,
+        );
+    }
+}
+
+/// Asserts the current prompt is a reveal of exactly `count` cards and
+/// returns its eligible choices.
+fn reveal_prompt(runner: &GameRunner, count: usize) -> HashSet<ObjectId> {
+    let WaitingFor::PayCost {
+        player,
+        kind: PayCostKind::Reveal,
+        choices,
+        count: prompt_count,
+        ..
+    } = &runner.state().waiting_for
+    else {
+        panic!(
+            "the reveal cost must prompt, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(*player, P0, "the payer reveals from their own hand");
+    assert_eq!(*prompt_count, count, "exactly X cards must be revealed");
+    choices.iter().copied().collect()
+}
+
+fn assert_still_revealing(runner: &GameRunner) {
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::PayCost {
+                kind: PayCostKind::Reveal,
+                ..
+            }
+        ),
+        "a rejected reveal must leave the reveal prompt open, got {:?}",
+        runner.state().waiting_for
+    );
+}
+
+fn revealed_cards(events: &[GameEvent]) -> Vec<Vec<ObjectId>> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            GameEvent::CardsRevealed { card_ids, .. } => Some(card_ids.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn resolve(runner: &mut GameRunner) {
+    runner.advance_until_stack_empty();
+    assert!(runner.state().stack.is_empty(), "the stack must resolve");
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "resolution must return to priority, got {:?}",
+        runner.state().waiting_for
+    );
+}
+
+/// R3 + R4 + R5a: Martyr of Sands announces X up to the white cards in its
+/// activator's hand, reveals exactly X of them, and gains three times X life.
+#[test]
+fn martyr_of_sands_announces_x_bounded_by_white_cards_in_your_hand() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let sands = scenario
+        .add_creature_from_oracle(P0, "Martyr of Sands", 1, 1, MARTYR_OF_SANDS)
+        .id();
+    let w1 = colored_hand_card(&mut scenario, P0, "White One", ManaColor::White);
+    let w2 = colored_hand_card(&mut scenario, P0, "White Two", ManaColor::White);
+    let w3 = colored_hand_card(&mut scenario, P0, "White Three", ManaColor::White);
+    let r1 = colored_hand_card(&mut scenario, P0, "Red One", ManaColor::Red);
+    colored_hand_card(&mut scenario, P1, "Opponent White One", ManaColor::White);
+    colored_hand_card(&mut scenario, P1, "Opponent White Two", ManaColor::White);
+    scenario.with_mana_pool(P0, pool(&[ManaType::Colorless]));
+    let mut runner = scenario.build();
+    let life_before = runner.life(P0);
+
+    let mut events = activate(&mut runner, sands);
+
+    // CR 107.3a + CR 118.3: X is capped at the white cards the activator can
+    // reveal — not the off-color card, not the opponent's white cards.
+    assert_eq!(offered_x(&runner), (0, 3));
+    assert!(
+        runner.act(GameAction::ChooseX { value: 4 }).is_err(),
+        "X above the white cards in hand must be rejected"
+    );
+    assert_eq!(offered_x(&runner), (0, 3));
+
+    events.extend(
+        runner
+            .act(GameAction::ChooseX { value: 2 })
+            .expect("announce X = 2")
+            .events,
+    );
+    pay_mana(&mut runner, &mut events);
+
+    let choices = reveal_prompt(&runner, 2);
+    assert_eq!(choices, HashSet::from([w1, w2, w3]));
+
+    assert!(
+        runner
+            .act(GameAction::SelectCards { cards: vec![w1] })
+            .is_err(),
+        "revealing fewer than X cards must be rejected"
+    );
+    assert_still_revealing(&runner);
+    assert!(
+        runner
+            .act(GameAction::SelectCards {
+                cards: vec![w1, r1]
+            })
+            .is_err(),
+        "revealing an off-color card must be rejected"
+    );
+    assert_still_revealing(&runner);
+
+    events.extend(
+        runner
+            .act(GameAction::SelectCards {
+                cards: vec![w1, w2],
+            })
+            .expect("revealing two white cards pays the cost")
+            .events,
+    );
+
+    // CR 701.20b: revealed cards stay in hand.
+    assert_eq!(runner.state().objects[&w1].zone, Zone::Hand);
+    assert_eq!(runner.state().objects[&w2].zone, Zone::Hand);
+    assert!(
+        revealed_cards(&events).contains(&vec![w1, w2]),
+        "the two chosen white cards are revealed, got {:?}",
+        revealed_cards(&events)
+    );
+    assert_eq!(
+        runner.state().objects[&sands].zone,
+        Zone::Graveyard,
+        "the self-sacrifice cost is paid"
+    );
+    assert_eq!(runner.state().stack.len(), 1);
+
+    resolve(&mut runner);
+    assert_eq!(
+        runner.life(P0) - life_before,
+        6,
+        "the effect's X equals the two cards revealed (three times X)"
+    );
+}
+
+/// R6: X = 0 is a legal announcement and reveals nothing (CR 107.3a +
+/// CR 601.2h).
+#[test]
+fn martyr_of_sands_x_zero_reveals_nothing() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let sands = scenario
+        .add_creature_from_oracle(P0, "Martyr of Sands", 1, 1, MARTYR_OF_SANDS)
+        .id();
+    let w1 = colored_hand_card(&mut scenario, P0, "White One", ManaColor::White);
+    scenario.with_mana_pool(P0, pool(&[ManaType::Colorless]));
+    let mut runner = scenario.build();
+    let life_before = runner.life(P0);
+
+    let mut events = activate(&mut runner, sands);
+    assert_eq!(offered_x(&runner), (0, 1));
+    events.extend(
+        runner
+            .act(GameAction::ChooseX { value: 0 })
+            .expect("announce X = 0")
+            .events,
+    );
+    pay_mana(&mut runner, &mut events);
+
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "a zero reveal surfaces no prompt, got {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(runner.state().stack.len(), 1);
+    assert_eq!(
+        runner.state().objects[&sands].zone,
+        Zone::Graveyard,
+        "the sacrifice leg after the reveal leg was paid"
+    );
+    assert_eq!(runner.state().objects[&w1].zone, Zone::Hand);
+    assert!(
+        !revealed_cards(&events).iter().any(|ids| ids.contains(&w1)),
+        "no card is revealed for X = 0"
+    );
+
+    resolve(&mut runner);
+    assert_eq!(runner.life(P0), life_before);
+}
+
+/// R5b: Martyr of Spores chooses its target after X and pumps it by X.
+#[test]
+fn martyr_of_spores_target_gets_plus_x_plus_x() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let spores = scenario
+        .add_creature_from_oracle(P0, "Martyr of Spores", 1, 1, MARTYR_OF_SPORES)
+        .id();
+    let g1 = colored_hand_card(&mut scenario, P0, "Green One", ManaColor::Green);
+    let g2 = colored_hand_card(&mut scenario, P0, "Green Two", ManaColor::Green);
+    let bear = scenario.add_creature(P1, "Target Bear", 2, 2).id();
+    scenario.with_mana_pool(P0, pool(&[ManaType::Colorless]));
+    let mut runner = scenario.build();
+
+    let mut events = activate(&mut runner, spores);
+    assert_eq!(offered_x(&runner), (0, 2));
+    events.extend(
+        runner
+            .act(GameAction::ChooseX { value: 2 })
+            .expect("announce X = 2")
+            .events,
+    );
+
+    // CR 601.2c: the target is chosen after X is announced.
+    let WaitingFor::TargetSelection { target_slots, .. } = &runner.state().waiting_for else {
+        panic!(
+            "the activation must choose its target after X, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert!(target_slots[0]
+        .legal_targets
+        .contains(&TargetRef::Object(bear)));
+    events.extend(
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(bear)),
+            })
+            .expect("target the bear")
+            .events,
+    );
+    pay_mana(&mut runner, &mut events);
+
+    let choices = reveal_prompt(&runner, 2);
+    assert_eq!(choices, HashSet::from([g1, g2]));
+    events.extend(
+        runner
+            .act(GameAction::SelectCards {
+                cards: vec![g1, g2],
+            })
+            .expect("reveal both green cards")
+            .events,
+    );
+    assert!(revealed_cards(&events).contains(&vec![g1, g2]));
+
+    resolve(&mut runner);
+    let bear_obj = &runner.state().objects[&bear];
+    assert_eq!(
+        (bear_obj.power, bear_obj.toughness),
+        (Some(4), Some(4)),
+        "the target gets +X/+X with X = 2"
+    );
+}
+
+/// R5c: Martyr of Bones' target count depends on X, so the activation takes
+/// the announce-X-before-targets route. X bounds the number of targets, the
+/// targets come from a single graveyard, and they are exiled.
+#[test]
+fn martyr_of_bones_exiles_up_to_x_cards_from_a_single_graveyard() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let bones = scenario
+        .add_creature_from_oracle(P0, "Martyr of Bones", 1, 1, MARTYR_OF_BONES)
+        .id();
+    let b1 = colored_hand_card(&mut scenario, P0, "Black One", ManaColor::Black);
+    let b2 = colored_hand_card(&mut scenario, P0, "Black Two", ManaColor::Black);
+    let n1 = colored_hand_card(&mut scenario, P0, "White One", ManaColor::White);
+    let g0 = scenario.add_spell_to_graveyard(P0, "Own Grave", true).id();
+    let g1a = scenario.add_spell_to_graveyard(P1, "Grave A", true).id();
+    let g1b = scenario.add_spell_to_graveyard(P1, "Grave B", true).id();
+    let g1c = scenario.add_spell_to_graveyard(P1, "Grave C", true).id();
+    scenario.with_mana_pool(P0, pool(&[ManaType::Colorless]));
+    let mut runner = scenario.build();
+
+    // The activation is offered even though its target count needs X.
+    assert!(can_activate_ability_now(runner.state(), P0, bones, 0));
+    assert!(
+        legal_actions(runner.state()).iter().any(|action| matches!(
+            action,
+            GameAction::ActivateAbility {
+                source_id,
+                ability_index: 0,
+                ..
+            } if *source_id == bones
+        )),
+        "the AI legal-action list offers the activation"
+    );
+
+    let mut events = activate(&mut runner, bones);
+    assert_eq!(offered_x(&runner), (0, 2));
+    assert!(
+        runner.act(GameAction::ChooseX { value: 3 }).is_err(),
+        "the white card cannot pay a black reveal"
+    );
+    events.extend(
+        runner
+            .act(GameAction::ChooseX { value: 2 })
+            .expect("announce X = 2")
+            .events,
+    );
+
+    // CR 601.2c: "up to X" builds X optional target slots.
+    let WaitingFor::TargetSelection { target_slots, .. } = &runner.state().waiting_for else {
+        panic!(
+            "the activation must choose targets after X, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(target_slots.len(), 2, "X = 2 builds two target slots");
+    assert!(target_slots.iter().all(|slot| slot.optional));
+
+    events.extend(
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(g1a)),
+            })
+            .expect("target a card in the opponent's graveyard")
+            .events,
+    );
+    assert!(
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(g0)),
+            })
+            .is_err(),
+        "a second target from a different graveyard must be rejected"
+    );
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::TargetSelection { .. }
+        ),
+        "the rejected target leaves target selection open"
+    );
+    events.extend(
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(g1b)),
+            })
+            .expect("target a second card in the same graveyard")
+            .events,
+    );
+    assert!(
+        !matches!(
+            runner.state().waiting_for,
+            WaitingFor::TargetSelection { .. }
+        ),
+        "target selection ends after X targets"
+    );
+    assert!(
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(g1c)),
+            })
+            .is_err(),
+        "no target beyond X can be added"
+    );
+    pay_mana(&mut runner, &mut events);
+
+    let choices = reveal_prompt(&runner, 2);
+    assert_eq!(choices, HashSet::from([b1, b2]));
+    events.extend(
+        runner
+            .act(GameAction::SelectCards {
+                cards: vec![b1, b2],
+            })
+            .expect("reveal both black cards")
+            .events,
+    );
+    assert!(revealed_cards(&events).contains(&vec![b1, b2]));
+
+    resolve(&mut runner);
+    let zone = |id: ObjectId| runner.state().objects[&id].zone;
+    assert_eq!(zone(g1a), Zone::Exile);
+    assert_eq!(zone(g1b), Zone::Exile);
+    assert_eq!(zone(g1c), Zone::Graveyard);
+    assert_eq!(zone(g0), Zone::Graveyard);
+    assert_eq!(zone(b1), Zone::Hand);
+    assert_eq!(zone(b2), Zone::Hand);
+    assert_eq!(zone(n1), Zone::Hand);
+}
+
+fn ember_tithe(scenario: &mut GameScenario) -> ObjectId {
+    scenario
+        .add_spell_to_hand_from_oracle(P0, "Ember Tithe", false, EMBER_TITHE)
+        .with_mana_cost(ManaCost::zero())
+        .with_color(vec![ManaColor::Red])
+        .id()
+}
+
+fn cast(runner: &mut GameRunner, spell: ObjectId) -> Vec<GameEvent> {
+    let card_id = runner.state().objects[&spell].card_id;
+    runner
+        .act(GameAction::CastSpell {
+            object_id: spell,
+            card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("the cast must be accepted")
+        .events
+}
+
+/// R12: the same cost as a spell's additional cost announces X, reveals
+/// exactly X red cards from the caster's hand, and the effect reads X.
+#[test]
+fn spell_reveal_x_additional_cost_reveals_the_announced_number() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let spell = ember_tithe(&mut scenario);
+    let r1 = colored_hand_card(&mut scenario, P0, "Red One", ManaColor::Red);
+    let r2 = colored_hand_card(&mut scenario, P0, "Red Two", ManaColor::Red);
+    let g1 = colored_hand_card(&mut scenario, P0, "Green One", ManaColor::Green);
+    colored_hand_card(&mut scenario, P1, "Opponent Red", ManaColor::Red);
+    let mut runner = scenario.build();
+    let life_before = runner.life(P0);
+
+    let mut events = cast(&mut runner, spell);
+    // CR 601.2a: the red spell itself is on the stack, not a card in hand.
+    assert_eq!(offered_x(&runner), (0, 2));
+    assert!(runner.act(GameAction::ChooseX { value: 3 }).is_err());
+    events.extend(
+        runner
+            .act(GameAction::ChooseX { value: 2 })
+            .expect("announce X = 2")
+            .events,
+    );
+    pay_mana(&mut runner, &mut events);
+
+    let choices = reveal_prompt(&runner, 2);
+    assert_eq!(choices, HashSet::from([r1, r2]));
+    assert!(runner
+        .act(GameAction::SelectCards { cards: vec![r1] })
+        .is_err());
+    assert_still_revealing(&runner);
+    assert!(runner
+        .act(GameAction::SelectCards {
+            cards: vec![r1, g1]
+        })
+        .is_err());
+    assert_still_revealing(&runner);
+    events.extend(
+        runner
+            .act(GameAction::SelectCards {
+                cards: vec![r1, r2],
+            })
+            .expect("reveal both red cards")
+            .events,
+    );
+    assert!(revealed_cards(&events).contains(&vec![r1, r2]));
+
+    resolve(&mut runner);
+    assert_eq!(runner.life(P0) - life_before, 2, "the effect reads X = 2");
+    assert_eq!(runner.state().objects[&r1].zone, Zone::Hand);
+    assert_eq!(runner.state().objects[&r2].zone, Zone::Hand);
+    assert_eq!(runner.state().objects[&spell].zone, Zone::Graveyard);
+}
+
+/// R12 (X = 0): announcing zero reveals nothing and the spell goes straight
+/// to the stack (CR 107.3a + CR 601.2h).
+#[test]
+fn spell_reveal_x_additional_cost_zero_reveals_nothing() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let spell = ember_tithe(&mut scenario);
+    let r1 = colored_hand_card(&mut scenario, P0, "Red One", ManaColor::Red);
+    let mut runner = scenario.build();
+    let life_before = runner.life(P0);
+
+    let mut events = cast(&mut runner, spell);
+    assert_eq!(offered_x(&runner), (0, 1));
+    events.extend(
+        runner
+            .act(GameAction::ChooseX { value: 0 })
+            .expect("announce X = 0")
+            .events,
+    );
+    pay_mana(&mut runner, &mut events);
+
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "a zero reveal surfaces no prompt, got {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(runner.state().stack.len(), 1);
+    assert_eq!(runner.state().stack[0].source_id, spell);
+    assert!(
+        !revealed_cards(&events).iter().any(|ids| ids.contains(&r1)),
+        "no card is revealed for X = 0"
+    );
+
+    resolve(&mut runner);
+    assert_eq!(runner.life(P0), life_before);
+    assert_eq!(runner.state().objects[&r1].zone, Zone::Hand);
+}
