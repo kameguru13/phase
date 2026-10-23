@@ -10819,18 +10819,12 @@ fn token_count_affected_by(
     registry: &IndexMap<ReplacementEvent, ReplacementHandlerEntry>,
 ) -> u32 {
     let Some(views) = proposed.token_batch_views() else {
-        return match proposed {
-            ProposedEvent::CreateToken { count, .. } => *count,
-            _ => 0,
-        };
+        return proposed.create_token_count().unwrap_or(0);
     };
     views
         .iter()
         .filter(|view| token_batch_admits(state, view, rid, registry))
-        .map(|view| match view {
-            ProposedEvent::CreateToken { count, .. } => *count,
-            _ => 0,
-        })
+        .filter_map(ProposedEvent::create_token_count)
         .fold(0, u32::saturating_add)
 }
 

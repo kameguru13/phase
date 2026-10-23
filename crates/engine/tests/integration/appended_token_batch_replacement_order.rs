@@ -1175,3 +1175,84 @@ fn copy_own_batch_on_token_route_emits_effect_resolved_once() {
     }
     assert_eq!(effect_resolved(&events, EffectKind::Token), 1);
 }
+
+const METALLIC_MIMIC: &str = "As this creature enters, choose a creature type.\nThis creature is the chosen type in addition to its other types.\nEach other creature you control of the chosen type enters with an additional +1/+1 counter on it.";
+
+/// CR 616.2 + CR 614.12a + CR 608.2c: Strike It Rich's Treasure event is not
+/// one Mystic Reflection applies to; Chatterfang appends a Squirrel batch, and
+/// Mystic Reflection then applies to that creature batch only, so the event's
+/// last batch is a copy of Metallic Mimic. That copy pauses for its as-enters
+/// creature-type choice on the plain Effect::Token route, with no CopyToken
+/// resolution owning the event and no earlier pause to carry the instruction's
+/// terminal event. The instruction still ends with exactly one
+/// `EffectResolved{Token}` (on the candidate before this, none).
+#[test]
+fn last_copy_batch_choice_pause_on_token_route_emits_effect_resolved_once() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_creature_from_oracle(P0, "Chatterfang, Squirrel General", 3, 3, CHATTERFANG);
+    let mimic = scenario
+        .add_creature_from_oracle(P0, "Metallic Mimic", 2, 1, METALLIC_MIMIC)
+        .as_artifact_creature()
+        .with_subtypes(vec!["Shapeshifter"])
+        .id();
+    let mystic = scenario
+        .add_spell_to_hand_from_oracle(P0, "Mystic Reflection", true, MYSTIC_REFLECTION)
+        .id();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Strike It Rich", false, STRIKE_IT_RICH)
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(mystic).target_object(mimic).resolve();
+    assert!(
+        runner.state().stack.is_empty(),
+        "reach guard: Mystic Reflection resolved"
+    );
+    let mut events = runner.cast(spell).resolve().events().to_vec();
+
+    let WaitingFor::NamedChoice {
+        player, options, ..
+    } = runner.state().waiting_for.clone()
+    else {
+        panic!(
+            "the Mimic copy asks for its creature type, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(player, P0);
+    assert!(options.iter().any(|option| option == "Goblin"));
+    let treasure = the_token(&runner, "Treasure");
+    assert!(
+        tokens_named(&runner, "Metallic Mimic").is_empty(),
+        "reach guard: the last batch, a Mimic copy, waits for its choice"
+    );
+    assert_eq!(
+        effect_resolved(&events, EffectKind::Token),
+        0,
+        "the instruction has not finished while its last batch is paused"
+    );
+    events.extend(
+        runner
+            .act(GameAction::ChooseOption {
+                choice: "Goblin".to_string(),
+            })
+            .expect("the creature type is accepted")
+            .events,
+    );
+    events.extend(settle(&mut runner, &[], Until::StackEmpty));
+
+    let mimic_copies = tokens_named(&runner, "Metallic Mimic");
+    assert_eq!(
+        mimic_copies.len(),
+        1,
+        "the Squirrel batch enters as a copy of Metallic Mimic"
+    );
+    let mimic_copy = mimic_copies[0].id;
+    assert!(tokens(&runner, "Squirrel").is_empty());
+    assert_eq!(ledger(&runner), vec![treasure, mimic_copy]);
+    assert_eq!(effect_resolved(&events, EffectKind::Token), 1);
+    assert!(
+        runner.state().resolution_stack.is_empty(),
+        "no completion frame is left parked"
+    );
+}

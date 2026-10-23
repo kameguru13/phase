@@ -1236,6 +1236,15 @@ impl ProposedEvent {
         matches!(self, ProposedEvent::CreateToken { appended, .. } if !appended.is_empty())
     }
 
+    /// The number of tokens a `CreateToken` event (or one batch view of a
+    /// compound one) creates; `None` for any other event.
+    pub fn create_token_count(&self) -> Option<u32> {
+        match self {
+            ProposedEvent::CreateToken { count, .. } => Some(*count),
+            _ => None,
+        }
+    }
+
     /// CR 616.1f + CR 616.2: one single-batch `CreateToken` view per batch of a
     /// compound token event — the event's own batch first, then each appended
     /// batch in event order — each carrying the event's `applied` set (CR 614.5:
@@ -1278,7 +1287,35 @@ impl ProposedEvent {
                 );
                 views
             }
-            other => vec![other],
+            event @ (ProposedEvent::ZoneChange { .. }
+            | ProposedEvent::Damage { .. }
+            | ProposedEvent::Draw { .. }
+            | ProposedEvent::SearchFound { .. }
+            | ProposedEvent::Scry { .. }
+            | ProposedEvent::Mill { .. }
+            | ProposedEvent::CoinFlip { .. }
+            | ProposedEvent::RollDice { .. }
+            | ProposedEvent::Explore { .. }
+            | ProposedEvent::Connive { .. }
+            | ProposedEvent::Proliferate { .. }
+            | ProposedEvent::LifeGain { .. }
+            | ProposedEvent::LifeLoss { .. }
+            | ProposedEvent::AddCounter { .. }
+            | ProposedEvent::RemoveCounter { .. }
+            | ProposedEvent::MoveCounter { .. }
+            | ProposedEvent::TokenEntry { .. }
+            | ProposedEvent::Discard { .. }
+            | ProposedEvent::Tap { .. }
+            | ProposedEvent::Untap { .. }
+            | ProposedEvent::TurnFaceUp { .. }
+            | ProposedEvent::Destroy { .. }
+            | ProposedEvent::Sacrifice { .. }
+            | ProposedEvent::BeginTurn { .. }
+            | ProposedEvent::BeginPhase { .. }
+            | ProposedEvent::ProduceMana { .. }
+            | ProposedEvent::EmptyManaPool { .. }
+            | ProposedEvent::Planeswalk { .. }
+            | ProposedEvent::Attach { .. }) => vec![event],
         }
     }
 

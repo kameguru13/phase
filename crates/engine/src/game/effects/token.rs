@@ -1233,8 +1233,12 @@ fn drive_token_event_delivery(
                 cursor.delivered.push(PositionedTokenIds { position, ids });
                 match status.completion {
                     super::token_copy::CopyTokenApplyCompletion::Completed => {}
+                    // CR 608.2c: the event's last batch, and the pause owes no
+                    // terminal event — a CopyToken owner emits it, or an
+                    // earlier pause of this event already carries it.
                     super::token_copy::CopyTokenApplyCompletion::Paused
-                        if cursor.remaining.is_empty() =>
+                        if cursor.remaining.is_empty()
+                            && matches!(pause_event, PendingEffectResolutionEvent::Suppress) =>
                     {
                         let primary_ids = primary_token_ids(&cursor.delivered);
                         // The copy pause published `initial ++ its finished
@@ -1246,7 +1250,10 @@ fn drive_token_event_delivery(
                     }
                     super::token_copy::CopyTokenApplyCompletion::Paused => {
                         // CR 614.1a + CR 616.2: batches remain behind this copy
-                        // pause. Its finished copies are in `delivered`; the rest
+                        // pause, or it is the event's last batch and still owes
+                        // the caller's terminal event (CR 608.2c), which the
+                        // cursor's completion carries once the event is
+                        // delivered. Its finished copies are in `delivered`; the rest
                         // of the batch reaches the ledger when its pause resumes
                         // (a liminal entry's commit, an entry counter or Aura host
                         // answer, or a direct choice), and the resume drops the
