@@ -1241,7 +1241,35 @@ impl ProposedEvent {
     pub fn create_token_count(&self) -> Option<u32> {
         match self {
             ProposedEvent::CreateToken { count, .. } => Some(*count),
-            _ => None,
+            ProposedEvent::ZoneChange { .. }
+            | ProposedEvent::Damage { .. }
+            | ProposedEvent::Draw { .. }
+            | ProposedEvent::SearchFound { .. }
+            | ProposedEvent::Scry { .. }
+            | ProposedEvent::Mill { .. }
+            | ProposedEvent::CoinFlip { .. }
+            | ProposedEvent::RollDice { .. }
+            | ProposedEvent::Explore { .. }
+            | ProposedEvent::Connive { .. }
+            | ProposedEvent::Proliferate { .. }
+            | ProposedEvent::LifeGain { .. }
+            | ProposedEvent::LifeLoss { .. }
+            | ProposedEvent::AddCounter { .. }
+            | ProposedEvent::RemoveCounter { .. }
+            | ProposedEvent::MoveCounter { .. }
+            | ProposedEvent::TokenEntry { .. }
+            | ProposedEvent::Discard { .. }
+            | ProposedEvent::Tap { .. }
+            | ProposedEvent::Untap { .. }
+            | ProposedEvent::TurnFaceUp { .. }
+            | ProposedEvent::Destroy { .. }
+            | ProposedEvent::Sacrifice { .. }
+            | ProposedEvent::BeginTurn { .. }
+            | ProposedEvent::BeginPhase { .. }
+            | ProposedEvent::ProduceMana { .. }
+            | ProposedEvent::EmptyManaPool { .. }
+            | ProposedEvent::Planeswalk { .. }
+            | ProposedEvent::Attach { .. } => None,
         }
     }
 
