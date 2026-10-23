@@ -519,6 +519,14 @@ mod tests {
                     })
                     .collect(),
             }]),
+            arranged_batches: vec![MassLibraryOrderBatch {
+                owner: PlayerId(0),
+                members: vec![MassLibraryOrderMember {
+                    identity: ObjectIncarnationRef::from_object(&state.objects[&card_a]),
+                    origin: Zone::Library,
+                }],
+            }],
+            resolving_entry: Some(ObjectId(1)),
         }));
 
         let filtered = filter_state_for_player(&state, PlayerId(1));

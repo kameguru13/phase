@@ -26,7 +26,9 @@
 //! runtime) and the two Once and Future records (an in-row reach guard plus a
 //! discriminating positive, which is not one of the three named pairings).
 
+use engine::ai_support::legal_actions;
 use engine::game::scenario::{CastOutcome, GameRunner, GameScenario, P0, P1};
+use engine::game::triggers::drain_order_triggers_with_identity;
 use engine::types::ability::{EffectKind, LibraryPosition, TargetRef};
 use engine::types::actions::GameAction;
 use engine::types::card_type::Supertype;
@@ -1003,22 +1005,37 @@ const LODESTONE_BAUBLE_ORACLE: &str = "{1}, {T}, Sacrifice this artifact: Put up
 
 const P2: PlayerId = PlayerId(2);
 
-/// CR 401.4 + CR 401.7 + CR 400.3: Riptide Gearhulk's per-opponent targets can
-/// share an owner. P1 controls a permanent P2 owns, and P2 controls one it
-/// owns; P0 targets both, so both go "third from the top" of P2's library at
-/// the same time and P2 arranges them. P2's library has three cards, so the
-/// third-from-the-top position exists.
-///
-/// The submitted order maps onto the library by the handler's
-/// `NthFromTop` replay: each card in submission order is inserted at index
-/// `n - 1`, so P2 submitting `[b, a]` leaves `a` third and `b` fourth.
-///
-/// REVERT-FAILING: with the arrangement gate removed, or with `NthFromTop`
-/// excluded from `position_can_be_arranged`, the trigger resolves straight to
-/// priority and the unconditional prompt assertion fails.
-#[test]
-fn riptide_gearhulk_owner_arranges_two_targets_third_from_the_top() {
-    let mut scenario = GameScenario::new_n_player(3, 42);
+const P3: PlayerId = PlayerId(3);
+
+const EXTRACTOR_DEMON_ORACLE: &str = "Flying\n\
+     Whenever another creature leaves the battlefield, you may have target player mill two \
+     cards.\n\
+     Unearth {2}{B} ({2}{B}: Return this card from your graveyard to the battlefield. It gains \
+     haste. Exile it at the beginning of the next end step or if it would leave the battlefield. \
+     Unearth only as a sorcery.)";
+
+/// The four-player Riptide Gearhulk board. P0 is active and casts Riptide.
+/// - P1 owns and controls Extractor Demon, and owns `borrowed`, which P2
+///   controls (`base_controller = P2`, no control effect).
+/// - P3 owns and controls `p3_bear`.
+/// - P1's library is `[f1, f2, f3]` and P3's is `[g1, g2, g3]`.
+/// - P0 also has Lodestone Bauble, and P1 two basic lands in the graveyard,
+///   for the later single-owner arrangement rows; P0's pool keeps one
+///   colorless mana after Riptide for the Bauble's {1}.
+struct RiptideBoard {
+    runner: GameRunner,
+    riptide: ObjectId,
+    demon: ObjectId,
+    borrowed: ObjectId,
+    p3_bear: ObjectId,
+    bauble: ObjectId,
+    lands: [ObjectId; 2],
+    p1_library: Vec<ObjectId>,
+    p3_library: Vec<ObjectId>,
+}
+
+fn riptide_four_player_board() -> RiptideBoard {
+    let mut scenario = GameScenario::new_n_player(4, 42);
     scenario.at_phase(Phase::PreCombatMain);
     scenario.with_mana_pool(
         P0,
@@ -1028,57 +1045,570 @@ fn riptide_gearhulk_owner_arranges_two_targets_third_from_the_top() {
             ManaUnit::new(ManaType::White, ObjectId(0), false, vec![]),
             ManaUnit::new(ManaType::Blue, ObjectId(0), false, vec![]),
             ManaUnit::new(ManaType::Blue, ObjectId(0), false, vec![]),
+            ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]),
         ],
     );
-    scenario.with_library_top(P2, &["P2 Library 1", "P2 Library 2", "P2 Library 3"]);
-    let a = scenario
-        .add_creature(P2, "Borrowed Bear", 2, 2)
-        .controlled_by(P1)
+    scenario.with_library_top(P1, &["P1 Library 1", "P1 Library 2", "P1 Library 3"]);
+    scenario.with_library_top(P3, &["P3 Library 1", "P3 Library 2", "P3 Library 3"]);
+    let demon = scenario
+        .add_creature_from_oracle(P1, "Extractor Demon", 5, 5, EXTRACTOR_DEMON_ORACLE)
         .id();
-    let b = scenario.add_creature(P2, "Their Bear", 2, 2).id();
+    let borrowed = scenario
+        .add_creature(P1, "Borrowed Bear", 2, 2)
+        .controlled_by(P2)
+        .id();
+    let p3_bear = scenario.add_creature(P3, "P3 Bear", 2, 2).id();
+    let bauble = scenario
+        .add_artifact_from_oracle(P0, "Lodestone Bauble", LODESTONE_BAUBLE_ORACLE)
+        .id();
+    let l1 = scenario.add_land_to_graveyard(P1, "Graveyard Forest").id();
+    let l2 = scenario.add_land_to_graveyard(P1, "Graveyard Island").id();
     let riptide = scenario
         .add_creature_to_hand_from_oracle(P0, "Riptide Gearhulk", 2, 5, RIPTIDE_GEARHULK_ORACLE)
         .id();
     let mut runner = scenario.build();
+    for land in [l1, l2] {
+        let object = runner.state_mut().objects.get_mut(&land).unwrap();
+        object.card_types.supertypes.push(Supertype::Basic);
+        object.base_card_types = object.card_types.clone();
+    }
     assert_eq!(
-        runner.state().objects[&a].controller,
-        P1,
-        "fixture: P1 controls the bear P2 owns"
+        runner.state().objects[&borrowed].controller,
+        P2,
+        "fixture: P2 controls the bear P1 owns"
     );
-    let p2_before = library(&runner, P2);
-    let (f1, f2, f3) = (p2_before[0], p2_before[1], p2_before[2]);
+    let p1_library = library(&runner, P1);
+    let p3_library = library(&runner, P3);
+    assert_eq!((p1_library.len(), p3_library.len()), (3, 3));
+    RiptideBoard {
+        runner,
+        riptide,
+        demon,
+        borrowed,
+        p3_bear,
+        bauble,
+        lands: [l1, l2],
+        p1_library,
+        p3_library,
+    }
+}
 
-    let outcome = runner
-        .cast(riptide)
-        .target_players(&[P1, P2])
-        .target_objects(&[a, b])
+/// Cast Riptide targeting one permanent per opponent and stop at the first
+/// owner's prompt: P1, the first owner in APNAP order (P0 owns no target).
+fn open_riptide_arrangement(board: &mut RiptideBoard) {
+    let outcome = board
+        .runner
+        .cast(board.riptide)
+        .target_players(&[P1, P2, P3])
+        .target_objects(&[board.demon, board.borrowed, board.p3_bear])
         .resolve();
-
-    // REVERT-FAILING: P2, the owner of both permanents, is prompted.
     assert_owner_arrangement_prompt(
         outcome.final_waiting_for(),
-        P2,
-        &[a, b],
+        P1,
+        &[board.demon, board.borrowed],
         LibraryPosition::NthFromTop { n: 3 },
     );
-    assert_eq!(zone(&runner, a), Zone::Battlefield);
-    assert_eq!(zone(&runner, b), Zone::Battlefield);
+    for id in [board.demon, board.borrowed, board.p3_bear] {
+        assert_eq!(zone(&board.runner, id), Zone::Battlefield);
+    }
+}
 
-    runner
-        .act(GameAction::SelectCards { cards: vec![b, a] })
-        .expect("P2 submits their arrangement");
-
-    assert_eq!(
-        library(&runner, P2),
-        vec![f1, f2, a, b, f3],
-        "both permanents sit third from the top of P2's library, in P2's arrangement"
+/// P1 submits `[borrowed, demon]`; P3 is prompted next.
+fn submit_p1_order(board: &mut RiptideBoard) {
+    board
+        .runner
+        .act(GameAction::SelectCards {
+            cards: vec![board.borrowed, board.demon],
+        })
+        .expect("P1 submits their arrangement");
+    assert_owner_arrangement_prompt(
+        &board.runner.state().waiting_for,
+        P3,
+        &[board.p3_bear],
+        LibraryPosition::NthFromTop { n: 3 },
     );
-    assert_eq!(zone(&runner, riptide), Zone::Battlefield);
-    assert!(runner.state().stack.is_empty(), "the trigger resolved");
+}
+
+/// P1's library after P1's two cards are delivered third from the top in
+/// P1's order. CHARACTERIZATION of the prompt's `NthFromTop` mapping (#10216):
+/// each submitted card is inserted at index `n - 1`, so submitting
+/// `[borrowed, demon]` leaves `demon` third and `borrowed` fourth. The card
+/// does not fix this mapping; CR 401.4 lets the owner choose any order.
+fn p1_library_after_both(board: &RiptideBoard) -> Vec<ObjectId> {
+    let f = &board.p1_library;
+    vec![f[0], f[1], board.demon, board.borrowed, f[2]]
+}
+
+fn p3_library_after(board: &RiptideBoard) -> Vec<ObjectId> {
+    let g = &board.p3_library;
+    vec![g[0], g[1], board.p3_bear, g[2]]
+}
+
+fn owner_arrangement_carrier_is_open(runner: &GameRunner) -> bool {
+    runner.state().pending_mass_library_order_choice.is_some()
+}
+
+/// Put pending triggers on the stack: order them as listed and give each the
+/// first legal target, until a player has priority.
+fn drive_trigger_prompts(runner: &mut GameRunner) {
+    for _ in 0..64 {
+        match &runner.state().waiting_for {
+            WaitingFor::Priority { .. } => return,
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+            }
+            WaitingFor::TriggerTargetSelection { .. } => {
+                runner
+                    .choose_first_legal_target()
+                    .expect("a trigger takes its first legal target");
+            }
+            other => panic!("unexpected prompt while putting triggers on the stack: {other:?}"),
+        }
+    }
+    panic!("triggers were not put on the stack within the prompt budget");
+}
+
+/// Resolve the stack to an empty priority window, declining every optional
+/// mill so the libraries stay as asserted.
+fn resolve_to_priority(runner: &mut GameRunner) {
+    for _ in 0..128 {
+        let state = runner.state();
+        let action = match &state.waiting_for {
+            WaitingFor::OptionalEffectChoice { .. } => {
+                GameAction::DecideOptionalEffect { accept: false }
+            }
+            WaitingFor::OrderTriggers { .. } => {
+                drain_order_triggers_with_identity(runner.state_mut());
+                continue;
+            }
+            WaitingFor::TriggerTargetSelection { .. } => {
+                runner
+                    .choose_first_legal_target()
+                    .expect("a trigger takes its first legal target");
+                continue;
+            }
+            WaitingFor::Priority { .. } if !state.stack.is_empty() => GameAction::PassPriority,
+            WaitingFor::Priority { .. } => return,
+            other => panic!("unexpected prompt while resolving to priority: {other:?}"),
+        };
+        runner.act(action).expect("resolve the stack");
+    }
+    panic!("the stack did not resolve within the prompt budget");
+}
+
+fn stack_entries_from(runner: &GameRunner, source: ObjectId) -> usize {
+    runner
+        .state()
+        .stack
+        .iter()
+        .filter(|entry| entry.source_id == source)
+        .count()
+}
+
+/// CR 101.4 + CR 401.4 + CR 603.10a + CR 603.2c: Riptide Gearhulk in four
+/// players puts one permanent per opponent into its owner's library third from
+/// the top. P1 owns two of them (the Demon it controls and a bear P2
+/// controls); P3 owns the third. Each owner arranges their own cards in APNAP
+/// order, then all three move as one simultaneous action. Extractor Demon,
+/// leaving in that same event, sees both other creatures leave (CR 603.10a;
+/// its ruling: it triggers when it and another creature leave at the same
+/// time) and triggers once for each (CR 603.2c).
+///
+/// REVERT-FAILING: with per-owner delivery restored, (a) P1's two cards are
+/// already in P1's library when P3 is prompted, and (b) the Demon is in the
+/// library when P3's bear leaves, so it triggers once instead of twice.
+#[test]
+fn riptide_gearhulk_collects_every_owners_order_before_one_simultaneous_move() {
+    let mut board = riptide_four_player_board();
+    open_riptide_arrangement(&mut board);
+    submit_p1_order(&mut board);
+
+    // (a) CR 101.4: nothing moves before the last owner chooses.
+    for id in [board.demon, board.borrowed, board.p3_bear] {
+        assert_eq!(
+            zone(&board.runner, id),
+            Zone::Battlefield,
+            "CR 101.4: no target moves before P3 chooses"
+        );
+    }
+    assert_eq!(library(&board.runner, P1), board.p1_library);
+
+    // Routing: P3's prompt belongs to P3 alone.
+    let p3_prompt = board.runner.state().waiting_for.clone();
+    assert!(
+        engine::game::engine::apply(
+            board.runner.state_mut(),
+            P1,
+            GameAction::SelectCards {
+                cards: vec![board.p3_bear],
+            },
+        )
+        .is_err(),
+        "P1 cannot answer P3's arrangement"
+    );
+    assert_eq!(board.runner.state().waiting_for, p3_prompt);
+    // AI: the generic candidates offer P3's only arrangement.
+    assert!(
+        legal_actions(board.runner.state())
+            .iter()
+            .any(|action| matches!(
+                action,
+                GameAction::SelectCards { cards } if cards == &vec![board.p3_bear]
+            )),
+        "the next owner's arrangement is a published legal action"
+    );
+
+    board
+        .runner
+        .act(GameAction::SelectCards {
+            cards: vec![board.p3_bear],
+        })
+        .expect("P3 submits their arrangement");
+    assert_eq!(library(&board.runner, P1), p1_library_after_both(&board));
+    assert_eq!(library(&board.runner, P3), p3_library_after(&board));
+    assert!(!owner_arrangement_carrier_is_open(&board.runner));
+
+    // (b) Reach guard: at least one trigger shows the Demon's ability parses
+    // and fires; exactly two show it saw both co-departing creatures.
+    drive_trigger_prompts(&mut board.runner);
     assert_eq!(
-        runner.state().waiting_for,
+        stack_entries_from(&board.runner, board.demon),
+        2,
+        "CR 603.10a + CR 603.2c: the departing Demon sees the other owner's creature leave"
+    );
+
+    resolve_to_priority(&mut board.runner);
+    assert_eq!(zone(&board.runner, board.riptide), Zone::Battlefield);
+    assert_eq!(
+        board.runner.state().waiting_for,
         WaitingFor::Priority { player: P0 }
     );
+    assert_eq!(library(&board.runner, P1), p1_library_after_both(&board));
+}
+
+/// CR 104.3a + CR 800.4a + CR 101.4: P3, the last chooser, concedes at their
+/// prompt. P3's bear leaves the game with them, so P3 has nothing to arrange,
+/// and the arrangement P1 already chose happens: P1's two cards move. Priority
+/// then goes to the active player (CR 117.3b).
+///
+/// REVERT-FAILING: without the departure reconciliation, P3's prompt is
+/// re-pointed to priority, P1's cards stay on the battlefield, and the
+/// collected order is stranded in the carrier.
+#[test]
+fn riptide_owner_departure_at_their_prompt_delivers_the_collected_arrangement() {
+    let mut board = riptide_four_player_board();
+    open_riptide_arrangement(&mut board);
+    submit_p1_order(&mut board);
+    // Reach guard: P1's order was collected, not delivered.
+    assert_eq!(zone(&board.runner, board.demon), Zone::Battlefield);
+    assert_eq!(zone(&board.runner, board.borrowed), Zone::Battlefield);
+
+    board
+        .runner
+        .act(GameAction::Concede { player_id: P3 })
+        .expect("P3 concedes");
+
+    assert_eq!(library(&board.runner, P1), p1_library_after_both(&board));
+    assert_eq!(
+        zone(&board.runner, board.p3_bear),
+        Zone::Exile,
+        "CR 800.4a: P3's bear leaves the game with P3"
+    );
+    assert!(!owner_arrangement_carrier_is_open(&board.runner));
+
+    resolve_to_priority(&mut board.runner);
+    assert!(board.runner.state().stack.is_empty());
+    assert_eq!(
+        board.runner.state().waiting_for,
+        WaitingFor::Priority { player: P0 }
+    );
+}
+
+/// CR 104.3a + CR 800.4a: P3, an owner still queued, concedes while P1 is
+/// choosing. P3's bear leaves the game, so P3's batch is dropped; P1's
+/// submission is then the last choice and moves P1's cards.
+///
+/// REVERT-FAILING: without the departure reconciliation, P1's submission opens
+/// a prompt for the departed P3 instead of completing.
+#[test]
+fn riptide_queued_owner_departure_drops_their_batch() {
+    let mut board = riptide_four_player_board();
+    open_riptide_arrangement(&mut board);
+
+    board
+        .runner
+        .act(GameAction::Concede { player_id: P3 })
+        .expect("P3 concedes");
+    assert_owner_arrangement_prompt(
+        &board.runner.state().waiting_for,
+        P1,
+        &[board.demon, board.borrowed],
+        LibraryPosition::NthFromTop { n: 3 },
+    );
+    assert!(owner_arrangement_carrier_is_open(&board.runner));
+    assert_eq!(zone(&board.runner, board.p3_bear), Zone::Exile);
+
+    board
+        .runner
+        .act(GameAction::SelectCards {
+            cards: vec![board.borrowed, board.demon],
+        })
+        .expect("P1 submits their arrangement");
+    assert_eq!(library(&board.runner, P1), p1_library_after_both(&board));
+    assert!(
+        !matches!(
+            board.runner.state().waiting_for,
+            WaitingFor::EffectZoneChoice { .. }
+        ),
+        "no prompt is opened for the departed P3: {:?}",
+        board.runner.state().waiting_for
+    );
+    assert!(!owner_arrangement_carrier_is_open(&board.runner));
+
+    resolve_to_priority(&mut board.runner);
+    assert_eq!(
+        board.runner.state().waiting_for,
+        WaitingFor::Priority { player: P0 }
+    );
+}
+
+/// CR 104.3a + CR 800.4a + CR 400.7: P2 concedes while P1 is choosing. P2
+/// controls P1's `borrowed` with no control effect, so CR 800.4a exiles it as
+/// an object still controlled by the departed player. It is a new object, so
+/// P1's prompt is republished with the Demon alone; then P3 chooses, and the
+/// two remaining cards move together.
+///
+/// REVERT-FAILING: without the departure reconciliation, P1's prompt still
+/// names the exiled bear and every submission is rejected.
+#[test]
+fn riptide_member_exiled_with_its_controller_is_dropped_from_the_owners_prompt() {
+    let mut board = riptide_four_player_board();
+    open_riptide_arrangement(&mut board);
+
+    board
+        .runner
+        .act(GameAction::Concede { player_id: P2 })
+        .expect("P2 concedes");
+    assert_eq!(
+        zone(&board.runner, board.borrowed),
+        Zone::Exile,
+        "CR 800.4a: an object still controlled by the departed player is exiled"
+    );
+    assert_owner_arrangement_prompt(
+        &board.runner.state().waiting_for,
+        P1,
+        &[board.demon],
+        LibraryPosition::NthFromTop { n: 3 },
+    );
+    assert!(
+        legal_actions(board.runner.state())
+            .iter()
+            .any(|action| matches!(
+                action,
+                GameAction::SelectCards { cards } if cards == &vec![board.demon]
+            )),
+        "the republished arrangement is a published legal action"
+    );
+
+    board
+        .runner
+        .act(GameAction::SelectCards {
+            cards: vec![board.demon],
+        })
+        .expect("P1 submits the republished arrangement");
+    assert_owner_arrangement_prompt(
+        &board.runner.state().waiting_for,
+        P3,
+        &[board.p3_bear],
+        LibraryPosition::NthFromTop { n: 3 },
+    );
+    assert_eq!(zone(&board.runner, board.demon), Zone::Battlefield);
+    board
+        .runner
+        .act(GameAction::SelectCards {
+            cards: vec![board.p3_bear],
+        })
+        .expect("P3 submits their arrangement");
+
+    let f = &board.p1_library;
+    assert_eq!(
+        library(&board.runner, P1),
+        vec![f[0], f[1], board.demon, f[2]]
+    );
+    assert_eq!(library(&board.runner, P3), p3_library_after(&board));
+    assert!(!owner_arrangement_carrier_is_open(&board.runner));
+
+    resolve_to_priority(&mut board.runner);
+    assert_eq!(
+        board.runner.state().waiting_for,
+        WaitingFor::Priority { player: P0 }
+    );
+}
+
+/// CR 104.3a + CR 800.4a + CR 101.4: P1, the current chooser, concedes at
+/// their prompt. P1 owned both cards in that prompt, so both leave the game
+/// with P1 and P1 has nothing left to arrange. The next owner, P3, chooses
+/// (and is the acting player), and P3's card moves.
+///
+/// REVERT-FAILING: without the departure reconciliation, P1's prompt is
+/// re-pointed to priority and P3 is never prompted.
+#[test]
+fn riptide_current_owner_departure_prompts_the_next_owner() {
+    let mut board = riptide_four_player_board();
+    open_riptide_arrangement(&mut board);
+
+    board
+        .runner
+        .act(GameAction::Concede { player_id: P1 })
+        .expect("P1 concedes");
+    assert_eq!(
+        zone(&board.runner, board.demon),
+        Zone::Exile,
+        "CR 800.4a: the Demon P1 owned leaves the game with P1"
+    );
+    assert_eq!(
+        zone(&board.runner, board.borrowed),
+        Zone::Exile,
+        "CR 800.4a: the bear P1 owned leaves the game with P1"
+    );
+    assert_owner_arrangement_prompt(
+        &board.runner.state().waiting_for,
+        P3,
+        &[board.p3_bear],
+        LibraryPosition::NthFromTop { n: 3 },
+    );
+    assert_eq!(board.runner.state().priority_player, P3);
+    assert!(owner_arrangement_carrier_is_open(&board.runner));
+
+    board
+        .runner
+        .act(GameAction::SelectCards {
+            cards: vec![board.p3_bear],
+        })
+        .expect("P3 submits their arrangement");
+    assert_eq!(library(&board.runner, P3), p3_library_after(&board));
+    assert!(!owner_arrangement_carrier_is_open(&board.runner));
+
+    resolve_to_priority(&mut board.runner);
+    assert_eq!(
+        board.runner.state().waiting_for,
+        WaitingFor::Priority { player: P0 }
+    );
+}
+
+/// Sibling of `riptide_current_owner_departure_prompts_the_next_owner`: after
+/// P1 leaves, P3 leaves at P3's prompt too. Nobody remains with a card to
+/// arrange, so the arrangement is retired and the departed chooser's prompt
+/// gives way to priority for a player still in the game.
+#[test]
+fn riptide_every_remaining_owner_departure_retires_the_arrangement() {
+    let mut board = riptide_four_player_board();
+    open_riptide_arrangement(&mut board);
+    board
+        .runner
+        .act(GameAction::Concede { player_id: P1 })
+        .expect("P1 concedes");
+    assert_owner_arrangement_prompt(
+        &board.runner.state().waiting_for,
+        P3,
+        &[board.p3_bear],
+        LibraryPosition::NthFromTop { n: 3 },
+    );
+
+    board
+        .runner
+        .act(GameAction::Concede { player_id: P3 })
+        .expect("P3 concedes");
+    assert!(!owner_arrangement_carrier_is_open(&board.runner));
+    match &board.runner.state().waiting_for {
+        WaitingFor::Priority { player } => assert!(
+            [P0, P2].contains(player),
+            "priority goes to a player still in the game, got {player:?}"
+        ),
+        other => panic!("expected priority after the last owner left, got {other:?}"),
+    }
+}
+
+/// Activate Lodestone Bauble on P1's two graveyard lands and arrange them as
+/// `[l2, l1]`, asserting P1's library is exactly those two cards on top of
+/// what it held before.
+fn lodestone_arrangement_moves_exactly_its_own_cards(board: &mut RiptideBoard) {
+    let [l1, l2] = board.lands;
+    assert_eq!(zone(&board.runner, l1), Zone::Graveyard);
+    assert_eq!(zone(&board.runner, l2), Zone::Graveyard);
+    let p1_before_bauble = library(&board.runner, P1);
+    let outcome = board
+        .runner
+        .activate(board.bauble, 0)
+        .target_objects(&[l1, l2])
+        .resolve();
+    assert_owner_arrangement_prompt(
+        outcome.final_waiting_for(),
+        P1,
+        &[l1, l2],
+        LibraryPosition::Top,
+    );
+    board
+        .runner
+        .act(GameAction::SelectCards {
+            cards: vec![l2, l1],
+        })
+        .expect("P1 submits their arrangement");
+
+    let mut expected = vec![l2, l1];
+    expected.extend(p1_before_bauble);
+    assert_eq!(
+        library(&board.runner, P1),
+        expected,
+        "the later arrangement moves exactly its own cards"
+    );
+    assert!(!owner_arrangement_carrier_is_open(&board.runner));
+    assert!(board.runner.state().stack.is_empty());
+    assert_eq!(
+        board.runner.state().waiting_for,
+        WaitingFor::Priority { player: P0 }
+    );
+}
+
+/// CR 104.3a + CR 800.4a + CR 608.2c: after a departure settled one
+/// arrangement, a later single-owner arrangement (Lodestone Bauble) moves
+/// exactly its own two cards; nothing from the earlier arrangement rides along.
+///
+/// Paired positive: `lodestone_bauble_after_a_completed_owner_arrangement_moves_exactly_its_own_cards`
+/// reaches the same relation without a departure.
+#[test]
+fn lodestone_bauble_after_an_owner_departure_moves_exactly_its_own_cards() {
+    let mut board = riptide_four_player_board();
+    open_riptide_arrangement(&mut board);
+    submit_p1_order(&mut board);
+    board
+        .runner
+        .act(GameAction::Concede { player_id: P3 })
+        .expect("P3 concedes");
+    assert_eq!(library(&board.runner, P1), p1_library_after_both(&board));
+    resolve_to_priority(&mut board.runner);
+
+    lodestone_arrangement_moves_exactly_its_own_cards(&mut board);
+}
+
+/// Paired positive for `lodestone_bauble_after_an_owner_departure_moves_exactly_its_own_cards`:
+/// the same later arrangement after the Riptide arrangement completed with
+/// every owner still in the game.
+#[test]
+fn lodestone_bauble_after_a_completed_owner_arrangement_moves_exactly_its_own_cards() {
+    let mut board = riptide_four_player_board();
+    open_riptide_arrangement(&mut board);
+    submit_p1_order(&mut board);
+    board
+        .runner
+        .act(GameAction::SelectCards {
+            cards: vec![board.p3_bear],
+        })
+        .expect("P3 submits their arrangement");
+    resolve_to_priority(&mut board.runner);
+    assert_eq!(library(&board.runner, P1), p1_library_after_both(&board));
+
+    lodestone_arrangement_moves_exactly_its_own_cards(&mut board);
 }
 
 /// Pass every priority window and declare nothing until the next turn's

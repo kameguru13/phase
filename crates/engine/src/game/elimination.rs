@@ -435,6 +435,8 @@ pub fn eliminate_players_simultaneously(
                 crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
             );
         }
+        // CR 104.1: the game is over; no owner arrangement is owed to a finished game.
+        state.pending_mass_library_order_choice = None;
         state.waiting_for = WaitingFor::GameOver { winner };
     } else {
         // CR 800.4a + CR 608.2m + CR 800.4g/800.4h: once every departure,
@@ -452,6 +454,24 @@ pub fn eliminate_players_simultaneously(
             )
         {
             tracing::error!(%refusal, "per-player zone choice was not reconciled after a departure");
+        }
+
+        // CR 800.4a + CR 101.4 + CR 401.4: an open owner library arrangement is
+        // reconciled with the players and objects still in the game — a departed
+        // owner's cards left with them, and a member exiled with its departed
+        // controller is gone — so the next owner chooses or the collected
+        // arrangement moves. Runs after every departure sweep and before the
+        // generic dead-actor repoint, which would otherwise strand the collected
+        // orders behind unrelated priority.
+        if let Err(error) =
+            super::engine_resolution_choices::settle_owner_library_arrangement_after_departure(
+                state, events,
+            )
+        {
+            debug_assert!(
+                false,
+                "owner library arrangement was not reconciled after a departure: {error}"
+            );
         }
 
         if let Some(frame) = staged_optional_sacrifice_decline {

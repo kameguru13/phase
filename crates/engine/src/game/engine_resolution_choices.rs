@@ -75,11 +75,11 @@ fn mass_library_order_batch_is_current(
         && unique_cards.len() == cards.len()
         && batch.members.iter().zip(cards).all(|(member, card_id)| {
             member.identity.object_id == *card_id
-                && state.objects.get(card_id).is_some_and(|object| {
-                    object.incarnation == member.identity.incarnation
-                        && object.zone == member.origin
-                        && object.owner == batch.owner
-                })
+                && effects::change_zone::mass_library_order_member_is_current(
+                    state,
+                    batch.owner,
+                    member,
+                )
         })
 }
 
@@ -204,26 +204,65 @@ fn legacy_mass_library_order_prompt_is_current(
 
     match state.pending_mass_library_order_choice.as_ref() {
         Some(pending) => {
-            pending.source_id == source_id
-                && pending.library_position == *library_position.expect("checked above")
-                && pending.track_exiled_by_source == track_exiled_by_source
-                && pending.duration.as_ref() == duration
-                && matches!(
-                    &pending.remaining_batches,
-                    crate::types::game_state::PendingMassLibraryOrderBatches::Legacy(batches)
-                        if !batches.is_empty() && batches.iter().all(|(owner, batch)| {
-                        !batch.is_empty()
-                            && batch.iter().all(|card_id| {
-                                all_members.insert(*card_id) && member_is_current(*card_id, *owner)
-                            })
+            effects::change_zone::owner_arrangement_carrier_binds(
+                state,
+                pending,
+                &effects::change_zone::OwnerArrangementInstruction {
+                    source_id,
+                    library_position: library_position.expect("checked above"),
+                    track_exiled_by_source,
+                    duration,
+                },
+            ) && matches!(
+                &pending.remaining_batches,
+                crate::types::game_state::PendingMassLibraryOrderBatches::Legacy(batches)
+                    if !batches.is_empty() && batches.iter().all(|(owner, batch)| {
+                    !batch.is_empty()
+                        && batch.iter().all(|card_id| {
+                            all_members.insert(*card_id) && member_is_current(*card_id, *owner)
                         })
-                )
+                    })
+            )
         }
         // The old producer did not write a continuation carrier when a single
         // owner had multiple cards to order. The exact resolving producer and
         // the mandatory current producer-origin owner/membership check above are
         // the only authority for that archived shape.
         None => cards.len() > 1,
+    }
+}
+
+/// CR 800.4a + CR 101.4 + CR 401.4: after a player leaves, continue an open
+/// owner library arrangement with the players and objects still in the game:
+/// republish or advance its prompt, or settle the last recorded order
+/// through this handler so the collected arrangement moves as one event with
+/// one completion.
+pub(crate) fn settle_owner_library_arrangement_after_departure(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EngineError> {
+    match effects::change_zone::reconcile_owner_library_arrangement(state) {
+        effects::change_zone::OwnerLibraryArrangementReconciliation::Unchanged
+        | effects::change_zone::OwnerLibraryArrangementReconciliation::Retired => Ok(()),
+        effects::change_zone::OwnerLibraryArrangementReconciliation::Prompted(owner) => {
+            state.priority_player = owner;
+            Ok(())
+        }
+        effects::change_zone::OwnerLibraryArrangementReconciliation::Settle { owner, cards } => {
+            state.priority_player = owner;
+            let waiting_for = state.waiting_for.clone();
+            match handle_resolution_choice(
+                state,
+                waiting_for,
+                GameAction::SelectCards { cards },
+                events,
+            )? {
+                ResolutionChoiceOutcome::WaitingFor(_)
+                | ResolutionChoiceOutcome::WaitingForWithInlineTriggers(_) => {}
+                ResolutionChoiceOutcome::ActionResult(result) => events.extend(result.events),
+            }
+            Ok(())
+        }
     }
 }
 
@@ -6428,6 +6467,39 @@ pub(super) fn handle_resolution_choice(
                 }
             }
 
+            // CR 101.4 + CR 401.4: owners arrange in APNAP order, then the
+            // arrangement happens as one simultaneous action. Collect this owner's
+            // order; only the last owner's submission moves cards, and it moves every
+            // owner's cards.
+            let chosen = if matches!(effect_kind, EffectKind::PutAtLibraryPosition)
+                && (typed_mass_library_order_is_current || legacy_mass_library_order_is_current)
+            {
+                let instruction = effects::change_zone::OwnerArrangementInstruction {
+                    source_id,
+                    library_position: library_position
+                        .as_ref()
+                        .expect("an owner arrangement prompt names its library position"),
+                    track_exiled_by_source,
+                    duration: duration.as_ref(),
+                };
+                match effects::change_zone::submit_owner_library_order(
+                    state,
+                    player,
+                    &instruction,
+                    &chosen,
+                ) {
+                    effects::change_zone::OwnerLibraryOrderProgress::NextOwner(next_owner) => {
+                        state.priority_player = next_owner;
+                        return Ok(ResolutionChoiceOutcome::WaitingFor(
+                            state.waiting_for.clone(),
+                        ));
+                    }
+                    effects::change_zone::OwnerLibraryOrderProgress::Complete(arranged) => arranged,
+                }
+            } else {
+                chosen
+            };
+
             if chosen.is_empty() && matches!(effect_kind, EffectKind::CastFromZone) {
                 // CR 608.2c: An empty selection at a hand-pick cast's
                 // `EffectZoneChoice` means the player did not cast ("you may cast
@@ -7053,6 +7125,8 @@ pub(super) fn handle_resolution_choice(
                 // selection order (first chosen = top). Expressive Iteration's
                 // tracked-set bottom step chains an exile `ParentTarget` tail —
                 // detect that continuation shape to honor bottom placement.
+                // CR 401.4 + CR 101.4: for an owner arrangement, `chosen` is the
+                // whole collected multi-owner arrangement, moved here at once.
                 EffectKind::PutAtLibraryPosition => {
                     let library_position = match library_position {
                         Some(LibraryPosition::Bottom) => LibraryPosition::Bottom,
@@ -7085,14 +7159,6 @@ pub(super) fn handle_resolution_choice(
                             &library_position,
                             events,
                         );
-                        if let Some(next_owner) =
-                            effects::change_zone::resume_next_mass_library_order_choice(state)
-                        {
-                            state.priority_player = next_owner;
-                            return Ok(ResolutionChoiceOutcome::WaitingFor(
-                                state.waiting_for.clone(),
-                            ));
-                        }
                     } else {
                         // The selected EffectZoneChoice is now consumed. Clear it
                         // before the pipeline may park a CR 616.1 prompt; otherwise
@@ -9202,6 +9268,8 @@ fn reposition_library_origins_after_batch_delivery(
     }
 }
 
+/// CR 401.4 + CR 101.4: the one completion of a (possibly multi-owner)
+/// arrangement: tracked set, count and EffectResolved cover the whole moved set.
 fn finish_effect_zone_put_at_library_position(
     state: &mut GameState,
     player: crate::types::player::PlayerId,
@@ -9218,10 +9286,6 @@ fn finish_effect_zone_put_at_library_position(
         &library_position,
         events,
     );
-    if let Some(next_owner) = effects::change_zone::resume_next_mass_library_order_choice(state) {
-        state.priority_player = next_owner;
-        return;
-    }
     if state.active_ability_continuation().is_some() {
         let tracked = if matches!(library_position, LibraryPosition::Bottom) {
             state
