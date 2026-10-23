@@ -232,21 +232,42 @@ fn legacy_mass_library_order_prompt_is_current(
     }
 }
 
+/// CR 401.4 + CR 608.2c: whether a departure settled an open owner library
+/// arrangement (`settle_owner_library_arrangement_after_departure`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerArrangementDepartureSettlement {
+    /// No arrangement was settled: none was open, its prompt still stands or
+    /// passed to the next owner, or its carrier was retired without
+    /// completion.
+    NotSettled,
+    /// The departure settled the arrangement through its handler — the
+    /// collected orders moved, or the instruction completed with nothing
+    /// moved — and the resolution went on to its remaining instructions
+    /// (CR 608.2m).
+    Settled,
+}
+
 /// CR 800.4a + CR 101.4 + CR 401.4: after a player leaves, continue an open
 /// owner library arrangement with the players and objects still in the game:
-/// republish or advance its prompt, or settle the last recorded order
-/// through this handler so the collected arrangement moves as one event with
-/// one completion.
+/// republish or advance its prompt, or settle the last recorded order, or the
+/// instruction's empty completion when nothing is left (its last chooser may
+/// have left), through this handler so the collected arrangement moves as one
+/// event with one completion. Reports whether it settled the arrangement, so
+/// the elimination leaves a departed controller's instant or sorcery that the
+/// settlement finished to the action boundary's final-part convergence
+/// (CR 608.2n) instead of retiring it.
 pub(crate) fn settle_owner_library_arrangement_after_departure(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
-) -> Result<(), EngineError> {
+) -> Result<OwnerArrangementDepartureSettlement, EngineError> {
     match effects::change_zone::reconcile_owner_library_arrangement(state) {
         effects::change_zone::OwnerLibraryArrangementReconciliation::Unchanged
-        | effects::change_zone::OwnerLibraryArrangementReconciliation::Retired => Ok(()),
+        | effects::change_zone::OwnerLibraryArrangementReconciliation::Retired => {
+            Ok(OwnerArrangementDepartureSettlement::NotSettled)
+        }
         effects::change_zone::OwnerLibraryArrangementReconciliation::Prompted(owner) => {
             state.priority_player = owner;
-            Ok(())
+            Ok(OwnerArrangementDepartureSettlement::NotSettled)
         }
         effects::change_zone::OwnerLibraryArrangementReconciliation::Settle { owner, cards } => {
             state.priority_player = owner;
@@ -261,7 +282,7 @@ pub(crate) fn settle_owner_library_arrangement_after_departure(
                 | ResolutionChoiceOutcome::WaitingForWithInlineTriggers(_) => {}
                 ResolutionChoiceOutcome::ActionResult(result) => events.extend(result.events),
             }
-            Ok(())
+            Ok(OwnerArrangementDepartureSettlement::Settled)
         }
     }
 }

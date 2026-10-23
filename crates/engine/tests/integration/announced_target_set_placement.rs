@@ -1599,11 +1599,20 @@ fn riptide_current_owner_departure_prompts_the_next_owner() {
 }
 
 /// Sibling of `riptide_current_owner_departure_prompts_the_next_owner`: after
-/// P1 leaves, P3 leaves at P3's prompt too. Nobody remains with a card to
-/// arrange, so the arrangement is retired and the departed chooser's prompt
-/// gives way to priority for a player still in the game.
+/// P1 leaves, P3 leaves at P3's prompt too. CR 104.3a + CR 800.4a: every
+/// remaining target left the game with its owner, so nobody has a card to
+/// arrange. P0's Riptide trigger survives and has begun resolving, so it
+/// continues fully (CR 608.2m): the instruction completes with nothing moved
+/// (CR 608.2c + CR 609.3), the resolution ends, and only then does the active
+/// player P0 receive priority (CR 117.2e + CR 117.3b), all within the Concede.
+/// The single completion is the engine's completion contract.
+///
+/// REVERT-FAILING: with the departed final chooser's arrangement retired
+/// instead of completed, the Concede emits no completion and the Riptide
+/// carrier stays live behind re-pointed priority. `Priority { P0 }` alone does
+/// not discriminate; it is the CR 117.3b check.
 #[test]
-fn riptide_every_remaining_owner_departure_retires_the_arrangement() {
+fn riptide_every_remaining_owner_departure_completes_the_arrangement_empty() {
     let mut board = riptide_four_player_board();
     open_riptide_arrangement(&mut board);
     board
@@ -1617,18 +1626,28 @@ fn riptide_every_remaining_owner_departure_retires_the_arrangement() {
         LibraryPosition::NthFromTop { n: 3 },
     );
 
-    board
+    let conceded = board
         .runner
         .act(GameAction::Concede { player_id: P3 })
         .expect("P3 concedes");
+    assert_eq!(
+        put_at_library_position_resolutions(&conceded.events, board.riptide),
+        1,
+        "the surviving instruction completes once, empty"
+    );
+    let state = board.runner.state();
+    assert!(
+        state.resolving_stack_entry.is_none(),
+        "the Riptide carrier settled"
+    );
+    assert!(
+        state.active_ability_continuation().is_none(),
+        "no continuation is left behind the departure"
+    );
     assert!(!owner_arrangement_carrier_is_open(&board.runner));
-    match &board.runner.state().waiting_for {
-        WaitingFor::Priority { player } => assert!(
-            [P0, P2].contains(player),
-            "priority goes to a player still in the game, got {player:?}"
-        ),
-        other => panic!("expected priority after the last owner left, got {other:?}"),
-    }
+    assert!(state.stack.is_empty());
+    assert_eq!(state.waiting_for, WaitingFor::Priority { player: P0 });
+    assert_eq!(state.priority_player, P0);
 }
 
 /// Activate Lodestone Bauble on P1's two graveyard lands and arrange them as
@@ -1835,6 +1854,500 @@ fn lodestone_bauble_owner_arranges_and_the_delayed_draw_takes_their_top_card() {
         p0_hand_before,
         "P0 drew nothing"
     );
+}
+
+// ---------------------------------------------------------------------------
+// An owner arrangement whose last chooser leaves the game completes empty, and
+// the resolution under way continues (CR 800.4a + CR 608.2m).
+// ---------------------------------------------------------------------------
+
+/// The `EffectResolved { PutAtLibraryPosition }` completions `source` emitted.
+fn put_at_library_position_resolutions(events: &[GameEvent], source: ObjectId) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                GameEvent::EffectResolved {
+                    kind: EffectKind::PutAtLibraryPosition,
+                    source_id,
+                    ..
+                } if *source_id == source
+            )
+        })
+        .count()
+}
+
+/// How many times `spell` was reported resolved.
+fn stack_resolved_count(events: &[GameEvent], spell: ObjectId) -> usize {
+    events
+        .iter()
+        .filter(
+            |event| matches!(event, GameEvent::StackResolved { object_id } if *object_id == spell),
+        )
+        .count()
+}
+
+/// `(controller, one_shot)` of every delayed trigger `source` created.
+fn delayed_triggers_from(runner: &GameRunner, source: ObjectId) -> Vec<(PlayerId, bool)> {
+    runner
+        .state()
+        .delayed_triggers
+        .iter()
+        .filter(|trigger| trigger.source_id == source)
+        .map(|trigger| (trigger.controller, trigger.one_shot))
+        .collect()
+}
+
+fn hand_len(runner: &GameRunner, player: PlayerId) -> usize {
+    runner.state().players[player.0 as usize].hand.len()
+}
+
+/// The three-player Lodestone Bauble board. P0 is active, controls Lodestone
+/// Bauble and has the {1} to activate it; `graveyard_owner` has two basic land
+/// cards in their graveyard. Every player's library holds two cards and every
+/// hand is empty.
+///
+/// Returns `(runner, bauble, [l1, l2])`.
+fn lodestone_three_player_board(
+    graveyard_owner: PlayerId,
+) -> (GameRunner, ObjectId, [ObjectId; 2]) {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(P0, colorless(1));
+    scenario.with_library_top(P0, &["P0 Library 1", "P0 Library 2"]);
+    scenario.with_library_top(P1, &["P1 Library 1", "P1 Library 2"]);
+    scenario.with_library_top(P2, &["P2 Library 1", "P2 Library 2"]);
+    let bauble = scenario
+        .add_artifact_from_oracle(P0, "Lodestone Bauble", LODESTONE_BAUBLE_ORACLE)
+        .id();
+    let l1 = scenario
+        .add_land_to_graveyard(graveyard_owner, "Graveyard Forest")
+        .id();
+    let l2 = scenario
+        .add_land_to_graveyard(graveyard_owner, "Graveyard Island")
+        .id();
+    let mut runner = scenario.build();
+    for land in [l1, l2] {
+        let object = runner.state_mut().objects.get_mut(&land).unwrap();
+        object.card_types.supertypes.push(Supertype::Basic);
+        object.base_card_types = object.card_types.clone();
+    }
+    grant_priority(&mut runner, P0);
+    (runner, bauble, [l1, l2])
+}
+
+/// Activate the Bauble on `[l1, l2]` and stop at `chooser`'s CR 401.4 prompt,
+/// with the reach guard every departure row below relies on: the cost was
+/// paid, nothing moved, the activation is still resolving with its "That
+/// player draws a card …" tail parked behind the prompt, and that tail has
+/// created no delayed trigger yet.
+fn open_lodestone_arrangement(
+    runner: &mut GameRunner,
+    bauble: ObjectId,
+    lands: [ObjectId; 2],
+    chooser: PlayerId,
+) {
+    let [l1, l2] = lands;
+    let outcome = runner
+        .activate(bauble, 0)
+        .target_objects(&[l1, l2])
+        .resolve();
+    assert_owner_arrangement_prompt(
+        outcome.final_waiting_for(),
+        chooser,
+        &[l1, l2],
+        LibraryPosition::Top,
+    );
+    assert_eq!(zone(runner, l1), Zone::Graveyard);
+    assert_eq!(zone(runner, l2), Zone::Graveyard);
+    assert_eq!(
+        zone(runner, bauble),
+        Zone::Graveyard,
+        "reach guard: the Bauble's sacrifice cost was paid"
+    );
+    let state = runner.state();
+    assert_eq!(
+        state
+            .resolving_stack_entry
+            .as_ref()
+            .map(|entry| entry.source_id),
+        Some(bauble),
+        "reach guard: the activation is still resolving"
+    );
+    assert!(
+        state.active_ability_continuation().is_some(),
+        "reach guard: the delayed-draw tail is parked behind the prompt"
+    );
+    assert!(
+        delayed_triggers_from(runner, bauble).is_empty(),
+        "reach guard: the tail has not run"
+    );
+    assert!(!owner_arrangement_carrier_is_open(runner));
+}
+
+/// Pass every priority window and declare nothing until the first priority
+/// window of the next turn (past its untap step) with an empty stack. Returns
+/// the most stack entries from `source` seen at once during that next turn.
+fn advance_into_next_turn_observing(runner: &mut GameRunner, source: ObjectId) -> usize {
+    let start_turn = runner.state().turn_number;
+    let mut seen = 0;
+    for _ in 0..128 {
+        let state = runner.state();
+        if state.turn_number > start_turn {
+            seen = seen.max(stack_entries_from(runner, source));
+            if state.phase != Phase::Untap
+                && state.stack.is_empty()
+                && matches!(state.waiting_for, WaitingFor::Priority { .. })
+            {
+                return seen;
+            }
+        }
+        let action = match &state.waiting_for {
+            WaitingFor::Priority { .. } => GameAction::PassPriority,
+            WaitingFor::DeclareAttackers { .. } => GameAction::DeclareAttackers {
+                attacks: vec![],
+                bands: vec![],
+            },
+            WaitingFor::DeclareBlockers { .. } => GameAction::DeclareBlockers {
+                assignments: vec![],
+            },
+            other => panic!("unexpected window while advancing to the next turn: {other:?}"),
+        };
+        runner.act(action).expect("advance to the next turn");
+    }
+    panic!("the next turn was not reached within the window budget");
+}
+
+/// CR 104.3a + CR 800.4a + CR 608.2c + CR 608.2m: P0 activates Lodestone
+/// Bauble on two basic lands in P1's graveyard; P2 stays in the game. P1, the
+/// owner and only chooser, concedes at P1's own arrangement prompt. P1's lands
+/// leave the game with P1, but P0's activation survives and has begun
+/// resolving, so it continues fully: the placement completes with nothing
+/// moved (CR 609.3), and the parked tail creates the delayed draw, controlled
+/// by P0, the player who controlled the ability as it resolved, with the
+/// Bauble as its source (CR 603.7a + CR 603.7e). Only then does the active
+/// player P0 receive priority (CR 117.2e + CR 117.3b), all within the Concede.
+/// The single completion is the engine's completion contract.
+///
+/// REVERT-FAILING: with the departed final chooser's arrangement retired
+/// instead of completed, the Concede emits no completion, creates no delayed
+/// trigger, and leaves the carrier and continuation live behind re-pointed
+/// priority — (b), (c) and (d) fail.
+///
+/// SUPPLEMENTARY (V2, not the discriminator): at the next upkeep, P2's turn
+/// (CR 800.4k), the living P0's trigger reaches the stack once and draws for
+/// no one, because "that player" is the departed P1 (CR 603.7b + CR 800.4a +
+/// CR 609.3).
+///
+/// Paired positive: `lodestone_bauble_owner_arranges_and_the_delayed_draw_takes_their_top_card`.
+#[test]
+fn lodestone_bauble_final_owner_concession_completes_the_activation_before_priority() {
+    let (mut runner, bauble, lands) = lodestone_three_player_board(P1);
+    let [l1, l2] = lands;
+    let p0_hand_before = hand_len(&runner, P0);
+    let p2_hand_before = hand_len(&runner, P2);
+    open_lodestone_arrangement(&mut runner, bauble, lands, P1);
+
+    let conceded = runner
+        .act(GameAction::Concede { player_id: P1 })
+        .expect("P1 concedes");
+
+    // (a) CR 800.4a: P1's lands leave the game with P1.
+    assert_eq!(zone(&runner, l1), Zone::Exile);
+    assert_eq!(zone(&runner, l2), Zone::Exile);
+    // (b) The surviving instruction completes once, with nothing moved.
+    assert_eq!(
+        put_at_library_position_resolutions(&conceded.events, bauble),
+        1,
+        "the placement completes once, empty, inside the Concede"
+    );
+    // (c) CR 603.7a + CR 603.7e: the tail ran and created P0's delayed draw.
+    assert_eq!(
+        delayed_triggers_from(&runner, bauble),
+        vec![(P0, true)],
+        "the parked tail created the delayed draw under P0"
+    );
+    // (d) The resolution is over.
+    let state = runner.state();
+    assert!(state.resolving_stack_entry.is_none(), "the carrier settled");
+    assert!(
+        state.active_ability_continuation().is_none(),
+        "the continuation drained"
+    );
+    assert!(state.pending_mass_library_order_choice.is_none());
+    assert!(state.stack.is_empty());
+    // (e) CR 117.3b: the active player receives priority.
+    assert_eq!(state.waiting_for, WaitingFor::Priority { player: P0 });
+    assert_eq!(state.priority_player, P0);
+
+    // SUPPLEMENTARY (V2).
+    let seen = advance_into_next_turn_observing(&mut runner, bauble);
+    assert_eq!(
+        seen, 1,
+        "CR 603.7b: the living P0's delayed trigger reaches the stack once"
+    );
+    assert_eq!(
+        runner.state().active_player,
+        P2,
+        "CR 800.4k: the next turn is P2's"
+    );
+    assert!(
+        delayed_triggers_from(&runner, bauble).is_empty(),
+        "the one-shot delayed trigger is spent"
+    );
+    assert_eq!(
+        hand_len(&runner, P0),
+        p0_hand_before,
+        "CR 609.3: P0 drew nothing"
+    );
+    assert_eq!(
+        hand_len(&runner, P2),
+        p2_hand_before,
+        "CR 609.3: P2 drew nothing"
+    );
+}
+
+/// UNCHANGED BRANCH (preservation): P2, a bystander who owns none of the
+/// cards, concedes while P1 is arranging. P1's prompt stands untouched and
+/// nothing completes; P1's later submission then completes the activation
+/// normally (CR 104.3a + CR 800.4a + CR 401.4).
+#[test]
+fn lodestone_bauble_bystander_concession_leaves_the_owner_arrangement_open() {
+    let (mut runner, bauble, lands) = lodestone_three_player_board(P1);
+    let [l1, l2] = lands;
+    let p1_before = library(&runner, P1);
+    open_lodestone_arrangement(&mut runner, bauble, lands, P1);
+
+    let conceded = runner
+        .act(GameAction::Concede { player_id: P2 })
+        .expect("P2 concedes");
+
+    assert_owner_arrangement_prompt(
+        &runner.state().waiting_for,
+        P1,
+        &[l1, l2],
+        LibraryPosition::Top,
+    );
+    assert_eq!(zone(&runner, l1), Zone::Graveyard);
+    assert_eq!(zone(&runner, l2), Zone::Graveyard);
+    assert!(delayed_triggers_from(&runner, bauble).is_empty());
+    assert!(runner.state().resolving_stack_entry.is_some());
+    assert_eq!(
+        put_at_library_position_resolutions(&conceded.events, bauble),
+        0,
+        "a bystander's departure completes nothing"
+    );
+
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![l2, l1],
+        })
+        .expect("P1 submits their arrangement");
+    let mut expected = vec![l2, l1];
+    expected.extend(p1_before);
+    assert_eq!(library(&runner, P1), expected);
+    assert_eq!(delayed_triggers_from(&runner, bauble), vec![(P0, true)]);
+    assert!(runner.state().stack.is_empty());
+    assert_eq!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { player: P0 }
+    );
+}
+
+/// CR 104.3a + CR 800.4a + CR 608.2m: P0 activates Lodestone Bauble on two
+/// basic lands in P0's own graveyard, then concedes at P0's own arrangement
+/// prompt; P1 and P2 stay in the game. P0's lands and the Bauble leave the
+/// game, and P0's ability ceases to exist, but it has begun resolving, so it
+/// continues fully: the placement completes with nothing moved (CR 609.3) and
+/// the tail creates the delayed draw, controlled by P0 (CR 603.7a +
+/// CR 603.7e) — creating a delayed triggered ability is not putting it on the
+/// stack. The resolution ends, and because the active player P0 has left, P1
+/// receives priority (CR 117.2e + CR 117.3b + CR 800.4j), all within the
+/// Concede. Nothing downstream of the Concede is asserted. The single
+/// completion is the engine's completion contract.
+///
+/// REVERT-FAILING: with the departed final chooser's arrangement retired
+/// instead of completed, (b), (c) and (d) fail. (e) is the CR 800.4j check
+/// and is not the discriminator.
+#[test]
+fn lodestone_bauble_controller_concession_at_own_arrangement_completes_before_priority() {
+    let (mut runner, bauble, lands) = lodestone_three_player_board(P0);
+    let [l1, l2] = lands;
+    open_lodestone_arrangement(&mut runner, bauble, lands, P0);
+
+    let conceded = runner
+        .act(GameAction::Concede { player_id: P0 })
+        .expect("P0 concedes");
+
+    // (a) CR 800.4a.
+    assert!(runner.state().players[P0.0 as usize].is_eliminated);
+    for id in [l1, l2, bauble] {
+        assert_eq!(
+            zone(&runner, id),
+            Zone::Exile,
+            "CR 800.4a: P0's cards leave the game with P0"
+        );
+    }
+    // (b)
+    assert_eq!(
+        put_at_library_position_resolutions(&conceded.events, bauble),
+        1,
+        "the placement completes once, empty, inside the Concede"
+    );
+    // (c) CR 603.7e.
+    assert_eq!(
+        delayed_triggers_from(&runner, bauble),
+        vec![(P0, true)],
+        "the parked tail created the delayed draw under P0"
+    );
+    // (d)
+    let state = runner.state();
+    assert!(state.resolving_stack_entry.is_none(), "the carrier settled");
+    assert!(
+        state.active_ability_continuation().is_none(),
+        "the continuation drained"
+    );
+    assert!(state.pending_mass_library_order_choice.is_none());
+    assert!(state.stack.is_empty());
+    // (e) CR 117.3b + CR 800.4j.
+    assert_eq!(state.waiting_for, WaitingFor::Priority { player: P1 });
+    assert_eq!(state.priority_player, P1);
+}
+
+/// The three-player Gravepurge board. P0 is active with Gravepurge (an
+/// instant) in hand and {B}{B}{B}; P0's graveyard holds two creature cards and
+/// P0's library one card. P1 and P2 each have a one-card library; every hand
+/// but P0's Gravepurge is empty.
+///
+/// Returns `(runner, gravepurge, [c1, c2])`.
+fn gravepurge_three_player_board() -> (GameRunner, ObjectId, [ObjectId; 2]) {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(P0, black_mana(3));
+    let c1 = scenario
+        .add_creature_to_graveyard(P0, "Graveyard Bear A", 2, 2)
+        .id();
+    let c2 = scenario
+        .add_creature_to_graveyard(P0, "Graveyard Bear B", 2, 2)
+        .id();
+    scenario.add_card_to_library_top(P0, "Library Pre-existing");
+    scenario.with_library_top(P1, &["P1 Library 1"]);
+    scenario.with_library_top(P2, &["P2 Library 1"]);
+    let gravepurge = scenario
+        .add_spell_to_hand_from_oracle(P0, "Gravepurge", true, GRAVEPURGE_ORACLE)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 2,
+            shards: vec![ManaCostShard::Black],
+        })
+        .id();
+    let mut runner = scenario.build();
+    grant_priority(&mut runner, P0);
+    (runner, gravepurge, [c1, c2])
+}
+
+/// CR 104.3a + CR 800.4a + CR 608.2m + CR 608.2n: P0 casts Gravepurge on two
+/// creature cards in P0's own graveyard on a three-player board, then concedes
+/// at P0's own arrangement prompt. P0's cards leave the game, the two targets
+/// and Gravepurge itself included, but the spell has begun resolving, so it
+/// continues fully: "Put … on top of your library" completes with nothing
+/// moved and "Draw a card" is followed for the departed P0, so no living
+/// player draws (CR 609.3). The resolution has finished; its final part
+/// cannot put the spell into a graveyard because it is already in exile, and
+/// under the engine's contract for a departed spell that continues to resolve
+/// fully it is reported resolved exactly once (an engine reporting contract,
+/// not a card fact). The active player P0 has left, so P1 receives priority
+/// (CR 117.2e + CR 117.3b + CR 800.4j), all before the Concede returns.
+///
+/// REVERT-FAILING, two reverts:
+/// - with the departed final chooser's arrangement retired instead of
+///   completed, (b), (c) and (d) fail: the Draw is stranded behind a live
+///   carrier;
+/// - with the completion kept but the paused-spell block's settled-arrangement
+///   conjunct removed, (c) fails: the block retires the carrier as
+///   `Eliminated` and the spell is never reported resolved.
+#[test]
+fn gravepurge_controller_concession_at_own_arrangement_finishes_the_spell_before_priority() {
+    let (mut runner, gravepurge, [c1, c2]) = gravepurge_three_player_board();
+    let p1_hand_before = hand_len(&runner, P1);
+    let p2_hand_before = hand_len(&runner, P2);
+
+    let outcome = runner.cast(gravepurge).target_objects(&[c1, c2]).resolve();
+    assert_owner_arrangement_prompt(
+        outcome.final_waiting_for(),
+        P0,
+        &[c1, c2],
+        LibraryPosition::Top,
+    );
+    // Reach guard: the spell is paused mid-resolution with its Draw parked.
+    assert!(
+        runner.state().players[P0.0 as usize].hand.is_empty(),
+        "reach guard: the chained Draw waits for the arrangement"
+    );
+    assert_eq!(zone(&runner, c1), Zone::Graveyard);
+    assert_eq!(zone(&runner, c2), Zone::Graveyard);
+    assert_eq!(zone(&runner, gravepurge), Zone::Stack);
+    assert_eq!(
+        runner
+            .state()
+            .owed_spell_final_part()
+            .map(|owed| owed.spell),
+        Some(gravepurge),
+        "reach guard: the spell owes its final part"
+    );
+    assert!(runner.state().active_ability_continuation().is_some());
+
+    let conceded = runner
+        .act(GameAction::Concede { player_id: P0 })
+        .expect("P0 concedes");
+
+    // (a) CR 800.4a.
+    assert!(runner.state().players[P0.0 as usize].is_eliminated);
+    for id in [c1, c2, gravepurge] {
+        assert_eq!(
+            zone(&runner, id),
+            Zone::Exile,
+            "CR 800.4a: P0's cards leave the game with P0"
+        );
+    }
+    // (b)
+    assert_eq!(
+        put_at_library_position_resolutions(&conceded.events, gravepurge),
+        1,
+        "the placement completes once, empty, inside the Concede"
+    );
+    // (c) CR 608.2m: the resolution finished and is reported once.
+    assert_eq!(
+        stack_resolved_count(&conceded.events, gravepurge),
+        1,
+        "the departed spell that continued to resolve fully is reported resolved once"
+    );
+    // (d)
+    let state = runner.state();
+    assert!(state.resolving_stack_entry.is_none(), "the carrier settled");
+    assert!(
+        state.owed_spell_final_part().is_none(),
+        "the final part ran"
+    );
+    assert!(
+        state.active_ability_continuation().is_none(),
+        "the continuation drained"
+    );
+    assert!(state.pending_mass_library_order_choice.is_none());
+    assert!(state.stack.is_empty());
+    assert!(
+        state
+            .objects
+            .values()
+            .all(|object| object.zone != Zone::Stack),
+        "no object is left on the stack"
+    );
+    // (e) CR 117.3b + CR 800.4j.
+    assert_eq!(state.waiting_for, WaitingFor::Priority { player: P1 });
+    assert_eq!(state.priority_player, P1);
+    // SUPPLEMENTARY: no living player draws (CR 609.3), paired with (b) and (c).
+    assert_eq!(hand_len(&runner, P1), p1_hand_before);
+    assert_eq!(hand_len(&runner, P2), p2_hand_before);
 }
 
 // ---------------------------------------------------------------------------

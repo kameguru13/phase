@@ -459,21 +459,25 @@ pub fn eliminate_players_simultaneously(
         // CR 800.4a + CR 101.4 + CR 401.4: an open owner library arrangement is
         // reconciled with the players and objects still in the game — a departed
         // owner's cards left with them, and a member exiled with its departed
-        // controller is gone — so the next owner chooses or the collected
-        // arrangement moves. Runs after every departure sweep and before the
-        // generic dead-actor repoint, which would otherwise strand the collected
-        // orders behind unrelated priority.
-        if let Err(error) =
-            super::engine_resolution_choices::settle_owner_library_arrangement_after_departure(
+        // controller is gone — so the next owner chooses, or the arrangement
+        // completes, moving what is collected or nothing, and its resolution
+        // continues (CR 608.2c). Runs after every departure sweep and before the
+        // generic dead-actor repoint, which would otherwise strand the
+        // resolution behind unrelated priority (CR 117.2e).
+        let owner_arrangement =
+            match super::engine_resolution_choices::settle_owner_library_arrangement_after_departure(
                 state, events,
-            )
-        {
-            tracing::error!(%error, "owner library arrangement was not reconciled after a departure");
-            debug_assert!(
-                false,
-                "owner library arrangement was not reconciled after a departure: {error}"
-            );
-        }
+            ) {
+                Ok(settlement) => settlement,
+                Err(error) => {
+                    tracing::error!(%error, "owner library arrangement was not reconciled after a departure");
+                    debug_assert!(
+                        false,
+                        "owner library arrangement was not reconciled after a departure: {error}"
+                    );
+                    super::engine_resolution_choices::OwnerArrangementDepartureSettlement::NotSettled
+                }
+            };
 
         if let Some(frame) = staged_optional_sacrifice_decline {
             state.push_optional_effect_frame(frame);
@@ -582,19 +586,29 @@ pub fn eliminate_players_simultaneously(
             }
         }
 
-        // CR 800.4a + CR 608.2m + CR 608.2n: a paused spell the departure
-        // sweeps took off the stack while its controller left. When nothing of
-        // its resolution is still live — the departed player's question was its
-        // last instruction — its carrier is retired here as `Eliminated`, and
-        // the spell is never reported resolved. When a surviving player still
-        // has one of its instructions to answer, the carrier stays; once those
-        // instructions are done, the departed-spell path reports it resolved
-        // exactly once. (A spell that reverted to a surviving owner stays on the
-        // stack, and its final part puts it into that owner's graveyard.) A
-        // spell whose final part already ran and parked was reported resolved
-        // at that moment; its carrier is retired with its departed controller.
+        // CR 800.4a + CR 608.2m + CR 608.2n: a paused spell the departure sweeps
+        // took off the stack while its controller left. When nothing of its
+        // resolution is still live because the departed player's unanswered
+        // question was its last instruction, its carrier is retired here as
+        // `Eliminated`, and the spell is never reported resolved. An owner
+        // arrangement the departure itself settled is not that case: the departure
+        // answered the question and the settlement ran the remaining instructions,
+        // so the carrier, which still owes its final part, is left to the action
+        // boundary's final-part convergence, which reports the spell resolved once
+        // and then checks state-based actions before any player acts (CR 608.2m +
+        // CR 608.2n + CR 704.3). When a surviving player still has one of its
+        // instructions to answer, the carrier stays; once those instructions are
+        // done, the departed-spell path reports it resolved exactly once. (A spell
+        // that reverted to a surviving owner stays on the stack, and its final part
+        // puts it into that owner's graveyard.) A spell whose final part already
+        // ran and parked was reported resolved at that moment; its carrier is
+        // retired with its departed controller.
         if let Some((spell, controller)) = paused_spell {
             if leaving_set.contains(&controller)
+                && matches!(
+                    owner_arrangement,
+                    super::engine_resolution_choices::OwnerArrangementDepartureSettlement::NotSettled
+                )
                 && state
                     .resolving_stack_entry
                     .as_ref()

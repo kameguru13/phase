@@ -2225,19 +2225,25 @@ pub(crate) enum OwnerLibraryArrangementReconciliation {
     /// `waiting_for` now holds this owner's prompt.
     Prompted(PlayerId),
     /// `waiting_for` holds this owner's prompt over `cards`; submitting `cards`
-    /// completes the arrangement as one simultaneous move.
+    /// completes the arrangement as one simultaneous move. `owner` may have left
+    /// the game; an empty `cards` completes the instruction with nothing moved.
     Settle {
         owner: PlayerId,
         cards: Vec<ObjectId>,
     },
-    /// The chooser left with nothing of theirs to move, and no current-shape
-    /// continuation remains; the carrier is gone.
+    /// The open prompt is not a current-shape prompt of this arrangement and its
+    /// actor has left, so nothing can continue the collected orders; the carrier
+    /// is dropped without completion. A current-shape prompt never reaches this:
+    /// its instruction completes through `Settle` even when its last chooser has
+    /// left. A finished game clears the carrier in elimination's GameOver branch.
     Retired,
 }
 
 /// CR 800.4a + CR 101.4 + CR 401.4: reconcile an open owner library arrangement
 /// with the players and objects still in the game after a departure. The only
-/// departure authority for the carrier and its open prompt.
+/// departure authority for the carrier and its open prompt. An instruction whose
+/// current-shape prompt is open always completes, even when its last chooser has
+/// left.
 pub(crate) fn reconcile_owner_library_arrangement(
     state: &mut GameState,
 ) -> OwnerLibraryArrangementReconciliation {
@@ -2327,20 +2333,23 @@ pub(crate) fn reconcile_owner_library_arrangement(
             return OwnerLibraryArrangementReconciliation::Settle { owner, cards };
         }
     }
-    if crate::game::players::is_alive(state, chooser) {
-        state.waiting_for = mass_library_order_effect_zone_choice(
-            live,
-            source_id,
-            library_position,
-            track_exiled_by_source,
-            duration,
-        );
-        return OwnerLibraryArrangementReconciliation::Settle {
-            owner: chooser,
-            cards: Vec::new(),
-        };
+    // CR 608.2c + CR 608.2m + CR 800.4a: nothing is left for anyone to arrange. The
+    // departure took the leaver's owned cards out of the arrangement, but the
+    // resolution under way continues (CR 608.2m), so the instruction completes with
+    // nothing moved — whether or not its last chooser is still in the game — and
+    // the resolution goes on to its remaining instructions before any player
+    // receives priority (CR 117.2e).
+    state.waiting_for = mass_library_order_effect_zone_choice(
+        live,
+        source_id,
+        library_position,
+        track_exiled_by_source,
+        duration,
+    );
+    OwnerLibraryArrangementReconciliation::Settle {
+        owner: chooser,
+        cards: Vec::new(),
     }
-    OwnerLibraryArrangementReconciliation::Retired
 }
 
 /// Move all objects matching the filter from `Origin` zone to `Destination` zone.
