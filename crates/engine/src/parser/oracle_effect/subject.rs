@@ -2,7 +2,7 @@ use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till, take_till1, take_until};
 use nom::character::complete::multispace0;
-use nom::combinator::{all_consuming, eof, map, not, opt, peek, rest, value, verify};
+use nom::combinator::{all_consuming, eof, map, not, opt, peek, recognize, rest, value, verify};
 use nom::multi::separated_list1;
 use nom::sequence::{delimited, pair, preceded, terminated};
 use nom::Parser;
@@ -29,6 +29,7 @@ use crate::types::statics::{ProhibitionScope, StaticMode};
 
 use super::super::oracle_keyword::parse_granted_keyword_fragment;
 use super::super::oracle_nom::bridge::nom_on_lower;
+use super::super::oracle_nom::condition as nom_condition;
 use super::super::oracle_nom::defender_exception;
 use super::super::oracle_nom::duration::parse_duration;
 use super::super::oracle_nom::error::OracleResult;
@@ -772,13 +773,13 @@ fn copular_conjunct_verb(input: &str) -> OracleResult<'_, ()> {
             alt((
                 tag("is no longer "),
                 tag("is not "),
-                tag("isn't "),
-                tag("aren't "),
+                recognize((nom_condition::parse_isnt, tag(" "))),
+                recognize((tag("aren"), nom_condition::parse_apostrophe, tag("t "))),
                 tag("is "),
                 tag("are "),
-                tag("doesn't have "),
+                recognize((nom_condition::parse_doesnt, tag(" have "))),
                 tag("does not have "),
-                tag("don't have "),
+                recognize((nom_condition::parse_dont, tag(" have "))),
                 tag("do not have "),
                 tag("has "),
                 tag("have "),
@@ -12753,6 +12754,27 @@ mod entry_onset_tests {
             "get +1/+0 and aren't legendary",
         ] {
             assert_eq!(predicate_onset(predicate), WithEntry, "{predicate:?}");
+        }
+    }
+
+    /// The contracted negations accept the typographic apostrophe (U+2019) exactly as they accept
+    /// the ASCII one, leading or as a later conjunct, and stay inside the still/goaded guard.
+    #[test]
+    fn predicate_onset_reads_typographic_apostrophe_negations() {
+        for predicate in [
+            "isn\u{2019}t legendary",
+            "aren\u{2019}t legendary",
+            "doesn\u{2019}t have flying",
+            "don\u{2019}t have flying",
+            "get +1/+0 and aren\u{2019}t legendary",
+        ] {
+            assert_eq!(predicate_onset(predicate), WithEntry, "{predicate:?}");
+        }
+        for predicate in [
+            "get +1/+0 and aren\u{2019}t goaded",
+            "isn\u{2019}t still a land",
+        ] {
+            assert_eq!(predicate_onset(predicate), WhenFollowed, "{predicate:?}");
         }
     }
 
