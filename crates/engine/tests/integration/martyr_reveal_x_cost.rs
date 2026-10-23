@@ -8,8 +8,8 @@
 //! is paid (CR 601.2h). CR 701.20a: revealing shows the cards to every player;
 //! CR 701.20b: a revealed card stays in its zone.
 //!
-//! The class covers activation costs (the Martyr cycle: Sands, Spores and
-//! Bones are driven here; Ashes and Frost read the same `chosen_x` channel) and
+//! The class covers activation costs (the whole Martyr cycle — Sands, Spores,
+//! Bones, Ashes and Frost — is driven here from its verbatim Oracle text) and
 //! the same cost printed as a spell's additional cost. No printed spell carries
 //! that additional cost, so the spell rows use a synthetic card ("Ember
 //! Tithe"). CR 601.2a: the spell being cast is on the stack, so it is never a
@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use engine::ai_support::legal_actions;
 use engine::game::casting::can_activate_ability_now;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::ability::TargetRef;
+use engine::types::ability::{AbilityCost, TargetRef};
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
 use engine::types::game_state::{CastPaymentMode, PayCostKind, WaitingFor};
@@ -33,6 +33,9 @@ use engine::types::zones::Zone;
 const MARTYR_OF_SANDS: &str = "{1}, Reveal X white cards from your hand, Sacrifice this creature: You gain three times X life.";
 const MARTYR_OF_SPORES: &str = "{1}, Reveal X green cards from your hand, Sacrifice this creature: Target creature gets +X/+X until end of turn.";
 const MARTYR_OF_BONES: &str = "{1}, Reveal X black cards from your hand, Sacrifice this creature: Exile up to X target cards from a single graveyard.";
+const MARTYR_OF_ASHES: &str = "{2}, Reveal X red cards from your hand, Sacrifice this creature: This creature deals X damage to each creature without flying.";
+const MARTYR_OF_FROST: &str = "{2}, Reveal X blue cards from your hand, Sacrifice this creature: Counter target spell unless its controller pays {X}.";
+const QUICK_TONIC: &str = "You gain 1 life.";
 const EMBER_TITHE: &str = "As an additional cost to cast this spell, reveal X red cards from your hand.\nYou gain X life.";
 
 fn pool(kinds: &[ManaType]) -> Vec<ManaUnit> {
@@ -476,6 +479,409 @@ fn martyr_of_bones_exiles_up_to_x_cards_from_a_single_graveyard() {
     assert_eq!(zone(b1), Zone::Hand);
     assert_eq!(zone(b2), Zone::Hand);
     assert_eq!(zone(n1), Zone::Hand);
+}
+
+/// Martyr of Ashes announces X up to the red cards in its activator's hand,
+/// reveals exactly X of them, and deals X damage to each creature without
+/// flying (CR 120.3e marks the damage; CR 704.5g destroys a creature whose
+/// marked damage reaches its toughness). A flier is not dealt damage.
+#[test]
+fn martyr_of_ashes_deals_x_damage_to_each_creature_without_flying() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let ashes = scenario
+        .add_creature_from_oracle(P0, "Martyr of Ashes", 1, 1, MARTYR_OF_ASHES)
+        .id();
+    let r1 = colored_hand_card(&mut scenario, P0, "Red One", ManaColor::Red);
+    let r2 = colored_hand_card(&mut scenario, P0, "Red Two", ManaColor::Red);
+    let r3 = colored_hand_card(&mut scenario, P0, "Red Three", ManaColor::Red);
+    let u1 = colored_hand_card(&mut scenario, P0, "Blue One", ManaColor::Blue);
+    colored_hand_card(&mut scenario, P1, "Opponent Red One", ManaColor::Red);
+    colored_hand_card(&mut scenario, P1, "Opponent Red Two", ManaColor::Red);
+    // Toughness equal to X: destroyed. Toughness above X: X damage marked.
+    let bear = scenario.add_creature(P1, "Ground Bear", 2, 2).id();
+    let wall = scenario.add_creature(P1, "Ground Wall", 0, 3).id();
+    let own = scenario.add_creature(P0, "Own Ground", 1, 4).id();
+    // A flier that X damage would destroy.
+    let bird = scenario.add_creature(P1, "Sky Bird", 1, 1).flying().id();
+    scenario.with_mana_pool(P0, pool(&[ManaType::Colorless, ManaType::Colorless]));
+    let mut runner = scenario.build();
+
+    let mut events = activate(&mut runner, ashes);
+
+    // CR 107.3a: X is capped at the red cards the activator can reveal — not
+    // the off-color card, not the opponent's red cards.
+    assert_eq!(offered_x(&runner), (0, 3));
+    assert!(
+        runner.act(GameAction::ChooseX { value: 4 }).is_err(),
+        "X above the red cards in hand must be rejected"
+    );
+    assert_eq!(offered_x(&runner), (0, 3));
+    events.extend(
+        runner
+            .act(GameAction::ChooseX { value: 2 })
+            .expect("announce X = 2")
+            .events,
+    );
+    pay_mana(&mut runner, &mut events);
+
+    let choices = reveal_prompt(&runner, 2);
+    assert_eq!(choices, HashSet::from([r1, r2, r3]));
+    assert!(
+        runner
+            .act(GameAction::SelectCards {
+                cards: vec![r1, u1]
+            })
+            .is_err(),
+        "revealing an off-color card must be rejected"
+    );
+    assert_still_revealing(&runner);
+    events.extend(
+        runner
+            .act(GameAction::SelectCards {
+                cards: vec![r1, r3],
+            })
+            .expect("revealing two red cards pays the cost")
+            .events,
+    );
+
+    assert!(
+        revealed_cards(&events).contains(&vec![r1, r3]),
+        "the two chosen red cards are revealed, got {:?}",
+        revealed_cards(&events)
+    );
+    // CR 701.20b: revealed cards stay in hand.
+    for card in [r1, r2, r3, u1] {
+        assert_eq!(runner.state().objects[&card].zone, Zone::Hand);
+    }
+    assert_eq!(
+        runner.state().objects[&ashes].zone,
+        Zone::Graveyard,
+        "the self-sacrifice cost is paid"
+    );
+    assert!(
+        runner.state().players[0].mana_pool.is_empty(),
+        "the {{2}} is paid"
+    );
+    assert_eq!(runner.state().stack.len(), 1);
+
+    resolve(&mut runner);
+    let obj = |id: ObjectId| &runner.state().objects[&id];
+    assert_eq!(obj(bear).zone, Zone::Graveyard, "2 damage destroys the 2/2");
+    assert_eq!(obj(wall).zone, Zone::Battlefield);
+    assert_eq!(obj(wall).damage_marked, 2, "the 0/3 is dealt X = 2");
+    assert_eq!(obj(own).zone, Zone::Battlefield);
+    assert_eq!(
+        obj(own).damage_marked,
+        2,
+        "each creature without flying, the activator's included"
+    );
+    assert_eq!(
+        obj(bird).zone,
+        Zone::Battlefield,
+        "the flier is not dealt damage"
+    );
+    assert_eq!(obj(bird).damage_marked, 0);
+}
+
+/// Martyr of Frost above a real opponent spell.
+struct FrostBoard {
+    runner: GameRunner,
+    frost: ObjectId,
+    /// The opponent's creature spell on the stack.
+    spell: ObjectId,
+    /// P0's own spell above it: a second legal target with another controller.
+    own_spell: ObjectId,
+    blue: Vec<ObjectId>,
+    off_color: ObjectId,
+    opponent_lands: Vec<ObjectId>,
+}
+
+/// P1 (the active player, four Forests) casts a {2} Bear and passes; P0 casts
+/// a {0} instant above it and keeps priority, holding Martyr of Frost, three
+/// blue cards and a red card, with {2} floating. P1's hand also holds two blue
+/// cards, which cannot pay P0's reveal.
+fn frost_above_opponent_spell() -> FrostBoard {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let frost = scenario
+        .add_creature_from_oracle(P0, "Martyr of Frost", 1, 1, MARTYR_OF_FROST)
+        .id();
+    let blue = vec![
+        colored_hand_card(&mut scenario, P0, "Blue One", ManaColor::Blue),
+        colored_hand_card(&mut scenario, P0, "Blue Two", ManaColor::Blue),
+        colored_hand_card(&mut scenario, P0, "Blue Three", ManaColor::Blue),
+    ];
+    let off_color = colored_hand_card(&mut scenario, P0, "Red One", ManaColor::Red);
+    colored_hand_card(&mut scenario, P1, "Opponent Blue One", ManaColor::Blue);
+    colored_hand_card(&mut scenario, P1, "Opponent Blue Two", ManaColor::Blue);
+    let spell = scenario
+        .add_creature_to_hand(P1, "Opponent Bear", 2, 2)
+        .with_mana_cost(ManaCost::generic(2))
+        .id();
+    let own_spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Quick Tonic", true, QUICK_TONIC)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let opponent_lands = (0..4)
+        .map(|_| scenario.add_basic_land(P1, ManaColor::Green))
+        .collect();
+    scenario.with_mana_pool(P0, pool(&[ManaType::Colorless, ManaType::Colorless]));
+    let mut runner = scenario.build();
+    {
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.priority_player = P1;
+        state.waiting_for = WaitingFor::Priority { player: P1 };
+    }
+    runner.cast(spell).commit();
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "the opponent's spell is cast"
+    );
+    assert_eq!(runner.state().objects[&spell].zone, Zone::Stack);
+    runner.act(GameAction::PassPriority).expect("P1 passes");
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { player: P0 }
+        ),
+        "P0 receives priority above the opponent's spell, got {:?}",
+        runner.state().waiting_for
+    );
+    runner.cast(own_spell).commit();
+    assert_eq!(runner.state().stack.len(), 2, "P0's own spell is cast");
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { player: P0 }
+        ),
+        "P0 keeps priority after casting, got {:?}",
+        runner.state().waiting_for
+    );
+    FrostBoard {
+        runner,
+        frost,
+        spell,
+        own_spell,
+        blue,
+        off_color,
+        opponent_lands,
+    }
+}
+
+fn tapped_opponent_lands(board: &FrostBoard) -> usize {
+    board
+        .opponent_lands
+        .iter()
+        .filter(|land| board.runner.state().objects[*land].tapped)
+        .count()
+}
+
+/// Activates Martyr of Frost with X = `x` targeting the opponent's spell,
+/// reveals exactly X blue cards, and resolves the ability up to the
+/// unless-payment prompt. CR 118.12a: the spell's controller (P1) is asked to
+/// pay {X} with the announced X (CR 107.3a); CR 118.5: a {0} is asked too.
+fn frost_up_to_unless_payment(board: &mut FrostBoard, x: u32) {
+    let runner = &mut board.runner;
+    let mut events = activate(runner, board.frost);
+    assert_eq!(offered_x(runner), (0, 3));
+    events.extend(
+        runner
+            .act(GameAction::ChooseX { value: x })
+            .expect("announce X")
+            .events,
+    );
+
+    // CR 601.2c: the target is chosen after X is announced.
+    let WaitingFor::TargetSelection { target_slots, .. } = &runner.state().waiting_for else {
+        panic!(
+            "the activation must choose its target after X, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(target_slots.len(), 1);
+    assert_eq!(
+        target_slots[0]
+            .legal_targets
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>(),
+        HashSet::from([
+            TargetRef::Object(board.spell),
+            TargetRef::Object(board.own_spell)
+        ]),
+        "both spells on the stack are legal targets"
+    );
+    events.extend(
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(board.spell)),
+            })
+            .expect("target the opponent's spell")
+            .events,
+    );
+    pay_mana(runner, &mut events);
+
+    let reveal = &board.blue[..x as usize];
+    if x > 0 {
+        let choices = reveal_prompt(runner, x as usize);
+        assert_eq!(choices, board.blue.iter().copied().collect());
+        let mut off = reveal[1..].to_vec();
+        off.push(board.off_color);
+        assert!(
+            runner.act(GameAction::SelectCards { cards: off }).is_err(),
+            "revealing an off-color card must be rejected"
+        );
+        assert_still_revealing(runner);
+        events.extend(
+            runner
+                .act(GameAction::SelectCards {
+                    cards: reveal.to_vec(),
+                })
+                .expect("revealing X blue cards pays the cost")
+                .events,
+        );
+    }
+    let revealed: Vec<ObjectId> = revealed_cards(&events).into_iter().flatten().collect();
+    assert_eq!(
+        revealed,
+        reveal.to_vec(),
+        "exactly the X chosen cards are revealed"
+    );
+
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { player: P0 }
+        ),
+        "the activation completes, got {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(runner.state().objects[&board.frost].zone, Zone::Graveyard);
+    assert!(
+        runner.state().players[0].mana_pool.is_empty(),
+        "the {{2}} is paid"
+    );
+    assert_eq!(runner.state().stack.len(), 3);
+    let ability = runner
+        .state()
+        .stack
+        .back()
+        .and_then(|entry| entry.ability())
+        .expect("Frost's ability is on top of the stack");
+    assert_eq!(ability.targets, vec![TargetRef::Object(board.spell)]);
+    assert_eq!(tapped_opponent_lands(board), 2, "the Bear's {{2}} only");
+
+    board.runner.resolve_top();
+    let WaitingFor::UnlessPayment { player, cost, .. } = &board.runner.state().waiting_for else {
+        panic!(
+            "Frost must ask the spell's controller to pay, got {:?}",
+            board.runner.state().waiting_for
+        );
+    };
+    assert_eq!(*player, P1, "the targeted spell's controller is asked");
+    assert_eq!(
+        *cost,
+        AbilityCost::Mana {
+            cost: ManaCost::generic(x)
+        },
+        "the unless cost is the announced X"
+    );
+    assert_eq!(board.runner.state().objects[&board.spell].zone, Zone::Stack);
+    assert_eq!(
+        board.runner.state().stack.len(),
+        2,
+        "only Frost's ability has left the stack"
+    );
+}
+
+/// After the unless payment is answered, P0's untargeted spell is untouched
+/// and resolves; the stack empties back to priority.
+fn resolve_rest(board: &mut FrostBoard) {
+    assert_eq!(
+        board.runner.state().objects[&board.own_spell].zone,
+        Zone::Stack,
+        "the untargeted spell is not countered"
+    );
+    let life_before = board.runner.life(P0);
+    resolve(&mut board.runner);
+    assert_eq!(
+        board.runner.state().objects[&board.own_spell].zone,
+        Zone::Graveyard
+    );
+    assert_eq!(
+        board.runner.life(P0) - life_before,
+        1,
+        "P0's spell resolved"
+    );
+}
+
+/// X = 2, the opponent pays {2}: the spell is not countered and resolves.
+#[test]
+fn martyr_of_frost_spell_resolves_when_its_controller_pays_x() {
+    let mut board = frost_above_opponent_spell();
+    frost_up_to_unless_payment(&mut board, 2);
+    board
+        .runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("P1 pays {2}");
+    assert_eq!(tapped_opponent_lands(&board), 4, "P1 paid X = 2 more");
+    assert_eq!(board.runner.state().objects[&board.spell].zone, Zone::Stack);
+    resolve_rest(&mut board);
+    assert_eq!(
+        board.runner.state().objects[&board.spell].zone,
+        Zone::Battlefield,
+        "the paid-for spell resolves"
+    );
+}
+
+/// X = 2, the opponent declines: the spell is countered (CR 701.6a).
+#[test]
+fn martyr_of_frost_counters_the_spell_when_its_controller_declines() {
+    let mut board = frost_above_opponent_spell();
+    frost_up_to_unless_payment(&mut board, 2);
+    board
+        .runner
+        .act(GameAction::PayUnlessCost { pay: false })
+        .expect("P1 declines");
+    assert_eq!(tapped_opponent_lands(&board), 2, "nothing is paid");
+    assert_eq!(
+        board.runner.state().objects[&board.spell].zone,
+        Zone::Graveyard,
+        "the declined spell is countered"
+    );
+    resolve_rest(&mut board);
+}
+
+/// X = 0 reveals nothing and asks for {0}. CR 118.5: a {0} cost is paid only
+/// by acknowledging it, so acknowledging lets the spell resolve and declining
+/// counters it.
+#[test]
+fn martyr_of_frost_x_zero_asks_for_zero() {
+    for pay in [true, false] {
+        let mut board = frost_above_opponent_spell();
+        frost_up_to_unless_payment(&mut board, 0);
+        for card in board.blue.iter().chain([&board.off_color]) {
+            assert_eq!(board.runner.state().objects[card].zone, Zone::Hand);
+        }
+        board
+            .runner
+            .act(GameAction::PayUnlessCost { pay })
+            .expect("P1 answers the {0}");
+        assert_eq!(tapped_opponent_lands(&board), 2, "{{0}} taps nothing");
+        resolve_rest(&mut board);
+        assert_eq!(
+            board.runner.state().objects[&board.spell].zone,
+            if pay {
+                Zone::Battlefield
+            } else {
+                Zone::Graveyard
+            },
+            "pay = {pay}"
+        );
+    }
 }
 
 fn ember_tithe(scenario: &mut GameScenario) -> ObjectId {

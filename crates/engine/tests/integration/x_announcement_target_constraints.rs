@@ -202,10 +202,38 @@ fn pay_and_resolve(board: &mut Board) {
     ));
 }
 
-/// "Up to X target cards from a single graveyard", X = 2: a card from a second
+/// "Up to X target cards from a single graveyard", X = 2: two cards from one
+/// graveyard are accepted as a whole declaration, a card from a second
 /// graveyard is refused both as a whole declaration and slot by slot, and two
-/// cards from one graveyard are accepted and exiled.
+/// cards from one graveyard chosen slot by slot are accepted and exiled.
 fn targets_come_from_a_single_graveyard(route: Route, text: &str) {
+    // Positive reach guard on a fresh board: a whole declaration of two cards
+    // from the same graveyard is accepted, so the mixed-graveyard rejection
+    // below is the constraint's, not `SelectTargets` refused in this state.
+    let mut accepted = board(route, text, 2);
+    begin(&mut accepted, route);
+    accepted
+        .runner
+        .act(GameAction::ChooseX { value: 2 })
+        .expect("announce X = 2");
+    assert_eq!(target_slot_count(&accepted.runner), 2);
+    let (first, second) = (accepted.other_graves[0], accepted.other_graves[1]);
+    accepted
+        .runner
+        .act(GameAction::SelectTargets {
+            targets: vec![obj(first), obj(second)],
+        })
+        .expect("a declaration from a single graveyard is legal");
+    assert!(!matches!(
+        accepted.runner.state().waiting_for,
+        WaitingFor::TargetSelection { .. }
+    ));
+    pay_and_resolve(&mut accepted);
+    let zone = |id: ObjectId| accepted.runner.state().objects[&id].zone;
+    assert_eq!(zone(first), Zone::Exile);
+    assert_eq!(zone(second), Zone::Exile);
+    assert_eq!(zone(accepted.own_grave), Zone::Graveyard);
+
     let mut board = board(route, text, 2);
     let (min, max) = begin(&mut board, route);
     assert_eq!(min, 0);
