@@ -1017,7 +1017,8 @@ const EXTRACTOR_DEMON_ORACLE: &str = "Flying\n\
 /// The four-player Riptide Gearhulk board. P0 is active and casts Riptide.
 /// - P1 owns and controls Extractor Demon, and owns `borrowed`, which P2
 ///   controls (`base_controller = P2`, no control effect).
-/// - P3 owns and controls `p3_bear`.
+/// - P3 owns and controls `p3_bear` and `p3_trinket`, a noncreature
+///   artifact for the rows that need P3's target not to be a creature.
 /// - P1's library is `[f1, f2, f3]` and P3's is `[g1, g2, g3]`.
 /// - P0 also has Lodestone Bauble, and P1 two basic lands in the graveyard,
 ///   for the later single-owner arrangement rows; P0's pool keeps one
@@ -1028,6 +1029,7 @@ struct RiptideBoard {
     demon: ObjectId,
     borrowed: ObjectId,
     p3_bear: ObjectId,
+    p3_trinket: ObjectId,
     bauble: ObjectId,
     lands: [ObjectId; 2],
     p1_library: Vec<ObjectId>,
@@ -1058,6 +1060,7 @@ fn riptide_four_player_board() -> RiptideBoard {
         .controlled_by(P2)
         .id();
     let p3_bear = scenario.add_creature(P3, "P3 Bear", 2, 2).id();
+    let p3_trinket = scenario.add_artifact_from_oracle(P3, "P3 Trinket", "").id();
     let bauble = scenario
         .add_artifact_from_oracle(P0, "Lodestone Bauble", LODESTONE_BAUBLE_ORACLE)
         .id();
@@ -1086,6 +1089,7 @@ fn riptide_four_player_board() -> RiptideBoard {
         demon,
         borrowed,
         p3_bear,
+        p3_trinket,
         bauble,
         lands: [l1, l2],
         p1_library,
@@ -1322,6 +1326,77 @@ fn riptide_owner_departure_at_their_prompt_delivers_the_collected_arrangement() 
         board.runner.state().waiting_for,
         WaitingFor::Priority { player: P0 }
     );
+}
+
+/// CR 104.3a + CR 800.4a + CR 603.10a + CR 603.3: the departure-settled move
+/// still puts its triggers on the stack. Riptide targets P3's noncreature
+/// `p3_trinket`, so P3 leaving the game exiles nothing the Demon can see
+/// (it watches creatures). The settled move then takes the Demon and
+/// `borrowed` together; the Demon looks back (CR 603.10a; its 2017-03-14
+/// ruling: it triggers when it and another creature leave at the same time)
+/// and triggers exactly once, for `borrowed`. A Concede returns before the
+/// post-action pipeline, so that trigger reaches the stack only through the
+/// settle's own completion and the elimination drain.
+///
+/// REVERT-FAILING: if the triggers of the departure-settled move are not put
+/// on the stack, the Demon's stack count is 0, not 1.
+#[test]
+fn riptide_owner_departure_settled_move_puts_its_triggers_on_the_stack() {
+    let mut board = riptide_four_player_board();
+    let outcome = board
+        .runner
+        .cast(board.riptide)
+        .target_players(&[P1, P2, P3])
+        .target_objects(&[board.demon, board.borrowed, board.p3_trinket])
+        .resolve();
+    assert_owner_arrangement_prompt(
+        outcome.final_waiting_for(),
+        P1,
+        &[board.demon, board.borrowed],
+        LibraryPosition::NthFromTop { n: 3 },
+    );
+    board
+        .runner
+        .act(GameAction::SelectCards {
+            cards: vec![board.borrowed, board.demon],
+        })
+        .expect("P1 submits their arrangement");
+    assert_owner_arrangement_prompt(
+        &board.runner.state().waiting_for,
+        P3,
+        &[board.p3_trinket],
+        LibraryPosition::NthFromTop { n: 3 },
+    );
+    // Reach guard: P1's order was collected, not delivered.
+    assert_eq!(zone(&board.runner, board.demon), Zone::Battlefield);
+    assert_eq!(zone(&board.runner, board.borrowed), Zone::Battlefield);
+
+    board
+        .runner
+        .act(GameAction::Concede { player_id: P3 })
+        .expect("P3 concedes");
+    assert_eq!(
+        zone(&board.runner, board.p3_trinket),
+        Zone::Exile,
+        "CR 800.4a: P3's artifact leaves the game with P3"
+    );
+    assert_eq!(library(&board.runner, P1), p1_library_after_both(&board));
+    assert!(!owner_arrangement_carrier_is_open(&board.runner));
+
+    drive_trigger_prompts(&mut board.runner);
+    assert_eq!(
+        stack_entries_from(&board.runner, board.demon),
+        1,
+        "CR 603.10a + CR 603.3: the Demon's trigger for `borrowed` reaches the stack"
+    );
+
+    resolve_to_priority(&mut board.runner);
+    assert!(board.runner.state().stack.is_empty());
+    assert_eq!(
+        board.runner.state().waiting_for,
+        WaitingFor::Priority { player: P0 }
+    );
+    assert_eq!(library(&board.runner, P1), p1_library_after_both(&board));
 }
 
 /// CR 104.3a + CR 800.4a: P3, an owner still queued, concedes while P1 is

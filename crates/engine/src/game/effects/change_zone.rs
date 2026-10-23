@@ -2230,7 +2230,8 @@ pub(crate) enum OwnerLibraryArrangementReconciliation {
         owner: PlayerId,
         cards: Vec<ObjectId>,
     },
-    /// The chooser left and nothing remains to move; the carrier is gone.
+    /// The chooser left with nothing of theirs to move, and no current-shape
+    /// continuation remains; the carrier is gone.
     Retired,
 }
 
@@ -2250,7 +2251,8 @@ pub(crate) fn reconcile_owner_library_arrangement(
         ..
     } = &state.waiting_for
     else {
-        // A legacy-shaped prompt carries no member provenance to reconcile.
+        // Every state that is not an owner-arrangement prompt, a legacy-shaped
+        // prompt included, carries no member provenance to reconcile.
         let Some(mut pending) = state.pending_mass_library_order_choice.take() else {
             return OwnerLibraryArrangementReconciliation::Unchanged;
         };

@@ -468,6 +468,7 @@ pub fn eliminate_players_simultaneously(
                 state, events,
             )
         {
+            tracing::error!(%error, "owner library arrangement was not reconciled after a departure");
             debug_assert!(
                 false,
                 "owner library arrangement was not reconciled after a departure: {error}"
