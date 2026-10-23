@@ -726,13 +726,15 @@ fn try_parse_subject_continuous_clause(
 }
 
 /// CR 611.2e + CR 205.1b: the onset a subject-predicate continuous clause states. `WithEntry` when
-/// any conjunct of the predicate opens with the "is/has" form (is, are, has, have, isn't, is not, is no
-/// longer, doesn't have, don't have, does not have, do not have) — at the predicate start, after "and ",
-/// or after a word that ends with ", " (optionally followed by "and ") — outside double-quoted ability
-/// text; the "still a [type]" retention qualifier (CR 205.1b) and the goaded designation (CR 701.15b) are not such statements. Otherwise
-/// `WhenFollowed`. A clause mixing an "is/has" conjunct with a "gains/gets" conjunct is `WithEntry`:
-/// it lowers to one instruction with one observation point, and the "is/has" part must apply with the
-/// entry (the "gains" part is then also visible — residual R-1).
+/// any conjunct of the predicate opens with the "is/has" form (is, are, has, have, isn't, is not,
+/// is no longer, doesn't have, don't have, does not have, do not have) — at the predicate start,
+/// after "and ", or after a word that ends with ", " (optionally followed by "and ") — outside
+/// double-quoted ability text; the "still a [type]" retention qualifier (CR 205.1b) and the goaded
+/// designation (CR 701.15b) are not such statements. Otherwise `WhenFollowed`. A clause mixing an
+/// "is/has" conjunct with a "gains/gets" conjunct is `WithEntry`: it lowers to one instruction with
+/// one observation point, and the "is/has" part must apply with the entry. Enter observers then
+/// also see the "gains" part; that over-exposure is a known limitation of having one observation
+/// point per instruction.
 ///
 /// Also the authority for the token-anaphor rewrite in `lower.rs`
 /// (`rewrite_populated_anaphor_in_def`), which reads the verb phrase that follows "the token(s)".

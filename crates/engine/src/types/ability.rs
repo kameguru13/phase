@@ -29720,10 +29720,10 @@ impl TargetReadOrigin {
 /// instruction holds the enter observation back until it has applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum ContinuousEffectOnset {
-    /// CR 608.2c: the effect begins when this instruction is followed — for an entrant of this
-    /// resolution, after it is on the battlefield (CR 611.2e names "becomes" and "gains"; any other wording that is not an
-    /// "is/has" statement, e.g. "gets", follows CR 608.2c order).
-    /// Every instruction that is not an "is/has" statement.
+    /// CR 608.2c: the effect begins when this instruction is followed. For a permanent an earlier
+    /// instruction of this resolution put onto the battlefield, that is after the permanent is on
+    /// the battlefield. CR 611.2e names "becomes" and "gains"; any other wording that is not an
+    /// "is/has" statement (for example "gets") follows CR 608.2c order.
     #[default]
     WhenFollowed,
     /// CR 611.2e: the instruction states the permanent "is"/"has" a characteristic or doesn't

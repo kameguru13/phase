@@ -353,9 +353,11 @@ fn v5_pair_two_anthems_satisfy_bond_at_entry() {
 
 /// V6 — CR 611.2e: Admiral Brass's "It has base power and toughness 4/4" applies as the Pirate
 /// enters, so Bond sees a 4/4 and draws; the trailing "It gains haste" is a later rider. Driven
-/// through the real beginning-of-combat trigger. This path records no entry observation (the
-/// observer reads the live entrant after the resolution), so it pins the parse and the outcome;
-/// the runtime deferral is discriminated by the sorcery-host row below.
+/// through the real beginning-of-combat trigger. This path records no entry observation: a phase
+/// trigger stamps `scoped_player` on its whole chain, so D3 in `entry_observation_deferred`
+/// defers every boundary and the observer reads the live entrant after the resolution, "gains"
+/// rider included (a known gap older than the onset). So this row pins the parse and the
+/// outcome; the runtime deferral is discriminated by the sorcery-host row below.
 #[test]
 fn v6_admiral_brass_has_rider_is_observed() {
     let mut scenario = board();
