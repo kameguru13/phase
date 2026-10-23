@@ -579,3 +579,48 @@ fn v9_bare_comma_has_conjunct_is_observed() {
     );
     outcome.assert_hand_drawn(P0, 1);
 }
+
+/// Brilliance Unleashed {4}{U}{R} Sorcery — verbatim Oracle text.
+const BRILLIANCE_UNLEASHED: &str = "Choose one or both —\n• Brilliance Unleashed deals 5 damage \
+     to target creature.\n• Choose target artifact card in your graveyard. Return it to the \
+     battlefield if it's an artifact creature card. Otherwise, return it to the battlefield and \
+     it's a 3/3 Robot artifact creature with flying.";
+
+/// V10 — CR 611.2e: Brilliance Unleashed's "Otherwise, return it to the battlefield and it's a
+/// 3/3 Robot artifact creature with flying" is an "is" statement, so the noncreature artifact
+/// card enters as a 3/3 artifact creature and Elemental Bond draws. Stamping the contracted
+/// copula's animation arm (`subject::try_parse_contracted_subject_additive_type_clause`)
+/// `WhenFollowed` instead observes a noncreature artifact, and Bond draws nothing.
+#[test]
+fn v10_brilliance_unleashed_contracted_copula_is_observed() {
+    let mut scenario = board();
+    add_bond(&mut scenario);
+    let artifact = scenario
+        .add_spell_to_graveyard(P0, "Filigree Relic", false)
+        .id();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Brilliance Unleashed", false, BRILLIANCE_UNLEASHED)
+        .id();
+    let mut runner = scenario.build();
+    {
+        // A noncreature artifact card: "if it's an artifact creature card" is false, so the
+        // Otherwise branch returns and animates it.
+        let object = runner.state_mut().objects.get_mut(&artifact).unwrap();
+        object.card_types.core_types = vec![CoreType::Artifact];
+        object.base_card_types = object.card_types.clone();
+    }
+    let outcome = runner
+        .cast(spell)
+        .modes(&[1])
+        .target_object(artifact)
+        .resolve();
+    let object = &outcome.state().objects[&artifact];
+    assert_eq!(object.zone, Zone::Battlefield);
+    assert!(
+        object.card_types.core_types.contains(&CoreType::Creature),
+        "reach: the Otherwise animation applied"
+    );
+    assert_eq!((object.power, object.toughness), (Some(3), Some(3)));
+    assert!(object.has_keyword(&Keyword::Flying));
+    outcome.assert_hand_drawn(P0, 1);
+}

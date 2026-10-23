@@ -12837,6 +12837,95 @@ mod entry_onset_tests {
         assert_eq!(found, vec![WithEntry], "type-setting");
     }
 
+    /// The `GenericEffect` nodes of `def`'s chain whose first static definition binds
+    /// `affected` and carries a modification `marker` selects.
+    fn become_nodes<'a>(
+        def: &'a AbilityDefinition,
+        affected: &TargetFilter,
+        marker: fn(&ContinuousModification) -> bool,
+    ) -> Vec<&'a AbilityDefinition> {
+        nodes(def)
+            .into_iter()
+            .filter(|node| match &*node.effect {
+                Effect::GenericEffect {
+                    static_abilities, ..
+                } => static_abilities.first().is_some_and(|definition| {
+                    definition.affected.as_ref() == Some(affected)
+                        && definition.modifications.iter().any(marker)
+                }),
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// The contracted-copula arms that lower through `PredicateAst::Become`: the
+    /// type-replacement "It's a Treasure artifact with …, and it loses all other card types"
+    /// (Vraska, the Silencer) and the non-additive animation "it's a 3/3 Robot artifact
+    /// creature with flying" (Brilliance Unleashed). Both are "is" statements.
+    #[test]
+    fn contracted_copula_become_arms_stamp_with_entry() {
+        use crate::parser::oracle::parse_oracle_text;
+        use crate::types::card_type::CoreType;
+        let strings = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let vraska = parse_oracle_text(
+            "Deathtouch\nWhenever a nontoken creature an opponent controls dies, you may pay {1}. If you do, return that card to the battlefield tapped under your control. It's a Treasure artifact with \"{T}, Sacrifice this artifact: Add one mana of any color,\" and it loses all other card types.",
+            "Vraska, the Silencer",
+            &strings(&["Deathtouch"]),
+            &strings(&["Legendary", "Creature"]),
+            &strings(&["Gorgon", "Assassin"]),
+        );
+        let execute = vraska
+            .triggers
+            .iter()
+            .find_map(|trigger| trigger.execute.as_deref())
+            .expect("the dies trigger's execute chain");
+        // Reach guard: only the type-replacement arm (`parse_its_a_type_loses_others`)
+        // replaces the card types with `[Artifact]` on the returned `TriggeringSource`.
+        let found = become_nodes(execute, &TargetFilter::TriggeringSource, |m| {
+            matches!(m, ContinuousModification::SetCardTypes { core_types }
+                if core_types == &[CoreType::Artifact])
+        });
+        assert_eq!(found.len(), 1, "type-replacement node: {execute:#?}");
+        assert_eq!(found[0].entry_onset, WithEntry, "type replacement");
+
+        let brilliance = parse_oracle_text(
+            "Choose one or both —\n• Brilliance Unleashed deals 5 damage to target creature.\n• Choose target artifact card in your graveyard. Return it to the battlefield if it's an artifact creature card. Otherwise, return it to the battlefield and it's a 3/3 Robot artifact creature with flying.",
+            "Brilliance Unleashed",
+            &[],
+            &strings(&["Sorcery"]),
+            &[],
+        );
+        let mode = brilliance.abilities.get(1).expect("the return mode");
+        // Reach guard: the animation arm (`build_become_clause`) binds the "it" anaphor to the
+        // chosen card (`ParentTarget`) and sets the Robot spec, in the else branch.
+        let found = become_nodes(
+            mode,
+            &TargetFilter::ParentTarget,
+            |m| matches!(m, ContinuousModification::AddSubtype { subtype } if subtype == "Robot"),
+        );
+        assert_eq!(found.len(), 1, "animation node: {mode:#?}");
+        assert!(
+            become_nodes(found[0], &TargetFilter::ParentTarget, |m| matches!(
+                m,
+                ContinuousModification::SetPower { value: 3 }
+            ))
+            .iter()
+            .any(|node| std::ptr::eq(*node, found[0])),
+            "the 3/3 animation spec: {mode:#?}"
+        );
+        let otherwise: Vec<_> = nodes(mode)
+            .into_iter()
+            .filter_map(|node| node.else_ability.as_deref())
+            .flat_map(nodes)
+            .collect();
+        assert!(
+            otherwise.iter().any(|node| std::ptr::eq(*node, found[0])),
+            "the animation sits in the Otherwise branch: {mode:#?}"
+        );
+        assert_eq!(found[0].entry_onset, WithEntry, "animation");
+    }
+
     /// CR 205.1b: "It's still a land" qualifies the governing "becomes"; neither it nor the
     /// "becomes" applies with the entry.
     #[test]

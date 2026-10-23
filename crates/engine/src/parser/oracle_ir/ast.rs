@@ -283,8 +283,10 @@ pub(crate) enum PredicateAst {
         effect: Effect,
         duration: Option<Duration>,
         sub_ability: Option<Box<AbilityDefinition>>,
-        /// CR 611.2e: "becomes" applies after the permanent is on the battlefield, so
-        /// every construction states `WhenFollowed`; carried for symmetry with `Continuous`.
+        /// CR 611.2e: the onset the clause states. A "becomes" predicate is `WhenFollowed`;
+        /// the copula arms that lower through this variant ("it's a 3/3 …", "it's a Treasure
+        /// artifact …, and it loses all other card types", "is no longer <supertype>") state
+        /// `WithEntry`.
         onset: ContinuousEffectOnset,
     },
     Restriction {
