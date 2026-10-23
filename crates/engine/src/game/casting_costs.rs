@@ -10959,6 +10959,13 @@ pub(crate) fn handle_reveal_for_cost(
             chosen.len()
         )));
     }
+    // CR 601.2h + CR 701.20a: revealing X cards shows X different cards, so
+    // the chosen cards must be distinct — one card can't pay for two.
+    if (0..chosen.len()).any(|i| chosen[i + 1..].contains(&chosen[i])) {
+        return Err(EngineError::InvalidAction(
+            "Selected cards must be unique".to_string(),
+        ));
+    }
     for card_id in chosen {
         if !legal_cards.contains(card_id) {
             return Err(EngineError::InvalidAction(

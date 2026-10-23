@@ -591,3 +591,127 @@ fn spell_reveal_x_additional_cost_zero_reveals_nothing() {
     assert_eq!(runner.life(P0), life_before);
     assert_eq!(runner.state().objects[&r1].zone, Zone::Hand);
 }
+
+/// Submits `[card, card]` against an open reveal prompt and asserts the
+/// rejection leaves the prompt, life and stack exactly as they were.
+fn assert_duplicate_reveal_rejected(runner: &mut GameRunner, card: ObjectId) {
+    let prompt_before = runner.state().waiting_for.clone();
+    let life_before = runner.life(P0);
+    let stack_before = runner.state().stack.len();
+    assert!(
+        runner
+            .act(GameAction::SelectCards {
+                cards: vec![card, card],
+            })
+            .is_err(),
+        "revealing one card twice must not pay a reveal of two cards"
+    );
+    assert_eq!(
+        runner.state().waiting_for,
+        prompt_before,
+        "the rejected duplicate leaves the same reveal prompt open"
+    );
+    assert_eq!(runner.life(P0), life_before, "no partial payment");
+    assert_eq!(
+        runner.state().stack.len(),
+        stack_before,
+        "no partial payment"
+    );
+}
+
+/// CR 601.2h + CR 701.20a: a reveal of X = 2 cards needs two different
+/// cards; a raw `SelectCards` naming one card twice is rejected before any
+/// payment, and the distinct pair then pays the activation cost.
+#[test]
+fn martyr_of_sands_rejects_revealing_one_card_twice() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let sands = scenario
+        .add_creature_from_oracle(P0, "Martyr of Sands", 1, 1, MARTYR_OF_SANDS)
+        .id();
+    let w1 = colored_hand_card(&mut scenario, P0, "White One", ManaColor::White);
+    let w2 = colored_hand_card(&mut scenario, P0, "White Two", ManaColor::White);
+    scenario.with_mana_pool(P0, pool(&[ManaType::Colorless]));
+    let mut runner = scenario.build();
+    let life_before = runner.life(P0);
+
+    let mut events = activate(&mut runner, sands);
+    events.extend(
+        runner
+            .act(GameAction::ChooseX { value: 2 })
+            .expect("announce X = 2")
+            .events,
+    );
+    pay_mana(&mut runner, &mut events);
+    assert_eq!(reveal_prompt(&runner, 2), HashSet::from([w1, w2]));
+
+    assert_duplicate_reveal_rejected(&mut runner, w1);
+    assert_eq!(reveal_prompt(&runner, 2), HashSet::from([w1, w2]));
+    assert_eq!(
+        runner.state().objects[&sands].zone,
+        Zone::Battlefield,
+        "the sacrifice leg is not paid by a rejected reveal"
+    );
+    assert!(
+        revealed_cards(&events).is_empty(),
+        "nothing has been revealed yet, got {:?}",
+        revealed_cards(&events)
+    );
+
+    events.extend(
+        runner
+            .act(GameAction::SelectCards {
+                cards: vec![w1, w2],
+            })
+            .expect("revealing two different white cards pays the cost")
+            .events,
+    );
+    assert_eq!(revealed_cards(&events), vec![vec![w1, w2]]);
+    assert_eq!(runner.state().objects[&sands].zone, Zone::Graveyard);
+    resolve(&mut runner);
+    assert_eq!(runner.life(P0) - life_before, 6);
+}
+
+/// CR 601.2h + CR 701.20a: the spell additional-cost leg rejects the same
+/// duplicate reveal, and the distinct pair then completes the cast.
+#[test]
+fn spell_reveal_x_additional_cost_rejects_revealing_one_card_twice() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let spell = ember_tithe(&mut scenario);
+    let r1 = colored_hand_card(&mut scenario, P0, "Red One", ManaColor::Red);
+    let r2 = colored_hand_card(&mut scenario, P0, "Red Two", ManaColor::Red);
+    let mut runner = scenario.build();
+    let life_before = runner.life(P0);
+
+    let mut events = cast(&mut runner, spell);
+    events.extend(
+        runner
+            .act(GameAction::ChooseX { value: 2 })
+            .expect("announce X = 2")
+            .events,
+    );
+    pay_mana(&mut runner, &mut events);
+    assert_eq!(reveal_prompt(&runner, 2), HashSet::from([r1, r2]));
+
+    assert_duplicate_reveal_rejected(&mut runner, r1);
+    assert_eq!(reveal_prompt(&runner, 2), HashSet::from([r1, r2]));
+    assert!(
+        revealed_cards(&events).is_empty(),
+        "nothing has been revealed yet, got {:?}",
+        revealed_cards(&events)
+    );
+
+    events.extend(
+        runner
+            .act(GameAction::SelectCards {
+                cards: vec![r1, r2],
+            })
+            .expect("revealing two different red cards pays the cost")
+            .events,
+    );
+    assert_eq!(revealed_cards(&events), vec![vec![r1, r2]]);
+    resolve(&mut runner);
+    assert_eq!(runner.life(P0) - life_before, 2);
+    assert_eq!(runner.state().objects[&spell].zone, Zone::Graveyard);
+}
