@@ -1,8 +1,8 @@
 use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
-use nom::bytes::complete::{tag, take_till, take_until};
+use nom::bytes::complete::{tag, take_till, take_till1, take_until};
 use nom::character::complete::multispace0;
-use nom::combinator::{all_consuming, eof, map, opt, peek, rest, value, verify};
+use nom::combinator::{all_consuming, eof, map, not, opt, peek, rest, value, verify};
 use nom::multi::separated_list1;
 use nom::sequence::{delimited, pair, preceded, terminated};
 use nom::Parser;
@@ -17,10 +17,10 @@ use super::{resolve_it_pronoun, ParseContext};
 use crate::parser::oracle_ir::ast::*;
 use crate::types::ability::{
     AbilityDefinition, AbilityKind, ChooseOneOfKind, ChosenSubtypeKind, ColorChangeMode,
-    ContinuousModification, ControllerRef, CopyRecipient, Duration, EachDamageRecipient, Effect,
-    EffectScope, FilterProp, MultiTargetSpec, ObjectScope, PlayerFilter, PlayerRelation,
-    PlayerScope, PtValue, QuantityExpr, StaticCondition, StaticDefinition, TargetFilter,
-    TypedFilter,
+    ContinuousEffectOnset, ContinuousModification, ControllerRef, CopyRecipient, Duration,
+    EachDamageRecipient, Effect, EffectScope, FilterProp, MultiTargetSpec, ObjectScope,
+    PlayerFilter, PlayerRelation, PlayerScope, PtValue, QuantityExpr, StaticCondition,
+    StaticDefinition, TargetFilter, TypedFilter,
 };
 use crate::types::game_state::DayNight;
 use crate::types::keywords::Keyword;
@@ -183,7 +183,7 @@ pub(super) fn try_parse_subject_predicate_ast(
         return Some(subject_predicate_ast_from_clause(
             text,
             clause,
-            |effect, duration, sub_ability| PredicateAst::Restriction {
+            |effect, duration, sub_ability, _onset| PredicateAst::Restriction {
                 effect,
                 duration,
                 sub_ability,
@@ -201,7 +201,7 @@ pub(super) fn try_parse_subject_predicate_ast(
         return Some(subject_predicate_ast_from_clause(
             text,
             clause,
-            |effect, duration, sub_ability| PredicateAst::Restriction {
+            |effect, duration, sub_ability, _onset| PredicateAst::Restriction {
                 effect,
                 duration,
                 sub_ability,
@@ -217,7 +217,7 @@ pub(super) fn try_parse_subject_predicate_ast(
         return Some(subject_predicate_ast_from_clause(
             text,
             clause,
-            |effect, duration, sub_ability| PredicateAst::Restriction {
+            |effect, duration, sub_ability, _onset| PredicateAst::Restriction {
                 effect,
                 duration,
                 sub_ability,
@@ -236,10 +236,13 @@ pub(super) fn try_parse_subject_predicate_ast(
         return Some(subject_predicate_ast_from_clause(
             text,
             clause,
-            |effect, duration, _sub_ability| PredicateAst::Continuous {
+            // CR 701.15b: goaded is a designation, not a characteristic (CR 109.3),
+            // so the copula here states no CR 611.2e "is [characteristic]" onset.
+            |effect, duration, _sub_ability, _onset| PredicateAst::Continuous {
                 effect,
                 duration,
                 sub_ability: None,
+                onset: ContinuousEffectOnset::WhenFollowed,
             },
             ctx,
         ));
@@ -261,10 +264,11 @@ pub(super) fn try_parse_subject_predicate_ast(
         return Some(subject_predicate_ast_from_clause(
             text,
             clause,
-            |effect, duration, sub_ability| PredicateAst::Continuous {
+            |effect, duration, sub_ability, onset| PredicateAst::Continuous {
                 effect,
                 duration,
                 sub_ability,
+                onset,
             },
             ctx,
         ));
@@ -291,10 +295,11 @@ pub(super) fn try_parse_subject_predicate_ast(
         return Some(subject_predicate_ast_from_clause(
             text,
             clause,
-            |effect, duration, sub_ability| PredicateAst::Become {
+            |effect, duration, sub_ability, onset| PredicateAst::Become {
                 effect,
                 duration,
                 sub_ability,
+                onset,
             },
             ctx,
         ));
@@ -304,10 +309,11 @@ pub(super) fn try_parse_subject_predicate_ast(
         return Some(subject_predicate_ast_from_clause(
             text,
             clause,
-            |effect, duration, sub_ability| PredicateAst::Become {
+            |effect, duration, sub_ability, onset| PredicateAst::Become {
                 effect,
                 duration,
                 sub_ability,
+                onset,
             },
             ctx,
         ));
@@ -336,7 +342,7 @@ pub(super) fn try_parse_subject_predicate_ast(
         return Some(subject_predicate_ast_from_clause(
             text,
             clause,
-            |effect, duration, sub_ability| PredicateAst::Restriction {
+            |effect, duration, sub_ability, _onset| PredicateAst::Restriction {
                 effect,
                 duration,
                 sub_ability,
@@ -394,7 +400,12 @@ fn subject_predicate_ast_from_clause<F>(
     ctx: &mut ParseContext,
 ) -> ClauseAst
 where
-    F: FnOnce(Effect, Option<Duration>, Option<Box<AbilityDefinition>>) -> PredicateAst,
+    F: FnOnce(
+        Effect,
+        Option<Duration>,
+        Option<Box<AbilityDefinition>>,
+        ContinuousEffectOnset,
+    ) -> PredicateAst,
 {
     // Issue #6965: an unbindable subject stays UNBOUND (see
     // `SubjectPhraseAst::affected`); it used to become `TargetFilter::Any`.
@@ -420,6 +431,7 @@ where
             clause.effect,
             clause.duration,
             clause.sub_ability,
+            clause.entry_onset,
         )),
     }
 }
@@ -470,6 +482,8 @@ fn try_parse_subject_additive_type_clause(text: &str, ctx: &mut ParseContext) ->
             effect: clause.effect,
             duration: clause.duration,
             sub_ability: clause.sub_ability,
+            // CR 611.2e: the copula "is/are … in addition" applies with the entry.
+            onset: predicate_onset(predicate_lower),
         }),
     })
 }
@@ -545,6 +559,8 @@ fn try_parse_contracted_subject_additive_type_clause(
                     },
                     duration: Some(Duration::UntilHostLeavesPlay),
                     sub_ability: None,
+                    // CR 611.2e: the contracted copula "it's a …" is an "is" statement.
+                    onset: ContinuousEffectOnset::WithEntry,
                 }),
             });
         }
@@ -566,6 +582,8 @@ fn try_parse_contracted_subject_additive_type_clause(
                     effect: clause.effect,
                     duration: clause.duration,
                     sub_ability: clause.sub_ability,
+                    // CR 611.2e: the contracted copula "it's a …" is an "is" statement.
+                    onset: ContinuousEffectOnset::WithEntry,
                 }),
             });
         }
@@ -649,6 +667,10 @@ fn try_parse_contracted_subject_additive_type_clause(
             effect: clause.effect,
             duration: clause.duration,
             sub_ability: clause.sub_ability,
+            // CR 611.2e: the contracted copula ("it's a 3/3 …", "she's a land …") is an
+            // "is" statement, so it applies with the entry even though it lowers through
+            // the shared "becomes" animation builder.
+            onset: ContinuousEffectOnset::WithEntry,
         }),
     })
 }
@@ -685,16 +707,82 @@ fn try_parse_subject_continuous_clause(
     if subject.eq_ignore_ascii_case("you") {
         return None;
     }
-    if let Some(clause) = try_parse_additive_type_continuous_clause(subject, predicate, ctx) {
+    // CR 611.2e: the predicate's verb form ("is/has" vs "gains/gets") decides when the
+    // clause's continuous effect starts relative to an entry of the same resolution.
+    let onset = predicate_onset(&predicate.to_lowercase());
+    if let Some(mut clause) = try_parse_additive_type_continuous_clause(subject, predicate, ctx) {
+        clause.entry_onset = onset;
         return Some(clause);
     }
     let application = parse_subject_application_for(subject, ctx, AnaphorConsumer::AffectedObject)?;
-    build_continuous_clause(
+    let mut clause = build_continuous_clause(
         application,
         predicate,
         ctx,
         clause_names_deferred_parser(text),
+    )?;
+    clause.entry_onset = onset;
+    Some(clause)
+}
+
+/// CR 611.2e + CR 205.1b: the onset a subject-predicate continuous clause states. `WithEntry` when
+/// any conjunct of the predicate opens with the "is/has" form (is, are, has, have, isn't, is not, is no
+/// longer, doesn't have, don't have, does not have, do not have) — at the predicate start, after "and ",
+/// or after a word that ends with ", " (optionally followed by "and ") — outside double-quoted ability
+/// text; the "still a [type]" retention qualifier (CR 205.1b) and the goaded designation (CR 701.15b) are not such statements. Otherwise
+/// `WhenFollowed`. A clause mixing an "is/has" conjunct with a "gains/gets" conjunct is `WithEntry`:
+/// it lowers to one instruction with one observation point, and the "is/has" part must apply with the
+/// entry (the "gains" part is then also visible — residual R-1).
+fn predicate_onset(predicate_lower: &str) -> ContinuousEffectOnset {
+    let text = nom_primitives::strip_double_quoted_spans(predicate_lower);
+    let leading = copular_conjunct_verb(&text).is_ok();
+    if leading || nom_primitives::scan_at_word_boundaries(&text, conjunct_copula).is_some() {
+        ContinuousEffectOnset::WithEntry
+    } else {
+        ContinuousEffectOnset::WhenFollowed
+    }
+}
+
+/// CR 611.2e: the "is/has" verb that opens a conjunct ("is", "has", "doesn't have", …), not
+/// followed by the CR 205.1b "still" retention qualifier or the CR 701.15b goaded designation.
+fn copular_conjunct_verb(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        terminated(
+            alt((
+                tag("is no longer "),
+                tag("is not "),
+                tag("isn't "),
+                tag("is "),
+                tag("are "),
+                tag("doesn't have "),
+                tag("does not have "),
+                tag("don't have "),
+                tag("do not have "),
+                tag("has "),
+                tag("have "),
+            )),
+            not(alt((tag("still "), tag("goaded")))),
+        ),
     )
+    .parse(input)
+}
+
+/// A later conjunct of a predicate that opens with an "is/has" verb: after "and ", or after a
+/// word ending in ", " (optionally followed by "and ") — "gains haste, has base power …".
+fn conjunct_copula(input: &str) -> OracleResult<'_, ()> {
+    alt((
+        preceded(tag("and "), copular_conjunct_verb),
+        preceded(
+            (
+                take_till1(|c: char| c == ' ' || c == ','),
+                tag(", "),
+                opt(tag("and ")),
+            ),
+            copular_conjunct_verb,
+        ),
+    ))
+    .parse(input)
 }
 
 /// CR 611.3a + CR 702.16: A multi-clause conditional protection grant
@@ -768,6 +856,7 @@ fn build_conditional_protection_grant_clause(
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
@@ -835,6 +924,7 @@ fn build_additive_type_continuous_clause(
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
@@ -915,6 +1005,7 @@ fn try_parse_compound_all_subjects_become_clause(
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
@@ -1039,6 +1130,9 @@ fn try_parse_subject_supertype_removal_clause(
             effect,
             duration,
             sub_ability: None,
+            // CR 611.2e: "isn't / is not / is no longer <supertype>" states the permanent
+            // doesn't have a characteristic, so it applies with the entry.
+            onset: ContinuousEffectOnset::WithEntry,
         }),
     })
 }
@@ -1527,6 +1621,8 @@ fn try_parse_subject_base_pt_set_clause_ast(
             effect,
             duration,
             sub_ability: None,
+            // CR 611.2e: "base power and toughness become" applies after the entry.
+            onset: ContinuousEffectOnset::WhenFollowed,
         }),
     })
 }
@@ -1657,6 +1753,7 @@ fn try_parse_combat_tax_effect_clause(text: &str) -> Option<ParsedEffectClause> 
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
@@ -1840,6 +1937,7 @@ fn try_parse_target_and_same_name_pump_clause(
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     };
     let mass_def = super::ability_definition_from_clause(AbilityKind::Spell, mass_clause);
 
@@ -1855,6 +1953,8 @@ fn try_parse_target_and_same_name_pump_clause(
             effect: primary_effect,
             duration: duration.or(Some(Duration::UntilEndOfTurn)),
             sub_ability: Some(Box::new(mass_def)),
+            // CR 608.2c: "get -N/-M" is not an "is/has" statement.
+            onset: ContinuousEffectOnset::WhenFollowed,
         }),
     })
 }
@@ -1976,6 +2076,7 @@ fn try_parse_subject_restriction_clause(
             condition: None,
             optional: false,
             unless_pay: None,
+            entry_onset: ContinuousEffectOnset::WhenFollowed,
         });
     }
 
@@ -2025,6 +2126,7 @@ fn try_parse_subject_restriction_clause(
                 condition: None,
                 optional: application.is_optional,
                 unless_pay: None,
+                entry_onset: ContinuousEffectOnset::WhenFollowed,
             });
         }
         // CR 508.1d + CR 701.15b + CR 611.2c: "[subject] attacks each combat if
@@ -2061,6 +2163,7 @@ fn try_parse_subject_restriction_clause(
                 condition: None,
                 optional: application.is_optional,
                 unless_pay: None,
+                entry_onset: ContinuousEffectOnset::WhenFollowed,
             });
         }
         // CR 508.1d + CR 506.3 + CR 611.2c: the defender-bound `ForceAttack` form
@@ -2126,6 +2229,7 @@ fn try_parse_subject_restriction_clause(
                     condition: None,
                     optional: application.is_optional,
                     unless_pay: None,
+                    entry_onset: ContinuousEffectOnset::WhenFollowed,
                 });
             }
         }
@@ -2158,6 +2262,7 @@ fn try_parse_subject_restriction_clause(
                 condition: None,
                 optional: application.is_optional,
                 unless_pay: None,
+                entry_onset: ContinuousEffectOnset::WhenFollowed,
             });
         }
     }
@@ -2225,6 +2330,7 @@ fn try_parse_subject_restriction_clause(
             condition: None,
             optional: false,
             unless_pay: None,
+            entry_onset: ContinuousEffectOnset::WhenFollowed,
         });
     }
 
@@ -2272,6 +2378,7 @@ fn try_parse_subject_restriction_clause(
             condition: None,
             optional: false,
             unless_pay: None,
+            entry_onset: ContinuousEffectOnset::WhenFollowed,
         });
     }
 
@@ -2332,6 +2439,7 @@ fn try_parse_subject_restriction_clause(
             condition: None,
             optional: false,
             unless_pay: None,
+            entry_onset: ContinuousEffectOnset::WhenFollowed,
         });
     }
 
@@ -2435,6 +2543,7 @@ fn try_parse_can_attack_with_defender(
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
@@ -2478,6 +2587,7 @@ fn try_parse_targeting_bypass_clause(text: &str) -> Option<ParsedEffectClause> {
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
@@ -2542,6 +2652,7 @@ fn try_parse_can_block_additional(
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
@@ -4795,6 +4906,7 @@ fn try_split_pump_compound(
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
@@ -4997,6 +5109,7 @@ fn build_keyword_choice_clause(
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
@@ -5199,6 +5312,7 @@ fn build_pt_choice_clause(
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
@@ -5245,6 +5359,7 @@ fn build_continuous_clause(
             condition: None,
             optional: false,
             unless_pay: None,
+            entry_onset: ContinuousEffectOnset::WhenFollowed,
         });
     }
 
@@ -5306,6 +5421,7 @@ fn build_continuous_clause(
             condition: None,
             optional: false,
             unless_pay: None,
+            entry_onset: ContinuousEffectOnset::WhenFollowed,
         });
     }
 
@@ -5416,6 +5532,7 @@ fn build_continuous_clause(
             condition: None,
             optional: false,
             unless_pay: None,
+            entry_onset: ContinuousEffectOnset::WhenFollowed,
         });
     }
 
@@ -5459,6 +5576,7 @@ fn build_continuous_clause(
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
@@ -5800,6 +5918,7 @@ fn build_become_clause(
             condition: None,
             optional: false,
             unless_pay: None,
+            entry_onset: ContinuousEffectOnset::WhenFollowed,
         });
     }
 
@@ -5831,6 +5950,7 @@ fn build_become_clause(
             condition: None,
             optional: false,
             unless_pay: None,
+            entry_onset: ContinuousEffectOnset::WhenFollowed,
         });
     }
 
@@ -5888,6 +6008,7 @@ fn build_become_clause(
             condition: None,
             optional: false,
             unless_pay: None,
+            entry_onset: ContinuousEffectOnset::WhenFollowed,
         });
     }
 
@@ -6030,6 +6151,7 @@ fn build_become_clause(
             condition: None,
             optional: false,
             unless_pay: None,
+            entry_onset: ContinuousEffectOnset::WhenFollowed,
         });
     }
 
@@ -6070,6 +6192,7 @@ fn build_become_clause(
             condition: None,
             optional: false,
             unless_pay: None,
+            entry_onset: ContinuousEffectOnset::WhenFollowed,
         });
     }
 
@@ -6107,6 +6230,7 @@ fn build_become_clause(
             condition: None,
             optional: false,
             unless_pay: None,
+            entry_onset: ContinuousEffectOnset::WhenFollowed,
         });
     }
 
@@ -6175,6 +6299,7 @@ fn build_become_clause(
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
@@ -6316,6 +6441,7 @@ fn try_parse_become_and_attack_if_able(
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
@@ -6413,6 +6539,7 @@ fn try_parse_set_life_total(
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
@@ -6678,6 +6805,7 @@ fn try_parse_become_choice(
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     };
 
     // CR 611.2a: the clause's PRINTED window — stripped here, or peeled upstream
@@ -6748,6 +6876,7 @@ fn build_life_lock_clause(scope_filter: TargetFilter) -> ParsedEffectClause {
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     }
 }
 
@@ -6809,6 +6938,7 @@ fn build_restriction_clause(
             condition: None,
             optional: false,
             unless_pay: None,
+            entry_onset: ContinuousEffectOnset::WhenFollowed,
         });
     }
 
@@ -7016,6 +7146,7 @@ fn build_restriction_clause(
                 condition: None,
                 optional: false,
                 unless_pay: None,
+                entry_onset: ContinuousEffectOnset::WhenFollowed,
             });
         }
     }
@@ -7127,6 +7258,7 @@ fn build_restriction_clause(
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
@@ -7670,6 +7802,7 @@ fn try_parse_copula_goaded_clause(
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
@@ -12533,5 +12666,289 @@ mod tests {
                 "{predicate:?}: Choose head window"
             );
         }
+    }
+}
+
+/// CR 611.2e: the onset each clause parser stamps from the verb form it recognized. The
+/// runtime consumer (the entry-observation deferral) is exercised by
+/// `tests/integration/etb_rider_onset.rs`; these rows pin the parse-time stamp per site.
+#[cfg(test)]
+mod entry_onset_tests {
+    use super::*;
+    use crate::parser::oracle_effect::parse_effect_chain;
+    use crate::types::ability::{AbilityKind, SubAbilityLink};
+    use ContinuousEffectOnset::{WhenFollowed, WithEntry};
+
+    /// Every node of the parsed chain (`sub_ability` and `else_ability`), in walk order.
+    fn nodes(def: &AbilityDefinition) -> Vec<&AbilityDefinition> {
+        let mut out = Vec::new();
+        let mut stack = vec![def];
+        while let Some(node) = stack.pop() {
+            out.push(node);
+            stack.extend(node.else_ability.as_deref());
+            stack.extend(node.sub_ability.as_deref());
+        }
+        out
+    }
+
+    /// The onsets of the chain's nodes whose effect `kind` selects, in walk order. Asserts the
+    /// reach guard: at least one such node exists.
+    fn onsets(
+        text: &str,
+        kind: AbilityKind,
+        select: fn(&Effect) -> bool,
+    ) -> Vec<ContinuousEffectOnset> {
+        let def = parse_effect_chain(text, kind);
+        let found: Vec<_> = nodes(&def)
+            .into_iter()
+            .filter(|node| select(&node.effect))
+            .map(|node| node.entry_onset)
+            .collect();
+        assert!(
+            !found.is_empty(),
+            "reach guard: no selected node in {text:?}: {def:#?}"
+        );
+        found
+    }
+
+    fn generic_effect(effect: &Effect) -> bool {
+        matches!(effect, Effect::GenericEffect { .. })
+    }
+
+    fn the_rider(text: &str) -> ContinuousEffectOnset {
+        let found = onsets(text, AbilityKind::Spell, generic_effect);
+        assert_eq!(found.len(), 1, "one rider node in {text:?}: {found:?}");
+        found[0]
+    }
+
+    #[test]
+    fn predicate_onset_reads_the_is_has_form_of_any_conjunct() {
+        for predicate in [
+            "is a black zombie in addition to its other colors and types",
+            "are zombies in addition to their other types",
+            "has base power and toughness 4/4",
+            "have \"sacrifice this token: add {c}.\"",
+            "has flying, lifelink, and \"when this token enters, it deals 3 damage to any target.\"",
+            "isn't legendary",
+            "is no longer snow",
+            "doesn't have flying",
+            "gets +1/+0 and is a zombie in addition to its other types",
+            "gains haste, has base power and toughness 4/4",
+            "gains haste, and has base power and toughness 4/4",
+            "is a spirit in addition to its other types and gains flying",
+        ] {
+            assert_eq!(predicate_onset(predicate), WithEntry, "{predicate:?}");
+        }
+    }
+
+    #[test]
+    fn predicate_onset_leaves_every_other_form_when_followed() {
+        for predicate in [
+            "gains haste until your next turn",
+            "gets +2/+0 and gains haste until end of turn",
+            "becomes a 4/3 insect creature with reach and haste",
+            "is still a land",
+            "are still lands",
+            "is goaded for the rest of the game",
+            "gets +2/+2 and is goaded",
+            "get +1/+0 and are goaded",
+            "gets +x/+0 until end of turn, where x is its power",
+            "gets +1/+1 until end of turn for each creature you control that is a zombie",
+            "gets +2/+0 and gains \"when this creature dies or is put into exile from the battlefield, return it to its owner's hand.\"",
+            "loses all abilities",
+            "can't block this turn",
+        ] {
+            assert_eq!(predicate_onset(predicate), WhenFollowed, "{predicate:?}");
+        }
+    }
+
+    /// The subject continuous arm stamps the rider node it builds; a "gains"/"gets" rider stays
+    /// `WhenFollowed`, and the conjunct arms of the same grammar fire on an "is/has" conjunct.
+    #[test]
+    fn subject_continuous_arm_stamps_rider_node() {
+        const RETURN: &str = "Return target creature card from your graveyard to the battlefield.";
+        for (rider, expected) in [
+            ("It has base power and toughness 4/4.", WithEntry),
+            (
+                "It gets +1/+0 and is a Zombie in addition to its other types.",
+                WithEntry,
+            ),
+            ("It gains haste, has base power and toughness 4/4.", WithEntry),
+            (
+                "It gains haste, and has base power and toughness 4/4.",
+                WithEntry,
+            ),
+            ("It gains haste until your next turn.", WhenFollowed),
+            ("It gets +2/+0 and gains haste until end of turn.", WhenFollowed),
+            (
+                "It gets +2/+0 and gains \"When this creature dies or is put into exile from the battlefield, return it to its owner's hand.\"",
+                WhenFollowed,
+            ),
+        ] {
+            assert_eq!(the_rider(&format!("{RETURN} {rider}")), expected, "{rider:?}");
+        }
+    }
+
+    /// The "where X is its power" / "that is a Zombie" hostiles lower to `Pump`, never a
+    /// rider kind; their onset is still the default.
+    #[test]
+    fn pump_hostiles_stay_when_followed() {
+        const RETURN: &str = "Return target creature card from your graveyard to the battlefield.";
+        for rider in [
+            "It gets +X/+0 until end of turn, where X is its power.",
+            "It gets +1/+1 until end of turn for each creature you control that is a Zombie.",
+        ] {
+            let found = onsets(&format!("{RETURN} {rider}"), AbilityKind::Spell, |e| {
+                matches!(e, Effect::Pump { .. })
+            });
+            assert_eq!(found, vec![WhenFollowed], "{rider:?}");
+        }
+    }
+
+    /// Admiral Brass's return text: the "has" rider is `WithEntry`, the trailing "gains" rider
+    /// `WhenFollowed`.
+    #[test]
+    fn has_and_gains_riders_in_one_chain() {
+        let found = onsets(
+            "Return target Pirate creature card from your graveyard to the battlefield with a finality counter on it. It has base power and toughness 4/4. It gains haste until end of turn.",
+            AbilityKind::Spell,
+            generic_effect,
+        );
+        assert_eq!(found, vec![WithEntry, WhenFollowed]);
+    }
+
+    /// Copula sites: the additive "is … in addition", the contracted "it's/he's", the
+    /// type-setting "It's an [type]", and the supertype removal.
+    #[test]
+    fn copula_sites_stamp_with_entry() {
+        for text in [
+            "Put target creature card from a graveyard onto the battlefield under your control. That creature is a black Zombie in addition to its other colors and types.",
+            "Return target creature card from your graveyard to the battlefield. It's a Spirit in addition to its other types.",
+            "Return this card to the battlefield under your control. He's a Spirit in addition to his other types.",
+            "Target snow land is no longer snow.",
+        ] {
+            assert_eq!(the_rider(text), WithEntry, "{text:?}");
+        }
+        let found = onsets(
+            "Return it to the battlefield under its owner's control. It's an enchantment.",
+            AbilityKind::Spell,
+            |e| matches!(e, Effect::Animate { .. } | Effect::GenericEffect { .. }),
+        );
+        assert_eq!(found, vec![WithEntry], "type-setting");
+    }
+
+    /// CR 205.1b: "It's still a land" qualifies the governing "becomes"; neither it nor the
+    /// "becomes" applies with the entry.
+    #[test]
+    fn becomes_and_still_a_land_stay_when_followed() {
+        let found = onsets(
+            "Search your library for a basic land card, put it onto the battlefield, then shuffle. Until end of turn, that land becomes a 4/3 Insect creature with reach and haste. It's still a land.",
+            AbilityKind::Spell,
+            generic_effect,
+        );
+        assert!(
+            found.iter().all(|onset| *onset == WhenFollowed),
+            "{found:?}"
+        );
+        let found = onsets(
+            "They're still lands.",
+            AbilityKind::Activated,
+            generic_effect,
+        );
+        assert_eq!(found, vec![WhenFollowed]);
+    }
+
+    /// Return-as-Aura and assimilate both state the "is" form by construction.
+    #[test]
+    fn return_as_aura_and_assimilate_stamp_with_entry() {
+        let found = onsets(
+            "Return it to the battlefield. It's an Aura enchantment with enchant creature you control and \"{G}{W}: Enchanted creature gains indestructible until end of turn,\" and it loses all other abilities.",
+            AbilityKind::Spell,
+            |e| matches!(e, Effect::ReturnAsAura { .. }),
+        );
+        assert_eq!(found, vec![WithEntry]);
+        let found = onsets(
+            "Assimilate target creature card from an opponent's graveyard.",
+            AbilityKind::Spell,
+            generic_effect,
+        );
+        assert_eq!(found, vec![WithEntry]);
+    }
+
+    /// Digital-only perpetual base P/T (no CR; by analogy to CR 611.2e): "has" with the entry,
+    /// "become" after it.
+    #[test]
+    fn perpetual_base_pt_verb_decides_onset() {
+        let perpetual = |e: &Effect| matches!(e, Effect::ApplyPerpetual { .. });
+        assert_eq!(
+            onsets(
+                "The duplicate perpetually has base power and toughness 1/1.",
+                AbilityKind::Spell,
+                perpetual
+            ),
+            vec![WithEntry]
+        );
+        assert_eq!(
+            onsets(
+                "Its base power and toughness perpetually become 2/2.",
+                AbilityKind::Spell,
+                perpetual
+            ),
+            vec![WhenFollowed]
+        );
+    }
+
+    /// CR 701.15b: goaded is a designation, not a characteristic.
+    #[test]
+    fn goaded_copula_stays_when_followed() {
+        let found = onsets(
+            "Put two +1/+1 counters on target creature. It's goaded for the rest of the game.",
+            AbilityKind::Spell,
+            |e| matches!(e, Effect::Goad { .. }),
+        );
+        assert_eq!(found, vec![WhenFollowed]);
+    }
+
+    /// CR 608.2c: the damage compound splitter rebuilds the "and" conjunct as a chained
+    /// continuation definition from its parsed clause; the rebuild carries that clause's onset.
+    /// (The targeted compound splitter copies it the same way, but its conjunct is parsed as an
+    /// imperative, which states no "is/has" onset.)
+    #[test]
+    fn continuation_rebuild_carries_onset() {
+        for (text, expected) in [
+            (
+                "~ deals 2 damage to target creature and it has base power and toughness 1/1.",
+                WithEntry,
+            ),
+            (
+                "~ deals 2 damage to target creature and it gains haste until end of turn.",
+                WhenFollowed,
+            ),
+        ] {
+            let clause =
+                super::super::try_split_damage_compound(text, &mut ParseContext::default())
+                    .unwrap_or_else(|| panic!("reach guard: {text:?} is a damage compound"));
+            let sub = clause.sub_ability.expect("the rebuilt continuation");
+            assert!(
+                matches!(*sub.effect, Effect::GenericEffect { .. }),
+                "{sub:#?}"
+            );
+            assert_eq!(sub.entry_onset, expected, "{text:?}");
+        }
+    }
+
+    /// CR 111.3: Dragonbroods' Relic's "It has …" sentence survives as a sibling node after the
+    /// token creation and is stamped `WithEntry`.
+    #[test]
+    fn token_defining_has_sibling_is_with_entry() {
+        let def = parse_effect_chain(
+            "Create a 4/4 Dragon creature token named Reliquary Dragon that's all colors. It has flying, lifelink, and \"When this token enters, it deals 3 damage to any target.\"",
+            AbilityKind::Activated,
+        );
+        assert!(matches!(*def.effect, Effect::Token { .. }), "{def:#?}");
+        let sibling = def.sub_ability.as_deref().expect("the It has sibling");
+        assert!(matches!(*sibling.effect, Effect::GenericEffect { .. }));
+        assert_eq!(sibling.sub_link, SubAbilityLink::SequentialSibling);
+        assert_eq!(sibling.entry_onset, WithEntry);
     }
 }

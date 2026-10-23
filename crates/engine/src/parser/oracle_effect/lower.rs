@@ -39,13 +39,13 @@ use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
     AttackSubject, CardTypeSetSource, CastCostModifier, CastFromZoneDriver,
     CastPermissionConstraint, CastingPermission, CoinFlipRun, CombatHistoryScope, Comparator,
-    ConjureSource, ContinuousModification, ControllerRef, CountBinding, DamageChannel,
-    DamageSource, DelayedTriggerCondition, Duration, Effect, EffectScope, ExiledSpellRider,
-    FilterProp, GameRestriction, LibraryPosition, MultiTargetSpec, NameStickerSet, ObjectProperty,
-    ObjectScope, PermissionGrantee, PlayerFilter, PreventionAmount, PreventionScope,
-    PropertyAggregate, PtValue, QuantityExpr, QuantityRef, RestrictionPlayerScope, RoundingMode,
-    SpellStackToGraveyardReplacement, StaticCondition, StaticDefinition, SubAbilityLink,
-    TargetChoiceTiming, TargetFilter, TargetSelectionMode, TypeFilter, TypedFilter,
+    ConjureSource, ContinuousEffectOnset, ContinuousModification, ControllerRef, CountBinding,
+    DamageChannel, DamageSource, DelayedTriggerCondition, Duration, Effect, EffectScope,
+    ExiledSpellRider, FilterProp, GameRestriction, LibraryPosition, MultiTargetSpec,
+    NameStickerSet, ObjectProperty, ObjectScope, PermissionGrantee, PlayerFilter, PreventionAmount,
+    PreventionScope, PropertyAggregate, PtValue, QuantityExpr, QuantityRef, RestrictionPlayerScope,
+    RoundingMode, SpellStackToGraveyardReplacement, StaticCondition, StaticDefinition,
+    SubAbilityLink, TargetChoiceTiming, TargetFilter, TargetSelectionMode, TypeFilter, TypedFilter,
 };
 use crate::types::ability_visit::nodes_mut::visit_ability_def;
 use crate::types::ability_visit::DefinitionNodeMut;
@@ -9789,6 +9789,7 @@ pub(super) fn try_parse_distribute_damage(lower: &str, text: &str) -> Option<Par
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
@@ -9875,6 +9876,7 @@ pub(super) fn try_parse_distribute_counters(lower: &str, text: &str) -> Option<P
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
@@ -9950,6 +9952,7 @@ pub(super) fn try_parse_prevent_distribute(text: &str) -> Option<ParsedEffectCla
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
@@ -10061,6 +10064,7 @@ pub(super) fn try_parse_bidirectional_prevent(
         condition: None,
         optional: false,
         unless_pay: None,
+        entry_onset: ContinuousEffectOnset::WhenFollowed,
     })
 }
 
