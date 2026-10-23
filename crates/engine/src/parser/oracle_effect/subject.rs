@@ -726,15 +726,15 @@ fn try_parse_subject_continuous_clause(
 }
 
 /// CR 611.2e + CR 205.1b: the onset a subject-predicate continuous clause states. `WithEntry` when
-/// any conjunct of the predicate opens with the "is/has" form (is, are, has, have, isn't, is not,
-/// is no longer, doesn't have, don't have, does not have, do not have) — at the predicate start,
-/// after "and ", or after a word that ends with ", " (optionally followed by "and ") — outside
-/// double-quoted ability text; the "still a [type]" retention qualifier (CR 205.1b) and the goaded
-/// designation (CR 701.15b) are not such statements. Otherwise `WhenFollowed`. A clause mixing an
-/// "is/has" conjunct with a "gains/gets" conjunct is `WithEntry`: it lowers to one instruction with
-/// one observation point, and the "is/has" part must apply with the entry. Enter observers then
-/// also see the "gains" part; that over-exposure is a known limitation of having one observation
-/// point per instruction.
+/// any conjunct of the predicate opens with the "is/has" form (is, are, has, have, isn't, aren't,
+/// is not, is no longer, doesn't have, don't have, does not have, do not have) — at the predicate
+/// start, after "and ", or after a word that ends with ", " (optionally followed by "and ") —
+/// outside double-quoted ability text; the "still a [type]" retention qualifier (CR 205.1b) and
+/// the goaded designation (CR 701.15b) are not such statements. Otherwise `WhenFollowed`. A clause
+/// mixing an "is/has" conjunct with a "gains/gets" conjunct is `WithEntry`: it lowers to one
+/// instruction with one observation point, and the "is/has" part must apply with the entry. Enter
+/// observers then also see the "gains" part; that over-exposure is a known limitation of having one
+/// observation point per instruction.
 ///
 /// Also the authority for the token-anaphor rewrite in `lower.rs`
 /// (`rewrite_populated_anaphor_in_def`), which reads the verb phrase that follows "the token(s)".
@@ -758,6 +758,7 @@ fn copular_conjunct_verb(input: &str) -> OracleResult<'_, ()> {
                 tag("is no longer "),
                 tag("is not "),
                 tag("isn't "),
+                tag("aren't "),
                 tag("is "),
                 tag("are "),
                 tag("doesn't have "),
@@ -12735,12 +12736,14 @@ mod entry_onset_tests {
             "have \"sacrifice this token: add {c}.\"",
             "has flying, lifelink, and \"when this token enters, it deals 3 damage to any target.\"",
             "isn't legendary",
+            "aren't legendary",
             "is no longer snow",
             "doesn't have flying",
             "gets +1/+0 and is a zombie in addition to its other types",
             "gains haste, has base power and toughness 4/4",
             "gains haste, and has base power and toughness 4/4",
             "is a spirit in addition to its other types and gains flying",
+            "get +1/+0 and aren't legendary",
         ] {
             assert_eq!(predicate_onset(predicate), WithEntry, "{predicate:?}");
         }
@@ -12757,6 +12760,7 @@ mod entry_onset_tests {
             "is goaded for the rest of the game",
             "gets +2/+2 and is goaded",
             "get +1/+0 and are goaded",
+            "get +1/+0 and aren't goaded",
             "gets +x/+0 until end of turn, where x is its power",
             "gets +1/+1 until end of turn for each creature you control that is a zombie",
             "gets +2/+0 and gains \"when this creature dies or is put into exile from the battlefield, return it to its owner's hand.\"",
