@@ -22284,6 +22284,16 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
     // Keep the primary phrase's announcer on `ctx`; only a chooser printed in
     // the continuation itself may be attached to the chained sub-ability.
     continuation_ctx.target_chooser = None;
+    // CR 608.2c + CR 608.2k: a bare object pronoun in an anaphoric continuation
+    // names the object the primary instruction acted on. When that object is the
+    // ability's source ("destroy it and all creatures it blocked this turn",
+    // Defiant Vanguard), pin the continuation's antecedent to `SelfRef`; the
+    // continuation context is otherwise blank, and a blank context is not evidence
+    // of any antecedent. Same pin the chunk loop applies when a continued
+    // instruction named the source (`parsed_clause_targets_self_ref`).
+    if uses_parent_target_reference && effect_targets_self_ref(&primary_effect) {
+        continuation_ctx.object_pronoun_ref = Some(TargetFilter::SelfRef);
+    }
 
     // CR 608.2c: when the primary instruction announced an OBJECT target, a
     // "that player" in a MASS continuation names that object's controller
