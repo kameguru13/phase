@@ -478,6 +478,161 @@ fn defiant_vanguard_trigger_still_finds_its_blockee_after_it_died() {
     }
 }
 
+const MURDER: &str = "Destroy target creature.";
+const CLOUDSHIFT: &str = "Exile target creature you control, then return that card to the battlefield under your control.";
+
+/// Cast `spell` (already in its owner's hand) at `target` while the blocks
+/// trigger waits on the stack, then pass priority until only that trigger
+/// remains (CR 117.4): the response resolves before the delayed trigger is
+/// created.
+fn respond_before_blocks_trigger_resolves(
+    runner: &mut GameRunner,
+    spell: ObjectId,
+    target: ObjectId,
+) {
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "the blocks trigger waits on the stack"
+    );
+    assert!(
+        runner.state().delayed_triggers.is_empty(),
+        "no delayed trigger exists yet"
+    );
+    {
+        let mut commit = runner.cast(spell).target_object(target).commit();
+        assert_eq!(commit.state().stack.len(), 2);
+        commit.act(GameAction::PassPriority).expect("pass");
+        commit.act(GameAction::PassPriority).expect("pass");
+    }
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "the response resolved; the blocks trigger remains"
+    );
+    assert!(runner.state().delayed_triggers.is_empty());
+}
+
+/// R5c: CR 113.7a + CR 603.7e + CR 400.7: Defiant Vanguard is destroyed while its
+/// blocks trigger is still on the stack. The trigger still resolves and
+/// creates the end-of-combat trigger, whose source is the Vanguard that blocked,
+/// so "all creatures it blocked this turn" still names the blocked attacker.
+#[test]
+fn defiant_vanguard_destroyed_before_its_trigger_resolves_still_destroys_its_blockee() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let blocked = scenario.add_creature(P0, "Blocked Attacker", 1, 4).id();
+    let unblocked = scenario.add_creature(P0, "Unblocked Attacker", 1, 1).id();
+    let defender_side_bystander = scenario.add_creature(P1, "P1 Bystander", 0, 2).id();
+    let vanguard = scenario
+        .add_creature_from_oracle(P1, "Defiant Vanguard", 2, 2, DEFIANT_VANGUARD)
+        .id();
+    let murder = scenario
+        .add_spell_to_hand_from_oracle(P0, "Murder", true, MURDER)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+
+    drive_declare_blockers(
+        &mut runner,
+        vec![
+            (blocked, AttackTarget::Player(P1)),
+            (unblocked, AttackTarget::Player(P1)),
+        ],
+        vec![(vanguard, blocked)],
+    );
+    respond_before_blocks_trigger_resolves(&mut runner, murder, vanguard);
+    assert_eq!(zone(&runner, vanguard), Zone::Graveyard);
+
+    // The blocks trigger resolves (CR 113.7a) and creates the delayed trigger.
+    runner.act(GameAction::PassPriority).expect("pass");
+    runner.act(GameAction::PassPriority).expect("pass");
+    assert!(runner.state().stack.is_empty());
+    assert_eq!(
+        runner.state().delayed_triggers.len(),
+        1,
+        "the delayed trigger was created"
+    );
+
+    settle_to_postcombat_main(&mut runner);
+
+    assert!(
+        runner.state().delayed_triggers.is_empty(),
+        "the delayed trigger fired"
+    );
+    // Reach guard: the blocker left before combat damage, so the attacker took none.
+    assert_eq!(damage(&runner, blocked), 0);
+    assert_eq!(
+        zone(&runner, blocked),
+        Zone::Graveyard,
+        "the delayed trigger must still destroy the creature Vanguard blocked"
+    );
+    assert_eq!(zone(&runner, vanguard), Zone::Graveyard);
+    for (label, id) in [
+        ("the unblocked attacker", unblocked),
+        ("the defending player's bystander", defender_side_bystander),
+    ] {
+        assert_eq!(
+            zone(&runner, id),
+            Zone::Battlefield,
+            "{label} must not be destroyed"
+        );
+    }
+}
+
+/// R5d: CR 400.7 + CR 603.7e + CR 113.7a: Defiant Vanguard is flickered while
+/// its blocks trigger is on the stack. The Vanguard that returns is a new
+/// object, so the delayed trigger keeps the Vanguard that blocked as its
+/// source, and "all creatures it blocked this turn" still names what that
+/// Vanguard blocked. Whether the delayed "destroy it" reaches the new Vanguard
+/// is a separate, pre-existing `self_ref_binding` defect and is not asserted.
+#[test]
+fn defiant_vanguard_flickered_before_its_trigger_resolves_still_destroys_its_blockee() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let blocked = scenario.add_creature(P0, "Blocked Attacker", 1, 4).id();
+    let vanguard = scenario
+        .add_creature_from_oracle(P1, "Defiant Vanguard", 2, 2, DEFIANT_VANGUARD)
+        .id();
+    let cloudshift = scenario
+        .add_spell_to_hand_from_oracle(P1, "Cloudshift", true, CLOUDSHIFT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+
+    drive_declare_blockers(
+        &mut runner,
+        vec![(blocked, AttackTarget::Player(P1))],
+        vec![(vanguard, blocked)],
+    );
+    // The active player passes; the defending player responds.
+    runner.act(GameAction::PassPriority).expect("pass");
+    let before = runner.state().objects[&vanguard].incarnation;
+    respond_before_blocks_trigger_resolves(&mut runner, cloudshift, vanguard);
+    assert_eq!(zone(&runner, vanguard), Zone::Battlefield);
+    assert_ne!(
+        runner.state().objects[&vanguard].incarnation,
+        before,
+        "it is a new object"
+    );
+
+    runner.act(GameAction::PassPriority).expect("pass");
+    runner.act(GameAction::PassPriority).expect("pass");
+    assert_eq!(runner.state().delayed_triggers.len(), 1);
+
+    settle_to_postcombat_main(&mut runner);
+
+    assert!(
+        runner.state().delayed_triggers.is_empty(),
+        "the delayed trigger fired"
+    );
+    assert_eq!(
+        zone(&runner, blocked),
+        Zone::Graveyard,
+        "the creature the original Vanguard blocked is destroyed"
+    );
+}
+
 /// One blocker with a self-subject block trigger blocks an attacker that its
 /// power cannot kill (1/4), then the game settles at the postcombat main phase.
 /// Returns the runner and the (blocker, attacker) ids.

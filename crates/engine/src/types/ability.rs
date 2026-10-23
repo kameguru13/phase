@@ -38979,6 +38979,18 @@ impl ResolvedAbility {
             return false;
         }
 
+        self.source_latest_move_is_latched_battlefield_to_graveyard(state, source)
+    }
+
+    /// CR 400.7: True when the source's most recent zone change this turn is
+    /// the battlefield-to-graveyard move of exactly the latched incarnation, so
+    /// the graveyard card is that departure's immediate successor. A same-id
+    /// blink or re-entry after that move is a newer object and fails.
+    fn source_latest_move_is_latched_battlefield_to_graveyard(
+        &self,
+        state: &crate::types::game_state::GameState,
+        source: &TriggerSourceContext,
+    ) -> bool {
         // CR 400.7e: Find the BF→GY departure whose captured identity matches
         // the ability's latched stamp, then require it is still the latest
         // same-id zone change this turn.
@@ -39005,6 +39017,55 @@ impl ResolvedAbility {
             .iter()
             .skip(departure_index + 1)
             .all(|later| later.object_id != self.source_id)
+    }
+
+    /// CR 400.7f: True when this ability triggered on the departure of a
+    /// permanent its source was attached to, and the source (an Aura latched
+    /// on the battlefield) is now the graveyard card it became by that same
+    /// departure or by the CR 704.5m state-based action that followed it. Such
+    /// an ability "can find the new object" the Aura became; no other move of
+    /// the source can be found (CR 400.7).
+    fn finds_aura_after_its_host_left(&self, state: &crate::types::game_state::GameState) -> bool {
+        let Some(source) = self.trigger_source.as_ref() else {
+            return false;
+        };
+        if source.identity.expected_zone != Zone::Battlefield
+            || source.identity.reference.object_id != self.source_id
+            || !state
+                .objects
+                .get(&self.source_id)
+                .is_some_and(|object| object.zone == Zone::Graveyard)
+        {
+            return false;
+        }
+        let Some(crate::types::GameEvent::ZoneChanged {
+            object_id, record, ..
+        }) = state.current_trigger_event.as_ref()
+        else {
+            return false;
+        };
+        *object_id != self.source_id
+            && record.from_zone == Some(Zone::Battlefield)
+            && record
+                .attachments
+                .iter()
+                .any(|attachment| attachment.identity == Some(source.identity.reference))
+            && self.source_latest_move_is_latched_battlefield_to_graveyard(state, source)
+    }
+
+    /// CR 400.7e + CR 400.7f + CR 400.7j: True when this ability can find the
+    /// new object its source became after the source changed zones since the
+    /// ability was created — the exceptions to CR 400.7's rule that a moved
+    /// object is a new object with no relation to its previous existence. A
+    /// source that has not moved is trivially found. A delayed triggered
+    /// ability this ability creates has the same source (CR 603.7e), so this
+    /// is also whether that delayed ability's source binding may follow the
+    /// source to its current zone.
+    pub(crate) fn finds_source_successor(
+        &self,
+        state: &crate::types::game_state::GameState,
+    ) -> bool {
+        self.self_ref_is_current(state) || self.finds_aura_after_its_host_left(state)
     }
 
     /// True when this ability (or a nested sub) is a `ChangeZone` of `SelfRef`

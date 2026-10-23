@@ -6,9 +6,51 @@ use crate::types::ability::{
 #[cfg(test)]
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
-use crate::types::game_state::{BattlefieldDepartureSourceContext, DelayedTrigger, GameState};
-use crate::types::identifiers::TrackedSetId;
+use crate::types::game_state::{
+    BattlefieldDepartureSourceContext, DelayedTrigger, GameState, TriggerSourceContext,
+};
+use crate::types::identifiers::{ObjectId, TrackedSetId};
 use crate::types::zones::Zone;
+
+/// CR 603.7e + CR 400.7: The source context a delayed triggered ability created
+/// by `ability` carries. Its source is the creating ability's source, so it is
+/// that ability's own capture — the exact incarnation that triggered, whose
+/// history and last known information answer source-relative questions
+/// ("creatures it blocked this turn", CR 113.7a). Spell and activated-ability
+/// sources carry no trigger provenance, so their current incarnation is
+/// captured here rather than later rebinding the stored `ObjectId`.
+///
+/// When the source changed zones before the delayed ability is created, the
+/// binding follows it only if the creating ability can find the new object it
+/// became (`ResolvedAbility::finds_source_successor`, CR 400.7e/f/j): Gift of
+/// Immortality's dies trigger finds the Aura the state-based action put into
+/// the graveyard (CR 400.7f), so its end-step "return this card" binds that
+/// card. Otherwise the moved source is a new object (CR 400.7) and the
+/// delayed ability keeps the original capture: Defiant Vanguard destroyed in
+/// response to its blocks trigger still names the Vanguard that blocked.
+pub(crate) fn delayed_source_context(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    delayed_source_id: ObjectId,
+) -> Option<TriggerSourceContext> {
+    let mut source_context = ability.trigger_source.clone().or_else(|| {
+        state
+            .objects
+            .get(&ability.source_id)
+            .map(|source| crate::game::triggers::trigger_source_context_for_latch(state, source))
+    })?;
+    // From `resolve`, `delayed_source_id` equals `ability.source_id`: forwarded-result
+    // rebinding (`rebind_child_to_forwarded_objects`) never rebinds a `CreateDelayedTrigger` node.
+    if source_context.identity.reference.object_id == delayed_source_id
+        && ability.finds_source_successor(state)
+    {
+        if let Some(obj) = state.objects.get(&delayed_source_id) {
+            source_context.identity.expected_zone = obj.zone;
+            source_context.identity.reference.incarnation = obj.incarnation;
+        }
+    }
+    Some(source_context)
+}
 
 /// CR 603.7: Create a delayed triggered ability during resolution.
 pub fn resolve(
@@ -634,33 +676,8 @@ pub fn resolve(
     if let Some(event) = &creation_departure_event {
         delayed_ability.set_creation_lookback_event_recursive(event);
     }
-    // A delayed trigger is a continuation of this resolved ability, so preserve
-    // the same exact trigger source across its later match and resolution. Spell
-    // and activated-ability sources may not already carry trigger provenance;
-    // capture their current incarnation at creation rather than later rebinding
-    // the stored ObjectId. CR 400.7.
-    //
-    // CR 400.7 + CR 603.7c: when the delayed ability's source is still the same
-    // ObjectId, refresh zone + incarnation to that object's creation-time
-    // location. The parent trigger often latched while the source was on the
-    // battlefield (Gift of Immortality's dies trigger), but SBAs may already
-    // have moved that Aura to the graveyard (bumping incarnation) before the
-    // delayed return is created. SelfRef resolution requires a zone+incarnation
-    // match (`source_is_current_via_zone_match`); keeping the BF/pre-move stamp
-    // would make the end-step SelfRef ChangeZone no-op.
-    let source_context = ability.trigger_source.clone().or_else(|| {
-        state
-            .objects
-            .get(&ability.source_id)
-            .map(|source| super::super::triggers::trigger_source_context_for_latch(state, source))
-    });
+    let source_context = delayed_source_context(state, ability, delayed_ability.source_id);
     if let Some(mut source_context) = source_context {
-        if source_context.identity.reference.object_id == delayed_ability.source_id {
-            if let Some(obj) = state.objects.get(&delayed_ability.source_id) {
-                source_context.identity.expected_zone = obj.zone;
-                source_context.identity.reference.incarnation = obj.incarnation;
-            }
-        }
         // CR 105.4 + CR 608.2c: "of that color" in the condition names THIS
         // resolution's color choice (Zombie Boa: "Choose a color. Whenever …
         // blocked by a creature of that color this turn"). The answer is read
