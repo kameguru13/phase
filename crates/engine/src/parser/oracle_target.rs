@@ -6330,7 +6330,9 @@ pub(crate) enum BlockedHistorySubjectWord {
 
 /// CR 509.1g + CR 608.2i: "[that] <it|~|this creature> blocked this
 /// <combat|turn>" — a look-back relation on the creatures the subject blocked
-/// (Cathedral Membrane, Defiant Vanguard); CR 500.8 / CR 511.3 for the window.
+/// (Cathedral Membrane, Defiant Vanguard). CR 511.3: "this combat" ends when
+/// the combat phase does; CR 500.8: a turn can add combat phases, so "this
+/// combat" is narrower than "this turn".
 /// Runs on lowercase text and requires the window plus a word boundary, so a
 /// bare "it blocked" (no window) or "this turnip" never parses. Returns the
 /// subject word and the window, leaving the boundary character in the

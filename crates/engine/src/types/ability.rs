@@ -39024,7 +39024,10 @@ impl ResolvedAbility {
     /// on the battlefield) is now the graveyard card it became by that same
     /// departure or by the CR 704.5m state-based action that followed it. Such
     /// an ability "can find the new object" the Aura became; no other move of
-    /// the source can be found (CR 400.7).
+    /// the source can be found (CR 400.7). The Aura fact is the host departure
+    /// record's attachment kind, captured as the source was attached when the
+    /// host left: CR 400.7f reaches "each Aura enchanting that permanent", so
+    /// an Equipment (CR 301.5) attached to it is not found.
     fn finds_aura_after_its_host_left(&self, state: &crate::types::game_state::GameState) -> bool {
         let Some(source) = self.trigger_source.as_ref() else {
             return false;
@@ -39046,10 +39049,10 @@ impl ResolvedAbility {
         };
         *object_id != self.source_id
             && record.from_zone == Some(Zone::Battlefield)
-            && record
-                .attachments
-                .iter()
-                .any(|attachment| attachment.identity == Some(source.identity.reference))
+            && record.attachments.iter().any(|attachment| {
+                attachment.kind == AttachmentKind::Aura
+                    && attachment.identity == Some(source.identity.reference)
+            })
             && self.source_latest_move_is_latched_battlefield_to_graveyard(state, source)
     }
 
@@ -45374,6 +45377,78 @@ mod tests {
                 !ability.self_ref_is_current(runner.state()),
                 "second same-id zone change must reject post-SBA SelfRef return"
             );
+        }
+
+        /// CR 400.7f + CR 301.5: a host-departure trigger finds the graveyard
+        /// card its attached source became only when that source was an Aura
+        /// enchanting the host. Each fixture is the same co-departure — the
+        /// source's own BF→GY move carries the latched identity and the host's
+        /// departure record lists it as an attachment — differing only in the
+        /// recorded attachment kind, so the Equipment row fails on the Aura
+        /// requirement alone.
+        #[test]
+        fn host_departure_finds_only_an_aura_source_in_the_graveyard() {
+            use crate::types::game_state::AttachmentSnapshot;
+
+            for (kind, finds) in [
+                (AttachmentKind::Aura, true),
+                (AttachmentKind::Equipment, false),
+            ] {
+                let mut scenario = GameScenario::new();
+                let host = scenario.add_vanilla(P0, 2, 2);
+                let source = scenario.add_vanilla(P0, 1, 1);
+                let mut runner = scenario.build();
+
+                let source_context = {
+                    let obj = runner.state().objects.get(&source).unwrap();
+                    crate::game::triggers::trigger_source_context_for_latch(runner.state(), obj)
+                };
+                let mut events = Vec::new();
+                move_to_zone(runner.state_mut(), host, Zone::Graveyard, &mut events);
+                move_to_zone(runner.state_mut(), source, Zone::Graveyard, &mut events);
+
+                let mut host_record =
+                    ZoneChangeRecord::test_minimal(host, Some(Zone::Battlefield), Zone::Graveyard);
+                host_record.turn_zone_change_index = 0;
+                host_record.attachments = vec![AttachmentSnapshot {
+                    object_id: source,
+                    identity: Some(source_context.identity.reference),
+                    controller: P0,
+                    kind: kind.clone(),
+                }];
+                let mut source_record = ZoneChangeRecord::test_minimal(
+                    source,
+                    Some(Zone::Battlefield),
+                    Zone::Graveyard,
+                );
+                source_record.trigger_source_context = Some(source_context.clone());
+                source_record.turn_zone_change_index = 1;
+                runner.state_mut().zone_changes_this_turn =
+                    vec![host_record.clone(), source_record].into();
+                runner.state_mut().current_trigger_event = Some(GameEvent::ZoneChanged {
+                    object_id: host,
+                    from: Some(Zone::Battlefield),
+                    to: Zone::Graveyard,
+                    record: Box::new(host_record),
+                });
+
+                let mut ability = ResolvedAbility::new(
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                    vec![],
+                    source,
+                    P0,
+                );
+                ability.trigger_source = Some(source_context);
+
+                assert_eq!(
+                    ability.finds_source_successor(runner.state()),
+                    finds,
+                    "a {kind:?} source whose host left must be found only if it is an Aura"
+                );
+            }
         }
     }
 
