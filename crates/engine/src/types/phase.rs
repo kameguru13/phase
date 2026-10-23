@@ -147,7 +147,7 @@ impl PhaseGroup {
         match self {
             // CR 501.1: untap, upkeep, draw.
             PhaseGroup::Beginning => &[Phase::Untap, Phase::Upkeep, Phase::Draw],
-            // CR 505.1
+            // CR 505.1 + CR 505.2: the precombat main phase has no steps; it is its own single entry.
             PhaseGroup::PrecombatMain => &[Phase::PreCombatMain],
             // CR 506.1: beginning of combat, declare attackers, declare
             // blockers, combat damage, end of combat.
@@ -158,7 +158,7 @@ impl PhaseGroup {
                 Phase::CombatDamage,
                 Phase::EndCombat,
             ],
-            // CR 505.1
+            // CR 505.1 + CR 505.2: the postcombat main phase has no steps; it is its own single entry.
             PhaseGroup::PostcombatMain => &[Phase::PostCombatMain],
             // CR 512.1: end, cleanup.
             PhaseGroup::Ending => &[Phase::End, Phase::Cleanup],
