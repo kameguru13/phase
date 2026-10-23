@@ -8201,6 +8201,10 @@ pub(super) fn begin_required_cost_before_targets(
     pending.casting_permission_index = casting_permission_index;
     pending.cast_timing_permission = cast_timing_permission;
     pending.distribute = distribute;
+    // CR 601.2c: the targets this deferred selection chooses must satisfy the
+    // spell's cross-target constraints ("from a single graveyard"); the spell's
+    // resolved ability carries them, built from its definition.
+    pending.target_constraints = pending.ability.target_constraints.clone();
     pending.origin_zone = origin_zone;
     pending.payment_mode = payment_mode;
     pending.deferred_target_selection = true;
