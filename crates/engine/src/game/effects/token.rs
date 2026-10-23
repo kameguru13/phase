@@ -1047,9 +1047,10 @@ pub(crate) fn deliver_create_token_event(
     let batches = event
         .into_token_batches()
         .expect("a compound token event is a CreateToken");
-    // CR 608.2c + CR 614.1a: the event is the action of the instruction that
-    // created its own batch; an appended batch's spec names the replacement's
-    // host, so every completion the cursor builds names this source instead.
+    // CR 608.2c + CR 614.1a: every completion the cursor builds names the
+    // event's own batch's source — the creating instruction's unless a
+    // replacement substituted that batch's spec — not an appended batch's,
+    // whose spec names the replacement's host.
     let source_id = batches
         .first()
         .expect("a compound token event has its own batch")
@@ -1358,9 +1359,10 @@ fn token_event_cursor_completion(
 /// The outcome's `primary_ids` are the ids this batch itself created, without
 /// `initial_created_ids`.
 ///
-/// `effect_source` is the source a pause's completion names: the creating
-/// instruction's (CR 608.2c), which for a replacement-appended batch is not
-/// the batch's own `spec.source_id`.
+/// `effect_source` is the source a pause's completion names: the event's own
+/// batch's source — the creating instruction's (CR 608.2c) unless a
+/// replacement substituted that batch's spec — which for a
+/// replacement-appended batch is not the batch's own `spec.source_id`.
 fn apply_create_token_batch(
     state: &mut GameState,
     event: ProposedEvent,
