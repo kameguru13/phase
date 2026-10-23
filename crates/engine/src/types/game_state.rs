@@ -7540,9 +7540,10 @@ pub struct PendingTokenEventDelivery {
     pub resumed: Option<u32>,
     /// Ids the caller placed ahead of the event (`initial_created_ids`).
     pub prefix: Vec<ObjectId>,
-    /// CR 608.2c + CR 614.1a: the source of the instruction whose action this
-    /// event is — its own batch's (position 0) — which every completion this
-    /// cursor builds names. A replacement modifies that action without making
+    /// CR 608.2c + CR 614.1a: its own batch's (position 0) source — the
+    /// creating instruction's unless a replacement substituted that batch's
+    /// spec — which every completion this cursor builds names. A replacement
+    /// that appends a batch modifies that action without making
     /// it the replacement's, though an appended batch's spec names its host.
     pub source_id: ObjectId,
 }
