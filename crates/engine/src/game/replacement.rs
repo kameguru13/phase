@@ -25485,6 +25485,7 @@ mod tests {
             copy: None,
             enter_tapped: EtbTapState::Unspecified,
             count: 2,
+            appended: Vec::new(),
             applied: HashSet::new(),
         };
 
