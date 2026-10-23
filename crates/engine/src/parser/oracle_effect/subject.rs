@@ -733,7 +733,10 @@ fn try_parse_subject_continuous_clause(
 /// `WhenFollowed`. A clause mixing an "is/has" conjunct with a "gains/gets" conjunct is `WithEntry`:
 /// it lowers to one instruction with one observation point, and the "is/has" part must apply with the
 /// entry (the "gains" part is then also visible — residual R-1).
-fn predicate_onset(predicate_lower: &str) -> ContinuousEffectOnset {
+///
+/// Also the authority for the token-anaphor rewrite in `lower.rs`
+/// (`rewrite_populated_anaphor_in_def`), which reads the verb phrase that follows "the token(s)".
+pub(super) fn predicate_onset(predicate_lower: &str) -> ContinuousEffectOnset {
     let text = nom_primitives::strip_double_quoted_spans(predicate_lower);
     let leading = copular_conjunct_verb(&text).is_ok();
     if leading || nom_primitives::scan_at_word_boundaries(&text, conjunct_copula).is_some() {
@@ -13039,5 +13042,145 @@ mod entry_onset_tests {
         assert!(matches!(*sibling.effect, Effect::GenericEffect { .. }));
         assert_eq!(sibling.sub_link, SubAbilityLink::SequentialSibling);
         assert_eq!(sibling.entry_onset, WithEntry);
+    }
+
+    /// The token-anaphor rewrite's node in a token-creating chain (`lower.rs`
+    /// `rewrite_populated_anaphor_in_def`). Reach guard: the chain's head creates the token, and
+    /// exactly one later node is the rewrite's `GenericEffect` — it targets `LastCreated` and its
+    /// static keeps the whole "the token(s) …" sentence as its description, which only the
+    /// rewrite writes.
+    fn token_anaphor_rider(chain: &AbilityDefinition) -> &AbilityDefinition {
+        assert!(chain.effect.is_token_creator(), "{chain:#?}");
+        let found: Vec<_> = nodes(chain)
+            .into_iter()
+            .filter(|node| match &*node.effect {
+                Effect::GenericEffect {
+                    static_abilities,
+                    target: Some(TargetFilter::LastCreated),
+                    ..
+                } => static_abilities.first().is_some_and(|definition| {
+                    definition.description.as_deref().is_some_and(|text| {
+                        let lower = text.to_lowercase();
+                        let names_the_token = alt((
+                            tag::<_, _, OracleError<'_>>("the token "),
+                            tag("the tokens "),
+                        ))
+                        .parse(lower.as_str())
+                        .is_ok();
+                        names_the_token
+                    })
+                }),
+                _ => false,
+            })
+            .collect();
+        assert_eq!(found.len(), 1, "one token-anaphor rider: {chain:#?}");
+        found[0]
+    }
+
+    /// `oracle` parsed as the card-data pipeline does, with the card's MTGJSON keywords and
+    /// type line.
+    fn card(
+        oracle: &str,
+        name: &str,
+        keywords: &[&str],
+        types: &[&str],
+        subtypes: &[&str],
+    ) -> crate::parser::oracle::ParsedAbilities {
+        let strings = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        crate::parser::oracle::parse_oracle_text(
+            oracle,
+            name,
+            &strings(keywords),
+            &strings(types),
+            &strings(subtypes),
+        )
+    }
+
+    /// CR 111.3 + CR 611.2e: a "the token(s) has/have …" sentence after the token creation
+    /// defines the token, so the rewrite stamps `WithEntry` — Return of the Mole Man (an
+    /// activated ability) and Scriv, the Obligator (a triggered ability), verbatim.
+    #[test]
+    fn token_anaphor_has_rider_is_with_entry() {
+        let mole_man = card(
+            "Landfall — Whenever a land you control enters, you may mill two cards.\n{5}{G}, Sacrifice this enchantment: Create X 1/1 green Minion creature tokens named Moloid, where X is the number of permanent cards in your graveyard. The tokens have \"Whenever this token attacks, you may mill a card.\" Activate only as a sorcery.",
+            "Return of the Mole Man",
+            &["Landfall", "Mill"],
+            &["Enchantment"],
+            &[],
+        );
+        let ability = mole_man
+            .abilities
+            .iter()
+            .find(|ability| ability.effect.is_token_creator())
+            .expect("the token-creating activated ability");
+        assert_eq!(token_anaphor_rider(ability).entry_onset, WithEntry);
+
+        let scriv = card(
+            "Flying, deathtouch\nWhenever Scriv enters or attacks, create a white Aura enchantment token named Contract attached to target creature an opponent controls. The token has enchant creature and \"Whenever enchanted creature attacks, it gets +2/+0 until end of turn if it's attacking one of your opponents. Otherwise, its controller loses 2 life.\"",
+            "Scriv, the Obligator",
+            &["Deathtouch", "Flying"],
+            &["Legendary", "Creature"],
+            &["Inkling", "Bird"],
+        );
+        let execute = scriv
+            .triggers
+            .iter()
+            .find_map(|trigger| trigger.execute.as_deref())
+            .expect("the enters-or-attacks trigger's execute chain");
+        assert_eq!(token_anaphor_rider(execute).entry_onset, WithEntry);
+    }
+
+    /// CR 611.2e: "the token gains haste" applies after the token is on the battlefield; the
+    /// same rewrite leaves it `WhenFollowed` — Inalla's plain "The token", Determined
+    /// Iteration's populate-qualified "The token created this way" and Pietra's mid-sentence
+    /// "the token", verbatim.
+    #[test]
+    fn token_anaphor_gains_rider_stays_when_followed() {
+        let pietra = card(
+            "Haste\nRobots you control get +1/+1.\n{R}{W}, {T}, Tell a joke you haven't told this game to someone outside the game: Create a 1/1 white Clown Robot artifact creature token. If that person laughed, the token gains haste until end of turn.",
+            "Pietra, Crafter of Clowns",
+            &["Haste"],
+            &["Legendary", "Creature"],
+            &["Human", "Clown", "Artificer"],
+        );
+        let ability = pietra
+            .abilities
+            .iter()
+            .flat_map(nodes)
+            .find(|node| node.effect.is_token_creator())
+            .expect("Pietra: the token-creating node");
+        assert_eq!(token_anaphor_rider(ability).entry_onset, WhenFollowed);
+
+        let inalla = card(
+            "Eminence — Whenever another nontoken Wizard you control enters, if Inalla is in the command zone or on the battlefield, you may pay {1}. If you do, create a token that's a copy of that Wizard. The token gains haste. Exile it at the beginning of the next end step.\nTap five untapped Wizards you control: Target player loses 7 life.",
+            "Inalla, Archmage Ritualist",
+            &["Eminence"],
+            &["Legendary", "Creature"],
+            &["Human", "Wizard"],
+        );
+        let determined_iteration = card(
+            "At the beginning of combat on your turn, populate. The token created this way gains haste. Sacrifice it at the beginning of the next end step. (To populate, create a token that's a copy of a creature token you control.)",
+            "Determined Iteration",
+            &["Populate"],
+            &["Enchantment"],
+            &[],
+        );
+        for (name, parsed) in [
+            ("Inalla", inalla),
+            ("Determined Iteration", determined_iteration),
+        ] {
+            let execute = parsed
+                .triggers
+                .iter()
+                .filter_map(|trigger| trigger.execute.as_deref())
+                .flat_map(nodes)
+                .find(|node| node.effect.is_token_creator())
+                .unwrap_or_else(|| panic!("{name}: the token-creating node"));
+            assert_eq!(
+                token_anaphor_rider(execute).entry_onset,
+                WhenFollowed,
+                "{name}"
+            );
+        }
     }
 }

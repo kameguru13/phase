@@ -24,6 +24,8 @@
 //!   life, the bare comma conjunct draws 0, and the Reliquary Dragon gets no haste (the real
 //!   Admiral Brass trigger and Dragonbroods' Relic rows also fail their parse reach guards). These rows pass on a
 //!   whole-change revert by construction: the blanket deferral already deferred every rider.
+//! - Dropping the stamp of the token-anaphor rewrite (`lower::rewrite_populated_anaphor_in_def`,
+//!   "The token has …") makes the V11 token get no haste and fail its parse reach guard.
 
 use engine::game::scenario::{CastOutcome, GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
@@ -623,4 +625,101 @@ fn v10_brilliance_unleashed_contracted_copula_is_observed() {
     assert_eq!((object.power, object.toughness), (Some(3), Some(3)));
     assert!(object.has_keyword(&Keyword::Flying));
     outcome.assert_hand_drawn(P0, 1);
+}
+
+/// Synthetic host (sorcery): a Return of the Mole Man–style token creation whose "The token has
+/// …" sentence also names a keyword an enter observer reads. The real Return of the Mole Man
+/// ("The tokens have \"Whenever this token attacks, …\"") and Scriv, the Obligator ("The token
+/// has enchant creature and \"…\"") grant only a trigger, or a keyword no observer filter keys
+/// on; an entry observation lends the live object's abilities either way, so neither can
+/// discriminate the onset at runtime (their parse rows are in `subject.rs`'s
+/// `entry_onset_tests`).
+const TOKEN_HAS_FLYING_AND_TRIGGER: &str = "Create a 1/1 green Minion creature token named \
+     Moloid. The token has flying and \"Whenever this token attacks, you may mill a card.\"";
+/// Synthetic pair: the same sentence with "gains".
+const TOKEN_GAINS_FLYING_AND_TRIGGER: &str = "Create a 1/1 green Minion creature token named \
+     Moloid. The token gains flying and \"Whenever this token attacks, you may mill a card.\"";
+
+/// Cast `text` with Dragon Tempest on the battlefield. Returns the final state and the token,
+/// after a parse reach guard: the spell's chain is the token creation followed by the
+/// token-anaphor rewrite's `GenericEffect` (its static keeps the whole "The token …" sentence),
+/// stamped `onset`.
+fn moloid_under_tempest(text: &str, onset: ContinuousEffectOnset) -> (GameState, ObjectId) {
+    let mut scenario = board();
+    scenario.add_enchantment_from_oracle(P0, "Dragon Tempest", DRAGON_TEMPEST);
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Moloid Spell", false, text)
+        .id();
+    let mut runner = scenario.build();
+
+    let ability = &runner.state().objects[&spell].abilities[0];
+    assert!(
+        matches!(*ability.effect, Effect::Token { .. }),
+        "{ability:#?}"
+    );
+    let rider = ability
+        .sub_ability
+        .as_deref()
+        .expect("the token-anaphor rider node");
+    let Effect::GenericEffect {
+        static_abilities, ..
+    } = &*rider.effect
+    else {
+        panic!("the rider is a GenericEffect: {rider:#?}");
+    };
+    assert!(
+        static_abilities[0]
+            .description
+            .as_deref()
+            .is_some_and(|description| description.starts_with("The token ")),
+        "reach: built by the token-anaphor rewrite: {rider:#?}"
+    );
+    assert_eq!(rider.entry_onset, onset);
+
+    let outcome = runner.cast(spell).resolve();
+    let state = outcome.state().clone();
+    let token = state
+        .battlefield
+        .iter()
+        .copied()
+        .find(|id| state.objects[id].is_token)
+        .expect("the Moloid token");
+    (state, token)
+}
+
+/// V11 (synthetic host) — CR 111.3 + CR 611.2e: "The token has flying and \"…\"" after the token
+/// creation defines the token, so it has flying as it enters and Dragon Tempest gives it haste.
+/// Dropping the token-anaphor rewrite's stamp (`lower::rewrite_populated_anaphor_in_def`)
+/// observes a token without flying, so it gets no haste.
+#[test]
+fn v11_token_anaphor_has_rider_is_observed() {
+    let (state, token) = moloid_under_tempest(
+        TOKEN_HAS_FLYING_AND_TRIGGER,
+        ContinuousEffectOnset::WithEntry,
+    );
+    let moloid = &state.objects[&token];
+    assert!(
+        moloid.has_keyword(&Keyword::Flying),
+        "reach: the rider applied"
+    );
+    assert!(
+        moloid.has_keyword(&Keyword::Haste),
+        "Dragon Tempest saw a flying entrant"
+    );
+}
+
+/// V11 pair (synthetic) — CR 611.2e: "The token gains flying and \"…\"" applies after the token
+/// is on the battlefield, so Dragon Tempest does not see a flying entrant.
+#[test]
+fn v11_pair_token_anaphor_gains_rider_is_not_observed() {
+    let (state, token) = moloid_under_tempest(
+        TOKEN_GAINS_FLYING_AND_TRIGGER,
+        ContinuousEffectOnset::WhenFollowed,
+    );
+    let moloid = &state.objects[&token];
+    assert!(
+        moloid.has_keyword(&Keyword::Flying),
+        "reach: the rider applied"
+    );
+    assert!(!moloid.has_keyword(&Keyword::Haste));
 }
