@@ -1017,8 +1017,8 @@ const EXTRACTOR_DEMON_ORACLE: &str = "Flying\n\
 /// The four-player Riptide Gearhulk board. P0 is active and casts Riptide.
 /// - P1 owns and controls Extractor Demon, and owns `borrowed`, which P2
 ///   controls (`base_controller = P2`, no control effect).
-/// - P3 owns and controls `p3_bear` and `p3_trinket`, a noncreature
-///   artifact for the rows that need P3's target not to be a creature.
+/// - P3 owns and controls `p3_trinket`, a noncreature artifact, and, unless
+///   built with [`P3Bear::Absent`], the creature `p3_bear`.
 /// - P1's library is `[f1, f2, f3]` and P3's is `[g1, g2, g3]`.
 /// - P0 also has Lodestone Bauble, and P1 two basic lands in the graveyard,
 ///   for the later single-owner arrangement rows; P0's pool keeps one
@@ -1028,7 +1028,7 @@ struct RiptideBoard {
     riptide: ObjectId,
     demon: ObjectId,
     borrowed: ObjectId,
-    p3_bear: ObjectId,
+    p3_bear: Option<ObjectId>,
     p3_trinket: ObjectId,
     bauble: ObjectId,
     lands: [ObjectId; 2],
@@ -1036,7 +1036,27 @@ struct RiptideBoard {
     p3_library: Vec<ObjectId>,
 }
 
+/// Whether P3's creature `p3_bear` is on the Riptide board.
+#[derive(Clone, Copy)]
+enum P3Bear {
+    OnBattlefield,
+    /// P3 controls no creature, so P3 leaving the game moves no creature off
+    /// the battlefield.
+    Absent,
+}
+
+impl RiptideBoard {
+    fn p3_bear(&self) -> ObjectId {
+        self.p3_bear
+            .expect("fixture: this row's board has P3's bear on the battlefield")
+    }
+}
+
 fn riptide_four_player_board() -> RiptideBoard {
+    riptide_four_player_board_with(P3Bear::OnBattlefield)
+}
+
+fn riptide_four_player_board_with(p3_bear: P3Bear) -> RiptideBoard {
     let mut scenario = GameScenario::new_n_player(4, 42);
     scenario.at_phase(Phase::PreCombatMain);
     scenario.with_mana_pool(
@@ -1059,7 +1079,10 @@ fn riptide_four_player_board() -> RiptideBoard {
         .add_creature(P1, "Borrowed Bear", 2, 2)
         .controlled_by(P2)
         .id();
-    let p3_bear = scenario.add_creature(P3, "P3 Bear", 2, 2).id();
+    let p3_bear = match p3_bear {
+        P3Bear::OnBattlefield => Some(scenario.add_creature(P3, "P3 Bear", 2, 2).id()),
+        P3Bear::Absent => None,
+    };
     let p3_trinket = scenario.add_artifact_from_oracle(P3, "P3 Trinket", "").id();
     let bauble = scenario
         .add_artifact_from_oracle(P0, "Lodestone Bauble", LODESTONE_BAUBLE_ORACLE)
@@ -1100,11 +1123,12 @@ fn riptide_four_player_board() -> RiptideBoard {
 /// Cast Riptide targeting one permanent per opponent and stop at the first
 /// owner's prompt: P1, the first owner in APNAP order (P0 owns no target).
 fn open_riptide_arrangement(board: &mut RiptideBoard) {
+    let p3_bear = board.p3_bear();
     let outcome = board
         .runner
         .cast(board.riptide)
         .target_players(&[P1, P2, P3])
-        .target_objects(&[board.demon, board.borrowed, board.p3_bear])
+        .target_objects(&[board.demon, board.borrowed, p3_bear])
         .resolve();
     assert_owner_arrangement_prompt(
         outcome.final_waiting_for(),
@@ -1112,7 +1136,7 @@ fn open_riptide_arrangement(board: &mut RiptideBoard) {
         &[board.demon, board.borrowed],
         LibraryPosition::NthFromTop { n: 3 },
     );
-    for id in [board.demon, board.borrowed, board.p3_bear] {
+    for id in [board.demon, board.borrowed, board.p3_bear()] {
         assert_eq!(zone(&board.runner, id), Zone::Battlefield);
     }
 }
@@ -1128,7 +1152,7 @@ fn submit_p1_order(board: &mut RiptideBoard) {
     assert_owner_arrangement_prompt(
         &board.runner.state().waiting_for,
         P3,
-        &[board.p3_bear],
+        &[board.p3_bear()],
         LibraryPosition::NthFromTop { n: 3 },
     );
 }
@@ -1145,7 +1169,7 @@ fn p1_library_after_both(board: &RiptideBoard) -> Vec<ObjectId> {
 
 fn p3_library_after(board: &RiptideBoard) -> Vec<ObjectId> {
     let g = &board.p3_library;
-    vec![g[0], g[1], board.p3_bear, g[2]]
+    vec![g[0], g[1], board.p3_bear(), g[2]]
 }
 
 fn owner_arrangement_carrier_is_open(runner: &GameRunner) -> bool {
@@ -1228,7 +1252,7 @@ fn riptide_gearhulk_collects_every_owners_order_before_one_simultaneous_move() {
     submit_p1_order(&mut board);
 
     // (a) CR 101.4: nothing moves before the last owner chooses.
-    for id in [board.demon, board.borrowed, board.p3_bear] {
+    for id in [board.demon, board.borrowed, board.p3_bear()] {
         assert_eq!(
             zone(&board.runner, id),
             Zone::Battlefield,
@@ -1239,12 +1263,13 @@ fn riptide_gearhulk_collects_every_owners_order_before_one_simultaneous_move() {
 
     // Routing: P3's prompt belongs to P3 alone.
     let p3_prompt = board.runner.state().waiting_for.clone();
+    let p3_bear = board.p3_bear();
     assert!(
         engine::game::engine::apply(
             board.runner.state_mut(),
             P1,
             GameAction::SelectCards {
-                cards: vec![board.p3_bear],
+                cards: vec![p3_bear],
             },
         )
         .is_err(),
@@ -1257,7 +1282,7 @@ fn riptide_gearhulk_collects_every_owners_order_before_one_simultaneous_move() {
             .iter()
             .any(|action| matches!(
                 action,
-                GameAction::SelectCards { cards } if cards == &vec![board.p3_bear]
+                GameAction::SelectCards { cards } if cards == &vec![board.p3_bear()]
             )),
         "the next owner's arrangement is a published legal action"
     );
@@ -1265,7 +1290,7 @@ fn riptide_gearhulk_collects_every_owners_order_before_one_simultaneous_move() {
     board
         .runner
         .act(GameAction::SelectCards {
-            cards: vec![board.p3_bear],
+            cards: vec![board.p3_bear()],
         })
         .expect("P3 submits their arrangement");
     assert_eq!(library(&board.runner, P1), p1_library_after_both(&board));
@@ -1314,7 +1339,7 @@ fn riptide_owner_departure_at_their_prompt_delivers_the_collected_arrangement() 
 
     assert_eq!(library(&board.runner, P1), p1_library_after_both(&board));
     assert_eq!(
-        zone(&board.runner, board.p3_bear),
+        zone(&board.runner, board.p3_bear()),
         Zone::Exile,
         "CR 800.4a: P3's bear leaves the game with P3"
     );
@@ -1329,12 +1354,14 @@ fn riptide_owner_departure_at_their_prompt_delivers_the_collected_arrangement() 
 }
 
 /// CR 104.3a + CR 800.4a + CR 603.10a + CR 603.3: the departure-settled move
-/// still puts its triggers on the stack. Riptide targets P3's noncreature
-/// `p3_trinket`, so P3 leaving the game exiles nothing the Demon can see
-/// (it watches creatures). The settled move then takes the Demon and
-/// `borrowed` together; the Demon looks back (CR 603.10a; its 2017-03-14
-/// ruling: it triggers when it and another creature leave at the same time)
-/// and triggers exactly once, for `borrowed`. A Concede returns before the
+/// still puts its triggers on the stack. The board has no `p3_bear`, so P3
+/// owns no creature, and Riptide targets P3's noncreature `p3_trinket`: P3
+/// leaving the game takes no creature off the battlefield, so it gives the
+/// Demon (which watches creatures) nothing to trigger on (CR 603.6c). The
+/// settled move then takes the Demon and `borrowed` together; the Demon
+/// looks back (CR 603.10a; its 2017-03-14 ruling: it triggers when it and
+/// another creature leave at the same time) and triggers exactly once, for
+/// `borrowed`. A Concede returns before the
 /// post-action pipeline, so that trigger reaches the stack only through the
 /// settle's own completion and the elimination drain.
 ///
@@ -1342,7 +1369,7 @@ fn riptide_owner_departure_at_their_prompt_delivers_the_collected_arrangement() 
 /// on the stack, the Demon's stack count is 0, not 1.
 #[test]
 fn riptide_owner_departure_settled_move_puts_its_triggers_on_the_stack() {
-    let mut board = riptide_four_player_board();
+    let mut board = riptide_four_player_board_with(P3Bear::Absent);
     let outcome = board
         .runner
         .cast(board.riptide)
@@ -1421,7 +1448,7 @@ fn riptide_queued_owner_departure_drops_their_batch() {
         LibraryPosition::NthFromTop { n: 3 },
     );
     assert!(owner_arrangement_carrier_is_open(&board.runner));
-    assert_eq!(zone(&board.runner, board.p3_bear), Zone::Exile);
+    assert_eq!(zone(&board.runner, board.p3_bear()), Zone::Exile);
 
     board
         .runner
@@ -1494,14 +1521,14 @@ fn riptide_member_exiled_with_its_controller_is_dropped_from_the_owners_prompt()
     assert_owner_arrangement_prompt(
         &board.runner.state().waiting_for,
         P3,
-        &[board.p3_bear],
+        &[board.p3_bear()],
         LibraryPosition::NthFromTop { n: 3 },
     );
     assert_eq!(zone(&board.runner, board.demon), Zone::Battlefield);
     board
         .runner
         .act(GameAction::SelectCards {
-            cards: vec![board.p3_bear],
+            cards: vec![board.p3_bear()],
         })
         .expect("P3 submits their arrangement");
 
@@ -1549,7 +1576,7 @@ fn riptide_current_owner_departure_prompts_the_next_owner() {
     assert_owner_arrangement_prompt(
         &board.runner.state().waiting_for,
         P3,
-        &[board.p3_bear],
+        &[board.p3_bear()],
         LibraryPosition::NthFromTop { n: 3 },
     );
     assert_eq!(board.runner.state().priority_player, P3);
@@ -1558,7 +1585,7 @@ fn riptide_current_owner_departure_prompts_the_next_owner() {
     board
         .runner
         .act(GameAction::SelectCards {
-            cards: vec![board.p3_bear],
+            cards: vec![board.p3_bear()],
         })
         .expect("P3 submits their arrangement");
     assert_eq!(library(&board.runner, P3), p3_library_after(&board));
@@ -1586,7 +1613,7 @@ fn riptide_every_remaining_owner_departure_retires_the_arrangement() {
     assert_owner_arrangement_prompt(
         &board.runner.state().waiting_for,
         P3,
-        &[board.p3_bear],
+        &[board.p3_bear()],
         LibraryPosition::NthFromTop { n: 3 },
     );
 
@@ -1677,7 +1704,7 @@ fn lodestone_bauble_after_a_completed_owner_arrangement_moves_exactly_its_own_ca
     board
         .runner
         .act(GameAction::SelectCards {
-            cards: vec![board.p3_bear],
+            cards: vec![board.p3_bear()],
         })
         .expect("P3 submits their arrangement");
     resolve_to_priority(&mut board.runner);
