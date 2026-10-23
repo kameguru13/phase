@@ -6897,9 +6897,11 @@ If you sang a song the whole time you were searching and shuffling, you may unta
     }
 
     /// The nine detector labels that pass `None` and are measured present in the phase-base
-    /// corpus. `ActivateLimit` and `ModalDynamicMaxDropped` are deliberately absent: both
-    /// have ZERO corpus warnings at base, so no fixture can reach them. They are bought by
-    /// the compiler instead — the constructor's new parameter makes omission a compile error.
+    /// corpus. `ActivateLimit`, `ModalDynamicMaxDropped` and `CombatHistoryRelation` are
+    /// deliberately absent: none has a corpus warning (`CombatHistoryRelation`'s clause is
+    /// printed on exactly two cards, both represented since #9179), so no corpus fixture
+    /// can reach them. They are bought by the compiler instead — the constructor's new
+    /// parameter makes omission a compile error.
     ///
     /// "Non-phrase" here means "no gap axis wired at the push site", NOT "no phrase is
     /// nameable". `Replacement` is in this set and its axis names phrases perfectly well —
@@ -15064,14 +15066,18 @@ this spell's mana cost.\nDestroy target attacking creature without flying.",
     /// style) has no source anchor and is outside the detector's grammar.
     #[test]
     fn combat_history_relation_detector_is_silent_when_represented() {
-        for (name, types, text) in [
+        // MTGJSON keywords are passed as production does: `parse_named`'s empty list
+        // would leave Membrane's bare "Defender" line `Unimplemented`.
+        for (name, keywords, types, text) in [
             (
                 "Cathedral Membrane",
+                &["Defender"][..],
                 &["Artifact", "Creature"][..],
                 "({W/P} can be paid with either {W} or 2 life.)\nDefender\nWhen this creature dies during combat, it deals 6 damage to each creature it blocked this combat.",
             ),
             (
                 "Defiant Vanguard",
+                &[][..],
                 &["Creature"][..],
                 "When this creature blocks, at end of combat, destroy it and all creatures it blocked this turn.\n{5}, {T}: Search your library for a Rebel permanent card with mana value 4 or less, put it onto the battlefield, then shuffle.",
             ),
@@ -15085,7 +15091,17 @@ this spell's mana cost.\nDestroy target attacking creature without flying.",
                 .is_some(),
                 "{name}: reach guard — the recognizer must find the clause"
             );
-            let parsed = parse_named(text, name, types);
+            let parsed = parse_oracle_text(
+                text,
+                name,
+                &keywords.iter().map(|kw| (*kw).to_string()).collect::<Vec<_>>(),
+                &types.iter().map(|ty| (*ty).to_string()).collect::<Vec<_>>(),
+                &[],
+            );
+            assert!(
+                !any_ability_has_unimplemented(&parsed),
+                "{name}: reach guard — an unimplemented unit is skipped before the detector runs"
+            );
             assert!(
                 parse_has_blocked_history_filter(&parsed),
                 "{name}: reach guard — the clause must be represented"
@@ -15100,6 +15116,14 @@ this spell's mana cost.\nDestroy target attacking creature without flying.",
         let unary = parse(
             "At end of combat, destroy each creature that blocked this turn.",
             &["Enchantment"],
+        );
+        assert!(
+            !any_ability_has_unimplemented(&unary),
+            "unary: reach guard — an unimplemented unit is skipped before the detector runs"
+        );
+        assert!(
+            UnitEvidence::of(&unary).any::<Effect>(|effect| destroy_all_target(effect).is_some()),
+            "unary: reach guard — the DestroyAll must parse"
         );
         assert!(
             !has_swallowed_detector(&unary, "CombatHistoryRelation"),
