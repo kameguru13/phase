@@ -266,7 +266,7 @@ pub(super) fn try_parse_subject_predicate_ast(
         return Some(subject_predicate_ast_from_clause(
             text,
             clause,
-            |effect, duration, sub_ability| PredicateAst::Restriction {
+            |effect, duration, sub_ability, _onset| PredicateAst::Restriction {
                 effect,
                 duration,
                 sub_ability,
