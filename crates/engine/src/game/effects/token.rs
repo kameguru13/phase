@@ -1028,11 +1028,18 @@ pub(crate) fn deliver_create_token_event(
     events: &mut Vec<GameEvent>,
 ) -> CreateTokenDelivery {
     if !event.has_appended_token_batches() {
+        let ProposedEvent::CreateToken { spec, .. } = &event else {
+            return CreateTokenDelivery::Completed {
+                primary_ids: Vec::new(),
+            };
+        };
+        let effect_source = spec.source_id;
         return apply_create_token_batch(
             state,
             event,
             initial_created_ids,
             pause_completion_event,
+            effect_source,
             events,
         );
     }
@@ -1040,6 +1047,14 @@ pub(crate) fn deliver_create_token_event(
     let batches = event
         .into_token_batches()
         .expect("a compound token event is a CreateToken");
+    // CR 608.2c + CR 614.1a: the event is the action of the instruction that
+    // created its own batch; an appended batch's spec names the replacement's
+    // host, so every completion the cursor builds names this source instead.
+    let source_id = batches
+        .first()
+        .expect("a compound token event has its own batch")
+        .spec
+        .source_id;
     // Delivery order: plain batches (event order), then copy batches (event
     // order). For a copy primary this keeps the physical order the appended
     // plain batch had. Batches can remain behind any batch's pause: a CR 616.2
@@ -1055,6 +1070,7 @@ pub(crate) fn deliver_create_token_event(
         delivered: Vec::new(),
         resumed: None,
         prefix: initial_created_ids,
+        source_id,
     };
     drive_token_event_delivery(state, cursor, pause_completion_event, events)
 }
@@ -1170,9 +1186,15 @@ fn drive_token_event_delivery(
         match batch.copy.take() {
             None => {
                 let event = batch.into_event(HashSet::new());
-                let completed =
-                    apply_create_token_batch(state, event, Vec::new(), pause_event, events)
-                        .is_completed();
+                let completed = apply_create_token_batch(
+                    state,
+                    event,
+                    Vec::new(),
+                    pause_event,
+                    cursor.source_id,
+                    events,
+                )
+                .is_completed();
                 // The batch's tokens that finished; on a pause, the paused token
                 // and the rest of the batch accumulate into the emptied ledger
                 // through the batch's own remainder.
@@ -1213,7 +1235,6 @@ fn drive_token_event_delivery(
                     .copied()
                     .chain(event_ordered_token_ids(&cursor.delivered))
                     .collect();
-                let source_id = batch.spec.source_id;
                 let batch_boundary = state.resolution_stack.capture_child_boundary();
                 let status = super::token_copy::apply_copy_token_after_replacement_with_created_ids(
                     state,
@@ -1268,7 +1289,7 @@ fn drive_token_event_delivery(
                         // active owner while the copy batch's remainder runs.
                         super::counters::park_pending_counter_completion_at_child_boundary(
                             state,
-                            token_event_cursor_completion(cursor, source_id, pause_event),
+                            token_event_cursor_completion(cursor, pause_event),
                             batch_boundary,
                         );
                         repark_event_copy_frame(state, held_frame.take(), Vec::new());
@@ -1309,12 +1330,13 @@ fn repark_event_copy_frame(
 
 /// CR 608.2c: the completion that carries the rest of a compound CreateToken
 /// event behind a copy batch's pause; it owes the caller's terminal event when
-/// that pause is the event's first and no CopyToken owner emits it.
+/// that pause is the event's first and no CopyToken owner emits it. It names
+/// the event's own source, not the paused batch's.
 fn token_event_cursor_completion(
     cursor: PendingTokenEventDelivery,
-    source_id: ObjectId,
     pause_event: PendingEffectResolutionEvent,
 ) -> PendingEffectResolved {
+    let source_id = cursor.source_id;
     let post_actions = vec![PendingCounterPostAction::ContinueTokenEventDelivery {
         delivery: Box::new(cursor),
     }];
@@ -1335,11 +1357,16 @@ fn token_event_cursor_completion(
 /// CR 111.1 + CR 614.1a: create one batch of an accepted CreateToken event.
 /// The outcome's `primary_ids` are the ids this batch itself created, without
 /// `initial_created_ids`.
+///
+/// `effect_source` is the source a pause's completion names: the creating
+/// instruction's (CR 608.2c), which for a replacement-appended batch is not
+/// the batch's own `spec.source_id`.
 fn apply_create_token_batch(
     state: &mut GameState,
     event: ProposedEvent,
     initial_created_ids: Vec<ObjectId>,
     pause_completion_event: PendingEffectResolutionEvent,
+    effect_source: ObjectId,
     events: &mut Vec<GameEvent>,
 ) -> CreateTokenDelivery {
     let ProposedEvent::CreateToken {
@@ -1520,13 +1547,13 @@ fn apply_create_token_batch(
                     PendingEffectResolutionEvent::Emit => {
                         crate::types::game_state::PendingEffectResolved::with_post_actions(
                             EffectKind::Token,
-                            spec.source_id,
+                            effect_source,
                             post_actions,
                         )
                     }
                     PendingEffectResolutionEvent::Suppress => crate::types::game_state::PendingEffectResolved::with_post_actions_without_effect(
                         EffectKind::Token,
-                        spec.source_id,
+                        effect_source,
                         post_actions,
                     ),
                 };

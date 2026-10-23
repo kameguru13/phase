@@ -231,6 +231,21 @@ fn effect_resolved(events: &[GameEvent], kind: EffectKind) -> usize {
         .count()
 }
 
+/// CR 608.2c: the source each `kind` `EffectResolved` names, in event order —
+/// the instruction's own source, never the host of a replacement that appended
+/// a batch to its event.
+fn effect_resolved_sources(events: &[GameEvent], kind: EffectKind) -> Vec<ObjectId> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            GameEvent::EffectResolved {
+                kind: k, source_id, ..
+            } if *k == kind => Some(*source_id),
+            _ => None,
+        })
+        .collect()
+}
+
 fn ledger(runner: &GameRunner) -> Vec<ObjectId> {
     runner.state().last_created_token_ids.clone()
 }
@@ -894,10 +909,11 @@ fn ojer_taq_triples_only_the_appended_creature_batch() {
 }
 
 /// P0: Chatterfang, Grumgully, Hardened Scales, Branching Evolution and Strike
-/// It Rich in hand (plus `extra`). Casts Strike It Rich up to its first prompt.
+/// It Rich in hand (plus `extra`). Casts Strike It Rich up to its first prompt;
+/// returns the runner, the spell and the events so far.
 fn strike_it_rich_counter_board(
     extra: impl FnOnce(&mut GameScenario),
-) -> (GameRunner, Vec<GameEvent>) {
+) -> (GameRunner, ObjectId, Vec<GameEvent>) {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     scenario.add_creature_from_oracle(P0, "Chatterfang, Squirrel General", 3, 3, CHATTERFANG);
@@ -908,22 +924,26 @@ fn strike_it_rich_counter_board(
         .id();
     let mut runner = scenario.build();
     let events = runner.cast(spell).resolve().events().to_vec();
-    (runner, events)
+    (runner, spell, events)
 }
 
 /// CR 608.2c: the Treasure batch completes, then the appended Squirrel (a
 /// noncreature event made a creature batch by Chatterfang, CR 616.2) pauses for
 /// its Grumgully counter's ordering. That pause owes the instruction's one
-/// terminal `EffectResolved` — on main a second one came from the nested event.
+/// terminal `EffectResolved` — on main a second one came from the nested event —
+/// and it names Strike It Rich, not Chatterfang, whose Squirrel batch paused.
 fn later_batch_pause(first: &'static str, squirrel_counters: u32) {
-    let (mut runner, mut events) = strike_it_rich_counter_board(|_| {});
+    let (mut runner, spell, mut events) = strike_it_rich_counter_board(|_| {});
     events.extend(settle(&mut runner, &[order(2, first)], Until::StackEmpty));
 
     let treasure = the_token(&runner, "Treasure");
     let squirrel = the_token(&runner, "Squirrel");
     assert_eq!(plus_counters(&runner, squirrel), squirrel_counters);
     assert_eq!(ledger(&runner), vec![treasure, squirrel]);
-    assert_eq!(effect_resolved(&events, EffectKind::Token), 1);
+    assert_eq!(
+        effect_resolved_sources(&events, EffectKind::Token),
+        vec![spell]
+    );
 }
 
 #[test]
@@ -941,10 +961,10 @@ fn later_batch_pause_branching_first() {
 /// With Parallel Lives, each of the two Squirrels pauses for its own counters;
 /// the second pause nests inside the first's completion and the rest of the
 /// event rides along. Two Treasures and two 4-counter Squirrels, in event order,
-/// and one terminal `EffectResolved`.
+/// and one terminal `EffectResolved`, naming Strike It Rich.
 #[test]
 fn nested_counter_pause_keeps_event_order() {
-    let (mut runner, mut events) = strike_it_rich_counter_board(|scenario| {
+    let (mut runner, spell, mut events) = strike_it_rich_counter_board(|scenario| {
         scenario.add_enchantment_from_oracle(P0, "Parallel Lives", PARALLEL_LIVES);
     });
     events.extend(settle(
@@ -964,7 +984,10 @@ fn nested_counter_pause_keeps_event_order() {
     assert_eq!(created.len(), 4);
     assert!(created[..2].iter().all(|id| treasures.contains(id)));
     assert!(created[2..].iter().all(|id| squirrels.contains(id)));
-    assert_eq!(effect_resolved(&events, EffectKind::Token), 1);
+    assert_eq!(
+        effect_resolved_sources(&events, EffectKind::Token),
+        vec![spell]
+    );
     assert!(created
         .iter()
         .all(|id| runner.state().objects[id].zone == Zone::Battlefield));
@@ -1137,7 +1160,8 @@ fn copy_counter_pause_halving_season_first() {
 /// Effect::Token route; no CopyToken resolution owns this event. Chatterfang
 /// then adds plain Squirrels, and Grumgully's counter on each token pauses for
 /// its ordering. The instruction still ends with exactly one
-/// `EffectResolved{Token}` (on the candidate before this, none).
+/// `EffectResolved{Token}` (on the candidate before this, none), naming Raise
+/// the Alarm, not Chatterfang, whose Squirrel batch paused first.
 #[test]
 fn copy_own_batch_on_token_route_emits_effect_resolved_once() {
     let mut scenario = GameScenario::new();
@@ -1173,7 +1197,10 @@ fn copy_own_batch_on_token_route_emits_effect_resolved_once() {
         // Grumgully's one counter, Hardened Scales first: (1 + 1) × 2.
         assert_eq!(plus_counters(&runner, id), 4);
     }
-    assert_eq!(effect_resolved(&events, EffectKind::Token), 1);
+    assert_eq!(
+        effect_resolved_sources(&events, EffectKind::Token),
+        vec![spell]
+    );
 }
 
 const METALLIC_MIMIC: &str = "As this creature enters, choose a creature type.\nThis creature is the chosen type in addition to its other types.\nEach other creature you control of the chosen type enters with an additional +1/+1 counter on it.";
@@ -1185,7 +1212,8 @@ const METALLIC_MIMIC: &str = "As this creature enters, choose a creature type.\n
 /// creature-type choice on the plain Effect::Token route, with no CopyToken
 /// resolution owning the event and no earlier pause to carry the instruction's
 /// terminal event. The instruction still ends with exactly one
-/// `EffectResolved{Token}` (on the candidate before this, none).
+/// `EffectResolved{Token}` (on the candidate before this, none), naming Strike
+/// It Rich, not Chatterfang, whose paused batch carries it.
 #[test]
 fn last_copy_batch_choice_pause_on_token_route_emits_effect_resolved_once() {
     let mut scenario = GameScenario::new();
@@ -1250,7 +1278,10 @@ fn last_copy_batch_choice_pause_on_token_route_emits_effect_resolved_once() {
     let mimic_copy = mimic_copies[0].id;
     assert!(tokens(&runner, "Squirrel").is_empty());
     assert_eq!(ledger(&runner), vec![treasure, mimic_copy]);
-    assert_eq!(effect_resolved(&events, EffectKind::Token), 1);
+    assert_eq!(
+        effect_resolved_sources(&events, EffectKind::Token),
+        vec![spell]
+    );
     assert!(
         runner.state().resolution_stack.is_empty(),
         "no completion frame is left parked"

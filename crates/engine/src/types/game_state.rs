@@ -7540,6 +7540,11 @@ pub struct PendingTokenEventDelivery {
     pub resumed: Option<u32>,
     /// Ids the caller placed ahead of the event (`initial_created_ids`).
     pub prefix: Vec<ObjectId>,
+    /// CR 608.2c + CR 614.1a: the source of the instruction whose action this
+    /// event is — its own batch's (position 0) — which every completion this
+    /// cursor builds names. A replacement modifies that action without making
+    /// it the replacement's, though an appended batch's spec names its host.
+    pub source_id: ObjectId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36447,6 +36452,7 @@ mod tests {
                 }],
                 resumed: Some(0),
                 prefix: vec![ObjectId(7)],
+                source_id: ObjectId(9),
             }),
         };
         let json = serde_json::to_string(&action).expect("cursor serializes");
