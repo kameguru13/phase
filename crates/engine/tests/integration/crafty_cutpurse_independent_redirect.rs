@@ -813,3 +813,84 @@ fn departed_redirect_suppresses_a_creation_resumed_from_a_replacement_choice() {
         );
     }
 }
+
+/// CR 616.1b + CR 707.2 + CR 800.4b: the token copy Cackling Counterpart would
+/// create for P1 is under both P0's and P2's redirects, so P1 chooses which
+/// applies first and the copy creation resumes from that choice. Either order
+/// settles the copy under the departed P0 (as for the Soldiers above), so no
+/// copy is created and no copy-token resolution is left parked.
+#[test]
+fn departed_redirect_suppresses_a_token_copy_resumed_from_a_replacement_choice() {
+    for p2_first in [true, false] {
+        let mut b = concession_board(
+            Some(P0),
+            Extras {
+                p2_cutpurse: true,
+                ..Extras::default()
+            },
+        );
+        b.runner.cast(b.counterpart).target_object(b.bear).commit();
+        pass_until(&mut b.runner, "P1 orders the two redirects", |r| {
+            matches!(r.state().waiting_for, WaitingFor::ReplacementChoice { .. })
+        });
+        let WaitingFor::ReplacementChoice {
+            player, candidates, ..
+        } = b.runner.state().waiting_for.clone()
+        else {
+            unreachable!("guarded above");
+        };
+        assert_eq!(player, P1, "CR 616.1: the affected player chooses");
+        assert_eq!(candidates.len(), 2, "reach guard: both redirects compete");
+        let index = candidates
+            .iter()
+            .position(|c| (c.source_id == b.p2_cutpurse) == p2_first)
+            .expect("the chosen redirect is a candidate");
+        b.runner
+            .act(GameAction::ChooseReplacement { index })
+            .expect("replacement choice accepted");
+        let prompts = resolve_to_settle(&mut b.runner, b.counterpart, 0);
+        assert_eq!(
+            prompts.replacement_choices, 0,
+            "one choice settles the event (P2 first: {p2_first})"
+        );
+
+        for player in [P0, P1, P2] {
+            assert_eq!(
+                tokens_controlled_by(&b.runner, player),
+                0,
+                "no copy under {player:?} (P2 first: {p2_first})"
+            );
+        }
+        assert_eq!(
+            b.runner
+                .state()
+                .objects
+                .values()
+                .filter(|obj| obj.is_token)
+                .count(),
+            0,
+            "no token exists anywhere (P2 first: {p2_first})"
+        );
+        assert!(
+            b.runner.state().last_created_token_ids.is_empty(),
+            "the created referent is empty (P2 first: {p2_first})"
+        );
+        assert!(
+            b.runner.state().active_copy_token().is_none(),
+            "no copy-token resolution is left active (P2 first: {p2_first})"
+        );
+        assert!(
+            b.runner.state().resolution_stack.is_empty(),
+            "no resolution frame is stranded (P2 first: {p2_first})"
+        );
+        assert_eq!(
+            b.runner.state().objects[&b.bear].zone,
+            Zone::Battlefield,
+            "reach guard: the copied Bear remains (P2 first: {p2_first})"
+        );
+        assert!(
+            has_priority(&b.runner, P1),
+            "P1 holds priority at the settled empty stack (P2 first: {p2_first})"
+        );
+    }
+}
