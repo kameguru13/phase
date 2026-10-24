@@ -56,16 +56,23 @@ pub fn resolve(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let (position, target_filter, count_expr) = match &ability.effect {
+    let (position, target_filter, count_expr, arranger_filter) = match &ability.effect {
         Effect::PutAtLibraryPosition {
             position,
             target,
             count,
-        } => (position.clone(), target.clone(), count.clone()),
+            arranger,
+        } => (
+            position.clone(),
+            target.clone(),
+            count.clone(),
+            arranger.clone(),
+        ),
         _ => (
             LibraryPosition::Top,
             TargetFilter::None,
             QuantityExpr::Fixed { value: 1 },
+            None,
         ),
     };
 
@@ -543,20 +550,30 @@ pub fn resolve(
     // CR 401.4 + CR 601.2c + CR 608.2d: an announced target set arrives in the
     // caster's announcement order, which is not an arrangement; the owner of two
     // or more cards put into one position of their library orders them as the
-    // effect is applied (CR 101.4 APNAP across owners). One card per owner has
-    // nothing to arrange and is delivered below. A linked-exile pool is a
-    // resolution-time scan, not the announcement. Resolution-time selections and
-    // ordered searches already carry the chooser's own arrangement and never
-    // announce a target set.
+    // effect is applied (CR 101.4 APNAP across owners), unless the instruction
+    // itself names who orders them (CR 101.1: "… in any order" in the
+    // controller's instruction). One card per owner has nothing to arrange and
+    // is delivered below. A linked-exile pool is a resolution-time scan, not the
+    // announcement. Resolution-time selections and ordered searches already
+    // carry the chooser's own arrangement and never announce a target set.
     if announced_target_set
         && !target_filter.references_exiled_by_source()
         && position_can_be_arranged
     {
         let owner_batches = super::change_zone::group_object_ids_by_owner_apnap(state, to_place);
         if owner_batches.iter().any(|(_, cards)| cards.len() >= 2) {
+            // CR 401.4 + CR 101.1 + CR 608.2c + CR 608.2d: the arranger the
+            // instruction names is determined now, at resolution, and snapshotted
+            // onto each owner's batch. A named arranger that resolves to no player
+            // leaves the owner default standing; that fallback is unreachable for
+            // every current producer, whose `Controller` always resolves.
+            let arranger = arranger_filter
+                .as_ref()
+                .and_then(|filter| super::resolve_player_for_context_ref(state, ability, filter));
             super::change_zone::open_owner_library_arrangement(
                 state,
                 owner_batches,
+                arranger,
                 ability.source_id,
                 position,
                 false,
@@ -673,6 +690,7 @@ mod tests {
                         target: filter,
                         count: QuantityExpr::Fixed { value: 1 },
                         position: LibraryPosition::Top,
+                        arranger: None,
                     },
                     if own_target {
                         vec![TargetRef::Object(own)]
@@ -728,6 +746,7 @@ mod tests {
                 target: TargetFilter::ParentTarget,
                 count: QuantityExpr::Fixed { value: 1 },
                 position: LibraryPosition::Top,
+                arranger: None,
             },
             vec![],
             source,
@@ -776,6 +795,7 @@ mod tests {
                 target: TargetFilter::Any,
                 count: QuantityExpr::Fixed { value: 1 },
                 position: LibraryPosition::Top,
+                arranger: None,
             },
             vec![TargetRef::Object(id2)],
             ObjectId(100),
@@ -822,6 +842,7 @@ mod tests {
                 target: TargetFilter::SelfRef,
                 count: QuantityExpr::Fixed { value: 1 },
                 position: LibraryPosition::Top,
+                arranger: None,
             },
             // Simulate chain target propagation from a parent that targeted
             // `other`. SelfRef must override and put the source on top.
@@ -878,6 +899,7 @@ mod tests {
                 target: TargetFilter::Any,
                 count: QuantityExpr::Fixed { value: 1 },
                 position: LibraryPosition::Top,
+                arranger: None,
             },
             vec![TargetRef::Object(id2)],
             ObjectId(100),
@@ -926,6 +948,7 @@ mod tests {
                 target: TargetFilter::ExiledBySource,
                 count: QuantityExpr::Fixed { value: 0 },
                 position: LibraryPosition::Bottom,
+                arranger: None,
             },
             vec![],
             ObjectId(100),
@@ -980,6 +1003,7 @@ mod tests {
                 target: TargetFilter::Any,
                 count: QuantityExpr::Fixed { value: 0 },
                 position: LibraryPosition::Top,
+                arranger: None,
             },
             vec![
                 TargetRef::Object(third),
@@ -1013,6 +1037,7 @@ mod tests {
                 target: TargetFilter::Any,
                 count: QuantityExpr::Fixed { value: 0 },
                 position: LibraryPosition::Top,
+                arranger: None,
             },
             vec![],
             ObjectId(100),
@@ -1057,6 +1082,7 @@ mod tests {
                 target: TargetFilter::Any,
                 count: QuantityExpr::Fixed { value: 1 },
                 position: LibraryPosition::Bottom,
+                arranger: None,
             },
             vec![TargetRef::Object(id1)],
             ObjectId(100),
@@ -1092,6 +1118,7 @@ mod tests {
                 target: TargetFilter::ParentTarget,
                 count: QuantityExpr::Fixed { value: 1 },
                 position: LibraryPosition::Top,
+                arranger: None,
             },
             vec![],
             obj_id,
@@ -1132,6 +1159,7 @@ mod tests {
                 target: TargetFilter::ParentTarget,
                 count: QuantityExpr::Fixed { value: 1 },
                 position: LibraryPosition::Top,
+                arranger: None,
             },
             vec![],
             obj_id,
@@ -1164,6 +1192,7 @@ mod tests {
                 target: TargetFilter::SelfRef,
                 count: QuantityExpr::Fixed { value: 1 },
                 position: LibraryPosition::Top,
+                arranger: None,
             },
             vec![],
             obj_id,
@@ -1193,6 +1222,7 @@ mod tests {
                 target: TargetFilter::None,
                 count: QuantityExpr::Fixed { value: 1 },
                 position: LibraryPosition::Top,
+                arranger: None,
             },
             vec![],
             obj_id,
@@ -1239,6 +1269,7 @@ mod tests {
                 target: TargetFilter::SelfRef,
                 count: QuantityExpr::Fixed { value: 1 },
                 position: LibraryPosition::Top,
+                arranger: None,
             },
             vec![TargetRef::Object(propagated_target)],
             obj_id,
@@ -1289,6 +1320,7 @@ mod tests {
                 target: TargetFilter::ParentTarget,
                 count: QuantityExpr::Fixed { value: 1 },
                 position: LibraryPosition::Top,
+                arranger: None,
             },
         )));
         state
@@ -1346,6 +1378,7 @@ mod tests {
                 target: TargetFilter::ParentTarget,
                 count: QuantityExpr::Fixed { value: 1 },
                 position: LibraryPosition::Top,
+                arranger: None,
             },
         )));
         state
@@ -1420,6 +1453,7 @@ mod tests {
                 target: TargetFilter::Any,
                 count: QuantityExpr::Fixed { value: 1 },
                 position: LibraryPosition::NthFromTop { n: 3 },
+                arranger: None,
             },
             vec![TargetRef::Object(id4)],
             ObjectId(100),
@@ -1477,6 +1511,7 @@ mod tests {
                 }),
                 count: QuantityExpr::Fixed { value: 2 },
                 position: LibraryPosition::Top,
+                arranger: None,
             },
             vec![], // No targets — resolution-time selection
             ObjectId(100),
@@ -1576,6 +1611,7 @@ mod tests {
                 },
                 count: QuantityExpr::Fixed { value: 1 },
                 position: LibraryPosition::Bottom,
+                arranger: None,
             },
             vec![],
             ObjectId(100),
@@ -1663,6 +1699,7 @@ mod tests {
                 },
                 count: QuantityExpr::Fixed { value: 1 },
                 position: LibraryPosition::Bottom,
+                arranger: None,
             },
             vec![],
             source,
@@ -1751,6 +1788,7 @@ mod tests {
                 target: TargetFilter::TrackedSet { id: set_id },
                 count: QuantityExpr::Fixed { value: 1 },
                 position: LibraryPosition::Bottom,
+                arranger: None,
             },
             vec![],
             ObjectId(100),

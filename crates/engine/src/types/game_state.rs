@@ -5215,7 +5215,9 @@ pub struct PendingPerPlayerZoneChoice {
 /// instruction that places several owners' cards at one library position. The
 /// first owner's batch is surfaced as `WaitingFor::EffectZoneChoice`; each
 /// submitted order is collected, the next owner is prompted in APNAP order, and
-/// every owner's cards move together after the last owner chooses.
+/// every owner's cards move together after the last owner chooses. Each prompt
+/// is answered by its batch's `chooser()` — the owner, unless the instruction
+/// names the arranger itself (CR 101.1).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MassLibraryOrderMember {
     /// The exact object incarnation that was selected for this ordered move.
@@ -5226,11 +5228,26 @@ pub struct MassLibraryOrderMember {
 
 /// One owner's exact members of a mass library-order instruction.
 /// The identity and origin are frozen at prompt creation so a later object with
-/// the same id cannot satisfy an in-flight ordering choice.
+/// the same id cannot satisfy an in-flight ordering choice. `owner` is whose
+/// cards and library these are; the player who arranges them is `chooser()`.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MassLibraryOrderBatch {
     pub owner: PlayerId,
+    /// CR 101.1 + CR 608.2c: the player the instruction directs to arrange this
+    /// owner's cards; `None` = CR 401.4 owner. Snapshotted at resolution
+    /// (CR 608.2d). Older saves decode as `None`: every earlier prompt was
+    /// owner-arranged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arranger: Option<PlayerId>,
     pub members: Vec<MassLibraryOrderMember>,
+}
+
+impl MassLibraryOrderBatch {
+    /// CR 401.4 + CR 101.1: the player who arranges this batch — the arranger
+    /// the instruction names, else the owner of the cards.
+    pub fn chooser(&self) -> PlayerId {
+        self.arranger.unwrap_or(self.owner)
+    }
 }
 
 /// Remaining batches of an in-flight mass library order.
@@ -16699,9 +16716,10 @@ pub enum WaitingFor {
         library_position: Option<LibraryPosition>,
         /// Exact origin/identity snapshot for a fresh CR 401.4 owner
         /// library-order prompt: a `ChangeZoneAll` mass placement or an
-        /// announced target set placed by `PutAtLibraryPosition`. Generic zone
-        /// choices leave this absent and therefore retain their ordinary strict
-        /// zone check.
+        /// announced target set placed by `PutAtLibraryPosition`. The prompt's
+        /// `player` is the batch's `chooser()`: its owner, or the arranger the
+        /// instruction names (CR 101.1). Generic zone choices leave this absent
+        /// and therefore retain their ordinary strict zone check.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mass_library_order: Option<MassLibraryOrderBatch>,
         /// CR 118.3: When true, this choice is for a cost payment (e.g., exile cost)
@@ -48661,6 +48679,7 @@ mod tests {
                 identity: ObjectIncarnationRef::of(ObjectId(1), 7),
                 origin: Zone::Battlefield,
             }],
+            arranger: None,
         };
         let wf = WaitingFor::EffectZoneChoice {
             player: PlayerId(0),
@@ -48763,6 +48782,7 @@ mod tests {
                     identity: ObjectIncarnationRef::of(ObjectId(5), 1),
                     origin: Zone::Battlefield,
                 }],
+                arranger: None,
             }]),
             arranged_batches: vec![MassLibraryOrderBatch {
                 owner: PlayerId(1),
@@ -48776,6 +48796,7 @@ mod tests {
                         origin: Zone::Graveyard,
                     },
                 ],
+                arranger: None,
             }],
             resolving_entry: Some(ObjectId(7)),
         };

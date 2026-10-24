@@ -20479,10 +20479,34 @@ fn is_ownership_candidate(reading: GuardReading, clause: &ParsedEffectClause) ->
         .is_some()
 }
 
+/// CR 608.2c + CR 101.1: does a positional placement's tail — the text from its
+/// terminator ("on top of" / "on the bottom of" / "into") onward — close the
+/// instruction with "in any order"? Only a closing "in any order" orders the
+/// placed cards as part of the instruction itself; a later clause is not read.
+fn placement_tail_orders_in_any_order(rest: &str) -> bool {
+    nom_primitives::scan_at_word_boundaries(rest, |i| {
+        (
+            tag::<_, _, OracleError<'_>>("in any order"),
+            opt(tag(".")),
+            eof,
+        )
+            .parse(i)
+    })
+    .is_some()
+}
+
+/// A placement's noun-phrase filter (`None` when it names nothing more specific
+/// than `Any`), its cardinality, and whether its tail closes with "in any order".
+type PlacementNounPhrase = (Option<TargetFilter>, LibraryPlacementCardinality, bool);
+
+/// `follower` is the player who follows this clause's instruction when the
+/// clause names one structurally (the controller of an imperative, CR 608.2c);
+/// `None` when the clause's grammar does not establish who follows it.
 fn refine_put_at_library_position(
     clause: &mut ParsedEffectClause,
     text: &str,
     ctx: &mut ParseContext,
+    follower: Option<&TargetFilter>,
 ) -> Option<MultiTargetSpec> {
     // "put [N] [type] on top/bottom of library" — the imperative parser
     // returns PutAtLibraryPosition { target: Any, count: Fixed(1) }
@@ -20498,6 +20522,7 @@ fn refine_put_at_library_position(
     if let Effect::PutAtLibraryPosition {
         ref mut target,
         ref mut count,
+        ref mut arranger,
         ..
     } = clause.effect
     {
@@ -20542,13 +20567,14 @@ fn refine_put_at_library_position(
                 };
             }
         }
-        let extracted = (|| -> Option<(Option<TargetFilter>, LibraryPlacementCardinality)> {
+        let extracted = (|| -> Option<PlacementNounPhrase> {
             let lower = text.to_lowercase();
             let (after_put, _) = tag::<_, _, OracleError<'_>>("put ")
                 .parse(lower.as_str())
                 .ok()?;
-            // Isolate the noun phrase before the first positional terminator.
-            let (_, before) = alt((
+            // Isolate the noun phrase before the first positional terminator;
+            // the remainder is the placement tail.
+            let (placement_tail, before) = alt((
                 take_until::<_, _, OracleError<'_>>(" on top of"),
                 take_until(" on the bottom of"),
                 take_until(" into "),
@@ -20567,9 +20593,13 @@ fn refine_put_at_library_position(
             } else {
                 Some(filter)
             };
-            Some((new_target, cardinality))
+            Some((
+                new_target,
+                cardinality,
+                placement_tail_orders_in_any_order(placement_tail),
+            ))
         })();
-        if let Some((maybe_filter, cardinality)) = extracted {
+        if let Some((maybe_filter, cardinality, orders_in_any_order)) = extracted {
             if *target == TargetFilter::Any {
                 if let Some(filter) = maybe_filter {
                     *target = filter;
@@ -20580,7 +20610,19 @@ fn refine_put_at_library_position(
                 LibraryPlacementCardinality::Exact(count_expr) => *count = count_expr,
                 // CR 601.2c + CR 115.1: the announced targets, rather than the
                 // effect's default count, define a targeted placement's size.
-                LibraryPlacementCardinality::TargetSet(spec) => placement_target_set = Some(spec),
+                LibraryPlacementCardinality::TargetSet(spec) => {
+                    // CR 608.2c + CR 101.1: "in any order" closing the controller's
+                    // instruction orders the announced set — the player following
+                    // the instruction arranges it, not each library's owner
+                    // (CR 401.4). A resolution-time selection ("put two cards …
+                    // in any order") is already placed in its selector's order.
+                    if orders_in_any_order {
+                        if let Some(follower) = follower {
+                            *arranger = Some(follower.clone());
+                        }
+                    }
+                    placement_target_set = Some(spec);
+                }
                 // CR 107.1c + CR 115.10a + CR 608.2d: untargeted "any number"
                 // selects zero through every card in the named population on resolution.
                 LibraryPlacementCardinality::AnyNumber => {
@@ -20606,7 +20648,14 @@ fn lower_clause_ast(
     match ast {
         ClauseAst::Imperative { text } => {
             let mut clause = lower_imperative_clause(&text, ctx);
-            let placement_target_set = refine_put_at_library_position(&mut clause, &text, ctx);
+            // CR 608.2c: the controller of the spell or ability follows an
+            // imperative instruction.
+            let placement_target_set = refine_put_at_library_position(
+                &mut clause,
+                &text,
+                ctx,
+                Some(&TargetFilter::Controller),
+            );
             if clause.multi_target.is_none() {
                 clause.multi_target = placement_target_set;
             }
@@ -28350,7 +28399,11 @@ fn lower_subject_predicate_ast_body(
             // pick rewrite in the player-target wrapper below), so sibling
             // predicates keep their original scope.
             let mut clause = lower_imperative_clause(&text, ctx);
-            let placement_target_set = refine_put_at_library_position(&mut clause, &text, ctx);
+            // A subject-led placement names its own follower, which this seam does
+            // not resolve to an arranger: no printed card puts an announced target
+            // set "in any order" under a subject, so the owner default stands.
+            let placement_target_set =
+                refine_put_at_library_position(&mut clause, &text, ctx, None);
             if clause.multi_target.is_none() {
                 clause.multi_target = placement_target_set;
             }

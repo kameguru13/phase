@@ -499,6 +499,7 @@ mod tests {
             mass_library_order: Some(MassLibraryOrderBatch {
                 owner: PlayerId(0),
                 members,
+                arranger: None,
             }),
             is_cost_payment: false,
             enters_modified_if: None,
@@ -518,6 +519,7 @@ mod tests {
                         origin: Zone::Library,
                     })
                     .collect(),
+                arranger: None,
             }]),
             arranged_batches: vec![MassLibraryOrderBatch {
                 owner: PlayerId(0),
@@ -525,6 +527,7 @@ mod tests {
                     identity: ObjectIncarnationRef::from_object(&state.objects[&card_a]),
                     origin: Zone::Library,
                 }],
+                arranger: None,
             }],
             resolving_entry: Some(ObjectId(1)),
         }));

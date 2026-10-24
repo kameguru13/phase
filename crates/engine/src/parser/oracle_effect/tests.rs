@@ -31640,6 +31640,7 @@ fn search_shuffle_put_those_cards_on_top_in_any_order() {
             target: TargetFilter::Any,
             count: QuantityExpr::Fixed { value: 0 },
             position: LibraryPosition::Top,
+            arranger: None,
         }
     ));
 }
@@ -31671,6 +31672,7 @@ fn dig_put_those_cards_on_top_in_any_order() {
             target: TargetFilter::Any,
             count: QuantityExpr::Fixed { value: 0 },
             position: LibraryPosition::Top,
+            arranger: None,
         }
     ));
 }
@@ -31698,6 +31700,7 @@ fn reveal_dig_put_those_cards_on_top_stays_dig() {
             target: TargetFilter::Any,
             count: QuantityExpr::Fixed { value: 0 },
             position: LibraryPosition::Top,
+            arranger: None,
         })
     ));
 }
@@ -52058,6 +52061,7 @@ fn doomsday_search_exiles_rest_and_orders_chosen_cards() {
             target: TargetFilter::Any,
             count: QuantityExpr::Fixed { value: 0 },
             position: LibraryPosition::Top,
+            arranger: None,
         }
     ));
     assert!(!ability_chain_has_unimplemented(&def));
@@ -54169,6 +54173,7 @@ fn chaos_wand_lowers_to_targeted_exile_until_optional_cast_and_cleanup() {
             target,
             count,
             position,
+            arranger: _,
         } = &*cleanup.effect
         else {
             panic!(
@@ -54225,6 +54230,7 @@ fn sanwell_exile_top_optional_cast_and_rest_on_bottom() {
             target,
             count,
             position,
+            arranger: _,
         } = &*cleanup.effect
         else {
             panic!(
@@ -74937,6 +74943,7 @@ fn brainstorm_exact_count_placement_shape_unchanged() {
             target,
             count,
             position,
+            arranger,
         } => {
             assert_eq!(
                 *count,
@@ -74951,6 +74958,13 @@ fn brainstorm_exact_count_placement_shape_unchanged() {
                         .controller(ControllerRef::You)
                         .properties(vec![FilterProp::InZone { zone: Zone::Hand }])
                 )
+            );
+            // PAIRED NEGATIVE (P1): "in any order" closes this clause too, but a
+            // resolution-time selection is placed in its selector's order, so
+            // only an announced target set names an arranger.
+            assert_eq!(
+                *arranger, None,
+                "an exact-count selection names no arranger"
             );
         }
         other => panic!("expected PutAtLibraryPosition, got {other:?}"),
@@ -75003,7 +75017,16 @@ fn bow_of_nylea_mode_four_gains_up_to_four_target_set_shape() {
             target,
             count,
             position,
+            arranger,
         } => {
+            // P1 (CR 608.2c + CR 101.1): "in any order" closes the controller's
+            // instruction over an announced target set, so the controller
+            // arranges. Inert here (the owner is the controller) but recorded.
+            assert_eq!(
+                *arranger,
+                Some(TargetFilter::Controller),
+                "Bow of Nylea mode 4's closing \"in any order\" names the controller"
+            );
             // PAIRED NEGATIVE: the quantifier must route to the spec, never to
             // the effect's count.
             assert_eq!(
@@ -75071,9 +75094,19 @@ fn lodestone_bauble_targets_up_to_four_basic_lands_in_a_graveyard() {
         "the announced target set must be up to four"
     );
 
-    let Effect::PutAtLibraryPosition { target, .. } = ability.effect.as_ref() else {
+    let Effect::PutAtLibraryPosition {
+        target, arranger, ..
+    } = ability.effect.as_ref()
+    else {
         panic!("expected PutAtLibraryPosition, got {:?}", ability.effect);
     };
+    // P1 (CR 608.2c + CR 101.1): the first clause ends at "in any order", so the
+    // activator arranges the chosen player's lands.
+    assert_eq!(
+        *arranger,
+        Some(TargetFilter::Controller),
+        "Lodestone Bauble's closing \"in any order\" names the controller"
+    );
     let TargetFilter::Typed(filter) = target else {
         panic!("expected a Typed filter, got {target:?}");
     };
@@ -75103,6 +75136,217 @@ fn lodestone_bauble_targets_up_to_four_basic_lands_in_a_graveyard() {
             .any(|property| matches!(property, FilterProp::Owned { .. })),
         "\"a player's\" binds no owner, got {:?}",
         filter.properties
+    );
+}
+
+/// Every `PutAtLibraryPosition` node of a parsed card: spell and activated
+/// abilities, their modes, and trigger bodies, through `sub_ability` and
+/// `else_ability` chains.
+fn parsed_library_placement_nodes(
+    parsed: &crate::parser::oracle::ParsedAbilities,
+) -> Vec<&AbilityDefinition> {
+    fn walk<'a>(definition: &'a AbilityDefinition, nodes: &mut Vec<&'a AbilityDefinition>) {
+        if matches!(
+            definition.effect.as_ref(),
+            Effect::PutAtLibraryPosition { .. }
+        ) {
+            nodes.push(definition);
+        }
+        for child in definition
+            .mode_abilities
+            .iter()
+            .chain(definition.sub_ability.as_deref())
+            .chain(definition.else_ability.as_deref())
+        {
+            walk(child, nodes);
+        }
+    }
+    let mut nodes = Vec::new();
+    for root in parsed.abilities.iter().chain(
+        parsed
+            .triggers
+            .iter()
+            .filter_map(|trigger| trigger.execute.as_deref()),
+    ) {
+        walk(root, &mut nodes);
+    }
+    nodes
+}
+
+fn placement_arranger(node: &AbilityDefinition) -> Option<&TargetFilter> {
+    let Effect::PutAtLibraryPosition { arranger, .. } = node.effect.as_ref() else {
+        unreachable!("only placement nodes are collected");
+    };
+    arranger.as_ref()
+}
+
+/// P1 — CR 608.2c + CR 101.1: "in any order" closing an imperative placement of
+/// an ANNOUNCED target set is part of the controller's instruction, so the
+/// controller arranges (`arranger: Some(Controller)`), overriding the CR 401.4
+/// owner default. Every placement without that closing phrase, and every
+/// resolution-time selection, keeps `None` (the owner default). Verbatim Oracle
+/// text throughout.
+///
+/// REVERT-FAILING: without the `TargetSet` + closing-"in any order" gate in
+/// `refine_put_at_library_position`, every positive row reads `None`.
+#[test]
+fn announced_target_set_placement_in_any_order_names_the_controller_arranger() {
+    let parse = |text: &str, name: &str, keywords: &[&str], types: &[&str]| {
+        parse_oracle_text(
+            text,
+            name,
+            &keywords.iter().map(|k| k.to_string()).collect::<Vec<_>>(),
+            &types.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+            &[],
+        )
+    };
+
+    let positives = [
+        parse(
+            "Put up to three target cards from an opponent's graveyard on top of their library \
+             in any order.",
+            "Misinformation",
+            &[],
+            &["Instant"],
+        ),
+        parse(
+            "{1}, {T}, Sacrifice this artifact: Put up to four target basic land cards from a \
+             player's graveyard on top of their library in any order. That player draws a card \
+             at the beginning of the next turn's upkeep.",
+            "Lodestone Bauble",
+            &[],
+            &["Artifact"],
+        ),
+        parse(
+            "Put any number of target artifact cards from target player's graveyard on top of \
+             their library in any order.",
+            "Drafna's Restoration",
+            &[],
+            &["Sorcery"],
+        ),
+        parse(
+            "Attacking creatures you control have deathtouch.\n{1}{G}, {T}: Choose one —\n\
+             • Put a +1/+1 counter on target creature.\n\
+             • Bow of Nylea deals 2 damage to target creature with flying.\n\
+             • You gain 3 life.\n\
+             • Put up to four target cards from your graveyard on the bottom of your library \
+             in any order.",
+            "Bow of Nylea",
+            &[],
+            &["Enchantment", "Artifact"],
+        ),
+    ];
+    for (parsed, name) in positives.iter().zip([
+        "Misinformation",
+        "Lodestone Bauble",
+        "Drafna's Restoration",
+        "Bow of Nylea",
+    ]) {
+        let nodes = parsed_library_placement_nodes(parsed);
+        assert_eq!(nodes.len(), 1, "reach guard: {name} has one placement node");
+        assert!(
+            nodes[0].multi_target.is_some(),
+            "reach guard: {name} places an announced target set"
+        );
+        assert_eq!(
+            placement_arranger(nodes[0]),
+            Some(&TargetFilter::Controller),
+            "{name}: the closing \"in any order\" names the controller as arranger"
+        );
+    }
+
+    // PAIRED NEGATIVES: announced target sets with no closing "in any order"
+    // keep the CR 401.4 owner default. Each reach guard proves the node is an
+    // announced target set, so `None` is not a missed node.
+    let owner_default = [
+        parse(
+            "Put two target lands on top of their owners' libraries.",
+            "Plow Under",
+            &[],
+            &["Sorcery"],
+        ),
+        parse(
+            "Put two target artifacts on top of their owners' libraries.",
+            "Rebuking Ceremony",
+            &[],
+            &["Sorcery"],
+        ),
+        parse(
+            "Put up to three target creature cards from your graveyard on top of your library.",
+            "Reinforcements",
+            &[],
+            &["Instant"],
+        ),
+        parse(
+            "Put any number of target creature cards from your graveyard on top of your \
+             library.\nDraw a card.",
+            "Gravepurge",
+            &[],
+            &["Instant"],
+        ),
+        parse(
+            "Double strike\nProwess (Whenever you cast a noncreature spell, this creature gets \
+             +1/+1 until end of turn.)\nWhen this creature enters, for each opponent, put up to \
+             one target nonland permanent that player controls into its owner's library third \
+             from the top.",
+            "Riptide Gearhulk",
+            &["Double strike", "Prowess"],
+            &["Artifact", "Creature"],
+        ),
+    ];
+    for (parsed, name) in owner_default.iter().zip([
+        "Plow Under",
+        "Rebuking Ceremony",
+        "Reinforcements",
+        "Gravepurge",
+        "Riptide Gearhulk",
+    ]) {
+        let nodes = parsed_library_placement_nodes(parsed);
+        assert_eq!(nodes.len(), 1, "reach guard: {name} has one placement node");
+        assert!(
+            nodes[0].multi_target.is_some(),
+            "reach guard: {name} places an announced target set"
+        );
+        assert_eq!(
+            placement_arranger(nodes[0]),
+            None,
+            "{name}: no closing \"in any order\", so each owner arranges (CR 401.4)"
+        );
+    }
+
+    // PAIRED NEGATIVE: a subject-led placement ("target opponent puts …") is not
+    // the controller's imperative, so it names no arranger even with a closing
+    // "in any order".
+    let imp = parse(
+        "({B/P} can be paid with either {B} or 2 life.)\nFlying\nWhen Phyrexian Chimney Imp \
+         dies, target opponent puts two cards from their hand on top of their library in any \
+         order.",
+        "Phyrexian Chimney Imp",
+        &["Flying"],
+        &["Creature"],
+    );
+    let nodes = parsed_library_placement_nodes(&imp);
+    assert_eq!(
+        nodes.len(),
+        1,
+        "reach guard: Phyrexian Chimney Imp has one placement node"
+    );
+    assert!(
+        matches!(
+            nodes[0].effect.as_ref(),
+            Effect::PutAtLibraryPosition {
+                count: QuantityExpr::Fixed { value: 2 },
+                position: LibraryPosition::Top,
+                ..
+            }
+        ),
+        "reach guard: the imp's placement of two cards on top, got {:?}",
+        nodes[0].effect
+    );
+    assert_eq!(
+        placement_arranger(nodes[0]),
+        None,
+        "a subject-led placement names no arranger"
     );
 }
 
@@ -75156,6 +75400,7 @@ fn assert_untargeted_any_number_placement_shape(placement: &AbilityDefinition) {
         target,
         count,
         position,
+        arranger,
     } = placement.effect.as_ref()
     else {
         panic!(
@@ -75177,6 +75422,10 @@ fn assert_untargeted_any_number_placement_shape(placement: &AbilityDefinition) {
     // REACH GUARDS: the node's own recipient and position.
     assert_eq!(*target, your_hand_cards_filter());
     assert_eq!(*position, LibraryPosition::Bottom);
+    assert_eq!(
+        *arranger, None,
+        "a resolution-time selection names no arranger"
+    );
     // GREEN AT BASE; its pairing is mutation MP-SPEC (see the row's doc comment).
     assert!(
         placement.multi_target.is_none(),
@@ -75217,6 +75466,7 @@ fn assert_pronoun_partition_keeps_base_shape(
         target,
         count,
         position,
+        arranger,
     } = placement.effect.as_ref()
     else {
         panic!(
@@ -75224,6 +75474,10 @@ fn assert_pronoun_partition_keeps_base_shape(
             placement.effect
         );
     };
+    assert_eq!(
+        *arranger, None,
+        "a pronoun partition is not an announced target set, so it names no arranger"
+    );
     assert_eq!(
         *count,
         QuantityExpr::Fixed { value: 1 },

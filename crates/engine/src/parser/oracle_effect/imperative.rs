@@ -9268,21 +9268,25 @@ pub(super) fn lower_put_ast(ast: PutImperativeAst) -> Effect {
             target: TargetFilter::Any,
             count: QuantityExpr::Fixed { value: 1 },
             position: LibraryPosition::Top,
+            arranger: None,
         },
         PutImperativeAst::BottomOfLibrary => Effect::PutAtLibraryPosition {
             target: TargetFilter::Any,
             count: QuantityExpr::Fixed { value: 1 },
             position: LibraryPosition::Bottom,
+            arranger: None,
         },
         PutImperativeAst::NthFromTop { n } => Effect::PutAtLibraryPosition {
             target: TargetFilter::Any,
             count: QuantityExpr::Fixed { value: 1 },
             position: LibraryPosition::NthFromTop { n },
+            arranger: None,
         },
         PutImperativeAst::BeneathTop { depth } => Effect::PutAtLibraryPosition {
             target: TargetFilter::Any,
             count: QuantityExpr::Fixed { value: 1 },
             position: LibraryPosition::BeneathTop { depth },
+            arranger: None,
         },
         PutImperativeAst::PutTopCardsIntoHandMatchingExileCount => Effect::Mill {
             count: QuantityExpr::Ref {

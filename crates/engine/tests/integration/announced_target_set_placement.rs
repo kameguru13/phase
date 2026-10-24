@@ -27,9 +27,11 @@
 //! discriminating positive, which is not one of the three named pairings).
 
 use engine::ai_support::legal_actions;
+use engine::game::engine::apply_with_rejection;
 use engine::game::scenario::{CastOutcome, GameRunner, GameScenario, P0, P1};
 use engine::game::triggers::drain_order_triggers_with_identity;
 use engine::types::ability::{EffectKind, LibraryPosition, TargetRef};
+use engine::types::action_rejection::ActionRejectionCode;
 use engine::types::actions::GameAction;
 use engine::types::card_type::Supertype;
 use engine::types::counter::CounterType;
@@ -67,13 +69,15 @@ fn library(runner: &GameRunner, player: PlayerId) -> Vec<ObjectId> {
         .collect()
 }
 
-/// CR 401.4: the owner's arrangement prompt for two or more announced targets
-/// put into one position of `owner`'s library at the same time. Asserted
-/// unconditionally: any other `WaitingFor` (including priority after an
-/// unprompted placement) fails the row.
-fn assert_owner_arrangement_prompt(
+/// The arrangement prompt for two or more announced targets put into one
+/// position of `owner`'s library at the same time, answered by `chooser`.
+/// Asserted unconditionally: any other `WaitingFor` (including priority after
+/// an unprompted placement) fails the row.
+fn assert_arrangement_prompt(
     waiting_for: &WaitingFor,
+    chooser: PlayerId,
     owner: PlayerId,
+    arranger: Option<PlayerId>,
     cards: &[ObjectId],
     position: LibraryPosition,
 ) {
@@ -89,7 +93,7 @@ fn assert_owner_arrangement_prompt(
             mass_library_order,
             ..
         } => {
-            assert_eq!(*player, owner, "CR 401.4: the cards' owner arranges them");
+            assert_eq!(*player, chooser, "the prompt names the arranging player");
             assert_eq!(
                 offered, cards,
                 "the prompt names exactly that owner's cards"
@@ -100,13 +104,43 @@ fn assert_owner_arrangement_prompt(
             );
             assert_eq!(*effect_kind, EffectKind::PutAtLibraryPosition);
             assert_eq!(*library_position, Some(position));
-            assert!(
-                mass_library_order.is_some(),
-                "the prompt carries the frozen owner batch"
+            let batch = mass_library_order
+                .as_ref()
+                .expect("the prompt carries the frozen owner batch");
+            assert_eq!(batch.owner, owner, "the batch is the owner's cards");
+            assert_eq!(
+                batch.arranger, arranger,
+                "the batch records the arranger the instruction named"
             );
         }
-        other => panic!("expected {owner:?}'s CR 401.4 ordering prompt, got {other:?}"),
+        other => {
+            panic!("expected {chooser:?}'s ordering prompt over {owner:?}'s cards, got {other:?}")
+        }
     }
+}
+
+/// CR 401.4: the owner's arrangement prompt — the instruction names no
+/// arranger, so the cards' owner orders them.
+fn assert_owner_arrangement_prompt(
+    waiting_for: &WaitingFor,
+    owner: PlayerId,
+    cards: &[ObjectId],
+    position: LibraryPosition,
+) {
+    assert_arrangement_prompt(waiting_for, owner, owner, None, cards, position);
+}
+
+/// CR 101.1 + CR 608.2c: the controller's arrangement prompt — "in any order"
+/// closing the controller's instruction makes `chooser`, the controller,
+/// arrange `owner`'s cards instead of the owner (CR 401.4 default).
+fn assert_controller_arrangement_prompt(
+    waiting_for: &WaitingFor,
+    chooser: PlayerId,
+    owner: PlayerId,
+    cards: &[ObjectId],
+    position: LibraryPosition,
+) {
+    assert_arrangement_prompt(waiting_for, chooser, owner, Some(chooser), cards, position);
 }
 
 fn zone(runner: &GameRunner, id: ObjectId) -> Zone {
@@ -786,19 +820,27 @@ fn gravepurge_with_empty_graveyard_resolves_and_still_draws() {
     ));
 }
 
-/// Matrix row 5 — A-5. A multi-object placement out of an OPPONENT's graveyard
-/// lands in that opponent's library, not the caster's, in the order that
-/// opponent arranges (CR 401.4: the owner of the cards arranges them, not the
-/// caster).
+/// Matrix row 5 — A-5, and maintainer review 4's row (N1). A multi-object
+/// placement out of an OPPONENT's graveyard lands in that opponent's library,
+/// not the caster's, in the order the CASTER arranges. Misinformation's
+/// "… on top of their library in any order" is part of the caster's
+/// instruction (CR 608.2c), and the card's text takes precedence over the
+/// CR 401.4 owner default (CR 101.1; WotC ruling: "You don't need to show the
+/// opponent what order you put the cards on top of their library."). P0 makes
+/// that choice as the effect is applied (CR 608.2d); P1, the owner, cannot.
+///
+/// REVERT-FAILING: with the arranger dropped (parser gate removed, or the
+/// prompt built for `batch.owner`), (a) the prompt names P1 and (b) P1's
+/// submission is accepted.
 ///
 /// NARROW CLAIM (stated deliberately): this fixture has a single non-caster
 /// owner, so it establishes "a multi-object placement from an opponent's
 /// graveyard lands in that opponent's library and not the caster's" — NOT
 /// per-card owner routing in general. Owner routing itself is the zone
 /// pipeline's (one `ZoneMoveRequest::effect(id, Zone::Library, source)` per
-/// object); the per-owner grouping only decides who arranges which cards.
+/// object); the per-owner grouping only decides which cards each prompt orders.
 #[test]
-fn misinformation_places_all_chosen_cards_into_that_opponents_library() {
+fn misinformation_places_all_chosen_cards_into_that_opponents_library_in_its_casters_arrangement() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     scenario.with_mana_pool(P0, black_mana(1));
@@ -828,23 +870,49 @@ fn misinformation_places_all_chosen_cards_into_that_opponents_library() {
         .target_objects(&[o1, o2, o3])
         .resolve();
 
-    // REVERT-FAILING: the opponent who owns the cards is prompted, not the caster.
-    assert_owner_arrangement_prompt(
+    // (a) REVERT-FAILING: the caster, not the opponent who owns the cards, is
+    // prompted; the batch is still P1's cards.
+    assert_controller_arrangement_prompt(
         outcome.final_waiting_for(),
+        P0,
         P1,
         &[o1, o2, o3],
         LibraryPosition::Top,
     );
+    // Reach guard: Misinformation is mid-resolution and nothing has moved.
+    assert_eq!(zone(&runner, misinformation), Zone::Stack);
+    for card in [o1, o2, o3] {
+        assert_eq!(zone(&runner, card), Zone::Graveyard);
+    }
+
+    // (b) REVERT-FAILING: the owner cannot submit the caster's arrangement, and
+    // the rejected submission changes nothing.
+    let before = runner.state().clone();
+    let rejection = apply_with_rejection(
+        runner.state_mut(),
+        P1,
+        GameAction::SelectCards {
+            cards: vec![o3, o1, o2],
+        },
+    )
+    .expect_err("P1 must not submit the caster's arrangement");
+    assert_eq!(rejection.code, ActionRejectionCode::WrongPlayer);
+    assert!(
+        *runner.state() == before,
+        "a rejected submission leaves the game unchanged"
+    );
+
+    // (c) The caster's arrangement is the exact top of P1's library.
     runner
         .act(GameAction::SelectCards {
             cards: vec![o3, o1, o2],
         })
-        .expect("P1 submits their arrangement");
+        .expect("P0 submits their arrangement");
 
     assert_eq!(
         library(&runner, P1),
         vec![o3, o1, o2, p1_lib],
-        "every chosen card lands on top of the OPPONENT's library, in that opponent's \
+        "every chosen card lands on top of the OPPONENT's library, in the caster's \
          arrangement"
     );
     assert_eq!(
@@ -903,9 +971,10 @@ fn bow_board() -> (GameRunner, ObjectId, Vec<ObjectId>, ObjectId, ObjectId) {
 
 /// Matrix row 8 — A-8 runtime. CR 601.2b announces the mode BEFORE CR 601.2c
 /// announces the targets, so the chosen mode's own `MultiTargetSpec` sizes the
-/// slots. Mode 4 places every chosen target on the bottom, in the owner's
-/// arrangement (CR 401.4: a bottom placement is a specific position too). P0
-/// orders `[g2, g1]`, which differs from the announcement.
+/// slots. Mode 4 places every chosen target on the bottom, in the controller's
+/// arrangement: its closing "in any order" names the controller (CR 101.1 +
+/// CR 608.2c), who here also owns the cards. P0 orders `[g2, g1]`, which
+/// differs from the announcement.
 #[test]
 fn bow_of_nylea_mode_four_places_every_chosen_target() {
     let (mut runner, bow, graveyard, lib_pre, _creature) = bow_board();
@@ -917,9 +986,10 @@ fn bow_of_nylea_mode_four_places_every_chosen_target() {
         .target_objects(&[g1, g2])
         .resolve();
 
-    // REVERT-FAILING: without the owner arrangement no prompt opens.
-    assert_owner_arrangement_prompt(
+    // REVERT-FAILING: without the arrangement no prompt opens.
+    assert_controller_arrangement_prompt(
         outcome.final_waiting_for(),
+        P0,
         P0,
         &[g1, g2],
         LibraryPosition::Bottom,
@@ -933,7 +1003,7 @@ fn bow_of_nylea_mode_four_places_every_chosen_target() {
     assert_eq!(
         library(&runner, P0),
         vec![lib_pre, g2, g1],
-        "both chosen targets go to the BOTTOM in the owner's arrangement"
+        "both chosen targets go to the BOTTOM in the controller's arrangement"
     );
     assert_eq!(
         zone(&runner, g3),
@@ -1651,8 +1721,8 @@ fn riptide_every_remaining_owner_departure_completes_the_arrangement_empty() {
 }
 
 /// Activate Lodestone Bauble on P1's two graveyard lands and arrange them as
-/// `[l2, l1]`, asserting P1's library is exactly those two cards on top of
-/// what it held before.
+/// `[l2, l1]` — P0, the activator, arranges (CR 101.1 + CR 608.2c) — asserting
+/// P1's library is exactly those two cards on top of what it held before.
 fn lodestone_arrangement_moves_exactly_its_own_cards(board: &mut RiptideBoard) {
     let [l1, l2] = board.lands;
     assert_eq!(zone(&board.runner, l1), Zone::Graveyard);
@@ -1663,8 +1733,9 @@ fn lodestone_arrangement_moves_exactly_its_own_cards(board: &mut RiptideBoard) {
         .activate(board.bauble, 0)
         .target_objects(&[l1, l2])
         .resolve();
-    assert_owner_arrangement_prompt(
+    assert_controller_arrangement_prompt(
         outcome.final_waiting_for(),
+        P0,
         P1,
         &[l1, l2],
         LibraryPosition::Top,
@@ -1674,7 +1745,7 @@ fn lodestone_arrangement_moves_exactly_its_own_cards(board: &mut RiptideBoard) {
         .act(GameAction::SelectCards {
             cards: vec![l2, l1],
         })
-        .expect("P1 submits their arrangement");
+        .expect("P0 submits their arrangement");
 
     let mut expected = vec![l2, l1];
     expected.extend(p1_before_bauble);
@@ -1761,16 +1832,19 @@ fn advance_through_next_upkeep(runner: &mut GameRunner) {
     panic!("the next upkeep was not reached within the window budget");
 }
 
-/// CR 401.4 + CR 608.2d + CR 603.7: Lodestone Bauble's targets come from P1's
-/// graveyard, so P1 arranges them on top of P1's library. The card's delayed
-/// "That player draws a card at the beginning of the next turn's upkeep" is
-/// created by the part of the ability parked behind that prompt, and it must
-/// still draw for P1 — exactly the card P1 chose to put on top.
+/// CR 101.1 + CR 608.2c + CR 608.2d + CR 603.7: Lodestone Bauble's targets come
+/// from P1's graveyard, and its "… on top of their library in any order" is
+/// part of the activator's instruction, so P0 arranges them on top of P1's
+/// library (the card's text takes precedence over the CR 401.4 owner default).
+/// The card's delayed "That player draws a card at the beginning of the next
+/// turn's upkeep" is created by the part of the ability parked behind that
+/// prompt, and it must still draw for P1 — exactly the card P0 put on top.
 ///
-/// REVERT-FAILING: with the arrangement gate removed, the activation resolves
-/// straight to priority and the unconditional prompt assertion fails.
+/// REVERT-FAILING: with the arranger dropped, the prompt names P1, the owner;
+/// with the arrangement gate removed, the activation resolves straight to
+/// priority. Either way the unconditional prompt assertion fails.
 #[test]
-fn lodestone_bauble_owner_arranges_and_the_delayed_draw_takes_their_top_card() {
+fn lodestone_bauble_controller_arranges_and_the_delayed_draw_takes_the_card_they_put_on_top() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     scenario.with_mana_pool(P0, colorless(1));
@@ -1796,9 +1870,10 @@ fn lodestone_bauble_owner_arranges_and_the_delayed_draw_takes_their_top_card() {
         .target_objects(&[l1, l2])
         .resolve();
 
-    // REVERT-FAILING: P1, the cards' owner, is prompted, not the activator.
-    assert_owner_arrangement_prompt(
+    // REVERT-FAILING: P0, the activator, is prompted over P1's cards.
+    assert_controller_arrangement_prompt(
         outcome.final_waiting_for(),
+        P0,
         P1,
         &[l1, l2],
         LibraryPosition::Top,
@@ -1810,14 +1885,14 @@ fn lodestone_bauble_owner_arranges_and_the_delayed_draw_takes_their_top_card() {
         .act(GameAction::SelectCards {
             cards: vec![l2, l1],
         })
-        .expect("P1 submits their arrangement");
+        .expect("P0 submits their arrangement");
 
     let mut expected = vec![l2, l1];
     expected.extend(p1_before.iter().copied());
     assert_eq!(
         library(&runner, P1),
         expected,
-        "P1's chosen order is the exact top of P1's library"
+        "P0's chosen order is the exact top of P1's library"
     );
     assert_eq!(
         zone(&runner, bauble),
@@ -1844,7 +1919,7 @@ fn lodestone_bauble_owner_arranges_and_the_delayed_draw_takes_their_top_card() {
             .copied()
             .collect::<Vec<_>>(),
         vec![l2],
-        "P1 drew exactly the card P1 put on top"
+        "P1 drew exactly the card P0 put on top"
     );
     let mut remaining = vec![l1];
     remaining.extend(p1_before);
@@ -1937,25 +2012,27 @@ fn lodestone_three_player_board(
     (runner, bauble, [l1, l2])
 }
 
-/// Activate the Bauble on `[l1, l2]` and stop at `chooser`'s CR 401.4 prompt,
-/// with the reach guard every departure row below relies on: the cost was
-/// paid, nothing moved, the activation is still resolving with its "That
-/// player draws a card …" tail parked behind the prompt, and that tail has
-/// created no delayed trigger yet.
+/// Activate the Bauble on `[l1, l2]`, owned by `owner`, and stop at P0's
+/// arrangement prompt over them (CR 101.1 + CR 608.2c: the activator follows
+/// "… in any order"), with the reach guard every departure row below relies
+/// on: the cost was paid, nothing moved, the activation is still resolving
+/// with its "That player draws a card …" tail parked behind the prompt, and
+/// that tail has created no delayed trigger yet.
 fn open_lodestone_arrangement(
     runner: &mut GameRunner,
     bauble: ObjectId,
     lands: [ObjectId; 2],
-    chooser: PlayerId,
+    owner: PlayerId,
 ) {
     let [l1, l2] = lands;
     let outcome = runner
         .activate(bauble, 0)
         .target_objects(&[l1, l2])
         .resolve();
-    assert_owner_arrangement_prompt(
+    assert_controller_arrangement_prompt(
         outcome.final_waiting_for(),
-        chooser,
+        P0,
+        owner,
         &[l1, l2],
         LibraryPosition::Top,
     );
@@ -2020,29 +2097,33 @@ fn advance_into_next_turn_observing(runner: &mut GameRunner, source: ObjectId) -
 }
 
 /// CR 104.3a + CR 800.4a + CR 608.2c + CR 608.2m: P0 activates Lodestone
-/// Bauble on two basic lands in P1's graveyard; P2 stays in the game. P1, the
-/// owner and only chooser, concedes at P1's own arrangement prompt. P1's lands
-/// leave the game with P1, but P0's activation survives and has begun
-/// resolving, so it continues fully: the placement completes with nothing
-/// moved (CR 609.3), and the parked tail creates the delayed draw, controlled
-/// by P0, the player who controlled the ability as it resolved, with the
-/// Bauble as its source (CR 603.7a + CR 603.7e). Only then does the active
-/// player P0 receive priority (CR 117.2e + CR 117.3b), all within the Concede.
-/// The single completion is the engine's completion contract.
+/// Bauble on two basic lands in P1's graveyard; P2 stays in the game. P0
+/// arranges them (CR 101.1 + CR 608.2c: the activator follows "… in any
+/// order"), and P1, the owner, concedes at P0's arrangement prompt. P1's lands
+/// leave the game with P1, so P0 has nothing left to arrange, but P0's
+/// activation has begun resolving, so it continues fully: the placement
+/// completes with nothing moved (CR 609.3), and the parked tail creates the
+/// delayed draw, controlled by P0, the player who controlled the ability as it
+/// resolved, with the Bauble as its source (CR 603.7a + CR 603.7e). Only then
+/// does the active player P0 receive priority (CR 117.2e + CR 117.3b), all
+/// within the Concede. The single completion is the engine's completion
+/// contract.
 ///
-/// REVERT-FAILING: with the departed final chooser's arrangement retired
-/// instead of completed, the Concede emits no completion, creates no delayed
-/// trigger, and leaves the carrier and continuation live behind re-pointed
-/// priority — (b), (c) and (d) fail.
+/// REVERT-FAILING: with the arranger dropped, the pre-Concede prompt is P1's.
+/// This row no longer discriminates the departed-final-chooser completion
+/// (P0, the chooser, stays); `lodestone_bauble_controller_concession_at_own_arrangement_completes_before_priority`,
+/// `plow_under_last_owner_concession_completes_the_spell_before_priority` and
+/// the Riptide departure rows carry that.
 ///
 /// SUPPLEMENTARY (V2, not the discriminator): at the next upkeep, P2's turn
 /// (CR 800.4k), the living P0's trigger reaches the stack once and draws for
 /// no one, because "that player" is the departed P1 (CR 603.7b + CR 800.4a +
 /// CR 609.3).
 ///
-/// Paired positive: `lodestone_bauble_owner_arranges_and_the_delayed_draw_takes_their_top_card`.
+/// Paired positive: `lodestone_bauble_controller_arranges_and_the_delayed_draw_takes_the_card_they_put_on_top`.
 #[test]
-fn lodestone_bauble_final_owner_concession_completes_the_activation_before_priority() {
+fn lodestone_bauble_owner_concession_at_the_controllers_arrangement_completes_the_activation_before_priority(
+) {
     let (mut runner, bauble, lands) = lodestone_three_player_board(P1);
     let [l1, l2] = lands;
     let p0_hand_before = hand_len(&runner, P0);
@@ -2109,11 +2190,11 @@ fn lodestone_bauble_final_owner_concession_completes_the_activation_before_prior
 }
 
 /// UNCHANGED BRANCH (preservation): P2, a bystander who owns none of the
-/// cards, concedes while P1 is arranging. P1's prompt stands untouched and
-/// nothing completes; P1's later submission then completes the activation
-/// normally (CR 104.3a + CR 800.4a + CR 401.4).
+/// cards, concedes while P0 is arranging P1's cards. P0's prompt stands
+/// untouched and nothing completes; P0's later submission then completes the
+/// activation normally (CR 104.3a + CR 800.4a + CR 101.1 + CR 608.2c).
 #[test]
-fn lodestone_bauble_bystander_concession_leaves_the_owner_arrangement_open() {
+fn lodestone_bauble_bystander_concession_leaves_the_controllers_arrangement_open() {
     let (mut runner, bauble, lands) = lodestone_three_player_board(P1);
     let [l1, l2] = lands;
     let p1_before = library(&runner, P1);
@@ -2123,8 +2204,9 @@ fn lodestone_bauble_bystander_concession_leaves_the_owner_arrangement_open() {
         .act(GameAction::Concede { player_id: P2 })
         .expect("P2 concedes");
 
-    assert_owner_arrangement_prompt(
+    assert_controller_arrangement_prompt(
         &runner.state().waiting_for,
+        P0,
         P1,
         &[l1, l2],
         LibraryPosition::Top,
@@ -2143,7 +2225,7 @@ fn lodestone_bauble_bystander_concession_leaves_the_owner_arrangement_open() {
         .act(GameAction::SelectCards {
             cards: vec![l2, l1],
         })
-        .expect("P1 submits their arrangement");
+        .expect("P0 submits their arrangement");
     let mut expected = vec![l2, l1];
     expected.extend(p1_before);
     assert_eq!(library(&runner, P1), expected);
@@ -2350,6 +2432,84 @@ fn gravepurge_controller_concession_at_own_arrangement_finishes_the_spell_before
     assert_eq!(hand_len(&runner, P2), p2_hand_before);
 }
 
+const PLOW_UNDER_ORACLE: &str = "Put two target lands on top of their owners' libraries.";
+
+/// N3 — CR 104.3a + CR 800.4a + CR 608.2m + CR 608.2n + CR 117.3b: P0 casts
+/// Plow Under on two lands P1 owns, on a three-player board. Plow Under names
+/// no arranger, so P1, the owner, arranges them (CR 401.4) and is the last and
+/// only chooser. P1 concedes at P1's own prompt while P2 stays in the game.
+/// P1's lands leave the game with P1, but the spell has begun resolving, so it
+/// continues fully: the placement completes with nothing moved (CR 609.3), the
+/// spell's final part puts it into P0's graveyard, and the active player P0
+/// receives priority (CR 117.2e + CR 117.3b), all within the Concede.
+///
+/// The owner-actor mirror of the controller-actor Misinformation row, and the
+/// Plow Under analogue of
+/// `hallowed_burial_owner_whose_cards_leave_with_their_controller_completes_empty`.
+/// REVERT-FAILING: with the departed final chooser's arrangement retired
+/// instead of completed, no completion is emitted and the spell stays on the
+/// stack behind a live resolution.
+#[test]
+fn plow_under_last_owner_concession_completes_the_spell_before_priority() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P1, &["P1 Library 1", "P1 Library 2"]);
+    let plow_under = scenario
+        .add_spell_to_hand_from_oracle(P0, "Plow Under", false, PLOW_UNDER_ORACLE)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let land_a = scenario
+        .add_land_from_oracle(P1, "Opposing Forest", "")
+        .id();
+    let land_b = scenario
+        .add_land_from_oracle(P1, "Opposing Island", "")
+        .id();
+    let mut runner = scenario.build();
+    grant_priority(&mut runner, P0);
+
+    let outcome = runner
+        .cast(plow_under)
+        .target_objects(&[land_a, land_b])
+        .resolve();
+    // Reach guard: the owner's prompt is open and the spell is mid-resolution.
+    assert_owner_arrangement_prompt(
+        outcome.final_waiting_for(),
+        P1,
+        &[land_a, land_b],
+        LibraryPosition::Top,
+    );
+    assert_eq!(zone(&runner, plow_under), Zone::Stack);
+    assert_eq!(zone(&runner, land_a), Zone::Battlefield);
+    assert_eq!(zone(&runner, land_b), Zone::Battlefield);
+
+    let conceded = runner
+        .act(GameAction::Concede { player_id: P1 })
+        .expect("P1 concedes");
+
+    // CR 800.4a: P1's lands leave the game with P1.
+    assert_eq!(zone(&runner, land_a), Zone::Exile);
+    assert_eq!(zone(&runner, land_b), Zone::Exile);
+    assert_eq!(
+        put_at_library_position_resolutions(&conceded.events, plow_under),
+        1,
+        "the placement completes once, empty, inside the Concede"
+    );
+    assert_eq!(
+        zone(&runner, plow_under),
+        Zone::Graveyard,
+        "the spell's final part put it into P0's graveyard"
+    );
+    let state = runner.state();
+    assert!(state.stack.is_empty());
+    assert!(
+        state.resolving_stack_entry.is_none(),
+        "the resolution is over"
+    );
+    assert!(state.pending_mass_library_order_choice.is_none());
+    assert_eq!(state.waiting_for, WaitingFor::Priority { player: P0 });
+    assert_eq!(state.priority_player, P0);
+}
+
 // ---------------------------------------------------------------------------
 // P1-C6 / P1-C7 runtime probes (recorded, not gates).
 // ---------------------------------------------------------------------------
@@ -2489,7 +2649,7 @@ const DRAFNAS_RESTORATION_ORACLE: &str = "Put any number of target artifact card
 /// GREEN AT THIS PHASE'S BASE. Its non-vacuity comes from a PAIRED
 /// RED-AT-BASE POSITIVE in the same class — placement into a NON-controller's
 /// library out of a targeted graveyard — namely
-/// `misinformation_places_all_chosen_cards_into_that_opponents_library`, whose
+/// `misinformation_places_all_chosen_cards_into_that_opponents_library_in_its_casters_arrangement`, whose
 /// `library(P1) == [o3, o1, o2, p1_lib]` cannot pass at base. That pairing
 /// proves the cross-player placement instrument is live. The three in-row reach
 /// guards (non-empty `target_slots`, an offered `TargetRef::Player(P1)` slot,

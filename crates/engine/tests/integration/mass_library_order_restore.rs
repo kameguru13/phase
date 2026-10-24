@@ -250,6 +250,7 @@ fn mass_library_order_rejects_stale_typed_incarnation_and_legacy_origin() {
             identity: ObjectIncarnationRef::from_object(object),
             origin: Zone::Battlefield,
         }],
+        arranger: None,
     };
     let WaitingFor::EffectZoneChoice {
         mass_library_order, ..

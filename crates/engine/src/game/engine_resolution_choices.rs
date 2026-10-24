@@ -62,7 +62,9 @@ fn bind_dig_continuation_targets(chain: &mut ResolvedAbility, selected: &[Object
 /// A fresh mass library-order prompt is valid only for
 /// the exact member identities and origins frozen by its producer. Prompt cards
 /// and snapshot members remain lockstep so an arbitrary eligible id cannot be
-/// substituted into a persisted choice.
+/// substituted into a persisted choice. The answering player must be the
+/// batch's arranger (CR 401.4 + CR 101.1: its owner unless the instruction
+/// names one); member currency stays bound to the batch's owner.
 fn mass_library_order_batch_is_current(
     state: &GameState,
     player: crate::types::player::PlayerId,
@@ -70,7 +72,7 @@ fn mass_library_order_batch_is_current(
     batch: &crate::types::game_state::MassLibraryOrderBatch,
 ) -> bool {
     let unique_cards: HashSet<_> = cards.iter().copied().collect();
-    batch.owner == player
+    batch.chooser() == player
         && batch.members.len() == cards.len()
         && unique_cards.len() == cards.len()
         && batch.members.iter().zip(cards).all(|(member, card_id)| {
@@ -265,12 +267,12 @@ pub(crate) fn settle_owner_library_arrangement_after_departure(
         | effects::change_zone::OwnerLibraryArrangementReconciliation::Retired => {
             Ok(OwnerArrangementDepartureSettlement::NotSettled)
         }
-        effects::change_zone::OwnerLibraryArrangementReconciliation::Prompted(owner) => {
-            state.priority_player = owner;
+        effects::change_zone::OwnerLibraryArrangementReconciliation::Prompted(chooser) => {
+            state.priority_player = chooser;
             Ok(OwnerArrangementDepartureSettlement::NotSettled)
         }
-        effects::change_zone::OwnerLibraryArrangementReconciliation::Settle { owner, cards } => {
-            state.priority_player = owner;
+        effects::change_zone::OwnerLibraryArrangementReconciliation::Settle { chooser, cards } => {
+            state.priority_player = chooser;
             let waiting_for = state.waiting_for.clone();
             match handle_resolution_choice(
                 state,
@@ -6531,10 +6533,15 @@ pub(super) fn handle_resolution_choice(
             // CR 101.4 + CR 401.4: owners arrange in APNAP order, then the
             // arrangement happens as one simultaneous action. Collect this owner's
             // order; only the last owner's submission moves cards, and it moves every
-            // owner's cards.
+            // owner's cards. The answered batch is keyed by its owner and the
+            // arranger the instruction named (CR 101.1); a legacy prompt carries no
+            // batch and was answered by its owner.
             let chosen = if matches!(effect_kind, EffectKind::PutAtLibraryPosition)
                 && (typed_mass_library_order_is_current || legacy_mass_library_order_is_current)
             {
+                let (batch_owner, batch_arranger) = mass_library_order
+                    .as_ref()
+                    .map_or((player, None), |batch| (batch.owner, batch.arranger));
                 let instruction = effects::change_zone::OwnerArrangementInstruction {
                     source_id,
                     library_position: library_position
@@ -6545,12 +6552,13 @@ pub(super) fn handle_resolution_choice(
                 };
                 match effects::change_zone::submit_owner_library_order(
                     state,
-                    player,
+                    batch_owner,
+                    batch_arranger,
                     &instruction,
                     &chosen,
                 ) {
-                    effects::change_zone::OwnerLibraryOrderProgress::NextOwner(next_owner) => {
-                        state.priority_player = next_owner;
+                    effects::change_zone::OwnerLibraryOrderProgress::NextOwner(next_chooser) => {
+                        state.priority_player = next_chooser;
                         return Ok(ResolutionChoiceOutcome::WaitingFor(
                             state.waiting_for.clone(),
                         ));
