@@ -29749,6 +29749,9 @@ impl TargetReadOrigin {
 /// copied from the `AbilityDefinition` onto its `ResolvedAbility`. Read by the resolution's
 /// entry-observation boundary (`effects::entry_observation_deferred`): a remaining `WithEntry`
 /// instruction holds the enter observation back until it has applied.
+///
+/// Persisted states written before the onset existed are admitted only when they hold no node of
+/// an onset-admitting kind (`types::resolution::admit_entry_onset_record`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum ContinuousEffectOnset {
     /// CR 608.2c: the effect begins when this instruction is followed. For a permanent an earlier
@@ -29767,6 +29770,25 @@ impl ContinuousEffectOnset {
     /// `skip_serializing_if` predicate — the default needs no JSON byte.
     pub fn is_when_followed(onset: &Self) -> bool {
         matches!(onset, Self::WhenFollowed)
+    }
+
+    /// CR 611.2e: can an instruction of this kind carry `WithEntry`? The parser stamps `WithEntry`
+    /// only on "is/has" continuous instructions, and those lower to these kinds. For every other
+    /// kind the `WhenFollowed` default is the only reachable onset, so an unrecorded node of that
+    /// kind is decided.
+    ///
+    /// BASE parity: before onsets were recorded, the engine deferred the enter observation by
+    /// kind, for exactly these four kinds (`effect_may_apply_with_entry` at fae445c80,
+    /// `game/effects/mod.rs`). A node of any other kind already behaved as `WhenFollowed` there,
+    /// so admitting it unrecorded changes no outcome, and detecting by kind never assigns an onset.
+    pub fn kind_admits_with_entry(kind: EffectKind) -> bool {
+        matches!(
+            kind,
+            EffectKind::GenericEffect
+                | EffectKind::Animate
+                | EffectKind::ReturnAsAura
+                | EffectKind::ApplyPerpetual
+        )
     }
 }
 

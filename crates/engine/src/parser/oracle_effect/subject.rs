@@ -13218,4 +13218,129 @@ mod entry_onset_tests {
             );
         }
     }
+
+    /// CR 611.2e: every `WithEntry` stamp this module's fixtures produce lands on a kind that
+    /// `ContinuousEffectOnset::kind_admits_with_entry` names, the parser invariant the persisted
+    /// onset admission (`types::resolution::admit_entry_onset_record`) relies on to call every
+    /// other kind decided. Each fixture must yield at least one stamped node (reach guard).
+    #[test]
+    fn every_with_entry_stamp_is_an_onset_admitting_kind() {
+        use crate::types::ability::EffectKind;
+
+        fn assert_stamps_admit(label: &str, roots: &[&AbilityDefinition]) {
+            let stamped: Vec<_> = roots
+                .iter()
+                .flat_map(|root| nodes(root))
+                .filter(|node| node.entry_onset == WithEntry)
+                .collect();
+            assert!(
+                !stamped.is_empty(),
+                "reach guard: {label:?} has a WithEntry node"
+            );
+            for node in stamped {
+                let kind = EffectKind::from(&*node.effect);
+                assert!(
+                    ContinuousEffectOnset::kind_admits_with_entry(kind),
+                    "{label:?}: WithEntry stamped on {kind:?}"
+                );
+            }
+        }
+
+        const RETURN: &str = "Return target creature card from your graveyard to the battlefield.";
+        let mut chains: Vec<(String, AbilityKind)> = [
+            "It has base power and toughness 4/4.",
+            "It gets +1/+0 and is a Zombie in addition to its other types.",
+            "It gains haste, has base power and toughness 4/4.",
+            "It gains haste, and has base power and toughness 4/4.",
+        ]
+        .iter()
+        .map(|rider| (format!("{RETURN} {rider}"), AbilityKind::Spell))
+        .collect();
+        chains.extend(
+            [
+                "Return target Pirate creature card from your graveyard to the battlefield with a finality counter on it. It has base power and toughness 4/4. It gains haste until end of turn.",
+                "Put target creature card from a graveyard onto the battlefield under your control. That creature is a black Zombie in addition to its other colors and types.",
+                "Return target creature card from your graveyard to the battlefield. It's a Spirit in addition to its other types.",
+                "Return this card to the battlefield under your control. He's a Spirit in addition to his other types.",
+                "Target snow land is no longer snow.",
+                "Return it to the battlefield under its owner's control. It's an enchantment.",
+                "Return it to the battlefield. It's an Aura enchantment with enchant creature you control and \"{G}{W}: Enchanted creature gains indestructible until end of turn,\" and it loses all other abilities.",
+                "Assimilate target creature card from an opponent's graveyard.",
+                "The duplicate perpetually has base power and toughness 1/1.",
+            ]
+            .iter()
+            .map(|text| (text.to_string(), AbilityKind::Spell)),
+        );
+        chains.push((
+            "Create a 4/4 Dragon creature token named Reliquary Dragon that's all colors. It has flying, lifelink, and \"When this token enters, it deals 3 damage to any target.\"".to_string(),
+            AbilityKind::Activated,
+        ));
+        for (text, kind) in &chains {
+            let def = parse_effect_chain(text, *kind);
+            assert_stamps_admit(text, &[&def]);
+        }
+
+        let compound =
+            "~ deals 2 damage to target creature and it has base power and toughness 1/1.";
+        let clause =
+            super::super::try_split_damage_compound(compound, &mut ParseContext::default())
+                .unwrap_or_else(|| panic!("reach guard: {compound:?} is a damage compound"));
+        let sub = clause.sub_ability.expect("the rebuilt continuation");
+        assert_stamps_admit(compound, &[&sub]);
+
+        for (name, parsed) in [
+            (
+                "Vraska, the Silencer",
+                card(
+                    "Deathtouch\nWhenever a nontoken creature an opponent controls dies, you may pay {1}. If you do, return that card to the battlefield tapped under your control. It's a Treasure artifact with \"{T}, Sacrifice this artifact: Add one mana of any color,\" and it loses all other card types.",
+                    "Vraska, the Silencer",
+                    &["Deathtouch"],
+                    &["Legendary", "Creature"],
+                    &["Gorgon", "Assassin"],
+                ),
+            ),
+            (
+                "Brilliance Unleashed",
+                card(
+                    "Choose one or both —\n• Brilliance Unleashed deals 5 damage to target creature.\n• Choose target artifact card in your graveyard. Return it to the battlefield if it's an artifact creature card. Otherwise, return it to the battlefield and it's a 3/3 Robot artifact creature with flying.",
+                    "Brilliance Unleashed",
+                    &[],
+                    &["Sorcery"],
+                    &[],
+                ),
+            ),
+            (
+                "Return of the Mole Man",
+                card(
+                    "Landfall — Whenever a land you control enters, you may mill two cards.\n{5}{G}, Sacrifice this enchantment: Create X 1/1 green Minion creature tokens named Moloid, where X is the number of permanent cards in your graveyard. The tokens have \"Whenever this token attacks, you may mill a card.\" Activate only as a sorcery.",
+                    "Return of the Mole Man",
+                    &["Landfall", "Mill"],
+                    &["Enchantment"],
+                    &[],
+                ),
+            ),
+            (
+                "Scriv, the Obligator",
+                card(
+                    "Flying, deathtouch\nWhenever Scriv enters or attacks, create a white Aura enchantment token named Contract attached to target creature an opponent controls. The token has enchant creature and \"Whenever enchanted creature attacks, it gets +2/+0 until end of turn if it's attacking one of your opponents. Otherwise, its controller loses 2 life.\"",
+                    "Scriv, the Obligator",
+                    &["Deathtouch", "Flying"],
+                    &["Legendary", "Creature"],
+                    &["Inkling", "Bird"],
+                ),
+            ),
+        ] {
+            let roots: Vec<&AbilityDefinition> = parsed
+                .abilities
+                .iter()
+                .chain(
+                    parsed
+                        .triggers
+                        .iter()
+                        .filter_map(|trigger| trigger.execute.as_deref()),
+                )
+                .collect();
+            assert_stamps_admit(name, &roots);
+        }
+    }
 }
