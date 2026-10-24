@@ -2297,6 +2297,68 @@ fn lodestone_bauble_controller_concession_at_own_arrangement_completes_before_pr
     assert_eq!(state.priority_player, P1);
 }
 
+/// CR 800.4a + CR 800.4g + CR 800.4h + CR 608.2m, ability side: P0 activates
+/// Lodestone Bauble on two basic lands in P2's graveyard, then concedes at
+/// P0's arrangement prompt. The lands stay (P2 is still in the game), so the
+/// arrangement passes to the next player in turn order after P0 — P1, not the
+/// owner P2 — and P1's submission completes the parked activation before
+/// priority (CR 117.3b + CR 800.4j). The delayed draw's controller is left to
+/// the CR 800.4d follow-up and is not asserted.
+///
+/// REVERT-FAILING: without the departed-arranger hand-on, the Concede leaves
+/// priority with no prompt, so the prompt assertion fails.
+#[test]
+fn lodestone_bauble_controller_concession_hands_the_arrangement_to_the_next_player() {
+    let (mut runner, bauble, lands) = lodestone_three_player_board(P2);
+    let [l1, l2] = lands;
+    let p2_before = library(&runner, P2);
+    open_lodestone_arrangement(&mut runner, bauble, lands, P2);
+
+    let conceded = runner
+        .act(GameAction::Concede { player_id: P0 })
+        .expect("P0 concedes");
+
+    assert!(runner.state().players[P0.0 as usize].is_eliminated);
+    assert_eq!(zone(&runner, l1), Zone::Graveyard);
+    assert_eq!(zone(&runner, l2), Zone::Graveyard);
+    assert_controller_arrangement_prompt(
+        &runner.state().waiting_for,
+        P1,
+        P2,
+        &[l1, l2],
+        LibraryPosition::Top,
+    );
+    assert_eq!(runner.state().priority_player, P1);
+    assert_eq!(
+        put_at_library_position_resolutions(&conceded.events, bauble),
+        0,
+        "nothing completes until P1 arranges"
+    );
+
+    let submitted = runner
+        .act(GameAction::SelectCards {
+            cards: vec![l2, l1],
+        })
+        .expect("P1 submits the arrangement");
+    let mut expected = vec![l2, l1];
+    expected.extend(p2_before);
+    assert_eq!(library(&runner, P2), expected);
+    assert_eq!(
+        put_at_library_position_resolutions(&submitted.events, bauble),
+        1,
+        "the placement completes once"
+    );
+    let state = runner.state();
+    assert!(state.resolving_stack_entry.is_none(), "the carrier settled");
+    assert!(
+        state.active_ability_continuation().is_none(),
+        "the continuation drained"
+    );
+    assert!(state.pending_mass_library_order_choice.is_none());
+    assert!(state.stack.is_empty());
+    assert_eq!(state.waiting_for, WaitingFor::Priority { player: P1 });
+}
+
 /// The three-player Gravepurge board. P0 is active with Gravepurge (an
 /// instant) in hand and {B}{B}{B}; P0's graveyard holds two creature cards and
 /// P0's library one card. P1 and P2 each have a one-card library; every hand
