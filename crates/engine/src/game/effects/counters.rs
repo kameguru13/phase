@@ -16,7 +16,7 @@ use crate::types::game_state::{
     DelayedTrigger, GameState, PendingCounterAddition, PendingCounterAdditionQueue,
     PendingCounterMove, PendingCounterMoveQueue, PendingCounterPostAction, PendingCounterRemoval,
     PendingCounterRemovalInFlight, PendingCounterRemovalQueue, PendingEffectResolutionEvent,
-    PendingEffectResolved, WaitingFor,
+    PendingEffectResolved, TriggerSourceRead, WaitingFor,
 };
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::player::PlayerId;
@@ -3054,13 +3054,14 @@ fn live_counters(
 /// 1. The departure that fired (or created) this ability, when it is the
 ///    source's battlefield departure: that event's record is the departed
 ///    object's last known information.
-/// 2. This triggered ability's own source, when `source_id` is it. While the
-///    captured incarnation is still the live object in its expected zone, its
-///    current counters answer (CR 608.2h). Once it has left — even if it came
-///    back, since the returned object is a new object (CR 400.7) — the answer
-///    is that incarnation's last known information, never the live same-id
-///    object and never the ObjectId-keyed LKI cache, which a later incarnation
-///    may have overwritten.
+/// 2. This triggered ability's own source, when `source_id` is it. Only while
+///    the captured incarnation is still the exact live object in its expected
+///    zone do its current counters answer (CR 608.2h). Once it has left — even
+///    if this same effect moved it and can still find it (CR 400.7j), and even
+///    if it came back, since the returned object is a new object (CR 400.7) —
+///    the answer is that incarnation's last known information, never the live
+///    same-id object and never the ObjectId-keyed LKI cache, which a later
+///    incarnation may have overwritten.
 /// 3. Any other source: its live counters, else the ObjectId-keyed LKI cache.
 fn put_source_counters(
     state: &GameState,
@@ -3078,10 +3079,9 @@ fn put_source_counters(
     if let Some(source) = ability.trigger_source.as_ref().filter(|source| {
         source_id == ability.source_id && source.identity.reference.object_id == source_id
     }) {
-        return if ability.source_is_current(state) {
-            live_counters(state, source_id)
-        } else {
-            captured_source_last_known_counters(state, source)
+        return match source.source_read(state) {
+            TriggerSourceRead::ExactLive(object) => object.counters.clone(),
+            TriggerSourceRead::Latched(_) => captured_source_last_known_counters(state, source),
         };
     }
 
@@ -6514,6 +6514,85 @@ mod tests {
                 .unwrap_or(0),
             3,
             "destination should receive counters from LKI cache"
+        );
+    }
+
+    /// CR 608.2h + CR 400.7j: a triggered ability that moved its own source out
+    /// of its expected zone earlier in the same effect can still find the moved
+    /// object (the resolution relatch), but "put its counters" must read the
+    /// captured incarnation's last known counters — the live graveyard object
+    /// has none.
+    #[test]
+    fn put_its_counters_reads_relatched_self_source_last_known_counters() {
+        use crate::types::game_state::ResolutionSourceRelatch;
+
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Carrier".to_string(),
+            Zone::Battlefield,
+        );
+        let dest_id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Recipient".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&source_id)
+            .unwrap()
+            .counters
+            .insert(CounterType::Plus1Plus1, 2);
+
+        let mut ability = ResolvedAbility::new(
+            Effect::MoveCounters {
+                source: TargetFilter::SelfRef,
+                counter_type: None,
+                count: None,
+                mode: CounterTransferMode::Put,
+                selection: CounterMoveSelection::StackTarget,
+                target: TargetFilter::Any,
+            },
+            vec![TargetRef::Object(dest_id)],
+            source_id,
+            PlayerId(0),
+        );
+        ability.trigger_source = Some(crate::game::triggers::trigger_source_context_for_latch(
+            &state,
+            &state.objects[&source_id],
+        ));
+        let captured = state.objects[&source_id].incarnation;
+
+        // The same effect sacrificed its own source before the counter clause.
+        let mut events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, source_id, Zone::Graveyard, &mut events);
+        state.resolution_source_relatch = Some(ResolutionSourceRelatch {
+            object_id: source_id,
+            original_stamp: captured,
+            current_incarnation: state.objects[&source_id].incarnation,
+        });
+        assert!(
+            ability.source_is_current(&state),
+            "reach guard: the relatch must let the effect find its moved source"
+        );
+        assert!(
+            state.objects[&source_id].counters.is_empty(),
+            "reach guard: the live graveyard object carries no counters"
+        );
+
+        resolve_move(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.objects[&dest_id]
+                .counters
+                .get(&CounterType::Plus1Plus1)
+                .copied(),
+            Some(2),
+            "the recipient gets the departed source's last known counters"
         );
     }
 

@@ -559,6 +559,95 @@ fn delayed_put_its_counters_reads_unmoved_source_current_counters() {
     assert_eq!(recipient.counters, last_known);
 }
 
+const ENTERS_PUT_ITS: &str =
+    "When this creature enters, put its counters on target creature you control.";
+
+const ZOMBIFY: &str = "Return target creature card from your graveyard to the battlefield.";
+
+/// CR 608.2h + CR 400.7: the carrier dies holding +1/+1 counters and is
+/// returned from the graveyard, and its enters trigger captures the carrier
+/// that returned — a new object with no counters. That source is still the
+/// exact object in its expected zone, so "its counters" are its own current
+/// (zero) counters, never the died carrier's counters the same-id LKI cache
+/// still holds this step.
+#[test]
+fn put_its_counters_reads_current_returned_source_not_same_id_lki() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    seed_libraries(&mut scenario);
+    let carrier = scenario
+        .add_creature_from_oracle(P0, "Counter Carrier", 2, 2, ENTERS_PUT_ITS)
+        .id();
+    let recipient = scenario.add_creature(P0, "Recipient", 2, 2).id();
+    scenario.with_counter(carrier, CounterType::Plus1Plus1, 3);
+    let vindicate = scenario
+        .add_spell_to_hand_from_oracle(P0, "Vindicate", false, VINDICATE)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let zombify = scenario
+        .add_spell_to_hand_from_oracle(P0, "Zombify", false, ZOMBIFY)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let mut runner = scenario.build();
+    let before = runner.state().objects[&carrier].incarnation;
+    let outcome = runner.cast(vindicate).target_object(carrier).resolve();
+    assert_eq!(outcome.zone_of(carrier), Zone::Graveyard);
+    let outcome = runner
+        .cast(zombify)
+        // Zombify's graveyard slot can only take the carrier; the recipient is
+        // listed first so the enters trigger's "target creature you control"
+        // slot, which the returned carrier could also fill, takes it.
+        .target_objects(&[recipient, carrier])
+        .resolve();
+
+    assert_eq!(outcome.zone_of(carrier), Zone::Battlefield);
+    assert!(
+        outcome.events().iter().any(|event| matches!(
+            event,
+            engine::types::events::GameEvent::BecomesTarget {
+                target: TargetRef::Object(target),
+                source_id,
+                ..
+            } if *target == recipient && *source_id == carrier
+        )),
+        "reach-guard: the returned carrier's enters trigger targets the recipient"
+    );
+    assert!(
+        outcome.events().iter().any(|event| matches!(
+            event,
+            engine::types::events::GameEvent::EffectResolved {
+                kind: engine::types::ability::EffectKind::MoveCounters,
+                source_id,
+                ..
+            } if *source_id == carrier
+        )),
+        "reach-guard: the returned carrier's enters trigger resolved its counter clause"
+    );
+    let state = runner.state();
+    let returned = &state.objects[&carrier];
+    assert_ne!(
+        returned.incarnation, before,
+        "the returned carrier is a new object"
+    );
+    assert!(
+        returned.counters.is_empty(),
+        "reach-guard: the returned carrier has no counters of its own"
+    );
+    assert_eq!(
+        state.lki_cache[&carrier]
+            .counters
+            .get(&CounterType::Plus1Plus1)
+            .copied(),
+        Some(3),
+        "reach-guard: the same-id LKI cache still holds the departed carrier's counters"
+    );
+    assert!(
+        state.objects[&recipient].counters.is_empty(),
+        "the recipient gets exactly the returned carrier's own (zero) counters"
+    );
+}
+
 #[test]
 fn another_creature_dies_this_turn_delayed_subject_is_strict_unsupported() {
     let face = spell_face(
