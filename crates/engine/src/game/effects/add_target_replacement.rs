@@ -1889,7 +1889,7 @@ mod tests {
     // battlefield under that player's control") + CR 614.1a (replacement
     // ordering: redirect applies before the token materializes).
     #[test]
-    fn crafty_cutpurse_self_install_redirects_opponent_tokens_to_controller() {
+    fn crafty_cutpurse_floating_redirect_redirects_opponent_tokens_to_controller() {
         use crate::types::ability::ControllerRef;
         use crate::types::proposed_event::TokenSpec;
         use std::collections::HashSet;
@@ -2117,6 +2117,11 @@ mod tests {
         );
         let mut events = Vec::new();
         resolve(&mut state, &install_ability, &mut events).unwrap();
+        assert_eq!(
+            state.pending_damage_replacements.len(),
+            1,
+            "reach guard: the floating redirect is installed"
+        );
 
         // Our own token creation — must not be intercepted.
         let token_spec = TokenSpec {

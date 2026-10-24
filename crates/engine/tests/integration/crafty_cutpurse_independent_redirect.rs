@@ -20,6 +20,8 @@ use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 
+const P2: PlayerId = PlayerId(2);
+
 const CRAFTY_CUTPURSE: &str = "Flash\nWhen this creature enters, each token that would be created under an opponent's control this turn is created under your control instead.";
 const CLOUDSHIFT: &str =
     "Exile target creature you control, then return that card to the battlefield under your control.";
@@ -311,4 +313,144 @@ fn redirect_keeps_the_trigger_controller_after_cutpurse_changes_control() {
         "the trigger's controller, P0, receives both Soldiers"
     );
     assert_eq!(soldiers(&runner, P1), 0);
+}
+
+/// Passes priority until `done` holds, failing after a bounded number of passes.
+fn pass_until(runner: &mut GameRunner, what: &str, done: impl Fn(&GameRunner) -> bool) {
+    for _ in 0..12 {
+        if done(runner) {
+            return;
+        }
+        pass(runner);
+    }
+    assert!(done(runner), "reach guard: {what}");
+}
+
+fn has_priority(runner: &GameRunner, player: PlayerId) -> bool {
+    matches!(runner.state().waiting_for, WaitingFor::Priority { player: p } if p == player)
+}
+
+/// Floating redirects installed for P0 (Crafty Cutpurse's resolved trigger).
+fn p0_redirects(runner: &GameRunner) -> Vec<bool> {
+    runner
+        .state()
+        .pending_damage_replacements
+        .iter()
+        .filter(|def| def.token_owner_redirect.is_some() && def.source_controller == Some(P0))
+        .map(|def| def.is_consumed)
+        .collect()
+}
+
+/// Three players: on P1's turn P0 flashes Cutpurse in and its enters trigger
+/// installs the redirect for P0; then `leaver` concedes. Returns the runner
+/// at P1's priority with Raise the Alarm's id.
+fn three_players_after_concession(leaver: PlayerId) -> (GameRunner, ObjectId) {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let cutpurse = scenario
+        .add_creature_to_hand_from_oracle(P0, "Crafty Cutpurse", 2, 2, CRAFTY_CUTPURSE)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let alarm = scenario
+        .add_spell_to_hand_from_oracle(P1, "Raise the Alarm", true, RAISE_THE_ALARM)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    // Every library must be non-empty so the turn's draw is not a loss.
+    for player in [P0, P1, P2] {
+        scenario.with_library_top(player, &["Forest", "Forest"]);
+    }
+    let mut runner = scenario.build();
+
+    runner.advance_to_upkeep();
+    runner.advance_to_phase(Phase::PreCombatMain);
+    assert_eq!(runner.state().active_player, P1, "reach guard: P1's turn");
+
+    // P0 flashes Cutpurse in; it and its enters trigger resolve.
+    pass_until(&mut runner, "P0 receives priority", |r| has_priority(r, P0));
+    runner.cast(cutpurse).commit();
+    pass_until(&mut runner, "Cutpurse and its trigger resolved", |r| {
+        r.state().objects[&cutpurse].zone == Zone::Battlefield && r.state().stack.is_empty()
+    });
+    assert_eq!(
+        p0_redirects(&runner),
+        vec![false],
+        "reach guard: the live redirect for P0 is installed before the concession"
+    );
+    let floating_before = runner.state().pending_damage_replacements.len();
+
+    runner
+        .act(GameAction::Concede { player_id: leaver })
+        .expect("a player concedes");
+    for player in [P0, P1, P2] {
+        let eliminated = runner
+            .state()
+            .players
+            .iter()
+            .any(|p| p.id == player && p.is_eliminated);
+        assert_eq!(
+            eliminated,
+            player == leaver,
+            "reach guard: only {leaver:?} left the game (checked {player:?})"
+        );
+    }
+    assert_eq!(
+        runner.state().pending_damage_replacements.len(),
+        floating_before,
+        "the concession removes no floating definition, so floating ids stay stable"
+    );
+
+    pass_until(&mut runner, "P1 receives priority", |r| has_priority(r, P1));
+    (runner, alarm)
+}
+
+/// P1 casts Raise the Alarm and it resolves to an empty stack with priority.
+fn p1_raises_the_alarm(runner: &mut GameRunner, alarm: ObjectId) {
+    runner.cast(alarm).commit();
+    pass_until(runner, "Raise the Alarm resolved", |r| {
+        r.state().objects[&alarm].zone == Zone::Graveyard
+    });
+    settled(runner);
+}
+
+/// CR 800.4a: "any effects which give that player control of any objects ...
+/// end" when a player leaves the game. P0 concedes after its Cutpurse trigger
+/// installed the redirect: the redirect giving P0 control of tokens ends, so
+/// P1's Raise the Alarm Soldiers are created under P1's own control.
+#[test]
+fn redirect_ends_when_its_controller_leaves_the_game() {
+    let (mut runner, alarm) = three_players_after_concession(P0);
+
+    p1_raises_the_alarm(&mut runner, alarm);
+    assert_eq!(
+        soldiers(&runner, P1),
+        2,
+        "the departed P0's redirect ended, so P1 receives both Soldiers"
+    );
+    assert_eq!(soldiers(&runner, P0), 0);
+    assert_eq!(
+        p0_redirects(&runner),
+        vec![true],
+        "the departed P0's redirect was ended in place, keeping its floating slot"
+    );
+}
+
+/// CR 800.4a ends only effects giving the LEAVING player control: when an
+/// unrelated P2 concedes, the surviving P0's redirect still takes the Soldiers
+/// P1 would create.
+#[test]
+fn redirect_survives_an_unrelated_player_leaving_the_game() {
+    let (mut runner, alarm) = three_players_after_concession(P2);
+
+    p1_raises_the_alarm(&mut runner, alarm);
+    assert_eq!(
+        soldiers(&runner, P0),
+        2,
+        "the surviving P0's redirect takes both Soldiers"
+    );
+    assert_eq!(soldiers(&runner, P1), 0);
+    assert_eq!(
+        p0_redirects(&runner),
+        vec![false],
+        "the surviving P0's redirect stays live"
+    );
 }
