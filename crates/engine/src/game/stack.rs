@@ -1432,6 +1432,37 @@ pub fn stack_object_controller(state: &GameState, entry: &StackEntry) -> PlayerI
         .map_or(entry.controller, |obj| obj.controller)
 }
 
+/// CR 109.4 + CR 113.8 + CR 608.2h + CR 608.2m + CR 613.1b: the controller of the
+/// object a resolution carrier (`state.resolving_stack_entry`) records, read now —
+/// for a decision the object owes after its resolution began (CR 800.4g's
+/// "controller of the object").
+///   * Still on the stack (a popped instant or sorcery keeps its object in
+///     `Zone::Stack` until its final part, CR 608.2n, and layer 2 re-applies to it
+///     through `LayerZoneObjectCache::ids_for`): the live, layer-derived
+///     controller. No caller of this authority resolves a paused permanent spell. The
+///     stack seed in `layers.rs` re-derives it for this carrier from the CR 112.2
+///     default every pass, so a layer-2 control change — or the end of one, as
+///     when a thief leaves the game (CR 800.4a) — is reflected here once layers are
+///     evaluated. `entry.controller` is that default, never the answer.
+///   * A spell that has left the stack while resolving (CR 608.2m — e.g. exiled
+///     with its departing owner): it has no controller now (CR 109.4), so its last
+///     known controller as it left (CR 608.2h), which the stack-exit LKI capture in
+///     `zones.rs` records before the CR 109.4 reset.
+///   * An ability (no object row, CR 113.8): `entry.controller`, fixed at
+///     activation or trigger; no card changes control of an ability on the stack.
+/// A card that is again a live stack entry is a new object, not this resolution
+/// (the guard `resolving_instant_or_sorcery_on_stack` and the stack seed share).
+pub(crate) fn resolving_object_controller(state: &GameState, entry: &StackEntry) -> PlayerId {
+    let recast = state.stack.iter().any(|live| live.id == entry.id);
+    match state.objects.get(&entry.id) {
+        Some(obj) if obj.zone == Zone::Stack && !recast => obj.controller,
+        Some(_) | None => state
+            .lki_cache
+            .get(&entry.id)
+            .map_or(entry.controller, |lki| lki.controller),
+    }
+}
+
 /// CR 608.3 + CR 400.7d: Snapshot cast-link / target facts for a permanent spell
 /// paused mid-resolution (delivery-tail `NeedsChoice`, replacement-choice
 /// `NeedsChoice`, or CallerEpilogue `CopyTargetChoice`). Single authority so a
@@ -6263,6 +6294,108 @@ mod tests {
 
     fn setup() -> GameState {
         GameState::new_two_player(42)
+    }
+
+    /// CR 109.4 + CR 113.8 + CR 608.2h + CR 613.1b: the resolving object's
+    /// controller is its live, layer-derived controller while this resolution's
+    /// object is on the stack; its last known controller once it has left; and
+    /// the entry's for an ability, which has no object. A same-id live stack
+    /// entry is a new object, so the popped carrier's object row does not answer
+    /// for it. The owner P3, the default P0, the live controller P2 and the
+    /// ability's P1 are distinct, so each rung is told apart from the others.
+    ///
+    /// REVERT-FAILING: the live and last-known asserts fail when the authority
+    /// reads `entry.controller` (P0); the last-known assert fails when it reads
+    /// `stack_object_controller` (off the stack, the reset owner P3); the recast
+    /// assert fails without the recast guard.
+    #[test]
+    fn resolving_object_controller_reads_live_then_last_known_then_the_entry() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 4, 42);
+        let spell = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(3),
+            "Stolen Spell".to_string(),
+            Zone::Stack,
+        );
+        state.objects.get_mut(&spell).unwrap().controller = PlayerId(2);
+        let entry = StackEntry {
+            id: spell,
+            source_id: spell,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(1),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        };
+
+        // Recast guard, before any zone exit: a live entry of the same id is a
+        // new object, and with no last known information the entry's controller
+        // answers. REVERT-FAILING: without the recast guard the authority
+        // answers the row's P2.
+        state.stack.push_back(entry.clone());
+        assert!(
+            state.lki_cache.get(&spell).is_none(),
+            "reach guard: no last known information yet"
+        );
+        assert_eq!(state.objects[&spell].zone, Zone::Stack);
+        assert_eq!(state.objects[&spell].controller, PlayerId(2));
+        assert_eq!(
+            resolving_object_controller(&state, &entry),
+            PlayerId(0),
+            "a recast is not this resolution's object"
+        );
+        state.stack.pop_back();
+
+        // Live: the popped carrier's object is on the stack.
+        assert_eq!(
+            resolving_object_controller(&state, &entry),
+            PlayerId(2),
+            "CR 613.1b: the live, layer-derived controller"
+        );
+
+        // Last known: the object left the stack while resolving (CR 608.2m).
+        let mut events = Vec::new();
+        zones::move_to_zone(&mut state, spell, Zone::Exile, &mut events);
+        assert_eq!(state.objects[&spell].zone, Zone::Exile);
+        assert_ne!(
+            state.objects[&spell].controller,
+            PlayerId(2),
+            "reach guard: CR 109.4 reset the controller off the stack"
+        );
+        assert_eq!(
+            resolving_object_controller(&state, &entry),
+            PlayerId(2),
+            "CR 608.2h: the controller it had as it left the stack"
+        );
+
+        // Ability: no object row, so the entry's controller (CR 113.8).
+        let ability_id = ObjectId(900);
+        assert!(!state.objects.contains_key(&ability_id));
+        let ability_entry = StackEntry {
+            id: ability_id,
+            source_id: ability_id,
+            controller: PlayerId(1),
+            kind: StackEntryKind::ActivatedAbility {
+                source_id: ability_id,
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                    vec![],
+                    ability_id,
+                    PlayerId(1),
+                )),
+            },
+        };
+        assert_eq!(
+            resolving_object_controller(&state, &ability_entry),
+            PlayerId(1),
+            "CR 113.8: an ability's controller is fixed at activation"
+        );
     }
 
     /// A-1 (CR 107.3i + CR 107.3k + CR 601.2h): the X-rewrite authority moves

@@ -2201,7 +2201,9 @@ fn departed_named_arranger(state: &GameState, batch: &MassLibraryOrderBatch) -> 
 /// left too, the next player in turn order after them — elects the player who
 /// arranges `batch`, which waits in the carrier until the election is answered
 /// (`answer_substitute_arranger`). Every election, a re-election included,
-/// reads the object's controller here, never a departed nominee. The only
+/// reads the object's controller now — live while it is on the stack,
+/// last-known once it has left (`stack::resolving_object_controller`) — never
+/// the caster baked into the carrier, nor a departed nominee. The only
 /// publisher of a `SubstituteArranger` prompt and of `arranger_election`.
 /// Returns the elector.
 fn open_arranger_election(
@@ -2217,7 +2219,7 @@ fn open_arranger_election(
         .ability()
         .expect("the resolving object carries the instruction that named the arranger")
         .clone();
-    let election = crate::game::players::substitute_chooser_election(state, entry.controller);
+    let election = crate::game::players::substitute_chooser_election(state, entry);
     pending.arranger_election = Some(batch);
     state.waiting_for = WaitingFor::ChooseFromZoneOpponentChooser {
         player: election.elector,

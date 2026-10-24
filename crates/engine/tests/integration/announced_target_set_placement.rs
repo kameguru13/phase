@@ -505,6 +505,11 @@ const REINFORCEMENTS_ORACLE: &str =
 const MISINFORMATION_ORACLE: &str = "Put up to three target cards from an opponent's graveyard \
      on top of their library in any order.";
 
+const COMMANDEER_ORACLE: &str = "You may exile two blue cards from your hand rather than pay \
+     this spell's mana cost.\nGain control of target noncreature spell. You may choose new \
+     targets for it. (If that spell is an artifact, enchantment, or planeswalker, the permanent \
+     enters under your control.)";
+
 fn black_mana(n: usize) -> Vec<ManaUnit> {
     (0..n)
         .map(|_| ManaUnit::new(ManaType::Black, ObjectId(0), false, vec![]))
@@ -2610,6 +2615,21 @@ fn misinformation_board(
     players: u8,
     owner: PlayerId,
 ) -> (GameRunner, ObjectId, [ObjectId; 3], ObjectId) {
+    let (scenario, misinformation, cards, owner_library_card) =
+        misinformation_scenario(players, owner);
+    let mut runner = scenario.build();
+    grant_priority(&mut runner, P0);
+    (runner, misinformation, cards, owner_library_card)
+}
+
+/// The scenario `misinformation_board` builds, before it is built, so a row
+/// can add cards to it.
+///
+/// Returns `(scenario, misinformation, [o1, o2, o3], owner_library_card)`.
+fn misinformation_scenario(
+    players: u8,
+    owner: PlayerId,
+) -> (GameScenario, ObjectId, [ObjectId; 3], ObjectId) {
     let mut scenario = GameScenario::new_n_player(players, 42);
     scenario.at_phase(Phase::PreCombatMain);
     scenario.with_mana_pool(P0, black_mana(1));
@@ -2625,10 +2645,8 @@ fn misinformation_board(
             shards: vec![ManaCostShard::Black],
         })
         .id();
-    let mut runner = scenario.build();
-    grant_priority(&mut runner, P0);
     (
-        runner,
+        scenario,
         misinformation,
         [cards[0], cards[1], cards[2]],
         owner_library_card,
@@ -3103,6 +3121,428 @@ fn misinformation_owner_departure_during_the_election_completes_empty() {
             .all(|object| object.zone != Zone::Stack),
         "no object is left on the stack"
     );
+    assert_eq!(state.waiting_for, WaitingFor::Priority { player: P1 });
+}
+
+// ---------------------------------------------------------------------------
+// A stolen arrangement whose thief leaves: the object's controller now — live
+// on the stack, last-known once it has left — elects (CR 800.4g).
+// ---------------------------------------------------------------------------
+
+/// CR 117.3d: pass priority in turn order until `player` holds it, resolving
+/// nothing on the way.
+fn pass_priority_to(runner: &mut GameRunner, player: PlayerId) {
+    let stack_len = runner.state().stack.len();
+    for _ in 0..runner.state().players.len() {
+        if runner.state().priority_player == player {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("the priority holder passes");
+        assert_eq!(
+            runner.state().stack.len(),
+            stack_len,
+            "passing priority to {player:?} resolves nothing"
+        );
+    }
+    assert_eq!(runner.state().waiting_for, WaitingFor::Priority { player });
+}
+
+/// `thief`, holding priority, casts `commandeer` on `spell` and it resolves,
+/// declining new targets: `thief` gains control of `spell`, which stays on the
+/// stack (CR 613.1b).
+fn resolve_commandeer(
+    runner: &mut GameRunner,
+    commandeer: ObjectId,
+    spell: ObjectId,
+    from: PlayerId,
+    thief: PlayerId,
+) {
+    assert_eq!(runner.state().priority_player, thief);
+    runner.cast(commandeer).target_object(spell).commit();
+    let mut control_changed = false;
+    for _ in 0..12 {
+        if zone(runner, commandeer) != Zone::Stack
+            && matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
+        {
+            break;
+        }
+        let result = match runner.state().waiting_for {
+            WaitingFor::Priority { .. } => runner.act(GameAction::PassPriority),
+            WaitingFor::OptionalEffectChoice { .. } => {
+                runner.act(GameAction::DecideOptionalEffect { accept: false })
+            }
+            ref other => panic!("unexpected Commandeer prompt: {other:?}"),
+        }
+        .expect("Commandeer resolves");
+        control_changed |= result.events.iter().any(|event| {
+            matches!(
+                event,
+                GameEvent::ControllerChanged { object_id, old_controller, new_controller }
+                    if *object_id == spell && *old_controller == from && *new_controller == thief
+            )
+        });
+    }
+    assert!(
+        control_changed,
+        "CR 613.1b: {thief:?} gains control of the spell from {from:?}"
+    );
+    assert_eq!(zone(runner, commandeer), Zone::Graveyard);
+    assert_eq!(zone(runner, spell), Zone::Stack);
+    assert_eq!(runner.state().objects[&spell].controller, thief);
+}
+
+/// The shared reach guard of the stolen-arrangement rows. On a four-player
+/// board P0 casts Misinformation on three cards in P1's graveyard; P2 and then
+/// P3 Commandeer it, each declining new targets (CR 613.1b + CR 613.7: P3's
+/// later control effect governs). It resolves under P3, who follows its
+/// instructions (CR 608.2c), so P3 arranges P1's cards and the batch names P3
+/// its arranger. The spell's CR 112.2 default controller, its caster P0, is
+/// unchanged.
+///
+/// Returns `(runner, misinformation, [o1, o2, o3], p1_library_card)`.
+fn open_commandeered_misinformation_arrangement() -> (GameRunner, ObjectId, [ObjectId; 3], ObjectId)
+{
+    let (mut scenario, misinformation, cards, p1_lib) = misinformation_scenario(4, P1);
+    let mut add_commandeer = |thief: PlayerId| {
+        scenario
+            .add_spell_to_hand_from_oracle(thief, "Commandeer", true, COMMANDEER_ORACLE)
+            .with_mana_cost(ManaCost::generic(0))
+            .id()
+    };
+    let p2_commandeer = add_commandeer(P2);
+    let p3_commandeer = add_commandeer(P3);
+    let mut runner = scenario.build();
+    grant_priority(&mut runner, P0);
+
+    runner.cast(misinformation).target_objects(&cards).commit();
+    assert_eq!(zone(&runner, misinformation), Zone::Stack);
+    pass_priority_to(&mut runner, P2);
+    resolve_commandeer(&mut runner, p2_commandeer, misinformation, P0, P2);
+    pass_priority_to(&mut runner, P3);
+    resolve_commandeer(&mut runner, p3_commandeer, misinformation, P2, P3);
+    // Every player passes in succession: Misinformation resolves.
+    for _ in 0..runner.state().players.len() {
+        if !matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("the priority holder passes");
+    }
+
+    assert_controller_arrangement_prompt(
+        &runner.state().waiting_for,
+        P3,
+        P1,
+        &cards,
+        LibraryPosition::Top,
+    );
+    let state = runner.state();
+    assert_eq!(state.objects[&misinformation].zone, Zone::Stack);
+    assert_eq!(state.objects[&misinformation].controller, P3);
+    assert_eq!(
+        state
+            .resolving_stack_entry
+            .as_ref()
+            .map(|entry| entry.controller),
+        Some(P0),
+        "CR 112.2: the carrier keeps the caster as the default controller"
+    );
+    for card in cards {
+        assert_eq!(zone(&runner, card), Zone::Graveyard);
+    }
+    (runner, misinformation, cards, p1_lib)
+}
+
+/// CR 800.4a + CR 613.1b + CR 613.7 + CR 800.4g + CR 109.4: the arranging
+/// thief P3 concedes at the arrangement prompt. P3's control effect ends with
+/// P3, so P2's earlier one governs the spell — still on the stack, still
+/// resolving — and P2, the controller of the object, elects who arranges P1's
+/// cards. The carrier's CR 112.2 default controller is still the caster P0.
+fn concede_the_arranging_thief(
+    runner: &mut GameRunner,
+    misinformation: ObjectId,
+    cards: [ObjectId; 3],
+) {
+    let conceded = runner
+        .act(GameAction::Concede { player_id: P3 })
+        .expect("P3 concedes");
+    let state = runner.state();
+    assert!(state.players[P3.0 as usize].is_eliminated);
+    assert_eq!(
+        state.objects[&misinformation].zone,
+        Zone::Stack,
+        "the spell is still resolving on the stack"
+    );
+    assert_eq!(
+        state.objects[&misinformation].controller, P2,
+        "CR 800.4a + CR 613.7: P3's control effect ended; P2's governs"
+    );
+    assert_eq!(
+        state
+            .resolving_stack_entry
+            .as_ref()
+            .map(|entry| entry.controller),
+        Some(P0),
+        "the carrier's default controller is not rewritten"
+    );
+    for card in cards {
+        assert_eq!(zone(runner, card), Zone::Graveyard);
+    }
+    // REVERT-FAILING: the elector is the object's controller now, P2 — not the
+    // caster P0 the carrier names. Every player still in the game is a
+    // candidate, the elector and the caster included.
+    assert_arranger_election(
+        &runner.state().waiting_for,
+        P2,
+        &[P0, P1, P2],
+        misinformation,
+    );
+    assert_eq!(runner.state().priority_player, P2);
+    assert_eq!(
+        held_election_batch(runner),
+        (P1, Some(P3), cards.to_vec()),
+        "the batch waits, still naming its departed arranger"
+    );
+    assert_eq!(
+        put_at_library_position_resolutions(&conceded.events, misinformation),
+        0,
+        "nothing completes while the arranger is elected"
+    );
+    assert!(library_arrivals(&conceded.events, &cards).is_empty());
+}
+
+/// CR 800.4g: P2 elects the caster P0, who arranges P1's cards.
+fn elect_the_caster(runner: &mut GameRunner, cards: [ObjectId; 3]) {
+    let elected = runner
+        .act(GameAction::ChooseZoneOpponentChooser { opponent: P0 })
+        .expect("P2 elects P0");
+    assert_controller_arrangement_prompt(
+        &runner.state().waiting_for,
+        P0,
+        P1,
+        &cards,
+        LibraryPosition::Top,
+    );
+    assert_eq!(runner.state().priority_player, P0);
+    for card in cards {
+        assert_eq!(zone(runner, card), Zone::Graveyard);
+    }
+    assert!(library_arrivals(&elected.events, &cards).is_empty());
+    assert!(
+        runner.state().pending_mass_library_order_choice.is_none(),
+        "a single-batch arrangement keeps no carrier once its arranger is elected"
+    );
+}
+
+/// C1 — CR 800.4a + CR 613.1b + CR 613.7 + CR 800.4g + CR 109.4: P0 casts
+/// Misinformation on three cards in P1's graveyard; P2 and then P3 Commandeer
+/// it, and it resolves under P3, who arranges. P3 concedes. P3's control
+/// effect ends (CR 800.4a), so P2's earlier one governs the spell, still on the
+/// stack (CR 613.7). The object requires a choice of the departed P3, so the
+/// controller of the object, P2, chooses another player to make it
+/// (CR 800.4g). P2 elects the caster P0, who arranges; the spell completes
+/// once and goes to P0's graveyard (CR 608.2n), and the active player P0
+/// receives priority (CR 117.3b).
+///
+/// Four roles are four players: caster P0, cards' owner P1, controller and
+/// elector P2, departed arranger P3. The caster cannot answer the election
+/// but may arrange once elected.
+///
+/// REVERT-FAILING: with the elector read from the carrier's CR 112.2 default
+/// controller, (b)'s `assert_arranger_election` names P0, the caster, not P2.
+#[test]
+fn commandeered_misinformation_reverted_controller_elects_the_arranger() {
+    let (mut runner, misinformation, cards, p1_lib) =
+        open_commandeered_misinformation_arrangement();
+    let [o1, o2, o3] = cards;
+
+    // (b) REVERT-FAILING: the controller of the object now, P2, elects.
+    concede_the_arranging_thief(&mut runner, misinformation, cards);
+
+    // (c) The AI is offered every candidate and no arrangement yet. The caster
+    // and the owner cannot answer P2's election; P2 cannot elect the departed
+    // P3. No rejection changes anything.
+    let actions = legal_actions(runner.state());
+    for candidate in [P0, P1, P2] {
+        assert!(
+            actions.contains(&GameAction::ChooseZoneOpponentChooser {
+                opponent: candidate
+            }),
+            "the elector may elect {candidate:?}"
+        );
+    }
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, GameAction::SelectCards { .. })),
+        "no arrangement is open during the election"
+    );
+    let before = runner.state().clone();
+    for bystander in [P0, P1] {
+        let rejection = apply_with_rejection(
+            runner.state_mut(),
+            bystander,
+            GameAction::ChooseZoneOpponentChooser { opponent: P0 },
+        )
+        .expect_err("only the elector P2 answers the election");
+        assert_eq!(rejection.code, ActionRejectionCode::WrongPlayer);
+        assert!(*runner.state() == before, "the rejection changes nothing");
+    }
+    apply_with_rejection(
+        runner.state_mut(),
+        P2,
+        GameAction::ChooseZoneOpponentChooser { opponent: P3 },
+    )
+    .expect_err("CR 102.1: a player who has left cannot be elected");
+    assert!(*runner.state() == before, "the rejection changes nothing");
+
+    // (d) CR 800.4g: the elected caster arranges.
+    elect_the_caster(&mut runner, cards);
+
+    // (e) The elector cannot submit the arrangement.
+    let before = runner.state().clone();
+    let rejection = apply_with_rejection(
+        runner.state_mut(),
+        P2,
+        GameAction::SelectCards {
+            cards: vec![o2, o3, o1],
+        },
+    )
+    .expect_err("P2 must not submit P0's arrangement");
+    assert_eq!(rejection.code, ActionRejectionCode::WrongPlayer);
+    assert!(*runner.state() == before, "the rejection changes nothing");
+
+    // (f) P0's arrangement completes the resolution, all three cards together.
+    let submitted = runner
+        .act(GameAction::SelectCards {
+            cards: vec![o2, o3, o1],
+        })
+        .expect("P0 submits the arrangement");
+    assert_eq!(
+        library(&runner, P1),
+        vec![o2, o3, o1, p1_lib],
+        "P0's arrangement is the exact top of P1's library"
+    );
+    assert_eq!(
+        put_at_library_position_resolutions(&submitted.events, misinformation),
+        1,
+        "the placement completes once"
+    );
+    let mut arrivals = library_arrivals(&submitted.events, &cards);
+    arrivals.sort_by_key(|id| id.0);
+    let mut expected = cards.to_vec();
+    expected.sort_by_key(|id| id.0);
+    assert_eq!(
+        arrivals, expected,
+        "CR 101.4: the three cards move in one batch"
+    );
+    assert_eq!(stack_resolved_count(&submitted.events, misinformation), 1);
+    let state = runner.state();
+    // CR 608.2n: the spell goes to its owner's graveyard.
+    assert_eq!(state.objects[&misinformation].zone, Zone::Graveyard);
+    assert!(state.players[P0.0 as usize]
+        .graveyard
+        .contains(&misinformation));
+    assert!(
+        state.resolving_stack_entry.is_none(),
+        "the resolution is over"
+    );
+    assert!(state.active_ability_continuation().is_none());
+    assert!(state.pending_mass_library_order_choice.is_none());
+    assert!(
+        state
+            .objects
+            .values()
+            .all(|object| object.zone != Zone::Stack),
+        "no object is left on the stack"
+    );
+    // CR 117.3b: the active player P0 is still in the game.
+    assert_eq!(state.waiting_for, WaitingFor::Priority { player: P0 });
+}
+
+/// C2 — CR 800.4a + CR 608.2m + CR 608.2h + CR 109.4 + CR 800.4g: continuing
+/// C1 to P0's arrangement prompt, the elected caster P0 concedes. Misinformation,
+/// owned by P0, leaves the game with P0, but it has begun resolving, so it
+/// continues fully (CR 608.2m). It has no controller now (CR 109.4); its last
+/// known controller, P2 (CR 608.2h), is the controller of the object, so P2
+/// elects again. P2 elects P1, whose order completes the spell, and the next
+/// player after the departed active player, P1, receives priority
+/// (CR 117.3b + CR 800.4j).
+///
+/// The object's default controller (P0), its controller off the stack (its
+/// owner, P0) and its last known controller (P2) are three readings; only the
+/// last names a living player who is not the next player after P0.
+///
+/// REVERT-FAILING: with the elector read from the carrier's default
+/// controller, or from the object's controller off the stack, both P0, the
+/// departed P0's successor P1 elects instead of P2.
+#[test]
+fn commandeered_misinformation_departed_nominee_is_reelected_by_the_last_known_controller() {
+    let (mut runner, misinformation, cards, p1_lib) =
+        open_commandeered_misinformation_arrangement();
+    let [o1, o2, o3] = cards;
+    concede_the_arranging_thief(&mut runner, misinformation, cards);
+    elect_the_caster(&mut runner, cards);
+
+    let conceded = runner
+        .act(GameAction::Concede { player_id: P0 })
+        .expect("P0 concedes");
+    assert!(runner.state().players[P0.0 as usize].is_eliminated);
+    assert_eq!(
+        zone(&runner, misinformation),
+        Zone::Exile,
+        "CR 800.4a: P0's spell leaves the game with P0"
+    );
+    for card in cards {
+        assert_eq!(zone(&runner, card), Zone::Graveyard);
+    }
+    // REVERT-FAILING: the last known controller, P2, elects again.
+    assert_arranger_election(&runner.state().waiting_for, P2, &[P1, P2], misinformation);
+    assert_eq!(runner.state().priority_player, P2);
+    assert_eq!(
+        held_election_batch(&runner),
+        (P1, Some(P0), vec![o1, o2, o3]),
+        "the batch waits, naming its departed nominee"
+    );
+    assert_eq!(
+        put_at_library_position_resolutions(&conceded.events, misinformation),
+        0,
+        "nothing completes while the arranger is elected"
+    );
+    assert!(library_arrivals(&conceded.events, &cards).is_empty());
+
+    runner
+        .act(GameAction::ChooseZoneOpponentChooser { opponent: P1 })
+        .expect("P2 elects P1");
+    assert_controller_arrangement_prompt(
+        &runner.state().waiting_for,
+        P1,
+        P1,
+        &cards,
+        LibraryPosition::Top,
+    );
+    let submitted = runner
+        .act(GameAction::SelectCards {
+            cards: vec![o3, o1, o2],
+        })
+        .expect("P1 submits the arrangement");
+    assert_eq!(library(&runner, P1), vec![o3, o1, o2, p1_lib]);
+    assert_eq!(
+        put_at_library_position_resolutions(&submitted.events, misinformation),
+        1,
+        "the placement completes once"
+    );
+    assert_eq!(stack_resolved_count(&submitted.events, misinformation), 1);
+    let state = runner.state();
+    assert!(state.pending_mass_library_order_choice.is_none());
+    assert!(
+        state.resolving_stack_entry.is_none(),
+        "the resolution is over"
+    );
+    // CR 117.3b + CR 800.4j: the next living player after the departed active P0.
     assert_eq!(state.waiting_for, WaitingFor::Priority { player: P1 });
 }
 

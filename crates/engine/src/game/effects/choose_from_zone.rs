@@ -1143,10 +1143,15 @@ fn advance_per_player_iteration(
         }
         None => {
             // CR 800.4g + CR 800.4h: the object requires this pick of a player
-            // who has left; the next player in turn order after the object's
-            // controller elects another player to make it. The pending pool
-            // (`current`) is carried through the election unchanged.
-            let election = players::substitute_chooser_election(state, ability.controller);
+            // who has left; the controller of the object (live, or last-known
+            // once it has left the stack) — or, when that player has left, the
+            // next player in turn order after them — elects another player to
+            // make it. The pending pool (`current`) is carried through the
+            // election unchanged.
+            let object = state.resolving_stack_entry.as_ref().expect(
+                "admit_per_player_park admitted this iteration only with a resolution carrier installed (CR 608.2)",
+            );
+            let election = players::substitute_chooser_election(state, object);
             state.waiting_for = WaitingFor::ChooseFromZoneOpponentChooser {
                 player: election.elector,
                 candidates: election.candidates,
