@@ -2510,6 +2510,144 @@ fn plow_under_last_owner_concession_completes_the_spell_before_priority() {
     assert_eq!(state.priority_player, P0);
 }
 
+/// N2 — CR 104.3a + CR 800.4a + CR 800.4g + CR 800.4h + CR 608.2m: P0 casts
+/// Misinformation on a three-player board, targeting three cards in P2's
+/// graveyard, and concedes at P0's own arrangement prompt (CR 101.1 +
+/// CR 608.2c: the caster follows "… in any order"). P0's spell leaves the game
+/// with P0, but it has begun resolving, so it continues fully (CR 608.2m).
+/// P2's cards are still in the game and still need arranging; the choice was
+/// P0's, so it passes to the next player in turn order after P0 (CR 800.4g +
+/// CR 800.4h) — P1, not P2, the owner. P1's arrangement is the exact top of
+/// P2's library, the spell is reported resolved once, and because the active
+/// player P0 has left, P1 receives priority (CR 117.3b + CR 800.4j).
+///
+/// The elector P1 is neither the departed controller P0 nor the owner P2, so
+/// the hand-on is told apart from a fallback to the owner. Scoped hand-on: P1
+/// arranges the cards; the CR 800.4g option to name another player is not
+/// modelled.
+///
+/// REVERT-FAILING: without the departed-arranger hand-on, (b) fails — the
+/// generic dead-actor repoint leaves priority with a live carrier and no
+/// arrangement prompt.
+#[test]
+fn misinformation_controller_concession_hands_the_arrangement_to_the_next_player() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(P0, black_mana(1));
+    let mut p2_cards = Vec::new();
+    for name in ["P2 Card A", "P2 Card B", "P2 Card C"] {
+        p2_cards.push(scenario.add_creature_to_graveyard(P2, name, 2, 2).id());
+    }
+    let p2_lib = scenario.add_card_to_library_top(P2, "P2 Library Card");
+    let misinformation = scenario
+        .add_spell_to_hand_from_oracle(P0, "Misinformation", false, MISINFORMATION_ORACLE)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 0,
+            shards: vec![ManaCostShard::Black],
+        })
+        .id();
+    let mut runner = scenario.build();
+    grant_priority(&mut runner, P0);
+    let (o1, o2, o3) = (p2_cards[0], p2_cards[1], p2_cards[2]);
+
+    let outcome = runner
+        .cast(misinformation)
+        .target_objects(&[o1, o2, o3])
+        .resolve();
+
+    // (a) Reach guard: the caster arranges P2's cards, mid-resolution.
+    assert_controller_arrangement_prompt(
+        outcome.final_waiting_for(),
+        P0,
+        P2,
+        &[o1, o2, o3],
+        LibraryPosition::Top,
+    );
+    assert_eq!(zone(&runner, misinformation), Zone::Stack);
+
+    let conceded = runner
+        .act(GameAction::Concede { player_id: P0 })
+        .expect("P0 concedes");
+
+    // (b) REVERT-FAILING: CR 800.4a — P0 and the spell leave; P2's cards stay.
+    // CR 800.4g + CR 800.4h — P1 now arranges P2's cards.
+    assert!(runner.state().players[P0.0 as usize].is_eliminated);
+    assert_eq!(
+        zone(&runner, misinformation),
+        Zone::Exile,
+        "CR 800.4a: P0's spell leaves the game with P0"
+    );
+    for card in [o1, o2, o3] {
+        assert_eq!(zone(&runner, card), Zone::Graveyard);
+    }
+    assert_controller_arrangement_prompt(
+        &runner.state().waiting_for,
+        P1,
+        P2,
+        &[o1, o2, o3],
+        LibraryPosition::Top,
+    );
+    assert_eq!(runner.state().priority_player, P1);
+    assert_eq!(
+        put_at_library_position_resolutions(&conceded.events, misinformation),
+        0,
+        "nothing completes while P1 arranges"
+    );
+
+    // (c) The owner cannot submit the arrangement handed to P1, and the
+    // rejected submission changes nothing.
+    let before = runner.state().clone();
+    let rejection = apply_with_rejection(
+        runner.state_mut(),
+        P2,
+        GameAction::SelectCards {
+            cards: vec![o3, o1, o2],
+        },
+    )
+    .expect_err("P2 must not submit P1's arrangement");
+    assert_eq!(rejection.code, ActionRejectionCode::WrongPlayer);
+    assert!(
+        *runner.state() == before,
+        "a rejected submission leaves the game unchanged"
+    );
+
+    // (d) P1's arrangement completes the resolution.
+    let submitted = runner
+        .act(GameAction::SelectCards {
+            cards: vec![o3, o1, o2],
+        })
+        .expect("P1 submits the arrangement");
+    assert_eq!(
+        library(&runner, P2),
+        vec![o3, o1, o2, p2_lib],
+        "P1's arrangement is the exact top of P2's library"
+    );
+    assert_eq!(
+        put_at_library_position_resolutions(&submitted.events, misinformation),
+        1,
+        "the placement completes once"
+    );
+    // CR 608.2m: the departed spell that continued to resolve fully is
+    // reported resolved once.
+    assert_eq!(stack_resolved_count(&submitted.events, misinformation), 1);
+    let state = runner.state();
+    assert!(
+        state.resolving_stack_entry.is_none(),
+        "the resolution is over"
+    );
+    assert!(state.active_ability_continuation().is_none());
+    assert!(state.pending_mass_library_order_choice.is_none());
+    assert!(
+        state
+            .objects
+            .values()
+            .all(|object| object.zone != Zone::Stack),
+        "no object is left on the stack"
+    );
+    // CR 117.3b + CR 800.4j.
+    assert_eq!(state.waiting_for, WaitingFor::Priority { player: P1 });
+}
+
 // ---------------------------------------------------------------------------
 // P1-C6 / P1-C7 runtime probes (recorded, not gates).
 // ---------------------------------------------------------------------------

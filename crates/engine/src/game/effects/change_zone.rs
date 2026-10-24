@@ -2225,11 +2225,42 @@ fn retain_live_mass_library_order_batches(
         .collect();
 }
 
+/// CR 800.4g + CR 800.4h: the arrangement a departed named arranger still owed
+/// passes on. The arranger is the instruction's controller (CR 101.1 +
+/// CR 608.2c); a controller who has left the game would choose another player
+/// to make the choice (CR 800.4g), and that choice is itself required of a
+/// player who has left, so the next player in turn order after them makes it
+/// (CR 800.4h). Writes that player onto `batch` as its arranger and returns
+/// them; `None` when the batch names no arranger or its arranger is still in
+/// the game.
+///
+/// Known limitation: the elector arranges the cards themself; the CR 800.4g
+/// option to name another player is not modelled.
+///
+/// An owner-arranged batch (`arranger: None`) never needs this: a departed
+/// owner's cards leave the game with them (CR 800.4a), so nothing of that batch
+/// is left to arrange.
+fn hand_on_departed_arranger(
+    state: &GameState,
+    batch: &mut MassLibraryOrderBatch,
+) -> Option<PlayerId> {
+    let departed = batch
+        .arranger
+        .filter(|arranger| !crate::game::players::is_alive(state, *arranger))?;
+    let substitute = crate::game::players::next_player_in_turn_order(state, departed);
+    batch.arranger = Some(substitute);
+    Some(substitute)
+}
+
 fn prune_owner_arrangement_carrier(state: &GameState, pending: &mut PendingMassLibraryOrderChoice) {
     // CR 800.4a + CR 400.7: a departed owner's cards left the game with them, and an object exiled with its departed controller is a new object; neither remains in the arrangement.
     match &mut pending.remaining_batches {
         PendingMassLibraryOrderBatches::Typed(batches) => {
-            retain_live_mass_library_order_batches(state, batches)
+            retain_live_mass_library_order_batches(state, batches);
+            // CR 800.4g + CR 800.4h: a queued batch whose named arranger left passes to the next player in turn order.
+            for batch in batches.iter_mut() {
+                hand_on_departed_arranger(state, batch);
+            }
         }
         PendingMassLibraryOrderBatches::Legacy(batches) => {
             batches.retain(|(owner, _)| crate::game::players::is_alive(state, *owner))
@@ -2265,6 +2296,12 @@ pub(crate) enum OwnerLibraryArrangementReconciliation {
 /// departure authority for the carrier and its open prompt. An instruction whose
 /// current-shape prompt is open always completes, even when its last chooser has
 /// left.
+///
+/// CR 800.4g + CR 800.4h: when the arranger the instruction named has left while
+/// the open batch, or a queued one, still has cards to arrange, the next player
+/// in turn order after them arranges those cards. Known limitation: the elector
+/// arranges the cards themself; the CR 800.4g option to name another player is
+/// not modelled.
 pub(crate) fn reconcile_owner_library_arrangement(
     state: &mut GameState,
 ) -> OwnerLibraryArrangementReconciliation {
@@ -2313,9 +2350,22 @@ pub(crate) fn reconcile_owner_library_arrangement(
     if let Some(pending) = pending.as_mut() {
         prune_owner_arrangement_carrier(state, pending);
     }
-    let live = live_mass_library_order_batch(state, &current);
+    let mut live = live_mass_library_order_batch(state, &current);
     if !live.members.is_empty() {
         state.pending_mass_library_order_choice = pending;
+        // CR 800.4a + CR 800.4g + CR 800.4h + CR 608.2m: the named arranger left
+        // while cards remain to arrange; the resolution continues, and the
+        // arrangement passes to the next player in turn order after them.
+        if let Some(substitute) = hand_on_departed_arranger(state, &mut live) {
+            state.waiting_for = mass_library_order_effect_zone_choice(
+                live,
+                source_id,
+                library_position,
+                track_exiled_by_source,
+                duration,
+            );
+            return OwnerLibraryArrangementReconciliation::Prompted(substitute);
+        }
         if live == current {
             return OwnerLibraryArrangementReconciliation::Unchanged;
         }
@@ -8945,6 +8995,99 @@ mod tests {
                 winner: Some(PlayerId(1))
             }
         );
+        assert!(state.pending_mass_library_order_choice.is_none());
+    }
+
+    /// CR 800.4g + CR 800.4h: when the arranger an instruction named leaves
+    /// with a batch still queued, that queued batch passes to the next player
+    /// in turn order too, not only the open one. P0 arranges P1's and P2's
+    /// cards; P0 concedes at P1's batch, so P1 arranges both.
+    ///
+    /// No printed card in the controller-arranged class places more than one
+    /// owner's cards, so this queue is reached only from a constructed
+    /// arrangement.
+    ///
+    /// REVERT-FAILING: without the queued rewrite, P2's batch is published to
+    /// the departed P0 once P1 submits.
+    #[test]
+    fn departed_arranger_hand_on_rewrites_the_queued_batches() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::standard(), 3, 42);
+        let mut cards = Vec::new();
+        for (cid, owner) in [(731, 1), (732, 1), (733, 1), (734, 2), (735, 2), (736, 2)] {
+            cards.push(create_object(
+                &mut state,
+                CardId(cid),
+                PlayerId(owner),
+                format!("Library Card {cid}"),
+                Zone::Library,
+            ));
+        }
+        let (p1_a, p1_b, p1_deep) = (cards[0], cards[1], cards[2]);
+        let (p2_a, p2_b, p2_deep) = (cards[3], cards[4], cards[5]);
+        state.players[1].library = im::vector![p1_deep, p1_a, p1_b];
+        state.players[2].library = im::vector![p2_deep, p2_a, p2_b];
+        open_owner_library_arrangement(
+            &mut state,
+            vec![
+                (PlayerId(1), vec![p1_a, p1_b]),
+                (PlayerId(2), vec![p2_a, p2_b]),
+            ],
+            Some(PlayerId(0)),
+            ObjectId(903),
+            LibraryPosition::Top,
+            false,
+            None,
+        );
+        let arranger_of = |state: &GameState| match &state.waiting_for {
+            WaitingFor::EffectZoneChoice {
+                player,
+                mass_library_order: Some(batch),
+                ..
+            } => (*player, batch.owner, batch.arranger),
+            other => panic!("expected an arrangement prompt, got {other:?}"),
+        };
+        // Reach guard: P0 arranges P1's batch, and P2's batch is queued for P0.
+        assert_eq!(
+            arranger_of(&state),
+            (PlayerId(0), PlayerId(1), Some(PlayerId(0)))
+        );
+
+        apply_as_current(
+            &mut state,
+            GameAction::Concede {
+                player_id: PlayerId(0),
+            },
+        )
+        .expect("P0 concedes");
+        assert_eq!(
+            arranger_of(&state),
+            (PlayerId(1), PlayerId(1), Some(PlayerId(1))),
+            "the open batch passes to the next player in turn order"
+        );
+
+        apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![p1_b, p1_a],
+            },
+        )
+        .expect("P1 arranges P1's batch");
+        assert_eq!(
+            arranger_of(&state),
+            (PlayerId(1), PlayerId(2), Some(PlayerId(1))),
+            "the queued batch passed on too"
+        );
+
+        let completed = apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![p2_b, p2_a],
+            },
+        )
+        .expect("P1 arranges P2's batch");
+        assert_eq!(library_ids(&state, PlayerId(1)), vec![p1_b, p1_a, p1_deep]);
+        assert_eq!(library_ids(&state, PlayerId(2)), vec![p2_b, p2_a, p2_deep]);
+        assert_eq!(put_at_library_position_resolutions(&completed.events), 1);
         assert!(state.pending_mass_library_order_choice.is_none());
     }
 
