@@ -4980,6 +4980,10 @@ fn fmt_trigger_condition(
             let parts: Vec<&str> = phases.iter().map(fmt_phase).collect();
             format!("cast during {}", parts.join(" or "))
         }
+        TC::CurrentPhaseIs { phases } => {
+            let parts: Vec<&str> = phases.iter().map(fmt_phase).collect();
+            format!("during {}", parts.join(" or "))
+        }
         TC::CastTimingPermission { .. } => "cast with timing permission".into(),
         TC::ManaColorSpent { color, minimum } => {
             format!("{}+ {} spent", minimum, fmt_mana_color_full(&color.color()))
@@ -10371,6 +10375,7 @@ fn extract_trigger_condition_features(
         | TriggerCondition::DefendingPlayerControlsNone { .. }
         | TriggerCondition::TributeNotPaid
         | TriggerCondition::CastDuringPhase { .. }
+        | TriggerCondition::CurrentPhaseIs { .. }
         | TriggerCondition::CastTimingPermission { .. }
         | TriggerCondition::ManaColorSpent { .. }
         | TriggerCondition::ManaSpentCondition { .. }

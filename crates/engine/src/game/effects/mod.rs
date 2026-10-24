@@ -9554,6 +9554,7 @@ fn trigger_condition_reads_filter_population(
         | TriggerCondition::LostLifeLastTurn
         | TriggerCondition::TributeNotPaid
         | TriggerCondition::CastDuringPhase { .. }
+        | TriggerCondition::CurrentPhaseIs { .. }
         | TriggerCondition::CastTimingPermission { .. }
         | TriggerCondition::ManaColorSpent { .. }
         | TriggerCondition::ManaSpentCondition { .. }
