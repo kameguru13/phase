@@ -1168,9 +1168,9 @@ fn copy_counter_pause_halving_season_first() {
 /// Reflection, the contained entry's copy effect and first among the entry's
 /// replacements, makes all four Grizzly Bears copies and is used up once. Then
 /// Grumgully's counter on each Bears copy pauses for its ordering. No CopyToken
-/// resolution owns this event (the plain Effect::Token route), yet "that token"
-/// names all four. The instruction ends with exactly one `EffectResolved{Token}`,
-/// naming Raise the Alarm, not Chatterfang.
+/// resolution owns this event (the plain Effect::Token route), yet the
+/// created-token referent names all four. The instruction ends with exactly one
+/// `EffectResolved{Token}`, naming Raise the Alarm, not Chatterfang.
 #[test]
 fn copy_on_entry_after_chatterfang_copies_every_token() {
     let mut scenario = GameScenario::new();
