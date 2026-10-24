@@ -38941,8 +38941,8 @@ impl ResolvedAbility {
     /// ability was created, or it is the new object one of CR 400.7's
     /// exceptions lets the ability find — the zone a zone-change trigger moved
     /// it to (CR 400.7e), an Aura that went to the graveyard with the
-    /// permanent it enchanted (CR 400.7f), or the object the ability's own cost
-    /// or resolution moved it to (CR 400.7j, read through
+    /// permanent it enchanted (CR 400.7f), or the object the ability's own
+    /// resolution moved it to (CR 400.7j, read through
     /// `resolution_source_relatch`: Bogardan Phoenix's dies trigger returns the
     /// card and then puts the death counter "on it"). A source that left and
     /// returned any other way is a new object, so the instruction has no
