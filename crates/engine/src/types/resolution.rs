@@ -4001,23 +4001,11 @@ pub const PRE_ENTRY_ONSET_RESTORE_ERROR: &str = "RESTORE_INCOMPATIBLE_PRE_ENTRY_
 /// [`PRE_ENTRY_ONSET_RESTORE_ERROR`]. A `Recorded` payload is untouched: its `WhenFollowed` nodes
 /// are explicit current onsets.
 fn admit_entry_onset_record(value: &mut Value) -> Result<(), String> {
-    let record = value
-        .as_object()
-        .ok_or_else(|| "resolution state wire must be a JSON object".to_string())?
-        .get(ABILITY_ONSET_RECORD_FIELD)
-        .map(|record| {
-            serde_json::from_value::<AbilityOnsetRecord>(record.clone()).map_err(|error| {
-                format!("invalid {ABILITY_ONSET_RECORD_FIELD} in persisted state: {error}")
-            })
-        })
-        .transpose()?;
-    match record {
+    match read_entry_onset_record(value)? {
         Some(AbilityOnsetRecord::Recorded) => return Ok(()),
         Some(AbilityOnsetRecord::Unrecorded) | None => {}
     }
-    if holds_onset_undecidable_ability_node(value) {
-        return Err(PRE_ENTRY_ONSET_RESTORE_ERROR.to_string());
-    }
+    refuse_onset_undecidable_carrier(value)?;
     let recorded =
         serde_json::to_value(AbilityOnsetRecord::Recorded).map_err(|error| error.to_string())?;
     value
@@ -4025,6 +4013,66 @@ fn admit_entry_onset_record(value: &mut Value) -> Result<(), String> {
         .expect("checked above: the resolution state wire is a JSON object")
         .insert(ABILITY_ONSET_RECORD_FIELD.to_string(), recorded);
     Ok(())
+}
+
+/// The `ability_onset_record` a resolution state wire was written with; `None` when the key is
+/// absent (a writer that predates the record).
+fn read_entry_onset_record(wire: &Value) -> Result<Option<AbilityOnsetRecord>, String> {
+    wire.as_object()
+        .ok_or_else(|| "resolution state wire must be a JSON object".to_string())?
+        .get(ABILITY_ONSET_RECORD_FIELD)
+        .map(|record| {
+            serde_json::from_value::<AbilityOnsetRecord>(record.clone()).map_err(|error| {
+                format!("invalid {ABILITY_ONSET_RECORD_FIELD} in persisted state: {error}")
+            })
+        })
+        .transpose()
+}
+
+/// CR 611.2e: the refusal of an unrecorded writer's carrier, shared by the in-state admission
+/// (`admit_entry_onset_record`) and the detached-carrier admission
+/// ([`PersistedEntryOnsetRecord::admit_detached_carrier`]).
+fn refuse_onset_undecidable_carrier(carrier: &Value) -> Result<(), String> {
+    if holds_onset_undecidable_ability_node(carrier) {
+        Err(PRE_ENTRY_ONSET_RESTORE_ERROR.to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// CR 611.2e: the onset record a persisted state's writer wrote, read BEFORE the state is decoded.
+///
+/// Decoding admits an unrecorded state that holds no onset-admitting node by stamping it
+/// `Recorded`, so the decoded state no longer says whether its writer recorded onsets. A
+/// persistence boundary that stores an ability carrier detached from the state it was lifted out
+/// of (the server's `deck_pools_json` column) reads this record from the serialized state first and
+/// admits the carrier against it with [`Self::admit_detached_carrier`] — the refusal the state's
+/// own admission (`admit_entry_onset_record`) applies to every carrier still inside it. The field
+/// is private, so a boundary cannot supply a record its payload did not carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistedEntryOnsetRecord(Option<AbilityOnsetRecord>);
+
+impl PersistedEntryOnsetRecord {
+    /// Reads the record of a serialized `PersistedGameState`, before it is decoded. A trusted
+    /// envelope `{state, …}` (the dispatch `PersistedGameState::deserialize` makes) holds it in
+    /// `state`; a raw state holds it at its root.
+    pub fn of_persisted_state(persisted_state: &Value) -> Result<Self, String> {
+        read_entry_onset_record(persisted_state.get("state").unwrap_or(persisted_state)).map(Self)
+    }
+
+    /// Admits `carrier`, a serialized ability carrier stored detached from this record's state.
+    /// Refuses it with [`PRE_ENTRY_ONSET_RESTORE_ERROR`] exactly when the state's own admission
+    /// would have, had the carrier stayed inside it: the record is absent or `Unrecorded` and the
+    /// carrier holds an ability node of an onset-admitting kind. A `Recorded` writer's carrier is
+    /// admitted untouched — its `WhenFollowed` nodes are explicit current onsets.
+    pub fn admit_detached_carrier(self, carrier: &Value) -> Result<(), String> {
+        match self.0 {
+            Some(AbilityOnsetRecord::Recorded) => Ok(()),
+            Some(AbilityOnsetRecord::Unrecorded) | None => {
+                refuse_onset_undecidable_carrier(carrier)
+            }
+        }
+    }
 }
 
 /// Whether any serialized ability node (`AbilityDefinition` / `ResolvedAbility`, the only shapes
@@ -10052,6 +10100,58 @@ mod tests {
             .expect("the unrecorded payload is admitted")
             .into_game_state();
         assert_eq!(restored.ability_onset_record, AbilityOnsetRecord::Recorded);
+    }
+
+    /// U3b: a carrier stored detached from its state is admitted against the record read from the
+    /// serialized state before decode, in both persisted shapes (trusted envelope and raw root).
+    /// An unrecorded writer's carrier holding an onset-admitting node is refused; the same carrier
+    /// beside a `Recorded` state, and an onset-free carrier beside an unrecorded one, are admitted.
+    #[test]
+    fn detached_carrier_is_admitted_against_the_pre_decode_record() {
+        let state = GameState::new_two_player(1);
+        let onset_carrier = serde_json::json!([{ "card": {
+            "abilities": [onset_admitting_definition_node()] } }]);
+        let onset_free_carrier = serde_json::json!([{ "card": { "abilities": [] } }]);
+
+        let trusted = serde_json::to_value(crate::types::game_state::PersistedGameState::capture(
+            state.clone(),
+        ))
+        .expect("the persisted envelope serializes");
+        let mut unrecorded_trusted = trusted.clone();
+        unrecorded_trusted["state"]
+            .as_object_mut()
+            .expect("the envelope's state is an object")
+            .remove(ABILITY_ONSET_RECORD_FIELD);
+        let unrecorded_raw = unrecorded_wire(&state);
+
+        for (label, persisted) in [
+            ("trusted envelope", &unrecorded_trusted),
+            ("raw root", &unrecorded_raw),
+        ] {
+            let record =
+                PersistedEntryOnsetRecord::of_persisted_state(persisted).expect("the record reads");
+            let error = record
+                .admit_detached_carrier(&onset_carrier)
+                .expect_err(label);
+            assert!(
+                error.starts_with("RESTORE_INCOMPATIBLE_PRE_ENTRY_ONSET:"),
+                "{label}: {error}"
+            );
+            record
+                .admit_detached_carrier(&onset_free_carrier)
+                .expect("an onset-free detached carrier is admitted");
+        }
+
+        PersistedEntryOnsetRecord::of_persisted_state(&trusted)
+            .expect("the record reads")
+            .admit_detached_carrier(&onset_carrier)
+            .expect("a Recorded writer's detached carrier is admitted untouched");
+
+        let mut malformed = trusted;
+        malformed["state"][ABILITY_ONSET_RECORD_FIELD] = Value::from(7);
+        let error = PersistedEntryOnsetRecord::of_persisted_state(&malformed)
+            .expect_err("a malformed record is a read error");
+        assert!(error.contains(ABILITY_ONSET_RECORD_FIELD), "{error}");
     }
 
     /// U4: every writer emits the record under its serde name — the derived serializer, the
