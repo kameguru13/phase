@@ -9092,6 +9092,90 @@ mod tests {
         assert!(state.pending_mass_library_order_choice.is_none());
     }
 
+    /// CR 101.1 + CR 401.4 + CR 101.4: a named arranger who orders two owners'
+    /// cards answers each owner's batch in turn; each recorded order stays keyed
+    /// to the library's owner, so both libraries receive the arranger's order in
+    /// the one simultaneous move.
+    ///
+    /// No printed card in the controller-arranged class places more than one
+    /// owner's cards, so this queue is reached only from a constructed
+    /// arrangement.
+    ///
+    /// REVERT-FAILING: with the answered batch keyed to the answering player
+    /// instead of its owner, P1's recorded order is dropped at the final move.
+    #[test]
+    fn named_arranger_orders_every_owners_batch_into_its_owners_library() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::standard(), 3, 42);
+        let mut cards = Vec::new();
+        for (cid, owner) in [(741, 1), (742, 1), (743, 1), (744, 2), (745, 2), (746, 2)] {
+            cards.push(create_object(
+                &mut state,
+                CardId(cid),
+                PlayerId(owner),
+                format!("Library Card {cid}"),
+                Zone::Library,
+            ));
+        }
+        let (p1_a, p1_b, p1_deep) = (cards[0], cards[1], cards[2]);
+        let (p2_a, p2_b, p2_deep) = (cards[3], cards[4], cards[5]);
+        state.players[1].library = im::vector![p1_deep, p1_a, p1_b];
+        state.players[2].library = im::vector![p2_deep, p2_a, p2_b];
+        open_owner_library_arrangement(
+            &mut state,
+            vec![
+                (PlayerId(1), vec![p1_a, p1_b]),
+                (PlayerId(2), vec![p2_a, p2_b]),
+            ],
+            Some(PlayerId(0)),
+            ObjectId(904),
+            LibraryPosition::Top,
+            false,
+            None,
+        );
+        let arranger_of = |state: &GameState| match &state.waiting_for {
+            WaitingFor::EffectZoneChoice {
+                player,
+                mass_library_order: Some(batch),
+                ..
+            } => (*player, batch.owner, batch.arranger),
+            other => panic!("expected an arrangement prompt, got {other:?}"),
+        };
+        assert_eq!(
+            arranger_of(&state),
+            (PlayerId(0), PlayerId(1), Some(PlayerId(0)))
+        );
+
+        apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![p1_b, p1_a],
+            },
+        )
+        .expect("P0 arranges P1's batch");
+        assert_eq!(
+            arranger_of(&state),
+            (PlayerId(0), PlayerId(2), Some(PlayerId(0))),
+            "P0 arranges the queued batch too"
+        );
+        assert_eq!(
+            library_ids(&state, PlayerId(1)),
+            vec![p1_deep, p1_a, p1_b],
+            "CR 101.4: nothing moves before the last batch is arranged"
+        );
+
+        let completed = apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![p2_b, p2_a],
+            },
+        )
+        .expect("P0 arranges P2's batch");
+        assert_eq!(library_ids(&state, PlayerId(1)), vec![p1_b, p1_a, p1_deep]);
+        assert_eq!(library_ids(&state, PlayerId(2)), vec![p2_b, p2_a, p2_deep]);
+        assert_eq!(put_at_library_position_resolutions(&completed.events), 1);
+        assert!(state.pending_mass_library_order_choice.is_none());
+    }
+
     /// Build an Exhume-shaped ability: `Effect::ChangeZone` Graveyard →
     /// Battlefield with a `Typed{Creature}` target carrying the post-fix
     /// owner constraint `Owned{ScopedPlayer}` + `InZone Graveyard`, and
