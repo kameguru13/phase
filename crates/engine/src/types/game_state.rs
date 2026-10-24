@@ -5235,7 +5235,8 @@ pub struct MassLibraryOrderBatch {
     pub owner: PlayerId,
     /// CR 101.1 + CR 608.2c: the player the instruction directs to arrange this
     /// owner's cards; `None` = CR 401.4 owner. Snapshotted at resolution
-    /// (CR 608.2d). Older saves decode as `None`: every earlier prompt was
+    /// (CR 608.2d); if that player leaves, the next player in turn order
+    /// replaces them (CR 800.4g + CR 800.4h). Older saves decode as `None`: every earlier prompt was
     /// owner-arranged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arranger: Option<PlayerId>,
