@@ -48805,6 +48805,45 @@ mod tests {
         assert_eq!(decoded, pending);
     }
 
+    /// CR 101.1 + CR 401.4: an instruction-named arranger survives serde on both
+    /// the queued and the arranged batch, so a reload still prompts the arranger
+    /// rather than falling back to the owner; a wire without the key decodes as
+    /// the owner default.
+    #[test]
+    fn mass_library_order_batch_round_trips_an_explicit_arranger() {
+        let batch = |owner: u8, object: u64| MassLibraryOrderBatch {
+            owner: PlayerId(owner),
+            members: vec![MassLibraryOrderMember {
+                identity: ObjectIncarnationRef::of(ObjectId(object), 0),
+                origin: Zone::Graveyard,
+            }],
+            arranger: Some(PlayerId(0)),
+        };
+        let pending = PendingMassLibraryOrderChoice {
+            source_id: ObjectId(10),
+            library_position: LibraryPosition::Top,
+            track_exiled_by_source: false,
+            duration: None,
+            remaining_batches: PendingMassLibraryOrderBatches::Typed(vec![batch(2, 5)]),
+            arranged_batches: vec![batch(1, 3)],
+            resolving_entry: None,
+        };
+        let wire = serde_json::to_value(&pending).unwrap();
+        assert_eq!(
+            wire["arranged_batches"][0]["arranger"],
+            serde_json::json!(0)
+        );
+        let decoded: PendingMassLibraryOrderChoice = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded, pending);
+        assert_eq!(decoded.arranged_batches[0].chooser(), PlayerId(0));
+
+        let mut legacy = serde_json::to_value(batch(1, 3)).unwrap();
+        legacy.as_object_mut().unwrap().remove("arranger");
+        let legacy: MassLibraryOrderBatch = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.arranger, None);
+        assert_eq!(legacy.chooser(), PlayerId(1));
+    }
+
     /// CR 502.3: the bounded untap-subset prompt must survive serde round-trip
     /// so the human-play transport can present it (and reload it) verbatim.
     #[test]

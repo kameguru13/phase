@@ -2136,8 +2136,8 @@ pub(crate) fn submit_owner_library_order(
 ///
 /// CR 101.1: an instruction that orders the cards itself names the arranger.
 /// `arranger` is that player, resolved at resolution (CR 608.2d) and written
-/// onto every batch here — the only writer of a batch's arranger; `None`
-/// leaves each library's owner arranging (CR 401.4).
+/// onto every batch here — the only place a batch's arranger is decided (later
+/// batches copy it); `None` leaves each library's owner arranging (CR 401.4).
 pub(crate) fn open_owner_library_arrangement(
     state: &mut GameState,
     owner_batches: Vec<(PlayerId, Vec<ObjectId>)>,

@@ -75314,9 +75314,9 @@ fn announced_target_set_placement_in_any_order_names_the_controller_arranger() {
         );
     }
 
-    // PAIRED NEGATIVE: a subject-led placement ("target opponent puts …") is not
-    // the controller's imperative, so it names no arranger even with a closing
-    // "in any order".
+    // PAIRED NEGATIVE: an exact-count subject-led selection ("target opponent puts
+    // two cards …") names no arranger — it never reaches the announced-target-set
+    // gate, whatever its closing "in any order".
     let imp = parse(
         "({B/P} can be paid with either {B} or 2 life.)\nFlying\nWhen Phyrexian Chimney Imp \
          dies, target opponent puts two cards from their hand on top of their library in any \
@@ -75346,7 +75346,7 @@ fn announced_target_set_placement_in_any_order_names_the_controller_arranger() {
     assert_eq!(
         placement_arranger(nodes[0]),
         None,
-        "a subject-led placement names no arranger"
+        "an exact-count subject-led selection names no arranger"
     );
 }
 
