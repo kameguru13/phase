@@ -2653,7 +2653,7 @@ pub fn resolve_move(
                 source_id,
                 mode,
                 counter_type_filter,
-                ability.context.creation_lookback_event.as_deref(),
+                ability,
             );
             if source_counters.is_empty() {
                 continue;
@@ -2695,13 +2695,8 @@ pub fn resolve_move(
     }
 
     for source_id in source_ids {
-        let source_counters = counter_transfer_source_counters(
-            state,
-            source_id,
-            mode,
-            counter_type_filter,
-            ability.context.creation_lookback_event.as_deref(),
-        );
+        let source_counters =
+            counter_transfer_source_counters(state, source_id, mode, counter_type_filter, ability);
 
         if source_counters.is_empty() {
             continue;
@@ -2772,7 +2767,7 @@ fn resolve_move_distribution(
         source_id,
         CounterTransferMode::Move,
         counter_type_filter,
-        ability.context.creation_lookback_event.as_deref(),
+        ability,
     );
     let destinations =
         resolution_counter_move_destinations(state, ability, target_filter, source_id);
@@ -2823,7 +2818,7 @@ fn resolve_stack_target_move_distribution(
         source_id,
         CounterTransferMode::Move,
         counter_type_filter,
-        ability.context.creation_lookback_event.as_deref(),
+        ability,
     );
 
     if available.is_empty() || destinations.is_empty() {
@@ -3027,41 +3022,103 @@ fn counter_transfer_source_counters(
     source_id: ObjectId,
     mode: CounterTransferMode,
     counter_type_filter: Option<&CounterType>,
-    creation_lookback_event: Option<&GameEvent>,
+    ability: &ResolvedAbility,
 ) -> Vec<(CounterType, u32)> {
-    let departure_counters = (mode == CounterTransferMode::Put)
-        .then(|| {
-            departure_counters_for_counter_reproduction(state, source_id, creation_lookback_event)
-        })
-        .flatten();
-    let mut counters = if mode == CounterTransferMode::Put {
-        departure_counters.clone().unwrap_or_else(|| {
-            state
-                .objects
-                .get(&source_id)
-                .map(|obj| obj.counters.clone())
-                .unwrap_or_default()
-        })
-    } else {
-        state
-            .objects
-            .get(&source_id)
-            .map(|obj| obj.counters.clone())
-            .unwrap_or_default()
+    let counters = match mode {
+        // CR 122.5: moving a counter removes it from the object it is on, so
+        // only the live object's counters can move.
+        CounterTransferMode::Move => live_counters(state, source_id),
+        CounterTransferMode::Put => put_source_counters(state, source_id, ability),
     };
-
-    if counters.is_empty() && mode == CounterTransferMode::Put && departure_counters.is_none() {
-        counters = state
-            .lki_cache
-            .get(&source_id)
-            .map(|lki| lki.counters.clone())
-            .unwrap_or_default();
-    }
 
     counters
         .into_iter()
         .filter(|(ct, count)| *count > 0 && counter_type_filter.is_none_or(|filter| filter == ct))
         .collect()
+}
+
+fn live_counters(
+    state: &GameState,
+    object_id: ObjectId,
+) -> std::collections::HashMap<CounterType, u32> {
+    state
+        .objects
+        .get(&object_id)
+        .map(|obj| obj.counters.clone())
+        .unwrap_or_default()
+}
+
+/// CR 122.8 + CR 608.2h + CR 400.7: the counters a "put its counters on"
+/// instruction reproduces from `source_id`, in precedence order:
+///
+/// 1. The departure that fired (or created) this ability, when it is the
+///    source's battlefield departure: that event's record is the departed
+///    object's last known information.
+/// 2. This triggered ability's own source, when `source_id` is it. While the
+///    captured incarnation is still the live object in its expected zone, its
+///    current counters answer (CR 608.2h). Once it has left — even if it came
+///    back, since the returned object is a new object (CR 400.7) — the answer
+///    is that incarnation's last known information, never the live same-id
+///    object and never the ObjectId-keyed LKI cache, which a later incarnation
+///    may have overwritten.
+/// 3. Any other source: its live counters, else the ObjectId-keyed LKI cache.
+fn put_source_counters(
+    state: &GameState,
+    source_id: ObjectId,
+    ability: &ResolvedAbility,
+) -> std::collections::HashMap<CounterType, u32> {
+    if let Some(counters) = departure_counters_for_counter_reproduction(
+        state,
+        source_id,
+        ability.context.creation_lookback_event.as_deref(),
+    ) {
+        return counters;
+    }
+
+    if let Some(source) = ability.trigger_source.as_ref().filter(|source| {
+        source_id == ability.source_id && source.identity.reference.object_id == source_id
+    }) {
+        return if ability.source_is_current(state) {
+            live_counters(state, source_id)
+        } else {
+            captured_source_last_known_counters(state, source)
+        };
+    }
+
+    let counters = live_counters(state, source_id);
+    if !counters.is_empty() {
+        return counters;
+    }
+    state
+        .lki_cache
+        .get(&source_id)
+        .map(|lki| lki.counters.clone())
+        .unwrap_or_default()
+}
+
+/// CR 608.2h + CR 400.7: the last known counters of a triggered ability's
+/// captured source incarnation after it left its expected zone. An incarnation
+/// leaves a zone only once, so the latest zone change recorded with that exact
+/// identity is the move it left by, and that record's snapshot is its last
+/// known information; without one this turn, the ability's own capture is the
+/// latest information the engine holds.
+fn captured_source_last_known_counters(
+    state: &GameState,
+    source: &crate::types::game_state::TriggerSourceContext,
+) -> std::collections::HashMap<CounterType, u32> {
+    state
+        .zone_changes_this_turn
+        .iter()
+        .rev()
+        .find_map(|record| {
+            record
+                .trigger_source_context()
+                .filter(|departed| departed.identity.reference == source.identity.reference)
+        })
+        .unwrap_or(source)
+        .lki
+        .counters
+        .clone()
 }
 
 /// CR 122.8 + CR 603.7 + CR 603.10a: the departure a counter reproduction reads.
@@ -3144,7 +3201,7 @@ pub(crate) fn move_counters_optional_is_infeasible(
             source_id,
             CounterTransferMode::Move,
             counter_type.as_ref(),
-            ability.context.creation_lookback_event.as_deref(),
+            ability,
         )
         .into_iter()
         .any(|(counter_type, available)| {
