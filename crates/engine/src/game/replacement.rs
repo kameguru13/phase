@@ -2061,14 +2061,20 @@ fn stub_applier(
 // --- 1. Moved (ZoneChange) ---
 
 fn change_zone_matcher(event: &ProposedEvent, _source: ObjectId, _state: &GameState) -> bool {
+    // CR 701.7a + CR 614.3: a creation of zero tokens (Halving Season on one token;
+    // Moonlit Meditation / Jinnie Fay zeroing the original event before their
+    // substitute is created) puts nothing onto the battlefield, so it contains no
+    // entry for an entry replacement to modify. A one-shot one ("the next time one or
+    // more creatures … enter") is not used up by it and waits for a real entry.
+    // Mirrors `draw_matcher`'s `count > 0`. A compound event is matched per batch
+    // view, so an empty batch is skipped while its siblings still match.
     matches!(
         event,
         ProposedEvent::ZoneChange {
             to: Zone::Battlefield,
             ..
-        } | ProposedEvent::CreateToken { .. }
-            | ProposedEvent::TokenEntry { .. }
-    )
+        } | ProposedEvent::TokenEntry { .. }
+    ) || matches!(event, ProposedEvent::CreateToken { count, .. } if *count > 0)
 }
 
 fn change_zone_applier(
@@ -12285,6 +12291,30 @@ fn as_enters_choice_changes_applicability(
     })
 }
 
+/// CR 616.1g + CR 701.7b: which event a candidate replacement modifies, relative to
+/// the proposed event. Declared outer-first, so the derived `Ord` ranks the event
+/// whose replacements must be chosen first as the least.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ReplacementEventLayer {
+    /// The proposed event itself — for a `CreateToken`, the token being created
+    /// (CR 701.7b, first sentence).
+    Proposed,
+    /// CR 616.1g: the battlefield entry contained within a token-creation event
+    /// (CR 701.7b, second sentence). Its replacements can't be chosen until the
+    /// creation event's have been.
+    ContainedEntry,
+}
+
+/// CR 616.1 + CR 616.1g: when a candidate may be chosen — the event it modifies
+/// first (an outer event's replacements before a contained event's), then the
+/// CR 616.1a-e step within that event. The derived `Ord` compares `layer`, then
+/// `step`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ReplacementPrecedence {
+    layer: ReplacementEventLayer,
+    step: ReplacementStep,
+}
+
 /// CR 616.1a-e: the step of the CR 616.1 procedure at which an applicable
 /// replacement/prevention candidate may be chosen. Declared in CR order, so the
 /// derived `Ord` ranks the step that must be chosen from first as the least.
@@ -12297,7 +12327,7 @@ fn as_enters_choice_changes_applicability(
 /// `ProposedEvent::ZoneChange::enter_transformed`, which is fixed when the event is
 /// built. A recognizer for either belongs here if that ever changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum ReplacementPrecedence {
+enum ReplacementStep {
     /// CR 616.1b: modifies under whose control an object enters the battlefield.
     EntryController,
     /// CR 616.1c: causes an object to become a copy of another object as it enters.
@@ -12306,10 +12336,36 @@ enum ReplacementPrecedence {
     Unrestricted,
 }
 
-/// CR 616.1b + CR 616.1c: the CR 616.1 step `rid` belongs to for `proposed`. Reads
-/// exactly what the appliers write: `enters_under` onto a battlefield `ZoneChange`
-/// (`apply_single_replacement`), `token_owner_redirect` onto a `CreateToken`
-/// (`create_token_applier`; CR 111.2), and an `execute` whose work is `BecomeCopy`.
+/// CR 616.1g + CR 701.7b: the event `def` modifies when it is a candidate for
+/// `proposed`. `change_zone_matcher` is the only registry matcher besides
+/// `create_token_matcher` that accepts a `CreateToken`; what a `ChangeZone`
+/// definition reaches there is the tokens' entry (Grumgully's counters, an
+/// enters-tapped, Mystic Reflection's "enter as copies"), while
+/// `ReplacementEvent::CreateToken` definitions modify the creation itself. Virtual
+/// candidates carry no definition and none applies to a `CreateToken`, so
+/// `replacement_precedence` keeps them on the proposed event.
+fn replacement_event_layer(
+    def: &ReplacementDefinition,
+    proposed: &ProposedEvent,
+) -> ReplacementEventLayer {
+    // CR 616.1g + CR 701.7b: entering the battlefield is an event contained within
+    // the event of creating a token, so its replacements are chosen after the
+    // creation's.
+    if matches!(proposed, ProposedEvent::CreateToken { .. })
+        && def.event == ReplacementEvent::ChangeZone
+    {
+        ReplacementEventLayer::ContainedEntry
+    } else {
+        ReplacementEventLayer::Proposed
+    }
+}
+
+/// CR 616.1b + CR 616.1c + CR 616.1g: when `rid` may be chosen for `proposed` —
+/// the event it modifies (`replacement_event_layer`), then its CR 616.1 step. The
+/// step reads exactly what the appliers write: `enters_under` onto a battlefield
+/// `ZoneChange` (`apply_single_replacement`), `token_owner_redirect` onto a
+/// `CreateToken` (`create_token_applier`; CR 111.2), and an `execute` whose work is
+/// `BecomeCopy`.
 fn replacement_precedence(
     state: &GameState,
     rid: ReplacementId,
@@ -12318,8 +12374,19 @@ fn replacement_precedence(
     // Virtual candidates (commander return, finality, shield/umbra, granted keywords,
     // dredge, combat skip) carry no definition and write neither controller nor copy.
     let Some(def) = replacement_choice_definition(state, rid) else {
-        return ReplacementPrecedence::Unrestricted;
+        return ReplacementPrecedence {
+            layer: ReplacementEventLayer::Proposed,
+            step: ReplacementStep::Unrestricted,
+        };
     };
+    ReplacementPrecedence {
+        layer: replacement_event_layer(def, proposed),
+        step: replacement_step(def, proposed),
+    }
+}
+
+/// CR 616.1b + CR 616.1c: the CR 616.1 step `def` belongs to for `proposed`.
+fn replacement_step(def: &ReplacementDefinition, proposed: &ProposedEvent) -> ReplacementStep {
     let rewrites_entry_controller = match proposed {
         ProposedEvent::ZoneChange {
             to: Zone::Battlefield,
@@ -12329,7 +12396,7 @@ fn replacement_precedence(
         _ => false,
     };
     if rewrites_entry_controller {
-        return ReplacementPrecedence::EntryController;
+        return ReplacementStep::EntryController;
     }
     // CR 111.1: a created or entering token enters the battlefield too.
     let enters_battlefield = matches!(
@@ -12340,15 +12407,19 @@ fn replacement_precedence(
         } | ProposedEvent::CreateToken { .. }
             | ProposedEvent::TokenEntry { .. }
     );
+    // CR 616.1c orders an entry copy first among the replacements of the entry it
+    // modifies. On a `CreateToken` that entry is the contained one, so CR 616.1g
+    // still puts it after every replacement of the creation (`replacement_event_layer`).
     if enters_battlefield && def.execute.as_deref().is_some_and(ability_becomes_copy) {
-        return ReplacementPrecedence::EntryCopy;
+        return ReplacementStep::EntryCopy;
     }
-    ReplacementPrecedence::Unrestricted
+    ReplacementStep::Unrestricted
 }
 
-/// CR 616.1 + CR 616.1f: the candidates the affected player may choose among now:
-/// every candidate of the earliest CR 616.1 step present (all of them when none is
-/// restricted). The single authority for CR 616.1 precedence: `pipeline_loop` parks and
+/// CR 616.1 + CR 616.1f + CR 616.1g: the candidates the affected player may choose
+/// among now: every candidate of the earliest CR 616.1 step present, on the
+/// outermost event that still has candidates (CR 616.1g) — all of them when none is
+/// restricted. The single authority for CR 616.1 precedence: `pipeline_loop` parks and
 /// applies only this subset, so a `ChooseReplacement` index can never name a withheld
 /// candidate; withheld candidates are rediscovered on the next pass.
 fn choosable_replacement_candidates(
@@ -19380,9 +19451,11 @@ mod tests {
         }
     }
 
-    /// CR 616.1b + CR 616.1c + CR 616.1e: of the applicable candidates only the earliest
-    /// CR 616.1 step present is choosable, off-entry events are unrestricted, and a
-    /// floating (`ObjectId(0)`) token-controller redirect is tiered (CR 111.2).
+    /// CR 616.1b + CR 616.1c + CR 616.1e + CR 616.1g: of the applicable candidates only
+    /// the earliest CR 616.1 step present is choosable, off-entry events are
+    /// unrestricted, a floating (`ObjectId(0)`) token-controller redirect is tiered
+    /// (CR 111.2), and on a token-creation event a replacement of the contained entry
+    /// waits for the creation's replacements.
     #[test]
     fn replacement_precedence_restricts_choosable_candidates_to_earliest_cr_616_1_step() {
         use crate::types::ability::{CopyRecipient, QuantityModification};
@@ -19409,10 +19482,29 @@ mod tests {
                 },
             )),
             entry_moved().enters_under(ControllerRef::Opponent),
-            entry_moved().execute(AbilityDefinition::new(AbilityKind::Spell, copy_effect)),
+            entry_moved().execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                copy_effect.clone(),
+            )),
             entry_moved().enters_under(ControllerRef::You),
         ];
         let mut state = test_state_with_object(ObjectId(10), Zone::Hand, defs);
+        // A Mystic Reflection-style entry copy, which reaches a token event through
+        // `change_zone_matcher` (the tokens' contained entry).
+        let mut copier = GameObject::new(
+            ObjectId(12),
+            CardId(3),
+            PlayerId(0),
+            "Copier".to_string(),
+            Zone::Battlefield,
+        );
+        copier.replacement_definitions =
+            vec![ReplacementDefinition::new(ReplacementEvent::ChangeZone)
+                .destination_zone(Zone::Battlefield)
+                .execute(AbilityDefinition::new(AbilityKind::Spell, copy_effect))]
+            .into();
+        state.objects.insert(ObjectId(12), copier);
+        state.battlefield.push_back(ObjectId(12));
         let mut doubler = GameObject::new(
             ObjectId(11),
             CardId(2),
@@ -19444,6 +19536,10 @@ mod tests {
             source: ObjectId(11),
             index: 0,
         };
+        let copy_rid = ReplacementId {
+            source: ObjectId(12),
+            index: 0,
+        };
         let entry = ProposedEvent::zone_change(ObjectId(10), Zone::Hand, Zone::Battlefield, None);
         let dies =
             ProposedEvent::zone_change(ObjectId(10), Zone::Battlefield, Zone::Graveyard, None);
@@ -19457,26 +19553,43 @@ mod tests {
             applied: HashSet::new(),
         };
 
+        let proposed = |step: ReplacementStep| ReplacementPrecedence {
+            layer: ReplacementEventLayer::Proposed,
+            step,
+        };
         // Each tier is recognized from what the appliers write.
         assert_eq!(
             replacement_precedence(&state, on_object(0), &entry),
-            ReplacementPrecedence::Unrestricted
+            proposed(ReplacementStep::Unrestricted)
         );
         assert_eq!(
             replacement_precedence(&state, on_object(1), &entry),
-            ReplacementPrecedence::EntryController
+            proposed(ReplacementStep::EntryController)
         );
         assert_eq!(
             replacement_precedence(&state, on_object(2), &entry),
-            ReplacementPrecedence::EntryCopy
+            proposed(ReplacementStep::EntryCopy)
         );
         assert_eq!(
             replacement_precedence(&state, floating_redirect, &token),
-            ReplacementPrecedence::EntryController
+            proposed(ReplacementStep::EntryController)
         );
         assert_eq!(
             replacement_precedence(&state, doubler_rid, &token),
-            ReplacementPrecedence::Unrestricted
+            proposed(ReplacementStep::Unrestricted)
+        );
+        // CR 616.1g: the same entry copy is on the contained entry of a token event,
+        // and on the proposed event itself when that event is the entry.
+        assert_eq!(
+            replacement_precedence(&state, copy_rid, &token),
+            ReplacementPrecedence {
+                layer: ReplacementEventLayer::ContainedEntry,
+                step: ReplacementStep::EntryCopy,
+            }
+        );
+        assert_eq!(
+            replacement_precedence(&state, copy_rid, &entry),
+            proposed(ReplacementStep::EntryCopy)
         );
 
         let choosable = |event: &ProposedEvent, candidates: Vec<ReplacementId>| {
@@ -19522,7 +19635,68 @@ mod tests {
             vec![floating_redirect],
             "CR 616.1b + CR 111.2: the token-controller redirect precedes the doubler"
         );
+        assert_eq!(
+            choosable(&token, vec![copy_rid, doubler_rid]),
+            vec![doubler_rid],
+            "CR 616.1g: the creation's doubler precedes the contained entry's copy"
+        );
+        assert_eq!(
+            choosable(&token, vec![copy_rid]),
+            vec![copy_rid],
+            "CR 616.1g: the contained entry's copy is chosen once no creation candidate remains"
+        );
+        assert_eq!(
+            choosable(&entry, vec![on_object(0), copy_rid]),
+            vec![copy_rid],
+            "CR 616.1c: on a non-token entry the copy keeps its step, with no layer change"
+        );
         assert!(choosable(&entry, Vec::new()).is_empty());
+    }
+
+    /// CR 701.7a + CR 614.3: a token-creation event contains a battlefield entry only
+    /// when it would create at least one token; zone-change entries are unaffected.
+    #[test]
+    fn change_zone_matcher_requires_a_token_to_enter() {
+        let state = GameState::new_two_player(42);
+        let token = |count: u32| ProposedEvent::CreateToken {
+            owner: PlayerId(0),
+            spec: Box::new(test_token_spec(PlayerId(0), CoreType::Creature)),
+            copy: None,
+            enter_tapped: EtbTapState::Unspecified,
+            count,
+            appended: Vec::new(),
+            applied: HashSet::new(),
+        };
+        let source = ObjectId(10);
+        assert!(
+            !change_zone_matcher(&token(0), source, &state),
+            "a creation of zero tokens contains no entry"
+        );
+        assert!(
+            change_zone_matcher(&token(1), source, &state),
+            "a creation of one token contains its entry"
+        );
+        assert!(change_zone_matcher(
+            &ProposedEvent::TokenEntry {
+                entry_ref: ObjectId(20),
+                enter_tapped: EtbTapState::Unspecified,
+                enter_with_counters: Vec::new(),
+                enter_with_choices: None,
+                applied: HashSet::new(),
+            },
+            source,
+            &state
+        ));
+        assert!(change_zone_matcher(
+            &ProposedEvent::zone_change(ObjectId(10), Zone::Hand, Zone::Battlefield, None),
+            source,
+            &state
+        ));
+        assert!(!change_zone_matcher(
+            &ProposedEvent::zone_change(ObjectId(10), Zone::Battlefield, Zone::Graveyard, None),
+            source,
+            &state
+        ));
     }
 
     #[test]

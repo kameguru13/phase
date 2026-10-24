@@ -10,6 +10,10 @@
 //! - CR 616.2: a replacement can become applicable to the event as the result of
 //!   another replacement (Ojer Taq on the Squirrels of a Treasure event).
 //! - CR 614.5: each replacement gets one opportunity at the event.
+//! - CR 616.1g + CR 701.7b: a replacement of the tokens' entry (Grumgully,
+//!   Mystic Reflection) can't be chosen until the creation's replacements
+//!   (Chatterfang, Parallel Lives, Halving Season) have been; it then applies to
+//!   every batch it matches.
 //! - CR 608.2c: "that token" / "those tokens" name every token the event
 //!   created (Chatterfang ruling: anything else the creating effect specifies
 //!   applies to the original tokens and the Squirrels alike).
@@ -600,7 +604,10 @@ fn cogwork_copy_resume_parallel_lives_first_includes_squirrel() {
 /// appended Squirrel is delivered first and stays in the referent; the stated
 /// engine order for this case is the Squirrel, then the copy (the copy route
 /// publishes after the ids already there). Counters with Halving Season last:
-/// (1 + 1) × 2 / 2 = 2 on each. On main there was no Squirrel.
+/// (1 + 1) × 2 / 2 = 2 on each. Grumgully, the copy's and the Squirrel's entry
+/// replacement, is no longer offered among the creation replacements (CR
+/// 616.1g). It applies to both batches after them without a prompt. On main
+/// there was no Squirrel.
 #[test]
 fn copy_batch_pause_keeps_squirrel_in_referent() {
     let (mut runner, assembler, _) = cogwork_board(true, |scenario| {
@@ -613,8 +620,8 @@ fn copy_batch_pause_keeps_squirrel_in_referent() {
     settle(
         &mut runner,
         &[
-            order(4, "Chatterfang, Squirrel General"),
-            order(3, "Parallel Lives"),
+            order(3, "Chatterfang, Squirrel General"),
+            order(2, "Parallel Lives"),
             // The Squirrel's entry counters, then the copy's.
             order(3, "Hardened Scales"),
             order(2, "Branching Evolution"),
@@ -679,9 +686,10 @@ fn copy_drive_appended_squirrel_pause_branching_first() {
 
 /// Resume path: the ordering choice parks the copy resolution; the event's
 /// delivery detaches it, re-parks it under the Squirrel's counter pause, and
-/// hands it the whole referent when the rest is delivered. Grumgully is offered
-/// in the second token prompt only through the Squirrel batch (CR 616.2).
-/// On main there was no Squirrel.
+/// hands it the whole referent when the rest is delivered. Grumgully, which
+/// applies only to the Squirrel batch (CR 616.2), is a replacement of the
+/// tokens' entry, so it is not offered with the creation replacements and
+/// applies after them (CR 616.1g). On main there was no Squirrel.
 #[test]
 fn copy_resume_appended_squirrel_pause_reaches_frame() {
     let (mut runner, assembler, mind_stone) = cogwork_board(false, |scenario| {
@@ -693,7 +701,7 @@ fn copy_resume_appended_squirrel_pause_reaches_frame() {
         &mut runner,
         &[
             order(3, "Chatterfang, Squirrel General"),
-            order(3, "Parallel Lives"),
+            order(2, "Parallel Lives"),
             order(3, "Hardened Scales"),
             order(2, "Branching Evolution"),
         ],
@@ -1155,15 +1163,16 @@ fn copy_counter_pause_halving_season_first() {
     copy_counter_pause("Halving Season", 2);
 }
 
-/// CR 608.2c + CR 616.1c: Mystic Reflection, a copy effect, applies first, so
-/// Raise the Alarm's own batch becomes two Grizzly Bears copies on the plain
-/// Effect::Token route; no CopyToken resolution owns this event. Chatterfang
-/// then adds plain Squirrels, and Grumgully's counter on each token pauses for
-/// its ordering. The instruction still ends with exactly one
-/// `EffectResolved{Token}` (on the candidate before this, none), naming Raise
-/// the Alarm, not Chatterfang, whose Squirrel batch paused first.
+/// CR 616.1g + CR 616.1c + CR 614.1a: Chatterfang's creation replacement
+/// applies first, so the event is two Soldiers plus two Squirrels. Then Mystic
+/// Reflection, the contained entry's copy effect and first among the entry's
+/// replacements, makes all four Grizzly Bears copies and is used up once. Then
+/// Grumgully's counter on each Bears copy pauses for its ordering. No CopyToken
+/// resolution owns this event (the plain Effect::Token route), yet "that token"
+/// names all four. The instruction ends with exactly one `EffectResolved{Token}`,
+/// naming Raise the Alarm, not Chatterfang.
 #[test]
-fn copy_own_batch_on_token_route_emits_effect_resolved_once() {
+fn copy_on_entry_after_chatterfang_copies_every_token() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     scenario.add_creature_from_oracle(P0, "Chatterfang, Squirrel General", 3, 3, CHATTERFANG);
@@ -1178,7 +1187,7 @@ fn copy_own_batch_on_token_route_emits_effect_resolved_once() {
     let mut runner = scenario.build();
     runner.cast(mystic).target_object(bears).resolve();
     let mut events = runner.cast(spell).resolve().events().to_vec();
-    // Each Squirrel, then each Bears copy, asks for its counters' order.
+    // Each Bears copy asks for its counters' order.
     events.extend(settle(
         &mut runner,
         &[order(2, "Hardened Scales"); 4],
@@ -1186,21 +1195,126 @@ fn copy_own_batch_on_token_route_emits_effect_resolved_once() {
     ));
 
     assert!(tokens(&runner, "Soldier").is_empty());
+    assert!(
+        tokens(&runner, "Squirrel").is_empty(),
+        "the Squirrels enter as Bears copies too"
+    );
     let bears_copies: Vec<ObjectId> = tokens_named(&runner, "Grizzly Bears")
         .iter()
         .map(|o| o.id)
         .collect();
-    let squirrels: Vec<ObjectId> = tokens(&runner, "Squirrel").iter().map(|o| o.id).collect();
-    assert_eq!(bears_copies.len(), 2, "both Soldiers enter as Bears copies");
-    assert_eq!(squirrels.len(), 2, "Chatterfang adds two Squirrels");
-    for &id in bears_copies.iter().chain(&squirrels) {
+    assert_eq!(
+        bears_copies.len(),
+        4,
+        "all four tokens enter as Bears copies"
+    );
+    for &id in &bears_copies {
         // Grumgully's one counter, Hardened Scales first: (1 + 1) × 2.
         assert_eq!(plus_counters(&runner, id), 4);
     }
+    // CR 608.2c: the referent is every token the event created, in event order
+    // (the Soldiers' copies, then the Squirrels').
+    assert_eq!(ledger(&runner), bears_copies);
     assert_eq!(
         effect_resolved_sources(&events, EffectKind::Token),
         vec![spell]
     );
+}
+
+/// CR 616.1g + CR 616.1: two creation-replacement prompts (Chatterfang, then
+/// Parallel Lives; P1's Halving Season last) settle the event as two Soldiers
+/// plus two Squirrels before Mystic Reflection, a replacement of the contained
+/// entry, can be chosen; it then makes every one of them a copy of Colossal
+/// Dreadmaw. Neither prompt offers it.
+#[test]
+fn contained_copy_reaches_every_batch_after_outer_prompts() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_creature_from_oracle(P0, "Chatterfang, Squirrel General", 3, 3, CHATTERFANG);
+    add_parallel_lives_and_opposing_halving_season(&mut scenario);
+    let dreadmaw = scenario.add_creature(P0, "Colossal Dreadmaw", 6, 6).id();
+    let mystic = scenario
+        .add_spell_to_hand_from_oracle(P0, "Mystic Reflection", true, MYSTIC_REFLECTION)
+        .id();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Raise the Alarm", true, RAISE_THE_ALARM)
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(mystic).target_object(dreadmaw).resolve();
+    runner.cast(spell).resolve();
+    settle(
+        &mut runner,
+        &[
+            order(3, "Chatterfang, Squirrel General"),
+            order(2, "Parallel Lives"),
+        ],
+        Until::StackEmpty,
+    );
+
+    assert_eq!(
+        tokens_named(&runner, "Colossal Dreadmaw").len(),
+        4,
+        "2 + 2, doubled, then halved: all four enter as Dreadmaw copies"
+    );
+    assert!(tokens(&runner, "Squirrel").is_empty());
+    assert!(tokens(&runner, "Soldier").is_empty());
+    assert_eq!(ledger(&runner).len(), 4);
+}
+
+/// Grumgully added before or after Chatterfang; Raise the Alarm.
+fn grumgully_chatterfang_board(grumgully_first: bool) -> GameRunner {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let add_grumgully = |scenario: &mut GameScenario| {
+        scenario.add_creature_from_oracle(P0, "Grumgully, the Generous", 3, 3, GRUMGULLY);
+    };
+    if grumgully_first {
+        add_grumgully(&mut scenario);
+    }
+    scenario.add_creature_from_oracle(P0, "Chatterfang, Squirrel General", 3, 3, CHATTERFANG);
+    if !grumgully_first {
+        add_grumgully(&mut scenario);
+    }
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Raise the Alarm", true, RAISE_THE_ALARM)
+        .id();
+    let mut runner = scenario.build();
+    runner.cast(spell).resolve();
+    runner
+}
+
+/// Every token the event creates (two Soldiers, two Squirrels) has Grumgully's
+/// one counter.
+fn assert_each_token_has_one_grumgully_counter(runner: &mut GameRunner) {
+    settle(runner, &[], Until::StackEmpty);
+    let soldiers = tokens(runner, "Soldier");
+    let squirrels = tokens(runner, "Squirrel");
+    assert_eq!(soldiers.len(), 2, "Raise the Alarm's two Soldiers");
+    assert_eq!(squirrels.len(), 2, "Chatterfang adds two Squirrels");
+    for token in soldiers.iter().chain(&squirrels) {
+        assert_eq!(
+            plus_counters(runner, token.id),
+            1,
+            "{} has Grumgully's counter",
+            token.name
+        );
+    }
+}
+
+/// CR 616.1g: Grumgully's counter is a replacement of the tokens' entry, so it
+/// can't be chosen until Chatterfang's creation replacement has been, whatever
+/// order the two are found in. It then reaches the Squirrels too.
+#[test]
+fn entry_counter_replacement_waits_for_chatterfang() {
+    assert_each_token_has_one_grumgully_counter(&mut grumgully_chatterfang_board(true));
+}
+
+/// Sibling of `entry_counter_replacement_waits_for_chatterfang` with Chatterfang
+/// found first: the same result, so that row's flip is the CR 616.1g order, not
+/// an artifact of the candidate order.
+#[test]
+fn entry_counter_replacement_after_chatterfang_found_first() {
+    assert_each_token_has_one_grumgully_counter(&mut grumgully_chatterfang_board(false));
 }
 
 const METALLIC_MIMIC: &str = "As this creature enters, choose a creature type.\nThis creature is the chosen type in addition to its other types.\nEach other creature you control of the chosen type enters with an additional +1/+1 counter on it.";

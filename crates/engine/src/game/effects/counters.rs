@@ -923,10 +923,9 @@ fn apply_pending_counter_post_action(
             enter_with_counters,
             remaining_count,
         } => {
-            if remaining_count == 0 {
-                return true;
-            }
-            let status = super::token_copy::apply_copy_token_after_replacement(
+            // CR 707.2 + CR 608.2c: the rest of the paused copy batch, published
+            // after the referent so far.
+            super::token_copy::resume_copy_token_batch_remainder(
                 state,
                 owner,
                 *copy,
@@ -934,13 +933,7 @@ fn apply_pending_counter_post_action(
                 enter_with_counters,
                 remaining_count,
                 events,
-            );
-            let completion = status.completion;
-            super::token_copy::extend_copy_batch_created_ids(state, status.created_ids);
-            match completion {
-                super::token_copy::CopyTokenApplyCompletion::Completed => true,
-                super::token_copy::CopyTokenApplyCompletion::Paused => false,
-            }
+            )
         }
         PendingCounterPostAction::ContinueCopyTokenEntryAfterAuraHost { object_id, tail } => {
             // CR 303.4f: the host choice is answered and the attach is applied;
