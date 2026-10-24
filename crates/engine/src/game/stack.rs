@@ -62,6 +62,16 @@ pub(super) fn begin_resolving_stack_entry(
         matches!(&entry.kind, StackEntryKind::TriggeredAbility { .. }),
         firing.is_some()
     );
+    // CR 400.7 + CR 608.2h: pin the exact object this carrier resolves while it is
+    // still on the stack — the incarnation whose stack-exit snapshot is its last
+    // known information if it leaves mid-resolution (CR 608.2m). An entry whose id
+    // names no object row in `Zone::Stack` (an ability, whose controller CR 113.8
+    // fixes) pins nothing.
+    state.resolving_stack_object = state
+        .objects
+        .get(&entry.id)
+        .filter(|object| object.zone == Zone::Stack)
+        .map(crate::types::identifiers::ObjectIncarnationRef::from_object);
     state.resolving_stack_entry = Some(entry);
     state.resolving_trigger_firing = firing;
     Ok(())
@@ -80,6 +90,8 @@ pub(super) fn finish_resolving_stack_entry(
     let firing = state.resolving_trigger_firing.take();
     // CR 608.2n: an owed final part belongs to this carrier and ends with it.
     state.resolving_spell_final_part = None;
+    // CR 608.2n: the resolution's object pin ends with its carrier.
+    state.resolving_stack_object = None;
     // CR 608.2c: the resolving stack entry owns every nested instruction-result
     // occurrence, including ones parked across replacement choices.
     state.return_result_frames.clear();
@@ -168,12 +180,14 @@ pub(super) fn abandon_active_resolution_carrier(
         (
             state.resolving_stack_entry.take(),
             state.resolving_spell_final_part.take(),
+            state.resolving_stack_object.take(),
         )
     });
     finish_resolving_stack_entry(state, disposition);
-    if let Some((entry, owed)) = owed_spell {
+    if let Some((entry, owed, object)) = owed_spell {
         state.resolving_stack_entry = entry;
         state.resolving_spell_final_part = owed;
+        state.resolving_stack_object = object;
     }
     state.resolution_source_relatch = None;
     state.deferred_entry_events.clear();
@@ -1432,10 +1446,10 @@ pub fn stack_object_controller(state: &GameState, entry: &StackEntry) -> PlayerI
         .map_or(entry.controller, |obj| obj.controller)
 }
 
-/// CR 109.4 + CR 113.8 + CR 608.2h + CR 608.2m + CR 613.1b: the controller of the
-/// object a resolution carrier (`state.resolving_stack_entry`) records, read now —
-/// for a decision the object owes after its resolution began (CR 800.4g's
-/// "controller of the object").
+/// CR 109.4 + CR 113.8 + CR 400.7 + CR 608.2h + CR 608.2m + CR 613.1b: the
+/// controller of the object a resolution carrier (`state.resolving_stack_entry`)
+/// records, read now — for a decision the object owes after its resolution began
+/// (CR 800.4g's "controller of the object").
 ///   * Still on the stack (a popped instant or sorcery keeps its object in
 ///     `Zone::Stack` until its final part, CR 608.2n, and layer 2 re-applies to it
 ///     through `LayerZoneObjectCache::ids_for`): the live, layer-derived
@@ -1445,22 +1459,36 @@ pub fn stack_object_controller(state: &GameState, entry: &StackEntry) -> PlayerI
 ///     when a thief leaves the game (CR 800.4a) — is reflected here once layers are
 ///     evaluated. `entry.controller` is that default, never the answer.
 ///   * A spell that has left the stack while resolving (CR 608.2m — e.g. exiled
-///     with its departing owner): it has no controller now (CR 109.4), so its last
-///     known controller as it left (CR 608.2h), which the stack-exit LKI capture in
-///     `zones.rs` records before the CR 109.4 reset.
-///   * An ability (no object row, CR 113.8): `entry.controller`, fixed at
-///     activation or trigger; no card changes control of an ability on the stack.
+///     with its departing owner or controller, CR 800.4a): it has no controller now
+///     (CR 109.4), so its last known controller as it left the stack (CR 608.2h) —
+///     the snapshot of the exact incarnation pinned when the carrier was installed
+///     (`GameState::resolving_stack_object`), read through
+///     `ability_utils::incarnation_controller`. Never the bare-id `lki_cache`: a
+///     later departure recorded under the same storage id (the exile of everything
+///     a departing owner owns, which moves the already-exiled card again)
+///     overwrites it.
+///   * An ability (no object row, so no pin, CR 113.8): `entry.controller`, fixed
+///     at activation or trigger; no card changes control of an ability on the
+///     stack.
 ///
 /// A card that is again a live stack entry is a new object, not this resolution
-/// (the guard `resolving_instant_or_sorcery_on_stack` and the stack seed share).
+/// (the guard `resolving_instant_or_sorcery_on_stack` and the stack seed share);
+/// its pinned snapshot still answers for this resolution.
 pub(crate) fn resolving_object_controller(state: &GameState, entry: &StackEntry) -> PlayerId {
     let recast = state.stack.iter().any(|live| live.id == entry.id);
     match state.objects.get(&entry.id) {
         Some(obj) if obj.zone == Zone::Stack && !recast => obj.controller,
         Some(_) | None => state
-            .lki_cache
-            .get(&entry.id)
-            .map_or(entry.controller, |lki| lki.controller),
+            .resolving_stack_object
+            .filter(|object| object.object_id == entry.id)
+            .and_then(|object| {
+                super::ability_utils::incarnation_controller(
+                    state,
+                    object.object_id,
+                    object.incarnation,
+                )
+            })
+            .unwrap_or(entry.controller),
     }
 }
 
@@ -6297,9 +6325,10 @@ mod tests {
         GameState::new_two_player(42)
     }
 
-    /// CR 109.4 + CR 113.8 + CR 608.2h + CR 613.1b: the resolving object's
-    /// controller is its live, layer-derived controller while this resolution's
-    /// object is on the stack; its last known controller once it has left; and
+    /// CR 109.4 + CR 113.8 + CR 400.7 + CR 608.2h + CR 613.1b: the resolving
+    /// object's controller is its live, layer-derived controller while this
+    /// resolution's object is on the stack; its last known controller once it has
+    /// left, read from the stack incarnation the carrier pinned at install; and
     /// the entry's for an ability, which has no object. A same-id live stack
     /// entry is a new object, so the popped carrier's object row does not answer
     /// for it. The owner P3, the default P0, the live controller P2 and the
@@ -6308,7 +6337,11 @@ mod tests {
     /// REVERT-FAILING: the live and last-known asserts fail when the authority
     /// reads `entry.controller` (P0); the last-known assert fails when it reads
     /// `stack_object_controller` (off the stack, the reset owner P3); the recast
-    /// assert fails without the recast guard.
+    /// assert fails without the recast guard. The re-exile assert fails when the
+    /// authority reads the bare-id `lki_cache` (the re-exile's reset owner P3);
+    /// the real-recast assert fails when the pin is not read; the foreign-pin
+    /// assert fails without the pin's id filter (the decoy's P1); the settle
+    /// assert fails when `finish_resolving_stack_entry` keeps the pin.
     #[test]
     fn resolving_object_controller_reads_live_then_last_known_then_the_entry() {
         let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 4, 42);
@@ -6331,6 +6364,12 @@ mod tests {
                 actual_mana_spent: 0,
             },
         };
+
+        // Install: the carrier pins the exact stack incarnation it resolves.
+        begin_resolving_stack_entry(&mut state, entry.clone(), None)
+            .expect("no carrier is installed yet");
+        let pin = ObjectIncarnationRef::from_object(&state.objects[&spell]);
+        assert_eq!(state.resolving_stack_object, Some(pin));
 
         // Recast guard, before any zone exit: a live entry of the same id is a
         // new object, and with no last known information the entry's controller
@@ -6372,6 +6411,68 @@ mod tests {
             "CR 608.2h: the controller it had as it left the stack"
         );
 
+        // Re-exile: a later departure recorded under the same storage id (the
+        // CR 800.4a exile of an already-exiled card) overwrites `lki_cache`, but
+        // a same-zone move keeps the incarnation, so the pinned stack snapshot
+        // still answers (CR 400.7).
+        let exile_incarnation = state.objects[&spell].incarnation;
+        zones::move_to_zone(&mut state, spell, Zone::Exile, &mut events);
+        assert_eq!(
+            state.objects[&spell].incarnation, exile_incarnation,
+            "reach guard: an Exile→Exile move keeps the incarnation"
+        );
+        assert_ne!(
+            state.lki_cache[&spell].controller,
+            PlayerId(2),
+            "reach guard: the re-exile overwrote the bare-id last known information"
+        );
+        assert_eq!(
+            resolving_object_controller(&state, &entry),
+            PlayerId(2),
+            "CR 608.2h: the pinned stack incarnation's snapshot, not the re-exile's"
+        );
+
+        // Real recast: the card is a new object on the stack (incarnation
+        // bumped) under a new controller; the pinned resolution still answers.
+        zones::move_to_zone(&mut state, spell, Zone::Stack, &mut events);
+        assert_ne!(
+            state.objects[&spell].incarnation, pin.incarnation,
+            "reach guard: a move between zones bumps the incarnation"
+        );
+        state.stack.push_back(entry.clone());
+        state.objects.get_mut(&spell).unwrap().controller = PlayerId(1);
+        assert_eq!(
+            resolving_object_controller(&state, &entry),
+            PlayerId(2),
+            "CR 400.7: the recast is a new object; the pinned resolution answers"
+        );
+
+        // A pin naming another object, with its own snapshot, is inert.
+        let recorded_pin = state.resolving_stack_object;
+        state.stack.pop_back();
+        zones::move_to_zone(&mut state, spell, Zone::Graveyard, &mut events);
+        let decoy = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Decoy Spell".to_string(),
+            Zone::Stack,
+        );
+        assert_ne!(decoy, spell);
+        let decoy_incarnation = state.objects[&decoy].incarnation;
+        zones::move_to_zone(&mut state, decoy, Zone::Exile, &mut events);
+        assert_eq!(
+            crate::game::ability_utils::incarnation_controller(&state, decoy, decoy_incarnation),
+            Some(PlayerId(1)),
+            "reach guard: the decoy's stack-exit snapshot names P1"
+        );
+        state.resolving_stack_object = Some(ObjectIncarnationRef::of(decoy, decoy_incarnation));
+        assert_eq!(
+            resolving_object_controller(&state, &entry),
+            PlayerId(0),
+            "a pin naming another object does not answer for this carrier"
+        );
+
         // Ability: no object row, so the entry's controller (CR 113.8).
         let ability_id = ObjectId(900);
         assert!(!state.objects.contains_key(&ability_id));
@@ -6397,6 +6498,16 @@ mod tests {
             PlayerId(1),
             "CR 113.8: an ability's controller is fixed at activation"
         );
+
+        // Settle: the pin ends with its carrier (CR 608.2n).
+        state.resolving_stack_object = recorded_pin;
+        assert_eq!(state.resolving_stack_object, Some(pin));
+        finish_resolving_stack_entry(
+            &mut state,
+            super::super::lifecycle::DelayedTerminalDisposition::Removed,
+        );
+        assert!(state.resolving_stack_entry.is_none());
+        assert!(state.resolving_stack_object.is_none());
     }
 
     /// A-1 (CR 107.3i + CR 107.3k + CR 601.2h): the X-rewrite authority moves
@@ -7199,6 +7310,8 @@ mod tests {
             );
             state.resolving_stack_entry = Some(pending_spell_entry(spell));
             state.resolving_spell_final_part = Some(OwedSpellFinalPart { spell });
+            let pin = ObjectIncarnationRef::from_object(&state.objects[&spell]);
+            state.resolving_stack_object = Some(pin);
             state.waiting_for = WaitingFor::Priority {
                 player: PlayerId(0),
             };
@@ -7216,6 +7329,11 @@ mod tests {
                 state.resolving_spell_final_part.map(|owed| owed.spell),
                 kept.then_some(spell),
                 "{zone:?}"
+            );
+            assert_eq!(
+                state.resolving_stack_object,
+                kept.then_some(pin),
+                "{zone:?}: the kept carrier keeps its object pin"
             );
             if !kept {
                 continue;
@@ -7239,6 +7357,7 @@ mod tests {
             );
             assert!(state.resolving_stack_entry.is_none());
             assert!(state.resolving_spell_final_part.is_none());
+            assert!(state.resolving_stack_object.is_none());
         }
     }
 

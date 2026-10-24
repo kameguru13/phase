@@ -24564,6 +24564,21 @@ declare_game_state! {
     /// `resolving_stack_entry` like `resolving_trigger_firing`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) resolving_spell_final_part: Option<OwedSpellFinalPart>,
+    /// CR 400.7 + CR 608.2h: the exact object — storage id and incarnation —
+    /// the resolution carrier (`resolving_stack_entry`) resolves, pinned by
+    /// `stack::begin_resolving_stack_entry` while it is still on the stack and
+    /// cleared with the carrier. A spell that leaves the stack once it starts to
+    /// resolve continues to resolve (CR 608.2m), and its last known information
+    /// is this incarnation's `lki_by_incarnation` snapshot. A later departure
+    /// recorded under the same storage id — e.g. the exile of everything a
+    /// departing owner owns (CR 800.4a), which moves the already-exiled card
+    /// again — overwrites `lki_cache` but never this snapshot. `None` for an
+    /// ability, which has no object row (its controller is fixed at activation or
+    /// trigger, CR 113.8). Read only by
+    /// `stack::resolving_object_controller`. Serialized because the carrier
+    /// survives a mid-resolution pause, like `resolving_spell_final_part`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resolving_stack_object: Option<ObjectIncarnationRef>,
     /// CR 603.3b + CR 608.2g: a terminal resolution batch (currently Ripple)
     /// has settled, but its final spell is still completing announcement. Keep
     /// the provenance until the post-announcement priority pipeline can collect
@@ -31823,6 +31838,7 @@ impl GameState {
             resolving_stack_entry: None,
             resolving_trigger_firing: None,
             resolving_spell_final_part: None,
+            resolving_stack_object: None,
             pending_resolution_completion: None,
             resolution_source_relatch: None,
             current_trigger_events: Vec::new(),
@@ -34882,6 +34898,13 @@ fn _gamestate_partition_is_total(s: &GameState) {
         resolving_stack_entry: _,
         resolving_trigger_firing: _,
         resolving_spell_final_part: _,
+        // `resolving_stack_object` (CR 400.7 resolution-object pin): EXCLUDED, like the
+        // carrier `resolving_stack_entry` it is derived from — a pure function of that
+        // carrier and its object's incarnation at install, cleared with it. Comparing an
+        // incarnation identity would make a loop sampled mid-resolution compare unequal
+        // every iteration; excluding it cannot hide growth (`resolution_source_relatch`
+        // precedent).
+        resolving_stack_object: _,
         pending_resolution_completion: _,
         current_trigger_events: _,
         stack_trigger_event_batches: _,

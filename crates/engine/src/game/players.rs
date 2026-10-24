@@ -152,18 +152,19 @@ pub fn next_player_in_turn_order(state: &GameState, current: PlayerId) -> Player
 /// CR 800.4g + CR 800.4h: an object requires a choice of a player who has left
 /// the game. The controller of the object — read now, live while it is on the
 /// stack and last-known once it has left (`stack::resolving_object_controller`),
-/// never the CR 112.2 default — chooses another player to make it; a controller
-/// who has left is a player a rule requires to choose, so the next player in
-/// turn order after them elects instead (CR 800.4h). "Another player" is any
-/// player other than the one who left — every player still in the game, in
-/// APNAP order, the elector included (CR 102.1). The second sentence of
-/// CR 800.4g does not apply to either caller: the original choice was the one
-/// the object's instructions give its controller (CR 608.2c + CR 608.2d), made
-/// by whoever controlled it when the choice was to be made — not by an opponent
-/// of the controller. A later change of control (a thief leaving, CR 800.4a)
-/// makes another player the object's controller; it does not turn that
-/// controller's own choice into an opponent's choice, and the new controller is
-/// the player its instructions now name (CR 109.5).
+/// never the CR 112.2 default while the spell is on the stack — chooses another
+/// player to make it; a controller who has left is a player a rule requires to
+/// choose, so the next player in turn order after them elects instead
+/// (CR 800.4h). "Another player" is any player other than the one who left —
+/// every player still in the game, in APNAP order, the elector included
+/// (CR 102.1). The second sentence of CR 800.4g does not apply to either
+/// caller: the original choice was the one the object's instructions give its
+/// controller (CR 608.2c + CR 608.2d), made by whoever controlled it when the
+/// choice was to be made — not by an opponent of the controller. A later change
+/// of control (a thief leaving, CR 800.4a) makes another player the object's
+/// controller; it does not turn that controller's own choice into an opponent's
+/// choice, and the new controller is the player its instructions now name
+/// (CR 608.2c).
 pub(crate) struct SubstituteChooserElection {
     pub elector: PlayerId,
     pub candidates: Vec<PlayerId>,

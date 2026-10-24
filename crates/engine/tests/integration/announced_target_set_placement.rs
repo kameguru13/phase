@@ -31,7 +31,10 @@ use engine::game::engine::apply_with_rejection;
 use engine::game::scenario::{CastOutcome, GameRunner, GameScenario, P0, P1};
 use engine::game::triggers::drain_order_triggers_with_identity;
 use engine::game::visibility::filter_state_for_viewer;
-use engine::types::ability::{EffectKind, LibraryPosition, TargetRef};
+use engine::types::ability::{
+    CardPlayMode, CastingPermission, Duration, EffectKind, LibraryPosition,
+    PlayFromExileProvenance, TargetRef,
+};
 use engine::types::action_rejection::ActionRejectionCode;
 use engine::types::actions::GameAction;
 use engine::types::card_type::Supertype;
@@ -42,7 +45,8 @@ use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
-use engine::types::zones::Zone;
+use engine::types::statics::CastFrequency;
+use engine::types::zones::{EtbTapState, Zone};
 
 const CONJURERS_BAUBLE_ORACLE: &str = "{T}, Sacrifice this artifact: Put up to one target card \
      from your graveyard on the bottom of your library. Draw a card.";
@@ -2633,11 +2637,7 @@ fn misinformation_scenario(
     let mut scenario = GameScenario::new_n_player(players, 42);
     scenario.at_phase(Phase::PreCombatMain);
     scenario.with_mana_pool(P0, black_mana(1));
-    let mut cards = Vec::new();
-    for name in ["Graveyard Card A", "Graveyard Card B", "Graveyard Card C"] {
-        cards.push(scenario.add_creature_to_graveyard(owner, name, 2, 2).id());
-    }
-    let owner_library_card = scenario.add_card_to_library_top(owner, "Owner Library Card");
+    let (cards, owner_library_card) = stage_misinformation_targets(&mut scenario, owner);
     let misinformation = scenario
         .add_spell_to_hand_from_oracle(P0, "Misinformation", false, MISINFORMATION_ORACLE)
         .with_mana_cost(ManaCost::Cost {
@@ -2645,12 +2645,73 @@ fn misinformation_scenario(
             shards: vec![ManaCostShard::Black],
         })
         .id();
-    (
-        scenario,
-        misinformation,
-        [cards[0], cards[1], cards[2]],
-        owner_library_card,
-    )
+    (scenario, misinformation, cards, owner_library_card)
+}
+
+/// Misinformation's targets: three creature cards in `owner`'s graveyard and a
+/// one-card library, so the placement order is observable above it.
+///
+/// Returns `([o1, o2, o3], owner_library_card)`.
+fn stage_misinformation_targets(
+    scenario: &mut GameScenario,
+    owner: PlayerId,
+) -> ([ObjectId; 3], ObjectId) {
+    let mut cards = Vec::new();
+    for name in ["Graveyard Card A", "Graveyard Card B", "Graveyard Card C"] {
+        cards.push(scenario.add_creature_to_graveyard(owner, name, 2, 2).id());
+    }
+    let owner_library_card = scenario.add_card_to_library_top(owner, "Owner Library Card");
+    ([cards[0], cards[1], cards[2]], owner_library_card)
+}
+
+/// The four-player board where P0 casts a Misinformation P2 owns from P2's
+/// exile, under an impulse permission granted to P0 (the Gonti, Lord of Luxury
+/// / Dire Fleet Daredevil class: "you may cast" another player's card). P0 is
+/// active with {B}; P3 has three creature cards in their graveyard and a
+/// one-card library.
+///
+/// Returns `(runner, misinformation, [o1, o2, o3], p3_library_card)`.
+fn misinformation_from_owners_exile_board() -> (GameRunner, ObjectId, [ObjectId; 3], ObjectId) {
+    let mut scenario = GameScenario::new_n_player(4, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(P0, black_mana(1));
+    let (cards, p3_library_card) = stage_misinformation_targets(&mut scenario, P3);
+    let misinformation = {
+        let mut builder = scenario.add_spell_to_exile(P2, "Misinformation", true);
+        builder.from_oracle_text(MISINFORMATION_ORACLE);
+        builder.with_mana_cost(ManaCost::Cost {
+            generic: 0,
+            shards: vec![ManaCostShard::Black],
+        });
+        builder.id()
+    };
+    let mut runner = scenario.build();
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&misinformation)
+        .unwrap()
+        .casting_permissions
+        .push(CastingPermission::PlayFromExile {
+            provenance: PlayFromExileProvenance::Impulse,
+            duration: Duration::UntilEndOfTurn,
+            granted_to: P0,
+            mode: CardPlayMode::Play,
+            frequency: CastFrequency::Unlimited,
+            source_id: None,
+            invalidation: None,
+            exiled_by_ability_controller: None,
+            mana_spend_permission: None,
+            card_filter: None,
+            single_use_group: None,
+            single_use: false,
+            cast_cost_modifier: None,
+            alt_ability_cost: None,
+            without_paying_mana_cost: false,
+            land_enter_tapped: EtbTapState::Unspecified,
+        });
+    grant_priority(&mut runner, P0);
+    (runner, misinformation, cards, p3_library_card)
 }
 
 /// Cast Misinformation on `cards`, owned by `owner`, and stop at P0's
@@ -3121,6 +3182,186 @@ fn misinformation_owner_departure_during_the_election_completes_empty() {
             .all(|object| object.zone != Zone::Stack),
         "no object is left on the stack"
     );
+    assert_eq!(state.waiting_for, WaitingFor::Priority { player: P1 });
+}
+
+/// CR 800.4a + CR 608.2m + CR 608.2h + CR 109.4 + CR 400.7 + CR 800.4g +
+/// CR 800.4h: a later departure that moves the exiled spell again does not
+/// move its last known controller. On a four-player board P0 casts a
+/// Misinformation that P2 owns from P2's exile and concedes at P0's own
+/// arrangement; the spell, still controlled by P0, leaves the game with P0
+/// (CR 800.4a) and continues to resolve (CR 608.2m). P1, the next player after
+/// P0, elects P2, and P2 concedes at their arrangement. P2's departure moves
+/// everything P2 owns out of the game — the already-exiled Misinformation
+/// again, Exile to Exile — which overwrites the card's bare-id last known
+/// information with its reset owner P2. But that is a different object now
+/// (CR 400.7); the spell has no controller (CR 109.4), and its last known
+/// information as a spell is the snapshot taken as it left the stack, naming
+/// P0 (CR 608.2h). P0 has left, so P1, the next player after P0, elects again
+/// (CR 800.4g + CR 800.4h), and P1 elects P3, whose order completes the spell.
+///
+/// The caster and last-known controller P0, the elector P1, the spell's owner
+/// and first nominee P2 (the overwrite's source), and the cards' owner and
+/// second nominee P3 are four distinct players.
+///
+/// REVERT-FAILING: (d) fails when the authority reads the bare-id `lki_cache`
+/// — it answers the departed P2, so the next player after P2, P3, elects.
+#[test]
+fn misinformation_cast_from_its_owners_exile_is_reelected_by_its_departed_casters_successor() {
+    let (mut runner, misinformation, cards, p3_lib) = misinformation_from_owners_exile_board();
+    let [o1, o2, o3] = cards;
+
+    // (a) Reach guard: P0 may cast P2's exiled card, and arranges P3's cards
+    // mid-resolution, controlling a spell P2 owns.
+    assert!(
+        legal_actions(runner.state()).iter().any(|action| matches!(
+            action,
+            GameAction::CastSpell { object_id, .. } if *object_id == misinformation
+        )),
+        "P0 may cast the exiled card under the impulse permission"
+    );
+    let outcome = runner.cast(misinformation).target_objects(&cards).resolve();
+    assert_controller_arrangement_prompt(
+        outcome.final_waiting_for(),
+        P0,
+        P3,
+        &cards,
+        LibraryPosition::Top,
+    );
+    assert_eq!(zone(&runner, misinformation), Zone::Stack);
+    assert_eq!(runner.state().objects[&misinformation].owner, P2);
+    assert_eq!(runner.state().objects[&misinformation].controller, P0);
+
+    // (b) CR 800.4a: the spell P0 controls leaves the game with P0; P1, the
+    // next player after P0, elects the arranger.
+    runner
+        .act(GameAction::Concede { player_id: P0 })
+        .expect("P0 concedes");
+    assert!(runner.state().players[P0.0 as usize].is_eliminated);
+    assert_eq!(
+        zone(&runner, misinformation),
+        Zone::Exile,
+        "CR 800.4a: the spell the leaver controls is exiled"
+    );
+    assert_eq!(
+        runner.state().lki_cache[&misinformation].controller,
+        P0,
+        "reach guard: the stack-exit snapshot names P0"
+    );
+    assert_arranger_election(
+        &runner.state().waiting_for,
+        P1,
+        &[P1, P2, P3],
+        misinformation,
+    );
+    assert_eq!(
+        held_election_batch(&runner),
+        (P3, Some(P0), vec![o1, o2, o3])
+    );
+
+    // (c) P1 elects P2, the spell's owner.
+    runner
+        .act(GameAction::ChooseZoneOpponentChooser { opponent: P2 })
+        .expect("P1 elects P2");
+    assert_controller_arrangement_prompt(
+        &runner.state().waiting_for,
+        P2,
+        P3,
+        &cards,
+        LibraryPosition::Top,
+    );
+
+    // (d) P2 concedes: P2's exiled card is moved again, overwriting its bare-id
+    // last known information.
+    let conceded = runner
+        .act(GameAction::Concede { player_id: P2 })
+        .expect("P2 concedes");
+    assert!(runner.state().players[P2.0 as usize].is_eliminated);
+    assert_eq!(zone(&runner, misinformation), Zone::Exile);
+    assert_eq!(
+        runner.state().lki_cache[&misinformation].controller,
+        P2,
+        "hostile reach guard: P2's departure moved the exiled card again"
+    );
+    for card in cards {
+        assert_eq!(zone(&runner, card), Zone::Graveyard);
+    }
+    // REVERT-FAILING: the spell's last known controller is P0, so P0's
+    // successor P1 elects — not P3, the successor of the overwrite's P2.
+    assert_arranger_election(&runner.state().waiting_for, P1, &[P1, P3], misinformation);
+    assert_eq!(runner.state().priority_player, P1);
+    assert_eq!(
+        held_election_batch(&runner),
+        (P3, Some(P2), vec![o1, o2, o3]),
+        "the batch waits, naming its departed nominee"
+    );
+    assert_eq!(
+        put_at_library_position_resolutions(&conceded.events, misinformation),
+        0,
+        "nothing completes while the arranger is elected"
+    );
+    assert!(library_arrivals(&conceded.events, &cards).is_empty());
+
+    // (e) P3, the elector the overwritten snapshot would name, cannot elect.
+    let before = runner.state().clone();
+    let rejection = apply_with_rejection(
+        runner.state_mut(),
+        P3,
+        GameAction::ChooseZoneOpponentChooser { opponent: P3 },
+    )
+    .expect_err("P3 must not answer P1's election");
+    assert_eq!(rejection.code, ActionRejectionCode::WrongPlayer);
+    assert!(*runner.state() == before, "the rejection changes nothing");
+
+    // (f) P1 elects P3.
+    runner
+        .act(GameAction::ChooseZoneOpponentChooser { opponent: P3 })
+        .expect("P1 elects P3");
+    assert_controller_arrangement_prompt(
+        &runner.state().waiting_for,
+        P3,
+        P3,
+        &cards,
+        LibraryPosition::Top,
+    );
+
+    // (g) P3's arrangement completes the resolution, all three cards together.
+    let submitted = runner
+        .act(GameAction::SelectCards {
+            cards: vec![o2, o3, o1],
+        })
+        .expect("P3 submits the arrangement");
+    assert_eq!(library(&runner, P3), vec![o2, o3, o1, p3_lib]);
+    assert_eq!(
+        put_at_library_position_resolutions(&submitted.events, misinformation),
+        1,
+        "the placement completes once"
+    );
+    let mut arrivals = library_arrivals(&submitted.events, &cards);
+    arrivals.sort_by_key(|id| id.0);
+    let mut expected = cards.to_vec();
+    expected.sort_by_key(|id| id.0);
+    assert_eq!(
+        arrivals, expected,
+        "CR 101.4: the three cards move in one batch"
+    );
+    assert_eq!(stack_resolved_count(&submitted.events, misinformation), 1);
+    let state = runner.state();
+    assert!(
+        state.resolving_stack_entry.is_none(),
+        "the resolution is over"
+    );
+    assert!(state.active_ability_continuation().is_none());
+    assert!(state.pending_mass_library_order_choice.is_none());
+    assert!(
+        state
+            .objects
+            .values()
+            .all(|object| object.zone != Zone::Stack),
+        "no object is left on the stack"
+    );
+    assert_eq!(zone(&runner, misinformation), Zone::Exile);
+    // CR 117.3b + CR 800.4j.
     assert_eq!(state.waiting_for, WaitingFor::Priority { player: P1 });
 }
 
