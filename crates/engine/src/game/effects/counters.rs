@@ -2593,7 +2593,7 @@ pub fn resolve_move(
             _ => return Ok(()),
         };
 
-    let source_ids = resolve_counter_transfer_sources(state, ability, source_filter);
+    let source_ids = resolve_counter_transfer_sources(state, ability, source_filter, mode);
     if mode == CounterTransferMode::Move {
         match selection {
             CounterMoveSelection::StackTargetAnyNumber => {
@@ -2938,9 +2938,25 @@ fn resolve_counter_transfer_sources(
     state: &GameState,
     ability: &ResolvedAbility,
     source_filter: &TargetFilter,
+    mode: CounterTransferMode,
 ) -> Vec<ObjectId> {
     if matches!(source_filter, TargetFilter::SelfRef | TargetFilter::None) {
-        return ability.self_ref_binding(state).into_iter().collect();
+        return match mode {
+            // CR 122.8 + CR 608.2h: a triggered ability that puts "this
+            // creature's counters" on another object reads the counters the
+            // source had (its departure's last known information once it has
+            // left); it does not act on the source, so the source need not be
+            // found.
+            CounterTransferMode::Put if ability.trigger_source.is_some() => {
+                vec![ability.source_id]
+            }
+            // CR 400.7: moving counters (CR 122.5) removes them from the source,
+            // which acts on it, so the source must still be found; any other
+            // ability's put keeps the same binding.
+            CounterTransferMode::Move | CounterTransferMode::Put => {
+                ability.self_ref_binding(state).into_iter().collect()
+            }
+        };
     }
 
     if let Some(TargetRef::Object(id)) = crate::game::targeting::resolve_event_context_target(
@@ -3116,7 +3132,8 @@ pub(crate) fn move_counters_optional_is_infeasible(
         return true;
     }
 
-    let source_ids = resolve_counter_transfer_sources(state, ability, source);
+    let source_ids =
+        resolve_counter_transfer_sources(state, ability, source, CounterTransferMode::Move);
     let destination_ids = resolve_counter_transfer_destinations(state, ability, source, target);
     let Some(destination_id) = destination_ids.first().copied() else {
         return true;

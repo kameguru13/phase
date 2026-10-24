@@ -583,9 +583,8 @@ fn defiant_vanguard_destroyed_before_its_trigger_resolves_still_destroys_its_blo
 /// R5d: CR 400.7 + CR 603.7e + CR 113.7a: Defiant Vanguard is flickered while
 /// its blocks trigger is on the stack. The Vanguard that returns is a new
 /// object, so the delayed trigger keeps the Vanguard that blocked as its
-/// source, and "all creatures it blocked this turn" still names what that
-/// Vanguard blocked. Whether the delayed "destroy it" reaches the new Vanguard
-/// is a separate, pre-existing `self_ref_binding` defect and is not asserted.
+/// source: "all creatures it blocked this turn" still names what that Vanguard
+/// blocked, and "destroy it" does not reach the new Vanguard (CR 603.7c).
 #[test]
 fn defiant_vanguard_flickered_before_its_trigger_resolves_still_destroys_its_blockee() {
     let mut scenario = GameScenario::new();
@@ -630,6 +629,11 @@ fn defiant_vanguard_flickered_before_its_trigger_resolves_still_destroys_its_blo
         zone(&runner, blocked),
         Zone::Graveyard,
         "the creature the original Vanguard blocked is destroyed"
+    );
+    assert_eq!(
+        zone(&runner, vanguard),
+        Zone::Battlefield,
+        "the returned Vanguard is a new object and is not destroyed"
     );
 }
 
@@ -732,5 +736,147 @@ fn zephyr_spirit_returns_itself_not_the_creature_it_blocked() {
 
     assert_eq!(zone(&runner, spirit), Zone::Hand);
     assert_eq!(runner.state().objects[&spirit].owner, P1);
+    assert_eq!(zone(&runner, attacker), Zone::Battlefield);
+}
+
+/// Block with `name`, let the blocks trigger resolve so its end-of-combat
+/// delayed trigger exists, then have the defending player Cloudshift the
+/// blocker (CR 400.7: the permanent that returns is a new object). Advance to
+/// the end of combat and stop with the delayed trigger on the stack. Returns
+/// the runner, the blocker and attacker ids, and the returned blocker's
+/// incarnation.
+fn blink_blocker_after_its_delayed_trigger_exists(
+    name: &str,
+    oracle: &str,
+) -> (GameRunner, ObjectId, ObjectId, u64) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario.add_creature(P0, "Attacker", 1, 4).id();
+    let blocker = scenario
+        .add_creature_from_oracle(P1, name, 0, 3, oracle)
+        .id();
+    let cloudshift = scenario
+        .add_spell_to_hand_from_oracle(P1, "Cloudshift", true, CLOUDSHIFT)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    drive_declare_blockers(
+        &mut runner,
+        vec![(attacker, AttackTarget::Player(P1))],
+        vec![(blocker, attacker)],
+    );
+
+    // The blocks trigger resolves (CR 603.7a) and creates the delayed trigger.
+    assert_eq!(runner.state().stack.len(), 1, "the blocks trigger waits");
+    runner.act(GameAction::PassPriority).expect("pass");
+    runner.act(GameAction::PassPriority).expect("pass");
+    assert!(runner.state().stack.is_empty());
+    assert_eq!(
+        runner.state().delayed_triggers.len(),
+        1,
+        "the end-of-combat trigger exists before the blink"
+    );
+
+    // The active player passes; the defending player Cloudshifts the blocker.
+    runner.act(GameAction::PassPriority).expect("pass");
+    let blocked_as = runner.state().objects[&blocker].incarnation;
+    {
+        let mut commit = runner.cast(cloudshift).target_object(blocker).commit();
+        commit.act(GameAction::PassPriority).expect("pass");
+        commit.act(GameAction::PassPriority).expect("pass");
+    }
+    assert!(runner.state().stack.is_empty(), "Cloudshift resolved");
+    assert_eq!(zone(&runner, blocker), Zone::Battlefield);
+    let returned_as = runner.state().objects[&blocker].incarnation;
+    assert_ne!(
+        returned_as, blocked_as,
+        "the returned blocker is a new object"
+    );
+
+    // Advance to the end of combat step, where the delayed trigger fires.
+    for _ in 0..200 {
+        if runner.state().phase == Phase::EndCombat && !runner.state().stack.is_empty() {
+            break;
+        }
+        let action = advance_action(&runner);
+        runner.act(action).expect("advance to the end of combat");
+    }
+    let stack = &runner.state().stack;
+    assert_eq!(stack.len(), 1, "the delayed trigger fired at end of combat");
+    assert_eq!(stack[0].source_id, blocker, "its source is the blocker");
+    assert!(runner.state().delayed_triggers.is_empty());
+    (runner, blocker, attacker, returned_as)
+}
+
+/// R10 — CR 603.7c + CR 400.7: Cinder Wall blocks, its end-of-combat "destroy
+/// it" is created, then the Wall is Cloudshifted. The Wall that returned is a
+/// new object, so the delayed trigger destroys nothing: the returned Wall and
+/// the attacker it blocked both survive. (R6 is the unchanged-Wall control.)
+#[test]
+fn cinder_wall_blinked_after_its_delayed_trigger_exists_survives() {
+    let (mut runner, wall, attacker, returned_as) =
+        blink_blocker_after_its_delayed_trigger_exists("Cinder Wall", CINDER_WALL);
+    settle_to_postcombat_main(&mut runner);
+
+    assert_eq!(
+        zone(&runner, wall),
+        Zone::Battlefield,
+        "the returned Wall must not be destroyed"
+    );
+    assert_eq!(runner.state().objects[&wall].incarnation, returned_as);
+    assert_eq!(
+        zone(&runner, attacker),
+        Zone::Battlefield,
+        "the creature the Wall blocked must not be destroyed"
+    );
+}
+
+/// R11 — CR 603.7c + CR 400.7: the same blink after Ceremonial Guard's
+/// delayed "destroy it" exists. (R8 (b) is the unchanged-Guard control.)
+#[test]
+fn ceremonial_guard_blinked_after_its_delayed_trigger_exists_survives() {
+    let (mut runner, guard, attacker, returned_as) =
+        blink_blocker_after_its_delayed_trigger_exists("Ceremonial Guard", CEREMONIAL_GUARD);
+    settle_to_postcombat_main(&mut runner);
+
+    assert_eq!(zone(&runner, guard), Zone::Battlefield);
+    assert_eq!(runner.state().objects[&guard].incarnation, returned_as);
+    assert_eq!(zone(&runner, attacker), Zone::Battlefield);
+}
+
+/// R12 — CR 603.7c + CR 400.7 + CR 113.7a: Defiant Vanguard is blinked after
+/// its delayed trigger exists. "Destroy it" no longer reaches the returned
+/// Vanguard, while "all creatures it blocked this turn" still names the
+/// creature the original Vanguard blocked.
+#[test]
+fn defiant_vanguard_blinked_after_its_delayed_trigger_exists_destroys_only_its_blockee() {
+    let (mut runner, vanguard, blocked, returned_as) =
+        blink_blocker_after_its_delayed_trigger_exists("Defiant Vanguard", DEFIANT_VANGUARD);
+    settle_to_postcombat_main(&mut runner);
+
+    assert_eq!(
+        zone(&runner, vanguard),
+        Zone::Battlefield,
+        "the returned Vanguard must not be destroyed"
+    );
+    assert_eq!(runner.state().objects[&vanguard].incarnation, returned_as);
+    assert_eq!(
+        zone(&runner, blocked),
+        Zone::Graveyard,
+        "the creature the original Vanguard blocked is still destroyed"
+    );
+}
+
+/// R13 — preservation, CR 603.7c: Wall of Junk's delayed "return it" already
+/// skipped a blinked Wall through `ChangeZone`'s own currency check; the
+/// returned Wall stays on the battlefield.
+#[test]
+fn wall_of_junk_blinked_after_its_delayed_trigger_exists_stays() {
+    let (mut runner, wall, attacker, returned_as) =
+        blink_blocker_after_its_delayed_trigger_exists("Wall of Junk", WALL_OF_JUNK);
+    settle_to_postcombat_main(&mut runner);
+
+    assert_eq!(zone(&runner, wall), Zone::Battlefield);
+    assert_eq!(runner.state().objects[&wall].incarnation, returned_as);
     assert_eq!(zone(&runner, attacker), Zone::Battlefield);
 }

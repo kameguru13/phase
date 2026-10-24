@@ -38936,28 +38936,40 @@ impl ResolvedAbility {
     /// that bind `SelfRef` (or an implicit-source filter) without going through
     /// `targeting::resolved_object_ids_for_filter`.
     ///
-    /// A non-triggered ability follows `self_ref_is_current`: a source that
-    /// left and returned before resolution is a new object, so the instruction
-    /// has no referent (Carrion Feeder sacrificed to its own ability and
-    /// returned by Supernatural Stamina; a creature blinked in response to its
-    /// own activation). A self-move made by the ability's own resolution stays
-    /// bound through `resolution_source_relatch`. A cost that moves the source
+    /// The source is bound only while this ability can find it
+    /// (`finds_source_successor`): it is still the object it was when the
+    /// ability was created, or it is the new object one of CR 400.7's
+    /// exceptions lets the ability find — the zone a zone-change trigger moved
+    /// it to (CR 400.7e), an Aura that went to the graveyard with the
+    /// permanent it enchanted (CR 400.7f), or the object the ability's own cost
+    /// or resolution moved it to (CR 400.7j, read through
+    /// `resolution_source_relatch`: Bogardan Phoenix's dies trigger returns the
+    /// card and then puts the death counter "on it"). A source that left and
+    /// returned any other way is a new object, so the instruction has no
+    /// referent: Carrion Feeder sacrificed to its own ability and returned by
+    /// Supernatural Stamina; a creature blinked in response to its own
+    /// activation; Cinder Wall blinked after its blocks trigger created the
+    /// end-of-combat "destroy it" (CR 603.7c). A cost that moves the source
     /// (Suspend, Plot) is paid before the incarnation is captured, which is CR
-    /// 400.7j: the ability's effects can find an object its own cost moved to a
-    /// public zone — and only that object, not what it becomes after moving
-    /// again (Carrion Feeder's graveyard card, once Supernatural Stamina
-    /// returns it to the battlefield).
+    /// 400.7j as well — and only that object, not what it becomes after moving
+    /// again.
     ///
-    /// A triggered source keeps the raw source binding here. Its provenance
-    /// rules live in `self_ref_is_current`, and they do not yet follow every
-    /// self-move a trigger makes during its own resolution: Bogardan Phoenix's
-    /// dies trigger returns the card from the graveyard and then puts the death
-    /// counter "on it", which these resolvers must keep reaching.
+    /// A forward-result continuation whose `source_id` was rebound by
+    /// `rebind_child_to_forwarded_objects` to an object its producer moved
+    /// keeps that rebound binding unchanged here; its trigger provenance still
+    /// names the original source, so the provenance check cannot judge it. This
+    /// preserves the existing forward-result binding and is not a rules claim:
+    /// a rebound child whose SelfRef prints the source's own name (General Leo
+    /// Cristophe) is mis-bound upstream, and that is a separate defect.
     pub fn self_ref_binding(
         &self,
         state: &crate::types::game_state::GameState,
     ) -> Option<crate::types::identifiers::ObjectId> {
-        (self.trigger_source.is_some() || self.self_ref_is_current(state)).then_some(self.source_id)
+        let rebound_to_moved_object = self
+            .trigger_source
+            .as_ref()
+            .is_some_and(|source| source.identity.reference.object_id != self.source_id);
+        (rebound_to_moved_object || self.finds_source_successor(state)).then_some(self.source_id)
     }
 
     /// Returns whether a self-reference can resolve to the source's current
@@ -45077,6 +45089,51 @@ mod tests {
             assert!(
                 ability.self_ref_is_current(runner.state()),
                 "own-departure successor must bind SelfRef through the mis-latch gate"
+            );
+        }
+
+        /// CR 400.7 + CR 603.7c: `self_ref_binding` binds a triggered source
+        /// only while the ability can still find it. A blinked source is a new
+        /// object and is not bound. A forward-result continuation whose
+        /// `source_id` was rebound to an object its producer moved keeps that
+        /// rebound binding unchanged; that row pins preserved behavior and makes
+        /// no rules claim.
+        #[test]
+        fn self_ref_binding_binds_a_triggered_source_only_while_it_can_be_found() {
+            let mut scenario = GameScenario::new();
+            let source = scenario.add_vanilla(P0, 2, 2);
+            let moved = scenario.add_vanilla(P0, 1, 1);
+            let mut runner = scenario.build();
+            let mut events = Vec::new();
+
+            let incarnation = runner.state().objects[&source].incarnation;
+            let ability = ability_with_mislatch(source, Zone::Battlefield, incarnation);
+            assert_eq!(
+                ability.self_ref_binding(runner.state()),
+                Some(source),
+                "reach: the unmoved triggered source is bound"
+            );
+
+            // The forward-result producer moved `moved`; its continuation is
+            // rebound to it.
+            move_to_zone(runner.state_mut(), moved, Zone::Exile, &mut events);
+            move_to_zone(runner.state_mut(), moved, Zone::Battlefield, &mut events);
+            let mut rebound = ability.clone();
+            rebound.source_id = moved;
+
+            // The source itself is blinked.
+            move_to_zone(runner.state_mut(), source, Zone::Exile, &mut events);
+            move_to_zone(runner.state_mut(), source, Zone::Battlefield, &mut events);
+            assert_ne!(runner.state().objects[&source].incarnation, incarnation);
+            assert_eq!(
+                ability.self_ref_binding(runner.state()),
+                None,
+                "CR 400.7: the permanent that returned is a new object"
+            );
+            assert_eq!(
+                rebound.self_ref_binding(runner.state()),
+                Some(moved),
+                "the rebound forward-result binding is preserved unchanged"
             );
         }
 
