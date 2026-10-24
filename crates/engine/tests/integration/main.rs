@@ -1716,6 +1716,7 @@ mod costed_mana_abilities_no_recursion;
 mod costed_mana_ability_autotap_order;
 mod costed_mana_ability_demand_aware_autotap;
 mod craft_material_references;
+mod crafty_cutpurse_independent_redirect;
 mod craterhoof_behemoth_dynamic_pump_2875;
 mod crowd_control_warden_dual_counters;
 mod cruel_revival_destroy_and_return_5281;

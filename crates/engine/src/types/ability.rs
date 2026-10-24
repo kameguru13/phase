@@ -35078,8 +35078,10 @@ pub struct ReplacementDefinition {
     /// Cutpurse ("each token that would be created under an opponent's control
     /// this turn is created under your control instead") — pair with
     /// `token_owner_scope: Some(Opponent)` so only the opponent-controlled
-    /// branch fires, and `Some(You)` here to redirect ownership to the source
-    /// controller. None = no redirect (existing replacements unaffected).
+    /// branch fires, and `Some(You)` here to redirect ownership to the
+    /// installing ability's controller (the floating definition's
+    /// `source_controller`). None = no redirect (existing replacements
+    /// unaffected).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_owner_redirect: Option<ControllerRef>,
     /// CR 614.1a: Restricts which player this replacement applies to.

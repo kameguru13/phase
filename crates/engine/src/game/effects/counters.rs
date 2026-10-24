@@ -16,7 +16,7 @@ use crate::types::game_state::{
     DelayedTrigger, GameState, PendingCounterAddition, PendingCounterAdditionQueue,
     PendingCounterMove, PendingCounterMoveQueue, PendingCounterPostAction, PendingCounterRemoval,
     PendingCounterRemovalInFlight, PendingCounterRemovalQueue, PendingEffectResolutionEvent,
-    PendingEffectResolved, TriggerSourceRead, WaitingFor,
+    PendingEffectResolved, WaitingFor,
 };
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::player::PlayerId;
@@ -3054,14 +3054,15 @@ fn live_counters(
 /// 1. The departure that fired (or created) this ability, when it is the
 ///    source's battlefield departure: that event's record is the departed
 ///    object's last known information.
-/// 2. This triggered ability's own source, when `source_id` is it. Only while
-///    the captured incarnation is still the exact live object in its expected
-///    zone do its current counters answer (CR 608.2h). Once it has left — even
-///    if this same effect moved it and can still find it (CR 400.7j), and even
-///    if it came back, since the returned object is a new object (CR 400.7) —
-///    the answer is that incarnation's last known information, never the live
-///    same-id object and never the ObjectId-keyed LKI cache, which a later
-///    incarnation may have overwritten.
+/// 2. This triggered ability's own source, when `source_id` is it. While the
+///    ability can find that source in the public zone it was expected to be
+///    in, its current counters answer (CR 608.2h): the captured incarnation
+///    itself, or the object this same effect moved back into that zone, which
+///    the effect can find (CR 400.7j). Otherwise — this effect moved it into
+///    another zone, or it left that zone some other way, whether or not it
+///    came back as a new object (CR 400.7) — the answer is that incarnation's
+///    last known information, never the live same-id object and never the
+///    ObjectId-keyed LKI cache, which a later incarnation may have overwritten.
 /// 3. Any other source: its live counters, else the ObjectId-keyed LKI cache.
 fn put_source_counters(
     state: &GameState,
@@ -3079,9 +3080,17 @@ fn put_source_counters(
     if let Some(source) = ability.trigger_source.as_ref().filter(|source| {
         source_id == ability.source_id && source.identity.reference.object_id == source_id
     }) {
-        return match source.source_read(state) {
-            TriggerSourceRead::ExactLive(object) => object.counters.clone(),
-            TriggerSourceRead::Latched(_) => captured_source_last_known_counters(state, source),
+        // CR 608.2h + CR 400.7j: current information only for the object the
+        // ability can find, and only in its expected zone.
+        let found_in_expected_zone = ability.source_is_current(state)
+            && state
+                .objects
+                .get(&source_id)
+                .is_some_and(|object| object.zone == source.identity.expected_zone);
+        return if found_in_expected_zone {
+            live_counters(state, source_id)
+        } else {
+            captured_source_last_known_counters(state, source)
         };
     }
 
@@ -6593,6 +6602,92 @@ mod tests {
                 .copied(),
             Some(2),
             "the recipient gets the departed source's last known counters"
+        );
+    }
+
+    /// CR 608.2h + CR 400.7j: a triggered ability whose own effect exiled its
+    /// source and returned it to the battlefield can find the returned object
+    /// there, its expected zone, so "put its counters" reads that object's
+    /// current counters, not the departed incarnation's.
+    #[test]
+    fn put_its_counters_reads_source_returned_to_expected_zone_by_same_effect_live() {
+        use crate::types::game_state::ResolutionSourceRelatch;
+
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Carrier".to_string(),
+            Zone::Battlefield,
+        );
+        let dest_id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Recipient".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&source_id)
+            .unwrap()
+            .counters
+            .insert(CounterType::Plus1Plus1, 2);
+
+        let mut ability = ResolvedAbility::new(
+            Effect::MoveCounters {
+                source: TargetFilter::SelfRef,
+                counter_type: None,
+                count: None,
+                mode: CounterTransferMode::Put,
+                selection: CounterMoveSelection::StackTarget,
+                target: TargetFilter::Any,
+            },
+            vec![TargetRef::Object(dest_id)],
+            source_id,
+            PlayerId(0),
+        );
+        ability.trigger_source = Some(crate::game::triggers::trigger_source_context_for_latch(
+            &state,
+            &state.objects[&source_id],
+        ));
+        let captured = state.objects[&source_id].incarnation;
+
+        // The same effect exiled its own source and returned it before the
+        // counter clause; the returned object has one counter of its own.
+        let mut events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, source_id, Zone::Exile, &mut events);
+        crate::game::zones::move_to_zone(&mut state, source_id, Zone::Battlefield, &mut events);
+        state.resolution_source_relatch = Some(ResolutionSourceRelatch {
+            object_id: source_id,
+            original_stamp: captured,
+            current_incarnation: state.objects[&source_id].incarnation,
+        });
+        state
+            .objects
+            .get_mut(&source_id)
+            .unwrap()
+            .counters
+            .insert(CounterType::Plus1Plus1, 1);
+        assert_ne!(
+            state.objects[&source_id].incarnation, captured,
+            "reach guard: the returned source is a new object"
+        );
+        assert!(
+            ability.source_is_current(&state),
+            "reach guard: the relatch lets the effect find its returned source"
+        );
+
+        resolve_move(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.objects[&dest_id]
+                .counters
+                .get(&CounterType::Plus1Plus1)
+                .copied(),
+            Some(1),
+            "the recipient gets the returned source's current counters, not the departed 2"
         );
     }
 
