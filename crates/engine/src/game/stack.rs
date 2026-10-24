@@ -1450,6 +1450,7 @@ pub fn stack_object_controller(state: &GameState, entry: &StackEntry) -> PlayerI
 ///     `zones.rs` records before the CR 109.4 reset.
 ///   * An ability (no object row, CR 113.8): `entry.controller`, fixed at
 ///     activation or trigger; no card changes control of an ability on the stack.
+///
 /// A card that is again a live stack entry is a new object, not this resolution
 /// (the guard `resolving_instant_or_sorcery_on_stack` and the stack seed share).
 pub(crate) fn resolving_object_controller(state: &GameState, entry: &StackEntry) -> PlayerId {
