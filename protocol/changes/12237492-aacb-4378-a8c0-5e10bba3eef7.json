@@ -3,5 +3,5 @@
     "full",
     "wire"
   ],
-  "reason": "CR 101.1 + CR 401.4: Effect::PutAtLibraryPosition gains arranger and MassLibraryOrderBatch gains arranger; an older full-game/P2P peer drops both, reads a controller-arranged placement (Misinformation, Lodestone Bauble) as owner-arranged and refuses the arranger's submission to a paused arrangement (PR #10196)"
+  "reason": "CR 101.1 + CR 401.4 + CR 800.4g + CR 800.4h: Effect::PutAtLibraryPosition gains arranger, MassLibraryOrderBatch gains arranger, PendingMassLibraryOrderChoice gains arranger_election and ZoneOpponentChooserPurpose gains SubstituteArranger; an older full-game/P2P peer drops the arranger fields and the held election batch, reads a controller-arranged placement (Misinformation, Lodestone Bauble) as owner-arranged, refuses the arranger's submission to a paused arrangement and cannot deserialize the substitute-arranger election (PR #10196)"
 }

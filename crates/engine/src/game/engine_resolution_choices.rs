@@ -4017,84 +4017,90 @@ pub(super) fn handle_resolution_choice(
                     "Chosen zone-choice player {opponent:?} is not a legal candidate"
                 )));
             }
-            if matches!(purpose, ZoneOpponentChooserPurpose::PerPlayerChoiceOrder) {
-                // CR 101.4c: the chooser picked whose selection to make next.
-                // Candidates may include the chooser themself (each player).
-                effects::choose_from_zone::answer_per_player_order(
-                    state, &ability, opponent, events,
-                )
-                .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
-                // A pool that emptied since the prompt re-advanced instead; if
-                // that disposed the whole iteration, its continuation resumes.
-                if state.active_per_player_zone_choice().is_none() {
-                    effects::choose_from_zone::settle_finished_per_player_iteration(
-                        state, &ability, events,
+            match purpose {
+                ZoneOpponentChooserPurpose::PerPlayerChoiceOrder => {
+                    // CR 101.4c: the chooser picked whose selection to make next.
+                    // Candidates may include the chooser themself (each player).
+                    effects::choose_from_zone::answer_per_player_order(
+                        state, &ability, opponent, events,
                     )
-                    .expect("a settled per-player iteration must resume its continuation");
-                }
-                return Ok(ResolutionChoiceOutcome::WaitingFor(
-                    state.waiting_for.clone(),
-                ));
-            }
-            if matches!(purpose, ZoneOpponentChooserPurpose::SubstituteChooser) {
-                // CR 800.4g: the elected player makes the pending pick only.
-                effects::choose_from_zone::answer_substitute_chooser(
-                    state, &ability, opponent, events,
-                )
-                .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
-                if state.active_per_player_zone_choice().is_none() {
-                    effects::choose_from_zone::settle_finished_per_player_iteration(
-                        state, &ability, events,
-                    )
-                    .expect("a settled per-player iteration must resume its continuation");
-                }
-                return Ok(ResolutionChoiceOutcome::WaitingFor(
-                    state.waiting_for.clone(),
-                ));
-            }
-            if matches!(purpose, ZoneOpponentChooserPurpose::BindReciprocalConsume) {
-                effects::bind_reciprocal_consumer_from_picker(state, opponent)
                     .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
-                let consumer = state
-                    .active_ability_continuation()
-                    .ok_or_else(|| {
-                        EngineError::InvalidAction(
-                            "bound reciprocal consumer disappeared".to_string(),
+                    // A pool that emptied since the prompt re-advanced instead; if
+                    // that disposed the whole iteration, its continuation resumes.
+                    if state.active_per_player_zone_choice().is_none() {
+                        effects::choose_from_zone::settle_finished_per_player_iteration(
+                            state, &ability, events,
                         )
-                    })?
-                    .chain
-                    .as_ref()
-                    .clone();
-                effects::choose_from_zone::resolve_with_choosing_player(
-                    state, &consumer, opponent, events,
-                )
-                .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
-                return Ok(ResolutionChoiceOutcome::WaitingFor(
-                    state.waiting_for.clone(),
-                ));
+                        .expect("a settled per-player iteration must resume its continuation");
+                    }
+                    ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
+                }
+                ZoneOpponentChooserPurpose::SubstituteChooser => {
+                    // CR 800.4g: the elected player makes the pending pick only.
+                    effects::choose_from_zone::answer_substitute_chooser(
+                        state, &ability, opponent, events,
+                    )
+                    .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
+                    if state.active_per_player_zone_choice().is_none() {
+                        effects::choose_from_zone::settle_finished_per_player_iteration(
+                            state, &ability, events,
+                        )
+                        .expect("a settled per-player iteration must resume its continuation");
+                    }
+                    ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
+                }
+                // CR 800.4g: the elected player arranges the batch whose named arranger left.
+                ZoneOpponentChooserPurpose::SubstituteArranger => {
+                    let chooser =
+                        effects::change_zone::answer_substitute_arranger(state, &ability, opponent)
+                            .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
+                    state.priority_player = chooser;
+                    ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
+                }
+                ZoneOpponentChooserPurpose::BindReciprocalConsume => {
+                    effects::bind_reciprocal_consumer_from_picker(state, opponent)
+                        .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
+                    let consumer = state
+                        .active_ability_continuation()
+                        .ok_or_else(|| {
+                            EngineError::InvalidAction(
+                                "bound reciprocal consumer disappeared".to_string(),
+                            )
+                        })?
+                        .chain
+                        .as_ref()
+                        .clone();
+                    effects::choose_from_zone::resolve_with_choosing_player(
+                        state, &consumer, opponent, events,
+                    )
+                    .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
+                    ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
+                }
+                ZoneOpponentChooserPurpose::Ordinary => {
+                    // CR 608.2d: Present the parked zone selection to the picked
+                    // opponent. This re-enters the standard `ChooseFromZoneChoice`
+                    // pause (or completes with no choice if the pool emptied), so the
+                    // already-parked continuation frame is untouched — exactly as if
+                    // the opponent had been the chooser from the start.
+                    effects::choose_from_zone::resolve_with_choosing_player(
+                        state, &ability, opponent, events,
+                    )
+                    .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
+                    // With an empty pool the choose completed without a new pause —
+                    // hand priority back to the controller (mirroring the settled-clash
+                    // arm above) so the parked continuation can actually drain: the
+                    // drain helper is gated on `WaitingFor::Priority`, and without
+                    // `set_priority` the stale opponent-chooser pause would wedge the
+                    // resolution (CR 608.2d — the choice is skipped, not the rest of
+                    // the ability).
+                    if !matches!(state.waiting_for, WaitingFor::ChooseFromZoneChoice { .. }) {
+                        set_priority(state, player);
+                        super::engine::resume_pending_continuation_if_priority(state, events)
+                            .expect("a settled opponent-chooser pick must resume its continuation");
+                    }
+                    ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
+                }
             }
-            // CR 608.2d: Present the parked zone selection to the picked
-            // opponent. This re-enters the standard `ChooseFromZoneChoice`
-            // pause (or completes with no choice if the pool emptied), so the
-            // already-parked continuation frame is untouched — exactly as if
-            // the opponent had been the chooser from the start.
-            effects::choose_from_zone::resolve_with_choosing_player(
-                state, &ability, opponent, events,
-            )
-            .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
-            // With an empty pool the choose completed without a new pause —
-            // hand priority back to the controller (mirroring the settled-clash
-            // arm above) so the parked continuation can actually drain: the
-            // drain helper is gated on `WaitingFor::Priority`, and without
-            // `set_priority` the stale opponent-chooser pause would wedge the
-            // resolution (CR 608.2d — the choice is skipped, not the rest of
-            // the ability).
-            if !matches!(state.waiting_for, WaitingFor::ChooseFromZoneChoice { .. }) {
-                set_priority(state, player);
-                super::engine::resume_pending_continuation_if_priority(state, events)
-                    .expect("a settled opponent-chooser pick must resume its continuation");
-            }
-            ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
         }
         (
             WaitingFor::ClashCardPlacement {

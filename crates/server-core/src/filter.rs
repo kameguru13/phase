@@ -530,6 +530,7 @@ mod tests {
                 arranger: None,
             }],
             resolving_entry: Some(ObjectId(1)),
+            arranger_election: None,
         }));
 
         let filtered = filter_state_for_player(&state, PlayerId(1));

@@ -30,13 +30,14 @@ use engine::ai_support::legal_actions;
 use engine::game::engine::apply_with_rejection;
 use engine::game::scenario::{CastOutcome, GameRunner, GameScenario, P0, P1};
 use engine::game::triggers::drain_order_triggers_with_identity;
+use engine::game::visibility::filter_state_for_viewer;
 use engine::types::ability::{EffectKind, LibraryPosition, TargetRef};
 use engine::types::action_rejection::ActionRejectionCode;
 use engine::types::actions::GameAction;
 use engine::types::card_type::Supertype;
 use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
-use engine::types::game_state::{CastPaymentMode, WaitingFor};
+use engine::types::game_state::{CastPaymentMode, WaitingFor, ZoneOpponentChooserPurpose};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
@@ -2299,16 +2300,21 @@ fn lodestone_bauble_controller_concession_at_own_arrangement_completes_before_pr
 
 /// CR 800.4a + CR 800.4g + CR 800.4h + CR 608.2m, ability side: P0 activates
 /// Lodestone Bauble on two basic lands in P2's graveyard, then concedes at
-/// P0's arrangement prompt. The lands stay (P2 is still in the game), so the
-/// arrangement passes to the next player in turn order after P0 — P1, not the
-/// owner P2 — and P1's submission completes the parked activation before
-/// priority (CR 117.3b + CR 800.4j). The delayed draw's controller is left to
-/// the CR 800.4d follow-up and is not asserted.
+/// P0's arrangement prompt. The lands stay (P2 is still in the game), and the
+/// activation keeps resolving (CR 608.2m), so its instruction requires the
+/// arrangement of a player who has left: the controller of the object would
+/// choose another player to make it (CR 800.4g), and since that controller has
+/// left too, the next player in turn order after them, P1, elects (CR 800.4h).
+/// P1 may elect themself — "another player" is another than the one who left —
+/// and then arranges; the owner P2 cannot submit. P1's submission completes the
+/// parked activation, its delayed-draw tail drained, before priority
+/// (CR 117.3b + CR 800.4j). The delayed draw's controller is left to the
+/// CR 800.4d follow-up and is not asserted.
 ///
-/// REVERT-FAILING: without the departed-arranger hand-on, the Concede leaves
-/// priority with no prompt, so the prompt assertion fails.
+/// REVERT-FAILING: without the election, the Concede publishes P1's ordering
+/// prompt directly, so the election assertion after the Concede fails.
 #[test]
-fn lodestone_bauble_controller_concession_hands_the_arrangement_to_the_next_player() {
+fn lodestone_bauble_controller_concession_lets_the_elector_choose_themself() {
     let (mut runner, bauble, lands) = lodestone_three_player_board(P2);
     let [l1, l2] = lands;
     let p2_before = library(&runner, P2);
@@ -2318,9 +2324,22 @@ fn lodestone_bauble_controller_concession_hands_the_arrangement_to_the_next_play
         .act(GameAction::Concede { player_id: P0 })
         .expect("P0 concedes");
 
+    // REVERT-FAILING: CR 800.4g + CR 800.4h — P1 elects the arranger.
     assert!(runner.state().players[P0.0 as usize].is_eliminated);
+    assert_arranger_election(&runner.state().waiting_for, P1, &[P1, P2], bauble);
+    assert_eq!(runner.state().priority_player, P1);
     assert_eq!(zone(&runner, l1), Zone::Graveyard);
     assert_eq!(zone(&runner, l2), Zone::Graveyard);
+    assert_eq!(
+        put_at_library_position_resolutions(&conceded.events, bauble),
+        0,
+        "nothing completes while the arranger is elected"
+    );
+
+    // CR 800.4g: the elector elects themself.
+    runner
+        .act(GameAction::ChooseZoneOpponentChooser { opponent: P1 })
+        .expect("P1 elects themself");
     assert_controller_arrangement_prompt(
         &runner.state().waiting_for,
         P1,
@@ -2328,11 +2347,21 @@ fn lodestone_bauble_controller_concession_hands_the_arrangement_to_the_next_play
         &[l1, l2],
         LibraryPosition::Top,
     );
-    assert_eq!(runner.state().priority_player, P1);
-    assert_eq!(
-        put_at_library_position_resolutions(&conceded.events, bauble),
-        0,
-        "nothing completes until P1 arranges"
+
+    // The owner cannot submit the arrangement P1 was elected to make.
+    let before = runner.state().clone();
+    let rejection = apply_with_rejection(
+        runner.state_mut(),
+        P2,
+        GameAction::SelectCards {
+            cards: vec![l2, l1],
+        },
+    )
+    .expect_err("P2 must not submit P1's arrangement");
+    assert_eq!(rejection.code, ActionRejectionCode::WrongPlayer);
+    assert!(
+        *runner.state() == before,
+        "a rejected submission leaves the game unchanged"
     );
 
     let submitted = runner
@@ -2572,35 +2601,23 @@ fn plow_under_last_owner_concession_completes_the_spell_before_priority() {
     assert_eq!(state.priority_player, P0);
 }
 
-/// N2 — CR 104.3a + CR 800.4a + CR 800.4g + CR 800.4h + CR 608.2m: P0 casts
-/// Misinformation on a three-player board, targeting three cards in P2's
-/// graveyard, and concedes at P0's own arrangement prompt (CR 101.1 +
-/// CR 608.2c: the caster follows "… in any order"). P0's spell leaves the game
-/// with P0, but it has begun resolving, so it continues fully (CR 608.2m).
-/// P2's cards are still in the game and still need arranging; the choice was
-/// P0's, so it passes to the next player in turn order after P0 (CR 800.4g +
-/// CR 800.4h) — P1, not P2, the owner. P1's arrangement is the exact top of
-/// P2's library, the spell is reported resolved once, and because the active
-/// player P0 has left, P1 receives priority (CR 117.3b + CR 800.4j).
+/// The `players`-player Misinformation board. P0 is active with Misinformation
+/// in hand and {B}; `owner` has three creature cards in their graveyard and a
+/// one-card library, so the placement order is observable above it.
 ///
-/// The elector P1 is neither the departed controller P0 nor the owner P2, so
-/// the hand-on is told apart from a fallback to the owner. Scoped hand-on: P1
-/// arranges the cards; the CR 800.4g option to name another player is not
-/// modelled.
-///
-/// REVERT-FAILING: without the departed-arranger hand-on, (b) fails — the
-/// generic dead-actor repoint leaves priority with a live carrier and no
-/// arrangement prompt.
-#[test]
-fn misinformation_controller_concession_hands_the_arrangement_to_the_next_player() {
-    let mut scenario = GameScenario::new_n_player(3, 42);
+/// Returns `(runner, misinformation, [o1, o2, o3], owner_library_card)`.
+fn misinformation_board(
+    players: u8,
+    owner: PlayerId,
+) -> (GameRunner, ObjectId, [ObjectId; 3], ObjectId) {
+    let mut scenario = GameScenario::new_n_player(players, 42);
     scenario.at_phase(Phase::PreCombatMain);
     scenario.with_mana_pool(P0, black_mana(1));
-    let mut p2_cards = Vec::new();
-    for name in ["P2 Card A", "P2 Card B", "P2 Card C"] {
-        p2_cards.push(scenario.add_creature_to_graveyard(P2, name, 2, 2).id());
+    let mut cards = Vec::new();
+    for name in ["Graveyard Card A", "Graveyard Card B", "Graveyard Card C"] {
+        cards.push(scenario.add_creature_to_graveyard(owner, name, 2, 2).id());
     }
-    let p2_lib = scenario.add_card_to_library_top(P2, "P2 Library Card");
+    let owner_library_card = scenario.add_card_to_library_top(owner, "Owner Library Card");
     let misinformation = scenario
         .add_spell_to_hand_from_oracle(P0, "Misinformation", false, MISINFORMATION_ORACLE)
         .with_mana_cost(ManaCost::Cost {
@@ -2610,84 +2627,264 @@ fn misinformation_controller_concession_hands_the_arrangement_to_the_next_player
         .id();
     let mut runner = scenario.build();
     grant_priority(&mut runner, P0);
-    let (o1, o2, o3) = (p2_cards[0], p2_cards[1], p2_cards[2]);
+    (
+        runner,
+        misinformation,
+        [cards[0], cards[1], cards[2]],
+        owner_library_card,
+    )
+}
 
-    let outcome = runner
-        .cast(misinformation)
-        .target_objects(&[o1, o2, o3])
-        .resolve();
-
-    // (a) Reach guard: the caster arranges P2's cards, mid-resolution.
+/// Cast Misinformation on `cards`, owned by `owner`, and stop at P0's
+/// arrangement prompt over them (CR 101.1 + CR 608.2c: the caster follows
+/// "… in any order"), mid-resolution: the reach guard every concession row
+/// below relies on.
+fn open_misinformation_arrangement(
+    runner: &mut GameRunner,
+    misinformation: ObjectId,
+    cards: [ObjectId; 3],
+    owner: PlayerId,
+) {
+    let outcome = runner.cast(misinformation).target_objects(&cards).resolve();
     assert_controller_arrangement_prompt(
         outcome.final_waiting_for(),
         P0,
-        P2,
-        &[o1, o2, o3],
+        owner,
+        &cards,
         LibraryPosition::Top,
     );
-    assert_eq!(zone(&runner, misinformation), Zone::Stack);
+    assert_eq!(zone(runner, misinformation), Zone::Stack);
+    for card in cards {
+        assert_eq!(zone(runner, card), Zone::Graveyard);
+    }
+}
+
+/// CR 800.4g + CR 800.4h: the open prompt is the election of an arranger —
+/// `elector` chooses among `candidates`, for the object `source`.
+fn assert_arranger_election(
+    waiting_for: &WaitingFor,
+    elector: PlayerId,
+    candidates: &[PlayerId],
+    source: ObjectId,
+) {
+    match waiting_for {
+        WaitingFor::ChooseFromZoneOpponentChooser {
+            player,
+            candidates: offered,
+            ability,
+            purpose,
+        } => {
+            assert_eq!(
+                *purpose,
+                ZoneOpponentChooserPurpose::SubstituteArranger,
+                "the prompt elects a substitute arranger"
+            );
+            assert_eq!(*player, elector, "the prompt names the elector");
+            assert_eq!(
+                offered.as_slice(),
+                candidates,
+                "every player still in the game, in APNAP order"
+            );
+            assert_eq!(
+                ability.source_id, source,
+                "the prompt carries the object that requires the choice"
+            );
+        }
+        other => panic!("expected {elector:?}'s arranger election, got {other:?}"),
+    }
+}
+
+/// `(owner, arranger, member ids)` of the batch the carrier holds while its
+/// arranger is elected.
+fn held_election_batch(runner: &GameRunner) -> (PlayerId, Option<PlayerId>, Vec<ObjectId>) {
+    let batch = runner
+        .state()
+        .pending_mass_library_order_choice
+        .as_ref()
+        .and_then(|pending| pending.arranger_election.as_ref())
+        .expect("the carrier holds the batch awaiting its arranger");
+    (
+        batch.owner,
+        batch.arranger,
+        batch
+            .members
+            .iter()
+            .map(|member| member.identity.object_id)
+            .collect(),
+    )
+}
+
+/// The members of `cards` that `events` moved into a library.
+fn library_arrivals(events: &[GameEvent], cards: &[ObjectId]) -> Vec<ObjectId> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            GameEvent::ZoneChanged {
+                object_id,
+                to: Zone::Library,
+                ..
+            } if cards.contains(object_id) => Some(*object_id),
+            _ => None,
+        })
+        .collect()
+}
+
+/// N2 — CR 104.3a + CR 800.4a + CR 800.4g + CR 800.4h + CR 608.2m: P0 casts
+/// Misinformation on a three-player board, targeting three cards in P2's
+/// graveyard, and concedes at P0's own arrangement prompt (CR 101.1 +
+/// CR 608.2c: the caster follows "… in any order"). P0's spell leaves the game
+/// with P0, but it has begun resolving, so it continues fully (CR 608.2m).
+/// P2's cards are still in the game and still need arranging, and the choice
+/// was P0's: the controller of the object would choose another player to make
+/// it (CR 800.4g), and since that controller has left, the next player in turn
+/// order after them, P1, elects (CR 800.4h). P1 elects P2. P2's arrangement is
+/// the exact top of P2's library, delivered in one move; the spell is reported
+/// resolved once, and because the active player P0 has left, P1 receives
+/// priority (CR 117.3b + CR 800.4j).
+///
+/// The elector P1, the nominee P2 and the departed controller P0 are three
+/// players, so the election is told apart from both a turn-order hand-on and an
+/// owner fallback.
+///
+/// REVERT-FAILING: without the election, (b) fails — the Concede publishes
+/// P1's ordering prompt directly.
+#[test]
+fn misinformation_controller_concession_has_the_next_player_elect_the_arranger() {
+    let (mut runner, misinformation, cards, p2_lib) = misinformation_board(3, P2);
+    let [o1, o2, o3] = cards;
+    // (a) Reach guard: the caster arranges P2's cards, mid-resolution.
+    open_misinformation_arrangement(&mut runner, misinformation, cards, P2);
 
     let conceded = runner
         .act(GameAction::Concede { player_id: P0 })
         .expect("P0 concedes");
 
     // (b) REVERT-FAILING: CR 800.4a — P0 and the spell leave; P2's cards stay.
-    // CR 800.4g + CR 800.4h — P1 now arranges P2's cards.
+    // CR 800.4g + CR 800.4h — P1 elects the player who arranges them.
     assert!(runner.state().players[P0.0 as usize].is_eliminated);
     assert_eq!(
         zone(&runner, misinformation),
         Zone::Exile,
         "CR 800.4a: P0's spell leaves the game with P0"
     );
-    for card in [o1, o2, o3] {
+    for card in cards {
         assert_eq!(zone(&runner, card), Zone::Graveyard);
     }
-    assert_controller_arrangement_prompt(
-        &runner.state().waiting_for,
-        P1,
-        P2,
-        &[o1, o2, o3],
-        LibraryPosition::Top,
-    );
+    assert_arranger_election(&runner.state().waiting_for, P1, &[P1, P2], misinformation);
     assert_eq!(runner.state().priority_player, P1);
+    assert_eq!(
+        held_election_batch(&runner),
+        (P2, Some(P0), vec![o1, o2, o3]),
+        "the batch waits, still naming its departed arranger"
+    );
     assert_eq!(
         put_at_library_position_resolutions(&conceded.events, misinformation),
         0,
-        "nothing completes while P1 arranges"
+        "nothing completes while the arranger is elected"
     );
+    assert!(library_arrivals(&conceded.events, &cards).is_empty());
+    // CR 401.4: the held batch is never shown to any player.
+    for viewer in [P1, P2] {
+        assert!(
+            filter_state_for_viewer(runner.state(), viewer)
+                .pending_mass_library_order_choice
+                .is_none(),
+            "{viewer:?} never sees the held batch"
+        );
+    }
 
-    // (c) The owner cannot submit the arrangement handed to P1, and the
-    // rejected submission changes nothing.
+    // (c) The AI is offered every candidate and no arrangement yet; the
+    // unelected P2 cannot answer the election, and P1 cannot elect the
+    // departed P0. Neither rejection changes anything.
+    let actions = legal_actions(runner.state());
+    for candidate in [P1, P2] {
+        assert!(
+            actions.contains(&GameAction::ChooseZoneOpponentChooser {
+                opponent: candidate
+            }),
+            "the elector may elect {candidate:?}"
+        );
+    }
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, GameAction::SelectCards { .. })),
+        "no arrangement is open during the election"
+    );
     let before = runner.state().clone();
     let rejection = apply_with_rejection(
         runner.state_mut(),
         P2,
+        GameAction::ChooseZoneOpponentChooser { opponent: P2 },
+    )
+    .expect_err("P2 must not answer P1's election");
+    assert_eq!(rejection.code, ActionRejectionCode::WrongPlayer);
+    assert!(*runner.state() == before, "the rejection changes nothing");
+    apply_with_rejection(
+        runner.state_mut(),
+        P1,
+        GameAction::ChooseZoneOpponentChooser { opponent: P0 },
+    )
+    .expect_err("CR 102.1: a player who has left cannot be elected");
+    assert!(*runner.state() == before, "the rejection changes nothing");
+
+    // (d) CR 800.4g: the elected P2 arranges.
+    let elected = runner
+        .act(GameAction::ChooseZoneOpponentChooser { opponent: P2 })
+        .expect("P1 elects P2");
+    assert_controller_arrangement_prompt(
+        &runner.state().waiting_for,
+        P2,
+        P2,
+        &cards,
+        LibraryPosition::Top,
+    );
+    assert_eq!(runner.state().priority_player, P2);
+    for card in cards {
+        assert_eq!(zone(&runner, card), Zone::Graveyard);
+    }
+    assert!(library_arrivals(&elected.events, &cards).is_empty());
+    assert!(
+        runner.state().pending_mass_library_order_choice.is_none(),
+        "a single-batch arrangement keeps no carrier once its arranger is elected"
+    );
+
+    // (e) The unelected elector cannot submit the arrangement.
+    let before = runner.state().clone();
+    let rejection = apply_with_rejection(
+        runner.state_mut(),
+        P1,
         GameAction::SelectCards {
             cards: vec![o3, o1, o2],
         },
     )
-    .expect_err("P2 must not submit P1's arrangement");
+    .expect_err("P1 must not submit P2's arrangement");
     assert_eq!(rejection.code, ActionRejectionCode::WrongPlayer);
-    assert!(
-        *runner.state() == before,
-        "a rejected submission leaves the game unchanged"
-    );
+    assert!(*runner.state() == before, "the rejection changes nothing");
 
-    // (d) P1's arrangement completes the resolution.
+    // (f) P2's arrangement completes the resolution, all three cards together.
     let submitted = runner
         .act(GameAction::SelectCards {
             cards: vec![o3, o1, o2],
         })
-        .expect("P1 submits the arrangement");
+        .expect("P2 submits the arrangement");
     assert_eq!(
         library(&runner, P2),
         vec![o3, o1, o2, p2_lib],
-        "P1's arrangement is the exact top of P2's library"
+        "P2's arrangement is the exact top of P2's library"
     );
     assert_eq!(
         put_at_library_position_resolutions(&submitted.events, misinformation),
         1,
         "the placement completes once"
+    );
+    let mut arrivals = library_arrivals(&submitted.events, &cards);
+    arrivals.sort_by_key(|id| id.0);
+    let mut expected = cards.to_vec();
+    expected.sort_by_key(|id| id.0);
+    assert_eq!(
+        arrivals, expected,
+        "CR 101.4: the three cards move in one batch"
     );
     // CR 608.2m: the departed spell that continued to resolve fully is
     // reported resolved once.
@@ -2707,6 +2904,205 @@ fn misinformation_controller_concession_hands_the_arrangement_to_the_next_player
         "no object is left on the stack"
     );
     // CR 117.3b + CR 800.4j.
+    assert_eq!(state.waiting_for, WaitingFor::Priority { player: P1 });
+}
+
+/// CR 800.4g + CR 800.4h + CR 608.2m: the elected arranger leaves too. On a
+/// four-player board P0 casts Misinformation on three cards in P3's graveyard
+/// and concedes; P1, the next player after P0, elects P2, and P2 concedes at
+/// their arrangement prompt. The object's controller is still the departed P0,
+/// so the arrangement is elected again by the next player in turn order after
+/// P0 — P1, not P3, the next after the departed nominee. P1 elects P3, whose
+/// order completes the spell.
+///
+/// The controller, the elector, both nominees and the owner are told apart:
+/// P0, P1, P2 and P3, with P3 both owner and second nominee.
+///
+/// REVERT-FAILING: with the elector derived from the departed arranger, the
+/// second election names P3 (`next_player_in_turn_order(P2)`), not P1.
+#[test]
+fn misinformation_departed_nominee_is_replaced_by_the_controllers_elector() {
+    let (mut runner, misinformation, cards, p3_lib) = misinformation_board(4, P3);
+    let [o1, o2, o3] = cards;
+    open_misinformation_arrangement(&mut runner, misinformation, cards, P3);
+    runner
+        .act(GameAction::Concede { player_id: P0 })
+        .expect("P0 concedes");
+    // Reach guard: the first election, and P2's arrangement once elected.
+    assert_arranger_election(
+        &runner.state().waiting_for,
+        P1,
+        &[P1, P2, P3],
+        misinformation,
+    );
+    runner
+        .act(GameAction::ChooseZoneOpponentChooser { opponent: P2 })
+        .expect("P1 elects P2");
+    assert_controller_arrangement_prompt(
+        &runner.state().waiting_for,
+        P2,
+        P3,
+        &cards,
+        LibraryPosition::Top,
+    );
+
+    let conceded = runner
+        .act(GameAction::Concede { player_id: P2 })
+        .expect("P2 concedes");
+    // REVERT-FAILING: the controller's elector, P1, elects again.
+    assert_arranger_election(&runner.state().waiting_for, P1, &[P1, P3], misinformation);
+    assert_eq!(runner.state().priority_player, P1);
+    assert_eq!(
+        held_election_batch(&runner),
+        (P3, Some(P2), vec![o1, o2, o3]),
+        "the batch waits, naming its departed nominee"
+    );
+    for card in cards {
+        assert_eq!(zone(&runner, card), Zone::Graveyard);
+    }
+    assert_eq!(
+        put_at_library_position_resolutions(&conceded.events, misinformation),
+        0
+    );
+
+    runner
+        .act(GameAction::ChooseZoneOpponentChooser { opponent: P3 })
+        .expect("P1 elects P3");
+    assert_controller_arrangement_prompt(
+        &runner.state().waiting_for,
+        P3,
+        P3,
+        &cards,
+        LibraryPosition::Top,
+    );
+    let submitted = runner
+        .act(GameAction::SelectCards {
+            cards: vec![o2, o3, o1],
+        })
+        .expect("P3 submits the arrangement");
+    assert_eq!(library(&runner, P3), vec![o2, o3, o1, p3_lib]);
+    assert_eq!(
+        put_at_library_position_resolutions(&submitted.events, misinformation),
+        1
+    );
+    assert_eq!(stack_resolved_count(&submitted.events, misinformation), 1);
+    assert!(runner.state().pending_mass_library_order_choice.is_none());
+    // CR 117.3b + CR 800.4j.
+    assert_eq!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { player: P1 }
+    );
+}
+
+/// CR 800.4g + CR 800.4h + CR 800.4a: the elector leaves during the election.
+/// On the four-player board P0 concedes, then P1 concedes at the election. The
+/// election is raised again against the players still in the game: the next
+/// player in turn order after the departed controller P0 is now P2, choosing
+/// between P2 and P3. P2 elects P3, whose order completes the spell.
+///
+/// REVERT-FAILING: without the open election's reconcile, the carrier is
+/// retired with its departed elector and the generic repoint leaves priority,
+/// so the re-raised election assertion fails.
+#[test]
+fn misinformation_elector_departure_reraises_the_election() {
+    let (mut runner, misinformation, cards, p3_lib) = misinformation_board(4, P3);
+    let [o1, o2, o3] = cards;
+    open_misinformation_arrangement(&mut runner, misinformation, cards, P3);
+    runner
+        .act(GameAction::Concede { player_id: P0 })
+        .expect("P0 concedes");
+    assert_arranger_election(
+        &runner.state().waiting_for,
+        P1,
+        &[P1, P2, P3],
+        misinformation,
+    );
+
+    let conceded = runner
+        .act(GameAction::Concede { player_id: P1 })
+        .expect("P1 concedes");
+    // REVERT-FAILING: the election is raised again for the players still in.
+    assert_arranger_election(&runner.state().waiting_for, P2, &[P2, P3], misinformation);
+    assert_eq!(runner.state().priority_player, P2);
+    assert_eq!(
+        held_election_batch(&runner),
+        (P3, Some(P0), vec![o1, o2, o3])
+    );
+    assert_eq!(
+        put_at_library_position_resolutions(&conceded.events, misinformation),
+        0
+    );
+
+    runner
+        .act(GameAction::ChooseZoneOpponentChooser { opponent: P3 })
+        .expect("P2 elects P3");
+    let submitted = runner
+        .act(GameAction::SelectCards {
+            cards: vec![o2, o3, o1],
+        })
+        .expect("P3 submits the arrangement");
+    assert_eq!(library(&runner, P3), vec![o2, o3, o1, p3_lib]);
+    assert_eq!(
+        put_at_library_position_resolutions(&submitted.events, misinformation),
+        1
+    );
+    assert_eq!(stack_resolved_count(&submitted.events, misinformation), 1);
+    assert!(runner.state().pending_mass_library_order_choice.is_none());
+    // CR 117.3b + CR 800.4j: the next living player after the departed active P0.
+    assert_eq!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { player: P2 }
+    );
+}
+
+/// CR 800.4a + CR 608.2m: the owner leaves during the election. On the
+/// four-player board P0 concedes, then P3, the owner, concedes at the
+/// election. P3's cards leave the game with P3, so nothing is left to
+/// arrange; the spell keeps resolving, and its instruction completes with
+/// nothing moved inside the Concede.
+///
+/// REVERT-FAILING: without the open election's emptied completion, the
+/// carrier is retired and no completion is emitted.
+#[test]
+fn misinformation_owner_departure_during_the_election_completes_empty() {
+    let (mut runner, misinformation, cards, _p3_lib) = misinformation_board(4, P3);
+    open_misinformation_arrangement(&mut runner, misinformation, cards, P3);
+    runner
+        .act(GameAction::Concede { player_id: P0 })
+        .expect("P0 concedes");
+    assert_arranger_election(
+        &runner.state().waiting_for,
+        P1,
+        &[P1, P2, P3],
+        misinformation,
+    );
+
+    let conceded = runner
+        .act(GameAction::Concede { player_id: P3 })
+        .expect("P3 concedes");
+    for card in cards {
+        assert_eq!(
+            zone(&runner, card),
+            Zone::Exile,
+            "CR 800.4a: P3's cards leave the game with P3"
+        );
+    }
+    // REVERT-FAILING: the instruction completes once, with nothing moved.
+    assert_eq!(
+        put_at_library_position_resolutions(&conceded.events, misinformation),
+        1,
+        "the placement completes once, empty, inside the Concede"
+    );
+    assert_eq!(stack_resolved_count(&conceded.events, misinformation), 1);
+    let state = runner.state();
+    assert!(state.pending_mass_library_order_choice.is_none());
+    assert!(
+        state
+            .objects
+            .values()
+            .all(|object| object.zone != Zone::Stack),
+        "no object is left on the stack"
+    );
     assert_eq!(state.waiting_for, WaitingFor::Priority { player: P1 });
 }
 

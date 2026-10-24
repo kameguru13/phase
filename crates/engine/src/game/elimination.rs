@@ -461,7 +461,10 @@ pub fn eliminate_players_simultaneously(
         // owner's cards left with them, and a member exiled with its departed
         // controller is gone — so the next owner chooses, or the arrangement
         // completes, moving what is collected or nothing, and its resolution
-        // continues (CR 608.2c). Runs after every departure sweep and before the
+        // continues (CR 608.2c). When the arranger an instruction named has left
+        // with cards still to arrange, the object's controller, or the next
+        // player in turn order after them, elects another player to arrange them
+        // (CR 800.4g + CR 800.4h). Runs after every departure sweep and before the
         // generic dead-actor repoint, which would otherwise strand the
         // resolution behind unrelated priority (CR 117.2e).
         let owner_arrangement =

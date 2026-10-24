@@ -1143,14 +1143,10 @@ fn advance_per_player_iteration(
             // who has left; the next player in turn order after the object's
             // controller elects another player to make it. The pending pool
             // (`current`) is carried through the election unchanged.
-            let elector = players::next_player_in_turn_order(state, ability.controller);
-            let candidates: Vec<PlayerId> = players::apnap_order(state)
-                .into_iter()
-                .filter(|&player| players::is_alive(state, player))
-                .collect();
+            let election = players::substitute_chooser_election(state, ability.controller);
             state.waiting_for = WaitingFor::ChooseFromZoneOpponentChooser {
-                player: elector,
-                candidates,
+                player: election.elector,
+                candidates: election.candidates,
                 ability: Box::new(ability.clone()),
                 purpose: ZoneOpponentChooserPurpose::SubstituteChooser,
             };
@@ -1216,7 +1212,8 @@ fn take_frame_for_prompt(
             frame.current.is_some() && frame.nominee.is_none()
         }
         ZoneOpponentChooserPurpose::Ordinary
-        | ZoneOpponentChooserPurpose::BindReciprocalConsume => false,
+        | ZoneOpponentChooserPurpose::BindReciprocalConsume
+        | ZoneOpponentChooserPurpose::SubstituteArranger => false,
     };
     if !frame_awaits_prompt || frame.ability.source_id != prompt_ability.source_id {
         return Err(EffectError::InvalidParam(

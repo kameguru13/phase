@@ -148,6 +148,42 @@ pub fn next_player_in_turn_order(state: &GameState, current: PlayerId) -> Player
     }
 }
 
+/// CR 800.4g + CR 800.4h: an object requires a choice of a player who has left
+/// the game. The controller of the object chooses another player to make it;
+/// a controller who has left is a player a rule requires to choose, so the next
+/// player in turn order after them elects instead. "Another player" is any
+/// player other than the one who left — every player still in the game, in
+/// APNAP order, the elector included (CR 102.1). The second sentence of
+/// CR 800.4g (an opponent's choice goes to another opponent) does not arise for
+/// either caller: each substitutes for a choice the object's controller was to
+/// make.
+pub(crate) struct SubstituteChooserElection {
+    pub elector: PlayerId,
+    pub candidates: Vec<PlayerId>,
+}
+
+/// The election of a substitute chooser for a choice the object controlled by
+/// `controller` requires of a player who has left (see
+/// [`SubstituteChooserElection`]).
+pub(crate) fn substitute_chooser_election(
+    state: &GameState,
+    controller: PlayerId,
+) -> SubstituteChooserElection {
+    let elector = if is_alive(state, controller) {
+        controller
+    } else {
+        next_player_in_turn_order(state, controller)
+    };
+    let candidates = apnap_order(state)
+        .into_iter()
+        .filter(|&player| is_alive(state, player))
+        .collect();
+    SubstituteChooserElection {
+        elector,
+        candidates,
+    }
+}
+
 /// CR 102.1 + CR 103.1: Single authority for seating-neighbor resolution.
 ///
 /// Resolves the living player seated immediately to `controller`'s left or
@@ -563,6 +599,50 @@ mod tests {
             apnap_order(&state),
             vec![PlayerId(0), PlayerId(3), PlayerId(2), PlayerId(1)],
             "CR 101.4: APNAP follows the reversed turn order",
+        );
+    }
+
+    /// CR 800.4g + CR 800.4h: a living controller elects the substitute
+    /// chooser; a departed controller's election passes to the next player in
+    /// turn order after them, in the current turn direction. The candidates are
+    /// every player still in the game in APNAP order, the elector included.
+    #[test]
+    fn substitute_chooser_election_names_the_controller_or_the_next_player() {
+        let mut state = make_state(4, FormatConfig::free_for_all());
+        state.active_player = PlayerId(0);
+
+        let living = substitute_chooser_election(&state, PlayerId(1));
+        assert_eq!(living.elector, PlayerId(1), "a living controller elects");
+        assert_eq!(
+            living.candidates,
+            vec![PlayerId(0), PlayerId(1), PlayerId(2), PlayerId(3)],
+            "every player in the game, in APNAP order"
+        );
+
+        eliminate(&mut state, PlayerId(1));
+        let departed = substitute_chooser_election(&state, PlayerId(1));
+        assert_eq!(
+            departed.elector,
+            PlayerId(2),
+            "CR 800.4h: the next player in turn order after the departed controller"
+        );
+        assert_eq!(
+            departed.candidates,
+            vec![PlayerId(0), PlayerId(2), PlayerId(3)],
+            "CR 102.1: a departed player is not a candidate"
+        );
+
+        state.turn_direction = TurnDirection::Reversed;
+        let reversed = substitute_chooser_election(&state, PlayerId(1));
+        assert_eq!(
+            reversed.elector,
+            PlayerId(0),
+            "CR 800.4h: the next player in the reversed turn order"
+        );
+        assert_eq!(
+            reversed.candidates,
+            vec![PlayerId(0), PlayerId(3), PlayerId(2)],
+            "APNAP follows the reversed turn order"
         );
     }
 

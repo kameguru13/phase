@@ -5235,9 +5235,10 @@ pub struct MassLibraryOrderBatch {
     pub owner: PlayerId,
     /// CR 101.1 + CR 608.2c: the player the instruction directs to arrange this
     /// owner's cards; `None` = CR 401.4 owner. Snapshotted at resolution
-    /// (CR 608.2d); if that player leaves, the next player in turn order
-    /// replaces them (CR 800.4g + CR 800.4h). Older saves decode as `None`: every earlier prompt was
-    /// owner-arranged.
+    /// (CR 608.2d); if that player leaves the game while this batch still has
+    /// cards to arrange, the controller of the object elects another player,
+    /// who is written here (CR 800.4g + CR 800.4h). Older saves decode as
+    /// `None`: every earlier prompt was owner-arranged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arranger: Option<PlayerId>,
     pub members: Vec<MassLibraryOrderMember>,
@@ -5303,6 +5304,12 @@ pub struct PendingMassLibraryOrderChoice {
     /// (older saves, or no resolving entry) binds on the instruction fields alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolving_entry: Option<ObjectId>,
+    /// CR 800.4g + CR 800.4h: the batch whose named arranger left the game with
+    /// cards still to arrange, held while the open prompt
+    /// (`ZoneOpponentChooserPurpose::SubstituteArranger`) elects the player who
+    /// arranges it. Taken when the election is answered; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arranger_election: Option<MassLibraryOrderBatch>,
 }
 
 /// CR 101.4: If players make choices for one instruction, they choose in
@@ -15662,6 +15669,12 @@ pub enum ZoneOpponentChooserPurpose {
     /// pick has left the game; the next player in turn order after the
     /// object's controller elects another player to make that one choice.
     SubstituteChooser,
+    /// CR 800.4g + CR 800.4h: the arranger an instruction named for an owner's
+    /// library-order batch (CR 101.1 + CR 401.4) has left the game while the
+    /// batch still has cards to arrange; the controller of the object, or the
+    /// next player in turn order after them, elects the player who arranges
+    /// that batch.
+    SubstituteArranger,
 }
 
 impl ZoneOpponentChooserPurpose {
@@ -17682,7 +17695,8 @@ pub enum WaitingFor {
     /// "target opponent chooses" pre-binds the chooser at announcement).
     /// `candidates` is the legal opponent set; `ability` is the resolving
     /// choose ability, carried so the zone choice can be presented to the
-    /// picked opponent.
+    /// picked opponent. `purpose` names the pending choice the picked player is
+    /// for, and so the authority that answers it.
     ChooseFromZoneOpponentChooser {
         player: PlayerId,
         candidates: Vec<PlayerId>,
@@ -48740,6 +48754,7 @@ mod tests {
             remaining_batches: PendingMassLibraryOrderBatches::Typed(Vec::new()),
             arranged_batches: Vec::new(),
             resolving_entry: None,
+            arranger_election: None,
         };
         let mut wire = serde_json::to_value(pending).unwrap();
         wire["remaining_batches"] = serde_json::json!([[1, [2, 3]]]);
@@ -48757,6 +48772,10 @@ mod tests {
         assert_eq!(
             decoded.resolving_entry, None,
             "an older save without entry provenance binds on the instruction fields alone"
+        );
+        assert!(
+            decoded.arranger_election.is_none(),
+            "an older save holds no election"
         );
 
         let reserialized = serde_json::to_value(decoded).unwrap();
@@ -48800,10 +48819,35 @@ mod tests {
                 arranger: None,
             }],
             resolving_entry: Some(ObjectId(7)),
+            arranger_election: Some(MassLibraryOrderBatch {
+                owner: PlayerId(3),
+                members: vec![MassLibraryOrderMember {
+                    identity: ObjectIncarnationRef::of(ObjectId(6), 0),
+                    origin: Zone::Graveyard,
+                }],
+                arranger: Some(PlayerId(0)),
+            }),
         };
         let wire = serde_json::to_value(&pending).unwrap();
         let decoded: PendingMassLibraryOrderChoice = serde_json::from_value(wire).unwrap();
         assert_eq!(decoded, pending);
+    }
+
+    /// CR 800.4g + CR 800.4h: the substitute-arranger election purpose has a
+    /// stable wire name, distinct from the per-player substitute election.
+    #[test]
+    fn substitute_arranger_purpose_round_trips_by_name() {
+        assert_eq!(
+            serde_json::to_value(ZoneOpponentChooserPurpose::SubstituteArranger).unwrap(),
+            serde_json::json!("SubstituteArranger")
+        );
+        assert_eq!(
+            serde_json::from_value::<ZoneOpponentChooserPurpose>(serde_json::json!(
+                "SubstituteArranger"
+            ))
+            .unwrap(),
+            ZoneOpponentChooserPurpose::SubstituteArranger
+        );
     }
 
     /// CR 101.1 + CR 401.4: an instruction-named arranger survives serde on both
@@ -48828,6 +48872,7 @@ mod tests {
             remaining_batches: PendingMassLibraryOrderBatches::Typed(vec![batch(2, 5)]),
             arranged_batches: vec![batch(1, 3)],
             resolving_entry: None,
+            arranger_election: None,
         };
         let wire = serde_json::to_value(&pending).unwrap();
         assert_eq!(
