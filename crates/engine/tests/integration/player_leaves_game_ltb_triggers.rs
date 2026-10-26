@@ -82,7 +82,7 @@ fn board(configure: impl FnOnce(&mut GameScenario)) -> Board {
     }
 }
 
-/// CR 603.7c: install a one-shot delayed ability P0 controls, sourced from
+/// CR 603.7b: install a one-shot delayed ability P0 controls, sourced from
 /// `marker`, that gains P0 one life when `condition` is met.
 fn install_delayed_gain_life(
     runner: &mut GameRunner,
@@ -421,7 +421,7 @@ fn losing_to_zero_life_departing_observer_sees_the_other_permanents_that_leave_w
     assert_departing_observer_sees_the_others(Departure::ZeroLife);
 }
 
-/// CR 704.5a + CR 800.4a + CR 603.6c + CR 603.7c: delayed abilities on a
+/// CR 704.5a + CR 800.4a + CR 603.6c + CR 603.7: delayed abilities on a
 /// permanent whose owner loses to a state-based action. "When it leaves the
 /// battlefield" sees it leave the game (the reach guard); "when it dies or is
 /// exiled" doesn't, since it did neither. No ordinary trigger opens a prompt on

@@ -1555,7 +1555,7 @@ fn fixed_point_shield_is_continuous_not_one_shot() {
 // Planar controller concedes: the handoff planeswalk triggers once
 // ---------------------------------------------------------------------------
 
-/// CR 901.10a + CR 901.11 + CR 603.2c: the planar controller concedes, so their
+/// CR 901.10 + CR 901.11 + CR 603.2c: the planar controller concedes, so their
 /// plane leaves the game and the next player planeswalks to the top of the
 /// planar deck. The handoff collects that planeswalk's triggers itself; the
 /// concession's own collection of the departure's events must not collect them
