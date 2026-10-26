@@ -263,7 +263,10 @@ fn low_life_alone_does_not_override_patience() {
 /// The ping here deals 1 to an opponent at 2, so it is held.
 #[test]
 fn a_ping_short_of_lethal_is_held() {
-    let board = build_board(Phase::Upkeep, 20, 2);
+    let mut board = build_board(Phase::Upkeep, 20, 2);
+    // A second 1-power body puts the AI's board power at the opponent's life, so the
+    // strategic intent reads PushLethal; the ping alone is still 1 short.
+    creature(&mut board.state, &mut Ids(9_700), AI, "Bear", 1, 1, None);
     let (delta, reason) = score_and_reason(&verdict_for(&board));
     assert_eq!(reason, "activation_patience_hold");
     assert!(delta < 0.0, "got {delta}");
@@ -317,6 +320,26 @@ fn an_upkeep_trigger_source_does_not_disable_the_draw_step() {
     let (delta, reason) = score_and_reason(&verdict_for(&board));
     assert_eq!(reason, "activation_patience_hold_for_main");
     assert!(delta < 0.0, "got {delta}");
+}
+
+/// CR 505.4 + CR 117.3a: the main phase opens with lore counters on the AI's Sagas (and any
+/// "beginning of precombat main" triggers) before it gets priority there, which an activation
+/// now could still change, so the draw step is not held.
+#[test]
+fn a_saga_stands_the_draw_step_down() {
+    let mut board = build_board(Phase::Draw, 20, 20);
+    let saga = creature(&mut board.state, &mut Ids(9_600), AI, "Saga", 0, 0, None);
+    board
+        .state
+        .objects
+        .get_mut(&saga)
+        .unwrap()
+        .card_types
+        .subtypes
+        .push("Saga".to_string());
+    let (delta, reason) = score_and_reason(&verdict_for(&board));
+    assert_eq!(reason, "activation_patience_na");
+    assert_eq!(delta, 0.0);
 }
 
 /// CR 602.5: an ability restricted to the upkeep can't be activated in the main
@@ -441,7 +464,7 @@ fn a_conditional_ability_overrides_patience() {
 /// genuinely pristine window — so that window is provably unreachable
 /// whenever one exists, and nothing is being given up by excluding it.
 #[test]
-fn an_upkeep_trigger_source_disables_the_upkeep_window() {
+fn an_upkeep_trigger_source_disables_the_upkeep_window_but_still_holds_for_main() {
     let mut ids = Ids::new();
     let mut state = GameState::new_two_player(4242);
     state.phase = Phase::Upkeep;
@@ -468,12 +491,13 @@ fn an_upkeep_trigger_source_disables_the_upkeep_window() {
 
     let (delta, reason) = score_and_reason(&verdict_for(&board));
     assert_eq!(
-        reason, "activation_patience_na",
+        reason, "activation_patience_hold_for_main",
         "an upkeep-trigger source on the AI's own board must disable the low-information \
-         gate entirely: whatever resolved before this priority window (possibly a real draw) \
-         already invalidates the 'wait, you haven't drawn yet' premise"
+         reason: whatever resolved before this priority window (possibly a real draw) \
+         already invalidates the 'wait, you haven't drawn yet' premise. The main phase \
+         still offers everything this window does, so the activation is held for it"
     );
-    assert_eq!(delta, 0.0);
+    assert!(delta < 0.0, "got {delta}");
 }
 
 /// Review finding: `is_low_information_window` (now `patient_window`) checked `phase`, `stack`, and

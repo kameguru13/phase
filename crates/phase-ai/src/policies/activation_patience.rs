@@ -19,10 +19,13 @@
 //! (matched by the engine's own comment beside `execute_draw` in
 //! `crates/engine/src/game/turns.rs`): the active player receives priority
 //! during the draw step only AFTER the turn-based draw, so waiting there buys no
-//! information. But the precombat main phase follows with nothing in between
-//! (CR 500.1), so waiting gives nothing up either: the ability can still be
-//! activated there, and the mana and untapped creatures it would spend now are
-//! still free for the sorcery-speed plays only the main phase allows (CR 307.1).
+//! information. But it gives nothing up either: the ability can still be
+//! activated in the precombat main phase, and the mana and untapped creatures it
+//! would spend now are still free for the sorcery-speed plays only the main phase
+//! allows (CR 307.1). The same holds in an upkeep whose triggers have already
+//! resolved. It fails only when the main phase opens with something an earlier
+//! activation could still change (CR 505.3-505.5 turn-based actions, CR 117.3a
+//! triggers), so those boards are not gated.
 //! The untap step is excluded because CR 502.4 means no player ever receives
 //! priority in it at all, so `WaitingFor::Priority` cannot occur there to gate on.
 //!
@@ -64,8 +67,9 @@ use crate::search::ability_is_temporary_combat_modifier;
 use engine::game::players;
 
 /// Base magnitude of the patience penalty, before the profile's interaction
-/// patience scales it. Preference-band: enough to lose to any real payoff the
-/// other policies price, enough to beat an idle activation's flat base score.
+/// patience scales it: preference band at the default patience (strong band at
+/// 0.75 and up), enough to lose to any real payoff the other policies price and
+/// to beat an idle activation's flat base score.
 const PATIENCE_PENALTY_BASE: f64 = 1.2;
 
 pub struct ActivationPatiencePolicy;
@@ -124,12 +128,13 @@ enum PatientWindow {
     /// CR 503.1: the upkeep step has no turn-based actions of its own, so taken with an empty
     /// stack it is the turn's low-information window: nothing has been drawn, cast, or declared.
     Upkeep,
-    /// CR 504.1 + CR 504.2 + CR 500.1: the draw step's priority comes after the draw, and the
-    /// precombat main phase follows it with nothing in between. Waiting buys no information
-    /// here, but it gives nothing up either: every instant-speed use of the ability is still on
-    /// offer in the main phase, and the mana and untapped permanents it would spend now are
-    /// still there for the sorcery-speed plays (CR 307.1) that only the main phase allows.
-    Draw,
+    /// The draw step (CR 504.2: its priority comes after the draw) or an upkeep whose triggers
+    /// have resolved: waiting buys no information, but it gives nothing up either, provided
+    /// nothing happens as the main phase begins (see [`main_phase_opens_with_events`]). Every
+    /// instant-speed use of the ability is still on offer in the main phase, and the mana and
+    /// untapped permanents it would spend now are still there for the sorcery-speed plays
+    /// (CR 307.1) that only the main phase allows.
+    BeforeMain,
 }
 
 /// The [`PatientWindow`] `ai_player` holds priority in, if any.
@@ -140,7 +145,7 @@ enum PatientWindow {
 ///
 /// # Why this must be `ai_player`'s OWN turn
 ///
-/// CR 117.4 rotates priority among every living player in turn
+/// CR 117.3d passes priority to the next player in turn order
 /// (`crates/engine/src/game/priority.rs`'s `priority_pass_participants`), not
 /// just the active player — so the AI can hold `WaitingFor::Priority` with an
 /// empty stack during an OPPONENT's upkeep or draw step too. During an opponent's turn the AI's
@@ -168,8 +173,8 @@ enum PatientWindow {
 /// queued (and, by the time the stack is next empty, already resolved)
 /// before the truly first grant, so the pristine window this predicate wants
 /// is provably unreachable whenever one exists — there is no non-conservative
-/// case being given up. The draw step needs no such guard, since its case never rested on
-/// information.
+/// case being given up. Such an upkeep is still a [`PatientWindow::BeforeMain`], whose case
+/// never rested on information.
 fn patient_window(state: &GameState, ai_player: PlayerId) -> Option<PatientWindow> {
     if state.active_player != ai_player
         || !state.stack.is_empty()
@@ -178,16 +183,40 @@ fn patient_window(state: &GameState, ai_player: PlayerId) -> Option<PatientWindo
         return None;
     }
     match state.phase {
-        Phase::Upkeep if !controls_beginning_of_upkeep_trigger(state, ai_player) => {
+        Phase::Upkeep if !controls_beginning_of_phase_trigger(state, ai_player, Phase::Upkeep) => {
             Some(PatientWindow::Upkeep)
         }
-        Phase::Draw => Some(PatientWindow::Draw),
+        Phase::Upkeep | Phase::Draw if !main_phase_opens_with_events(state, ai_player) => {
+            Some(PatientWindow::BeforeMain)
+        }
         _ => None,
     }
 }
 
+/// Does `player`'s precombat main phase open with something that happens before they receive
+/// priority in it, which an activation now could still change? CR 505.3: they are the archenemy
+/// and set a scheme in motion. CR 505.4: they put a lore counter on each of their Sagas.
+/// CR 505.5: they roll to visit their Attractions. CR 117.3a: "at the beginning of your
+/// precombat main phase" triggers go on the stack. Coarse in the safe direction, like
+/// [`controls_beginning_of_phase_trigger`]: any such permanent stands the window down.
+fn main_phase_opens_with_events(state: &GameState, player: PlayerId) -> bool {
+    state.archenemy == Some(player)
+        || controls_beginning_of_phase_trigger(state, player, Phase::PreCombatMain)
+        || state.battlefield.iter().any(|&id| {
+            state.objects.get(&id).is_some_and(|object| {
+                object.controller == player
+                    && object
+                        .card_types
+                        .subtypes
+                        .iter()
+                        .any(|subtype| subtype == "Saga" || subtype == "Attraction")
+            })
+        })
+}
+
 /// Does `player` control a permanent with a printed "at the beginning of your
-/// upkeep" trigger (CR 503.1a)? Deliberately NOT gated on the trigger
+/// `phase`" trigger (CR 503.1a for the upkeep, CR 117.3a in general)? Deliberately NOT gated
+/// on the trigger
 /// currently functioning — `Definitions::iter_unchecked` is the sanctioned
 /// classification-only accessor (engine runtime paths use the CR-gated
 /// `functioning_*` helpers instead; this is neither, so a source under a
@@ -196,13 +225,13 @@ fn patient_window(state: &GameState, ai_player: PlayerId) -> Option<PatientWindo
 /// over-including a source that could not actually have fired only means the
 /// policy declines to nudge a few boards it safely could have — never the
 /// reverse.
-fn controls_beginning_of_upkeep_trigger(state: &GameState, player: PlayerId) -> bool {
+fn controls_beginning_of_phase_trigger(state: &GameState, player: PlayerId, phase: Phase) -> bool {
     state.battlefield.iter().any(|&id| {
         state.objects.get(&id).is_some_and(|object| {
             object.controller == player
                 && object.trigger_definitions.iter_unchecked().any(|entry| {
                     let def = entry.definition();
-                    def.mode == TriggerMode::Phase && def.phase == Some(Phase::Upkeep)
+                    def.mode == TriggerMode::Phase && def.phase == Some(phase)
                 })
         })
     })
@@ -290,7 +319,7 @@ impl TacticalPolicy for ActivationPatiencePolicy {
             -PATIENCE_PENALTY_BASE * (0.5 + patience),
             PolicyReason::new(match window {
                 PatientWindow::Upkeep => "activation_patience_hold",
-                PatientWindow::Draw => "activation_patience_hold_for_main",
+                PatientWindow::BeforeMain => "activation_patience_hold_for_main",
             })
             .with_fact("phase", ctx.state.phase as i64),
         )
