@@ -3455,7 +3455,7 @@ enum RootDecisionContext {
 
 impl RootDecisionContext {
     /// Classify the root decision. Precedence: target selection, then a stack holding an
-    /// opponent's entry, then the AI's own Upkeep/Draw window, then everything else.
+    /// entry another player controls, then the AI's own Upkeep/Draw window, then everything else.
     fn classify(state: &GameState, ai_player: PlayerId) -> Self {
         if matches!(
             state.waiting_for,
