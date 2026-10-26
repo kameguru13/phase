@@ -27778,9 +27778,10 @@ fn selection_could_be_anaphor(anaphor: &DefiniteAnaphor, choice: &ResolutionChoi
     }
 }
 
-/// CR 205.3: whether a choice's selection filter can yield an object carrying
-/// the anaphor's noun. An untyped or card-only filter, and any filter shape
-/// this walk does not read, admits it.
+/// CR 205.3: whether a choice's selection filter names the anaphor's noun —
+/// its type filters carry the noun's type or subtype
+/// (`typed_filter_admits_anaphor_noun`). An untyped or card-only filter, and
+/// any filter shape this walk does not read, could name anything and admits it.
 fn selection_filter_admits_anaphor_noun(noun: &AnaphorNoun, filter: &TargetFilter) -> bool {
     match filter {
         TargetFilter::Typed(tf) => {
