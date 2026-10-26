@@ -526,6 +526,55 @@ fn floating_mana_the_activation_could_spend_stands_patience_down() {
         score_and_reason(&verdict_for(&ping)).1,
         "activation_patience_hold"
     );
+    // CR 107.4a: floating {C} can't pay an {R} leg, so a red pinger is still held.
+    let red_pinger = creature(
+        &mut board.state,
+        &mut Ids(9_300),
+        AI,
+        "Red Pinger",
+        1,
+        1,
+        Some("{R}, {T}: This creature deals 1 damage to any target."),
+    );
+    let red = Board {
+        state: board.state.clone(),
+        pinger: red_pinger,
+    };
+    assert_eq!(
+        score_and_reason(&verdict_for(&red)).1,
+        "activation_patience_hold",
+        "colorless mana can't pay {{R}}"
+    );
+}
+
+/// CR 500.5 + CR 614.17: mana kept past the step ("you don't lose this mana as steps and
+/// phases end") is still there in the main phase, so it doesn't stand patience down.
+#[test]
+fn retained_floating_mana_leaves_the_hold() {
+    use engine::types::mana::{ManaExpiry, ManaRestriction, ManaType, ManaUnit};
+    let mut board = build_board(Phase::Upkeep, 20, 20);
+    let staff = creature(
+        &mut board.state,
+        &mut Ids(9_200),
+        AI,
+        "Staff",
+        0,
+        1,
+        Some("{2}, {T}: You gain 1 life."),
+    );
+    let mut unit = ManaUnit::new(
+        ManaType::Colorless,
+        ObjectId(9_900),
+        false,
+        vec![ManaRestriction::OnlyForActivation],
+    );
+    unit.expiry = Some(ManaExpiry::EndOfTurn);
+    board.state.players[AI.0 as usize].mana_pool.add(unit);
+    board.pinger = staff;
+    assert_eq!(
+        score_and_reason(&verdict_for(&board)).1,
+        "activation_patience_hold"
+    );
 }
 
 /// CR 602.5: an ability restricted to the upkeep can't be activated in the main

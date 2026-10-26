@@ -2366,6 +2366,29 @@ fn mana_type_to_color(mt: ManaType) -> Option<crate::types::mana::ManaColor> {
 }
 
 /// Map a `ManaCostShard` to its payment requirement (CR 107.4).
+/// CR 107.4: Could one unit of shape `unit` pay toward `requirement` on its own, ignoring the
+/// payment context (check that with [`mana_unit_permits_payment_context`])? Life and two-generic
+/// alternatives count only for the mana half they offer.
+pub(crate) fn unit_can_pay_toward_shard(unit: &ManaShape, requirement: &ShardRequirement) -> bool {
+    match *requirement {
+        ShardRequirement::Single(color) | ShardRequirement::Phyrexian(color) => unit.color == color,
+        ShardRequirement::Hybrid(a, b) | ShardRequirement::HybridPhyrexian(a, b) => {
+            unit.color == a || unit.color == b
+        }
+        // CR 107.4e: {C/color} takes colorless or the colored half.
+        ShardRequirement::ColorlessHybrid(color) => {
+            unit.color == ManaType::Colorless || unit.color == color
+        }
+        // CR 107.4e + CR 107.3: a {2/color} half and X take mana of any type.
+        ShardRequirement::TwoGenericHybrid(_)
+        | ShardRequirement::TwoGenericHybridPhyrexian(_)
+        | ShardRequirement::X => true,
+        // CR 107.4h: {S} takes mana from a snow source.
+        ShardRequirement::Snow => unit.supertype == Some(crate::types::mana::ManaSupertype::Snow),
+        ShardRequirement::TwoOrMoreColorSource => unit.source_could_produce_two_or_more_colors,
+    }
+}
+
 pub(crate) fn shard_to_mana_type(shard: ManaCostShard) -> ShardRequirement {
     match shard {
         ManaCostShard::White => ShardRequirement::Single(ManaType::White),

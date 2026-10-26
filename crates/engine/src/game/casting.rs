@@ -32216,24 +32216,31 @@ pub(crate) fn fold_activation_cost(
     cost
 }
 
-/// CR 106.4 + CR 106.6 + CR 602.2b: Does `player`'s mana pool hold mana that could be spent
-/// toward activating `source_id`'s ability `ability_index`? True when the activation's cost has
-/// a mana leg and some unit's type and restrictions are allowed by that activation's payment
-/// context. Read-only, for callers weighing whether floating mana (which empties as the step
-/// ends, CR 500.5) would be wasted by not activating now; the payment pipeline stays the
-/// authority on whether the whole cost can actually be paid.
+/// CR 106.4 + CR 106.6 + CR 500.5 + CR 602.2b: Does `player`'s mana pool hold mana that will
+/// empty as this step ends and that could be spent toward activating `source_id`'s ability
+/// `ability_index`? A unit counts when the activation's payment context allows it and it can pay
+/// some leg of the activation's mana cost: a generic leg takes any type, a shard only the types
+/// it names (CR 107.4). Units held past the step by an expiry ("you don't lose this mana") are
+/// not counted; mana a step-end handler such as Upwelling would keep still is, which errs toward
+/// answering yes. Read-only, for callers weighing whether waiting wastes floating mana; the
+/// payment pipeline stays the authority on whether the whole cost can actually be paid.
 pub fn pool_mana_can_pay_toward_activation(
     state: &GameState,
     player: PlayerId,
     source_id: ObjectId,
     ability_index: usize,
 ) -> bool {
-    let has_mana_leg = activation_ability_definition(state, source_id, ability_index)
-        .and_then(|ability| ability.cost)
-        .is_some_and(|cost| activation_mana_component(&cost) != ManaCost::zero());
-    if !has_mana_leg {
+    let Some(ManaCost::Cost { shards, generic }) =
+        activation_ability_definition(state, source_id, ability_index)
+            .and_then(|ability| ability.cost)
+            .map(|cost| activation_mana_component(&cost))
+    else {
         return false;
-    }
+    };
+    let requirements: Vec<_> = shards
+        .iter()
+        .map(|shard| mana_payment::shard_to_mana_type(*shard))
+        .collect();
     let context = activation_payment_context(state, source_id, Some(ability_index));
     let ctx = context.as_payment_context();
     state
@@ -32241,10 +32248,14 @@ pub fn pool_mana_can_pay_toward_activation(
         .iter()
         .find(|p| p.id == player)
         .is_some_and(|p| {
-            p.mana_pool.units().any(|unit| {
-                ctx.permits_actual_mana_type(unit.color)
-                    && unit.restrictions.iter().all(|r| r.allows(&ctx))
-            })
+            p.mana_pool.count_where(|unit| {
+                unit.expiry.is_none()
+                    && mana_payment::mana_unit_permits_payment_context(unit, &ctx)
+                    && (generic > 0
+                        || requirements.iter().any(|requirement| {
+                            mana_payment::unit_can_pay_toward_shard(unit, requirement)
+                        }))
+            }) > 0
         })
 }
 
