@@ -834,6 +834,30 @@ fn answered_choice(replay: &GameState, action: &GameAction) -> Option<PinnedDeci
     }
 }
 
+/// The objects of `state` the period's plays cast: each cast card, and for a prepared copy cast,
+/// every copy linked to its prepared permanent wherever it is.
+///
+/// CR 722.3c + CR 722.3d: each time the permanent becomes prepared its controller creates a new
+/// copy of its prepare spell in exile, and that copy carries the link onto the stack when cast,
+/// so a period that casts one and re-prepares the permanent holds a different copy in each frame.
+fn period_casts(state: &GameState, items: &[PeriodItem]) -> Vec<ObjectId> {
+    let mut casts = Vec::new();
+    for item in items {
+        match item.action {
+            GameAction::CastSpell { object_id, .. } => casts.push(object_id),
+            GameAction::CastPreparedCopy { source } => casts.extend(
+                state
+                    .objects
+                    .values()
+                    .filter(|object| object.prepared_copy_source == Some(source))
+                    .map(|object| object.id),
+            ),
+            _ => {}
+        }
+    }
+    casts
+}
+
 /// The frame with every object the period cast removed, since a cast card returns where it
 /// came from (CR 400.7), and its churning bookkeeping cleared.
 pub(crate) fn normalize_cast_frame(state: &GameState, casts: &[ObjectId]) -> GameState {
@@ -893,16 +917,9 @@ pub(crate) fn confirm(frame: &GameState, span: NamedSpan) -> Result<Confirmation
         Ok(_) => (&s_n1, &replay),
         Err(_) => (&s_n, &s_n1),
     };
-    let casts: Vec<ObjectId> = items
-        .iter()
-        .filter_map(|item| match item.action {
-            GameAction::CastSpell { object_id, .. } => Some(object_id),
-            _ => None,
-        })
-        .collect();
     let (verdict, growth) = certify_object_growth_frames(
         [&s_n, &s_n1, current],
-        |state| normalize_cast_frame(state, &casts),
+        |state| normalize_cast_frame(state, &period_casts(state, &items)),
         holder,
     );
     // CR 732.2a: one count per offer. Something of its proposer's own falling makes the period
