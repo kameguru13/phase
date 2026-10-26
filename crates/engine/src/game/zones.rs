@@ -2239,8 +2239,8 @@ pub fn mark_simultaneous_departures(events: &mut [GameEvent], group: &[ObjectId]
 /// CR 800.4a + CR 603.6c: Record that `object_id` left the game with its owner
 /// rather than moving to the zone the engine keeps it in. The player-leaves-game
 /// procedure calls this on the events and per-turn records (from `record_start`)
-/// that the object's move just produced, so trigger matchers and look-back queries
-/// read the departure as leaving the game, not as being exiled.
+/// that the object's move just produced, so trigger matchers read the departure as
+/// leaving the game, not as being exiled.
 pub fn mark_left_game(
     state: &mut GameState,
     events: &mut [GameEvent],

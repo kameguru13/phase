@@ -287,8 +287,24 @@ fn concession_with_a_phased_out_permanent_triggers_nothing_for_it() {
         demon,
         soulherder,
         owned_bear,
+        leaves_marker,
+        dies_or_exiled_marker: filtered_leaves_marker,
         ..
     } = board(|_| {});
+    install_delayed_gain_life(
+        &mut runner,
+        leaves_marker,
+        DelayedTriggerCondition::WhenLeavesPlay {
+            object_id: owned_bear,
+        },
+    );
+    install_delayed_gain_life(
+        &mut runner,
+        filtered_leaves_marker,
+        DelayedTriggerCondition::WhenLeavesPlayFiltered {
+            filter: TargetFilter::SpecificObject { id: owned_bear },
+        },
+    );
     runner
         .state_mut()
         .objects
@@ -310,17 +326,30 @@ fn concession_with_a_phased_out_permanent_triggers_nothing_for_it() {
         "CR 702.26k: only the exiled bear, not the phased-out one, is seen leaving"
     );
     assert_eq!(triggers_from(&runner, soulherder), 1);
+    for marker in [leaves_marker, filtered_leaves_marker] {
+        assert_eq!(
+            triggers_from(&runner, marker),
+            0,
+            "CR 702.26k: a delayed leaves-the-battlefield ability doesn't see it either"
+        );
+    }
+}
+
+/// How P2 leaves the game in a test.
+#[derive(Clone, Copy, Debug)]
+enum Departure {
+    /// CR 104.3a: P2 concedes.
+    Concession,
+    /// CR 704.5a: P2 is at 0 life when P0 passes priority.
+    ZeroLife,
 }
 
 /// CR 800.4a + CR 603.10a: everything P2 owns leaves the game at once. An
-/// Extractor Demon P2 owns but P0 controls leaves with P2's bear and, looking
-/// back, sees the bear leave in the same event; P0 controls that trigger. A
-/// trigger P2 would control isn't put on the stack (CR 800.4d).
-///
-/// REVERT-FAILING: without marking the departure simultaneous, the departing
-/// Demon doesn't see the bear and triggers zero times.
-#[test]
-fn concession_departing_observer_sees_the_other_permanents_that_leave_with_it() {
+/// Extractor Demon P2 owns but P0 controls leaves with P2's other creatures and,
+/// looking back, sees them leave in the same event; P0 controls those triggers.
+/// The Demon P2 controlled sees them too, but a trigger P2 would control isn't
+/// put on the stack (CR 800.4d), and the game doesn't wait on P2.
+fn assert_departing_observer_sees_the_others(departure: Departure) {
     let mut scenario = GameScenario::new_n_player(3, 42);
     scenario.at_phase(Phase::PreCombatMain);
     let borrowed_demon = scenario
@@ -331,30 +360,55 @@ fn concession_departing_observer_sees_the_other_permanents_that_leave_with_it() 
         .add_creature_from_oracle(P2, "Extractor Demon", 5, 5, EXTRACTOR_DEMON_ORACLE)
         .id();
     scenario.add_creature(P2, "P2 Bear", 2, 2);
+    if matches!(departure, Departure::ZeroLife) {
+        scenario.with_life(P2, 0);
+    }
     let mut runner = scenario.build();
 
-    runner
-        .act(GameAction::Concede { player_id: P2 })
-        .expect("P2 concedes");
+    let action = match departure {
+        Departure::Concession => GameAction::Concede { player_id: P2 },
+        Departure::ZeroLife => GameAction::PassPriority,
+    };
+    runner.act(action).expect("P2 leaves the game");
+    assert!(runner.state().players[2].is_eliminated);
     assert_eq!(zone(&runner, borrowed_demon), Zone::Exile);
+    assert_ne!(
+        runner.state().waiting_for.acting_player(),
+        Some(P2),
+        "{departure:?}: CR 800.4a: the game doesn't wait on a player who left"
+    );
 
     drive_trigger_prompts(&mut runner);
     assert_eq!(
         triggers_from(&runner, borrowed_demon),
         2,
-        "CR 603.10a: the departing Demon P0 controlled sees the other two creatures \
-         leave with it"
+        "{departure:?}: CR 603.10a: the departing Demon P0 controlled sees the other two creatures leave with it"
     );
     assert_eq!(
         triggers_from(&runner, p2_demon),
         0,
-        "CR 800.4d: a trigger the departed player would control isn't put on the stack"
+        "{departure:?}: CR 800.4d: a trigger the departed player would control isn't put on the stack"
     );
     assert!(runner
         .state()
         .stack
         .iter()
         .all(|entry| entry.controller == P0));
+}
+
+/// REVERT-FAILING: without marking the departure simultaneous, the departing
+/// Demon doesn't see the others and triggers zero times.
+#[test]
+fn concession_departing_observer_sees_the_other_permanents_that_leave_with_it() {
+    assert_departing_observer_sees_the_others(Departure::Concession);
+}
+
+/// REVERT-FAILING: without dropping triggers a departed player would control at
+/// collection, P2's own Demon goes on the stack and the game waits on P2 to
+/// choose its target.
+#[test]
+fn losing_to_zero_life_departing_observer_sees_the_other_permanents_that_leave_with_it() {
+    assert_departing_observer_sees_the_others(Departure::ZeroLife);
 }
 
 /// CR 704.5a + CR 800.4a + CR 603.6c + CR 603.7c: delayed abilities on a

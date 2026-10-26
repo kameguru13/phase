@@ -6768,6 +6768,21 @@ fn collect_pending_triggers_with_collection(
     apply_trigger_doubling(state, &mut pending);
     pending = filter_auto_inert_noop_triggers(state, pending);
 
+    // CR 800.4d: a triggered ability that would be controlled by a player who
+    // has left the game isn't put on the stack. A departing permanent's own
+    // leaves-the-battlefield abilities look back to a controller who may have
+    // left with it (CR 603.10a), on every path that collects the departure.
+    let (live, departed): (Vec<_>, Vec<_>) = pending
+        .into_iter()
+        .partition(|context| super::players::is_alive(state, context.pending.controller));
+    for context in departed {
+        crate::game::lifecycle::record_delayed_terminal(
+            context.firing(),
+            crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
+        );
+    }
+    let mut pending = live;
+
     // CR 603.3b + CR 101.4 + CR 805.6/805.7: Stack-placement order is full
     // APNAP turn order. Shared-team-turn formats rank/order by team while
     // preserving the real trigger controller on each pending trigger.
