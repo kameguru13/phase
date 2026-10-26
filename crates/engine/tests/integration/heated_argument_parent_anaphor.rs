@@ -769,15 +769,15 @@ fn farther_choice_to_battlefield_names_that_creature() {
             nodes[0].effect
         );
         assert!(
-            nodes.iter().any(|node| match node.effect.as_ref() {
-                Effect::SearchLibrary { .. } => true,
-                Effect::ChangeZone {
-                    origin: Some(Zone::Hand),
-                    destination: Zone::Battlefield,
-                    ..
-                } => true,
-                _ => false,
-            }),
+            nodes.iter().any(|node| matches!(
+                node.effect.as_ref(),
+                Effect::SearchLibrary { .. }
+                    | Effect::ChangeZone {
+                        origin: Some(Zone::Hand),
+                        destination: Zone::Battlefield,
+                        ..
+                    }
+            )),
             "{label}: the battlefield choice parses"
         );
         assert!(
