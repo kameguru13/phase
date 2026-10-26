@@ -1741,3 +1741,51 @@ fn creature_form_convulsing_licid_can_block() {
         .declare_blockers(&[(licid, attacker)])
         .expect("CR 509.1b + CR 303.4m: the creature-form Convulsing Licid must be able to block");
 }
+
+#[test]
+fn attached_convulsing_licid_still_stops_its_host_from_blocking() {
+    // Positive control for the block side: once the Licid IS attached,
+    // "Enchanted creature can't block" names its host and the restriction
+    // applies. P1 gets an unrestricted bystander so the block is a real choice.
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(P0, floating_mana(1, ManaType::Red));
+    let licid = scenario
+        .add_creature(P0, "Convulsing Licid", 2, 2)
+        .from_oracle_text(CONVULSING_LICID_ORACLE)
+        .id();
+    let attacker = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+    let victim = scenario.add_creature(P1, "Colossal Dreadmaw", 7, 7).id();
+    let bystander = scenario.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    let mut runner = scenario.build();
+    runner.activate(licid, 0).target_object(victim).resolve();
+    assert_eq!(
+        runner.state().objects[&licid].attached_to,
+        Some(AttachTarget::Object(victim)),
+        "reach guard: the Convulsing Licid must enchant the victim"
+    );
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(attacker, CombatAttackTarget::Player(P1))])
+        .expect("declare attackers");
+    for _ in 0..8 {
+        if runner.waiting_for_kind() == "DeclareBlockers" {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("pass priority into the declare-blockers step");
+    }
+    assert_eq!(
+        runner.waiting_for_kind(),
+        "DeclareBlockers",
+        "reach guard: P1 must be at the declare-blockers prompt"
+    );
+    assert!(
+        runner.declare_blockers(&[(victim, attacker)]).is_err(),
+        "CR 509.1b + CR 303.4b: the creature the Licid enchants can't block"
+    );
+    runner
+        .declare_blockers(&[(bystander, attacker)])
+        .expect("paired control: the unenchanted bystander may block");
+}
