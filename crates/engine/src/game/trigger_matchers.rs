@@ -7,7 +7,7 @@ use crate::types::ability::{
     TargetRef, TriggerDefinition, TypedFilter,
 };
 use crate::types::events::{BoundActivationCost, ExertOrigin, GameEvent, PlayerActionKind};
-use crate::types::game_state::{GameState, TriggerSourceContext};
+use crate::types::game_state::{GameState, TriggerSourceContext, ZoneDeparture};
 use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
 use crate::types::triggers::{
@@ -1216,6 +1216,23 @@ fn named_origin_zone(origin: &OriginConstraint, from: Option<Zone>) -> Option<Zo
     }
 }
 
+/// CR 603.6c: a leaves-the-battlefield clause names the battlefield as the zone the
+/// object left and doesn't require it to have gone to a particular zone, so it also
+/// sees a phased-in permanent leave the game because its owner left the game.
+fn leaves_the_battlefield_clause(
+    origin: &OriginConstraint,
+    destination: Option<&Zone>,
+    destination_constraint: &DestinationConstraint,
+    from: Option<Zone>,
+) -> bool {
+    named_origin_zone(origin, from) == Some(Zone::Battlefield)
+        && destination.is_none()
+        && matches!(
+            destination_constraint,
+            DestinationConstraint::Any | DestinationConstraint::NotEquals(_)
+        )
+}
+
 fn destination_matches_constraint(zone: Zone, constraint: &DestinationConstraint) -> bool {
     match constraint {
         DestinationConstraint::Any => true,
@@ -1255,13 +1272,28 @@ fn zone_change_clause_matches(
     if !origin_ok {
         return false;
     }
-    if let Some(dest) = destination {
-        if dest != to {
-            return false;
+    match record.departure {
+        ZoneDeparture::Moved => {
+            if let Some(dest) = destination {
+                if dest != to {
+                    return false;
+                }
+            }
+            if !destination_matches_constraint(*to, destination_constraint) {
+                return false;
+            }
         }
-    }
-    if !destination_matches_constraint(*to, destination_constraint) {
-        return false;
+        // CR 800.4a + CR 603.6c: a phased-in permanent that left the game with
+        // its owner went to no zone, so only a leaves-the-battlefield clause sees
+        // it: one naming the battlefield as origin and no destination it went to.
+        ZoneDeparture::LeftGame => {
+            if !leaves_the_battlefield_clause(origin, destination, destination_constraint, *from) {
+                return false;
+            }
+        }
+        // CR 702.26k: a phased-out permanent leaving the game with its owner
+        // doesn't cause zone-change abilities to trigger.
+        ZoneDeparture::LeftGamePhasedOut => return false,
     }
     if let Some(filter) = valid_card {
         let ctx = super::filter::FilterContext::from_trigger_source(source_context);
@@ -3377,8 +3409,15 @@ pub(super) fn match_exiled(
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> bool {
-    if let GameEvent::ZoneChanged { object_id, to, .. } = event {
-        if *to != Zone::Exile {
+    if let GameEvent::ZoneChanged {
+        object_id,
+        to,
+        record,
+        ..
+    } = event
+    {
+        // CR 800.4a: an object that left the game with its owner was not exiled.
+        if *to != Zone::Exile || record.departure.left_game() {
             return false;
         }
         if !valid_card_matches(trigger, state, *object_id, source_context) {

@@ -2236,6 +2236,37 @@ pub fn mark_simultaneous_departures(events: &mut [GameEvent], group: &[ObjectId]
     }
 }
 
+/// CR 800.4a + CR 603.6c: Record that `object_id` left the game with its owner
+/// rather than moving to the zone the engine keeps it in. The player-leaves-game
+/// procedure calls this on the events and per-turn records (from `record_start`)
+/// that the object's move just produced, so trigger matchers and look-back queries
+/// read the departure as leaving the game, not as being exiled.
+pub fn mark_left_game(
+    state: &mut GameState,
+    events: &mut [GameEvent],
+    record_start: usize,
+    object_id: ObjectId,
+    departure: crate::types::game_state::ZoneDeparture,
+) {
+    for event in events.iter_mut() {
+        if let GameEvent::ZoneChanged {
+            object_id: moved,
+            record,
+            ..
+        } = event
+        {
+            if *moved == object_id {
+                record.departure = departure;
+            }
+        }
+    }
+    for record in state.zone_changes_this_turn.iter_mut().skip(record_start) {
+        if record.object_id == object_id {
+            record.departure = departure;
+        }
+    }
+}
+
 /// CR 603.10a: Mirror a simultaneous-departure stamp into the authoritative
 /// per-turn LKI records. A replacement-choice pause can split one logical
 /// simultaneous action across two action-result event buffers; the prior
