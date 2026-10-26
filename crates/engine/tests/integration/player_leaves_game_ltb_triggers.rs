@@ -7,14 +7,16 @@
 use engine::game::game_object::{PhaseOutCause, PhaseStatus};
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::triggers::drain_order_triggers_with_identity;
+use engine::game::zones::apply_resolved_zone_change;
 use engine::types::ability::{
     DelayedTriggerCondition, Effect, QuantityExpr, ResolvedAbility, TargetFilter,
 };
 use engine::types::actions::GameAction;
-use engine::types::game_state::{DelayedTrigger, WaitingFor};
+use engine::types::game_state::{DelayedTrigger, WaitingFor, ZoneDeparture};
 use engine::types::identifiers::ObjectId;
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
+use engine::types::resolved_commands::{ResolvedRulesCommand, ResolvedZoneChangeCommand};
 use engine::types::zones::Zone;
 
 const P2: PlayerId = PlayerId(2);
@@ -502,4 +504,82 @@ fn losing_to_zero_life_delayed_abilities_read_the_departure_as_leaving_the_game(
         0,
         "CR 800.4d: a delayed ability the departed player would control isn't put on the stack"
     );
+}
+
+/// CR 800.4a + CR 603.6c + CR 702.26k: the resolved-rules journal records each
+/// owned permanent's leave-the-game move with its departure, so a serialized
+/// replay of the concession installs the same records as live play: `LeftGame`
+/// for a phased-in permanent, `LeftGamePhasedOut` for a phased-out one, and
+/// `Moved` for the permanent the leaver controlled but didn't own (it is exiled).
+///
+/// REVERT-FAILING: stamping the departure after the move journals it leaves the
+/// recorded commands, and so the replayed records, at `Moved`.
+#[test]
+fn concession_journal_records_and_replays_the_departure() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let phased_in = scenario.add_creature(P2, "P2 Bear", 2, 2).id();
+    let phased_out = scenario.add_creature(P2, "P2 Phased Bear", 2, 2).id();
+    let borrowed = scenario
+        .add_creature(P1, "P1 Bear", 2, 2)
+        .controlled_by(P2)
+        .id();
+    let mut runner = scenario.build();
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&phased_out)
+        .expect("the bear is on the battlefield")
+        .phase_status = PhaseStatus::PhasedOut {
+        cause: PhaseOutCause::Directly,
+    };
+    let before = runner.state().clone();
+    let journal_start = before.resolved_rules_journal.entries().len();
+
+    runner
+        .act(GameAction::Concede { player_id: P2 })
+        .expect("P2 concedes");
+
+    let commands: Vec<ResolvedZoneChangeCommand> = runner
+        .state()
+        .resolved_rules_journal
+        .entries_since(journal_start)
+        .into_iter()
+        .filter_map(|entry| match entry.command {
+            Some(ResolvedRulesCommand::ZoneChange(command)) => Some(*command),
+            _ => None,
+        })
+        .collect();
+    let mut replayed = before.clone();
+    for command in &commands {
+        let wire = serde_json::to_string(command).expect("the command serializes");
+        let decoded: ResolvedZoneChangeCommand =
+            serde_json::from_str(&wire).expect("the command deserializes");
+        apply_resolved_zone_change(&mut replayed, &decoded).expect("the command replays");
+    }
+
+    for (id, expected) in [
+        (phased_in, ZoneDeparture::LeftGame),
+        (phased_out, ZoneDeparture::LeftGamePhasedOut),
+        (borrowed, ZoneDeparture::Moved),
+    ] {
+        let live = runner
+            .state()
+            .zone_changes_this_turn
+            .iter()
+            .rev()
+            .find(|record| record.object_id == id)
+            .expect("the live move is recorded");
+        assert_eq!(live.departure, expected, "{id:?}: live record");
+        let replayed_record = replayed
+            .zone_changes_this_turn
+            .iter()
+            .rev()
+            .find(|record| record.object_id == id)
+            .expect("the replayed move is recorded");
+        assert_eq!(
+            replayed_record.departure, expected,
+            "{id:?}: the replayed record matches live play"
+        );
+    }
 }

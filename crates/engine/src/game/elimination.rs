@@ -2,8 +2,9 @@ use std::collections::HashSet;
 
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    ActiveSearchDecisionAuthority, CostResume, GameEnd, GameState, PayCostKind, PendingCast,
-    PendingCostMoveResume, PendingSacrificeCostCompletion, WaitingFor, ZoneDeparture,
+    ActiveSearchDecisionAuthority, CostResume, GameEnd, GameState, LeavingGameDeparture,
+    PayCostKind, PendingCast, PendingCostMoveResume, PendingSacrificeCostCompletion, WaitingFor,
+    ZoneDeparture,
 };
 use crate::types::identifiers::ObjectIncarnationRef;
 use crate::types::match_config::MatchPhase;
@@ -954,16 +955,14 @@ fn exile_owned_objects_on_player_left_game(
         } else {
             ZoneDeparture::LeftGame
         };
-        let event_start = events.len();
-        let record_start = state.zone_changes_this_turn.len();
-        move_object_for_player_left_game(state, id, player, events);
-        super::zones::mark_left_game(
-            state,
-            &mut events[event_start..],
-            record_start,
-            id,
+        // The move's record carries the departure from the moment it is built
+        // (and journaled); see `GameState::leaving_game_departure`.
+        state.leaving_game_departure = Some(LeavingGameDeparture {
+            object_id: id,
             departure,
-        );
+        });
+        move_object_for_player_left_game(state, id, player, events);
+        state.leaving_game_departure = None;
     }
 }
 

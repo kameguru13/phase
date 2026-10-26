@@ -1777,6 +1777,15 @@ pub(crate) fn move_to_zone_with_entry_flags(
         zone_change_record.attachments.clone(),
     );
 
+    // CR 800.4a + CR 603.6c: the player-leaves-game procedure names how this
+    // object leaves its zone, so the record carries it before it is journaled.
+    if let Some(leaving) = state
+        .leaving_game_departure
+        .take_if(|leaving| leaving.object_id == object_id)
+    {
+        zone_change_record.departure = leaving.departure;
+    }
+
     // Command-zone routes select between the ordinary command container and
     // the owner-specific Attraction/Contraption containers. Stack routes have
     // their `StackEntry` insertion/removal owned by the casting and resolution
@@ -2232,37 +2241,6 @@ pub fn mark_simultaneous_departures(events: &mut [GameEvent], group: &[ObjectId]
                     .filter(|&member| member != *object_id)
                     .collect();
             }
-        }
-    }
-}
-
-/// CR 800.4a + CR 603.6c: Record that `object_id` left the game with its owner
-/// rather than moving to the zone the engine keeps it in. The player-leaves-game
-/// procedure calls this on the events and per-turn records (from `record_start`)
-/// that the object's move just produced, so trigger matchers read the departure as
-/// leaving the game, not as being exiled.
-pub fn mark_left_game(
-    state: &mut GameState,
-    events: &mut [GameEvent],
-    record_start: usize,
-    object_id: ObjectId,
-    departure: crate::types::game_state::ZoneDeparture,
-) {
-    for event in events.iter_mut() {
-        if let GameEvent::ZoneChanged {
-            object_id: moved,
-            record,
-            ..
-        } = event
-        {
-            if *moved == object_id {
-                record.departure = departure;
-            }
-        }
-    }
-    for record in state.zone_changes_this_turn.iter_mut().skip(record_start) {
-        if record.object_id == object_id {
-            record.departure = departure;
         }
     }
 }
