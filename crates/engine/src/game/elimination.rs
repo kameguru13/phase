@@ -198,6 +198,7 @@ fn eliminate_players(
     events: &mut Vec<GameEvent>,
 ) {
     let first_event = events.len();
+    let first_record = state.zone_changes_this_turn.len();
     let mut eliminated_any = false;
     let mut leaving_set = HashSet::new();
     // CR 733: the CR 800.4a stack step is batch-scoped over the whole
@@ -329,6 +330,7 @@ fn eliminate_players(
     if !eliminated_any {
         return;
     }
+    mark_left_game_departures_simultaneous(state, events, first_event, first_record);
 
     // CR 800.4a: after ALL owned-exiles, end control effects the leaving players
     // control and exile anything still under a leaver's control. Runs ONCE over
@@ -431,7 +433,7 @@ fn eliminate_players(
     // left (CR 800.4d) and the drain puts the rest on the stack together. CR 104.1:
     // once the game is over, nothing triggered goes on the stack.
     if departure_triggers == DepartureTriggers::CollectedByDeparture && game_over_winner.is_none() {
-        super::triggers::collect_triggers_into_deferred(state, &events[first_event..]);
+        super::triggers::collect_unclaimed_triggers_into_deferred(state, events, first_event);
     }
 
     // CR 603.3b + CR 800.4a: Always resolve in-flight trigger-ordering work
@@ -957,9 +959,6 @@ fn exile_owned_objects_on_player_left_game(
     to_exile.sort_by_key(|id| id.0);
     to_exile.dedup();
 
-    let first_event = events.len();
-    let first_record = state.zone_changes_this_turn.len();
-    let mut left_battlefield = Vec::new();
     for id in to_exile {
         // CR 603.6c + CR 702.26k: a phased-in permanent leaving the game with its
         // owner triggers leaves-the-battlefield abilities; a phased-out one
@@ -973,9 +972,6 @@ fn exile_owned_objects_on_player_left_game(
         } else {
             ZoneDeparture::LeftGame
         };
-        if departure == ZoneDeparture::LeftGame && state.battlefield.contains(&id) {
-            left_battlefield.push(id);
-        }
         let event_start = events.len();
         let record_start = state.zone_changes_this_turn.len();
         move_object_for_player_left_game(state, id, player, events);
@@ -987,9 +983,31 @@ fn exile_owned_objects_on_player_left_game(
             departure,
         );
     }
-    // CR 800.4a + CR 603.10a: everything the player owns leaves the game at once,
-    // so a leaves-the-battlefield observer among those permanents (one a surviving
-    // player controlled) sees the others leave with it.
+}
+
+/// CR 800.4a + CR 603.10a: everything the leaving players own leaves the game at
+/// once, so a leaves-the-battlefield observer among those permanents (one a
+/// surviving player controlled) sees the others leave with it. Stamps the
+/// phased-in permanents that left the game in `events[first_event..]` and in the
+/// per-turn records from `first_record` as one simultaneous departure.
+fn mark_left_game_departures_simultaneous(
+    state: &mut GameState,
+    events: &mut [GameEvent],
+    first_event: usize,
+    first_record: usize,
+) {
+    let left_battlefield: Vec<_> = events[first_event..]
+        .iter()
+        .filter_map(|event| match event {
+            GameEvent::ZoneChanged {
+                object_id,
+                from: Some(Zone::Battlefield),
+                record,
+                ..
+            } if record.departure == ZoneDeparture::LeftGame => Some(*object_id),
+            _ => None,
+        })
+        .collect();
     super::zones::mark_simultaneous_departures(&mut events[first_event..], &left_battlefield);
     let records: Vec<usize> = (first_record..state.zone_changes_this_turn.len()).collect();
     super::zones::mark_simultaneous_departure_records(state, &records, &left_battlefield);

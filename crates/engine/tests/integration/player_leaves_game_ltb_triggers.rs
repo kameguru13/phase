@@ -7,8 +7,11 @@
 use engine::game::game_object::{PhaseOutCause, PhaseStatus};
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::triggers::drain_order_triggers_with_identity;
+use engine::types::ability::{
+    DelayedTriggerCondition, Effect, QuantityExpr, ResolvedAbility, TargetFilter,
+};
 use engine::types::actions::GameAction;
-use engine::types::game_state::WaitingFor;
+use engine::types::game_state::{DelayedTrigger, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
@@ -23,14 +26,22 @@ const EXTRACTOR_DEMON_ORACLE: &str = "Flying\n\
 const SOULHERDER_ORACLE: &str =
     "Whenever a creature is exiled from the battlefield, put a +1/+1 counter on this creature.";
 
-/// The board every test shares: P0 has Extractor Demon and Soulherder; P2 owns
-/// a bear, and controls a bear P1 owns.
+const EXILE_WATCHER_ORACLE: &str =
+    "Whenever a creature is put into exile from the battlefield, you gain 1 life.";
+
+/// The board every test shares: P0 has Extractor Demon, Soulherder and an
+/// exile watcher (a zone-change trigger naming exile as the destination); P2
+/// owns a bear, and controls a bear P1 owns. Two P0 enchantments are the sources
+/// of delayed abilities a test may install on the owned bear.
 struct Board {
     runner: GameRunner,
     demon: ObjectId,
     soulherder: ObjectId,
+    exile_watcher: ObjectId,
     owned_bear: ObjectId,
     borrowed_bear: ObjectId,
+    leaves_marker: ObjectId,
+    dies_or_exiled_marker: ObjectId,
 }
 
 fn board(configure: impl FnOnce(&mut GameScenario)) -> Board {
@@ -42,19 +53,78 @@ fn board(configure: impl FnOnce(&mut GameScenario)) -> Board {
     let soulherder = scenario
         .add_creature_from_oracle(P0, "Soulherder", 1, 1, SOULHERDER_ORACLE)
         .id();
+    let exile_watcher = scenario
+        .add_creature_from_oracle(P0, "Exile Watcher", 1, 1, EXILE_WATCHER_ORACLE)
+        .id();
     let owned_bear = scenario.add_creature(P2, "P2 Bear", 2, 2).id();
     let borrowed_bear = scenario
         .add_creature(P1, "P1 Bear", 2, 2)
         .controlled_by(P2)
+        .id();
+    let leaves_marker = scenario
+        .add_creature(P0, "Leaves Marker", 0, 0)
+        .as_enchantment()
+        .id();
+    let dies_or_exiled_marker = scenario
+        .add_creature(P0, "Dies Or Exiled Marker", 0, 0)
+        .as_enchantment()
         .id();
     configure(&mut scenario);
     Board {
         runner: scenario.build(),
         demon,
         soulherder,
+        exile_watcher,
         owned_bear,
         borrowed_bear,
+        leaves_marker,
+        dies_or_exiled_marker,
     }
+}
+
+/// CR 603.7c: install a one-shot delayed ability P0 controls, sourced from
+/// `marker`, that gains P0 one life when `condition` is met.
+fn install_delayed_gain_life(
+    runner: &mut GameRunner,
+    marker: ObjectId,
+    condition: DelayedTriggerCondition,
+) {
+    runner
+        .state_mut()
+        .delayed_triggers
+        .push(DelayedTrigger::new(
+            condition,
+            Box::new(ResolvedAbility::new(
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    player: TargetFilter::Controller,
+                },
+                vec![],
+                marker,
+                P0,
+            )),
+            P0,
+            marker,
+            true,
+        ));
+}
+
+/// The two delayed abilities on the owned bear: "when it leaves the
+/// battlefield" and "when it dies or is exiled".
+fn install_delayed_watchers_on_owned_bear(board: &mut Board) {
+    let bear = board.owned_bear;
+    install_delayed_gain_life(
+        &mut board.runner,
+        board.leaves_marker,
+        DelayedTriggerCondition::WhenLeavesPlay { object_id: bear },
+    );
+    install_delayed_gain_life(
+        &mut board.runner,
+        board.dies_or_exiled_marker,
+        DelayedTriggerCondition::WhenDiesOrExiled {
+            filter: TargetFilter::SpecificObject { id: bear },
+        },
+    );
 }
 
 /// Put pending triggers on the stack: order them as listed and give each the
@@ -90,41 +160,73 @@ fn zone(runner: &GameRunner, id: ObjectId) -> Zone {
     runner.state().objects[&id].zone
 }
 
-/// CR 104.3a + CR 800.4a + CR 603.6c: P2 concedes. Their bear leaves the game
-/// and the bear they controlled is exiled (it is still controlled by P2 once the
-/// owned objects are gone). Extractor Demon sees both leave the battlefield;
-/// Soulherder sees only the exiled one.
-///
-/// REVERT-FAILING: without the concession collecting its triggers, the Demon
-/// triggers zero times; without the leave-the-game departure, Soulherder
-/// triggers for the bear that left the game too.
-#[test]
-fn concession_triggers_leaves_the_battlefield_but_not_exile_for_owned_permanents() {
-    let Board {
-        mut runner,
-        demon,
-        soulherder,
-        owned_bear,
-        borrowed_bear,
-    } = board(|_| {});
-
-    runner
-        .act(GameAction::Concede { player_id: P2 })
-        .expect("P2 concedes");
-    assert_eq!(zone(&runner, owned_bear), Zone::Exile);
-    assert_eq!(zone(&runner, borrowed_bear), Zone::Exile);
-
-    drive_trigger_prompts(&mut runner);
+/// Assert what P0's observers put on the stack for P2's departure: the bear P2
+/// owned left the game, and the bear P2 controlled but didn't own was exiled.
+fn assert_departure_triggers(board: &Board) {
+    let runner = &board.runner;
     assert_eq!(
-        triggers_from(&runner, demon),
+        triggers_from(runner, board.demon),
         2,
-        "CR 603.6c: Extractor Demon sees the conceding player's bear leave the game \
-         and the bear they controlled get exiled"
+        "CR 603.6c: Extractor Demon sees the bear P2 owned leave the game and the bear \
+         P2 controlled get exiled"
     );
     assert_eq!(
-        triggers_from(&runner, soulherder),
+        triggers_from(runner, board.soulherder),
         1,
         "CR 800.4a: only the bear P2 controlled but didn't own was exiled"
+    );
+    assert_eq!(
+        triggers_from(runner, board.exile_watcher),
+        1,
+        "CR 800.4a: a trigger naming exile as the destination sees only the exiled bear"
+    );
+}
+
+/// Assert what the two delayed abilities on the owned bear put on the stack.
+fn assert_delayed_departure_triggers(
+    runner: &GameRunner,
+    leaves: ObjectId,
+    dies_or_exiled: ObjectId,
+) {
+    assert_eq!(
+        triggers_from(runner, leaves),
+        1,
+        "CR 603.6c: the delayed leaves-the-battlefield ability sees the bear leave the game"
+    );
+    assert_eq!(
+        triggers_from(runner, dies_or_exiled),
+        0,
+        "CR 800.4a: the bear that left the game neither died nor was exiled"
+    );
+}
+
+/// CR 104.3a + CR 800.4a + CR 603.6c: P2 concedes. Their bear leaves the game
+/// and the bear they controlled is exiled (it is still controlled by P2 once the
+/// owned objects are gone). Leaves-the-battlefield observers, ordinary and
+/// delayed, see both leave; exile observers see only the exiled one.
+///
+/// REVERT-FAILING: without the concession collecting its triggers (ordinary and
+/// delayed), the Demon and the delayed leaves ability trigger zero times; without
+/// the leave-the-game departure, Soulherder and the exile watcher trigger for the
+/// bear that left the game too.
+#[test]
+fn concession_triggers_leaves_the_battlefield_but_not_exile_for_owned_permanents() {
+    let mut board = board(|_| {});
+    install_delayed_watchers_on_owned_bear(&mut board);
+
+    board
+        .runner
+        .act(GameAction::Concede { player_id: P2 })
+        .expect("P2 concedes");
+    assert_eq!(zone(&board.runner, board.owned_bear), Zone::Exile);
+    assert_eq!(zone(&board.runner, board.borrowed_bear), Zone::Exile);
+
+    drive_trigger_prompts(&mut board.runner);
+    assert_departure_triggers(&board);
+    assert_delayed_departure_triggers(
+        &board.runner,
+        board.leaves_marker,
+        board.dies_or_exiled_marker,
     );
 }
 
@@ -133,31 +235,43 @@ fn concession_triggers_leaves_the_battlefield_but_not_exile_for_owned_permanents
 /// this row pins the departure reading: the owned bear left the game and was not
 /// exiled.
 ///
-/// REVERT-FAILING: without the leave-the-game departure, Soulherder triggers
-/// twice.
+/// REVERT-FAILING: without the leave-the-game departure, Soulherder and the exile
+/// watcher trigger twice.
 #[test]
 fn losing_to_zero_life_triggers_leaves_the_battlefield_but_not_exile_for_owned_permanents() {
-    let Board {
-        mut runner,
-        demon,
-        soulherder,
-        ..
-    } = board(|scenario| {
+    let mut board = board(|scenario| {
         scenario.with_life(P2, 0);
     });
 
-    runner
+    board
+        .runner
         .act(GameAction::PassPriority)
         .expect("state-based actions run");
-    assert!(runner.state().players[2].is_eliminated);
+    assert!(board.runner.state().players[2].is_eliminated);
 
-    drive_trigger_prompts(&mut runner);
-    assert_eq!(triggers_from(&runner, demon), 2);
+    drive_trigger_prompts(&mut board.runner);
+    assert_departure_triggers(&board);
+}
+
+/// CR 104.3a + CR 104.1: a concession that ends the game puts nothing on the
+/// stack, though the conceding player's creature left the battlefield.
+#[test]
+fn concession_that_ends_the_game_puts_no_trigger_on_the_stack() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_creature_from_oracle(P0, "Extractor Demon", 5, 5, EXTRACTOR_DEMON_ORACLE);
+    scenario.add_creature(P1, "P1 Bear", 2, 2);
+    let mut runner = scenario.build();
+
+    runner
+        .act(GameAction::Concede { player_id: P1 })
+        .expect("P1 concedes");
     assert_eq!(
-        triggers_from(&runner, soulherder),
-        1,
-        "CR 800.4a: only the bear P2 controlled but didn't own was exiled"
+        runner.state().waiting_for,
+        WaitingFor::GameOver { winner: Some(P0) }
     );
+    assert!(runner.state().stack.is_empty());
+    assert!(runner.state().deferred_triggers.is_empty());
 }
 
 /// CR 702.26k: a phased-out permanent owned by a leaving player also leaves the
@@ -241,4 +355,48 @@ fn concession_departing_observer_sees_the_other_permanents_that_leave_with_it() 
         .stack
         .iter()
         .all(|entry| entry.controller == P0));
+}
+
+/// CR 704.5a + CR 800.4a + CR 603.6c + CR 603.7c: delayed abilities on a
+/// permanent whose owner loses to a state-based action. "When it leaves the
+/// battlefield" sees it leave the game (the reach guard); "when it dies or is
+/// exiled" doesn't, since it did neither. No ordinary trigger opens a prompt on
+/// this board.
+///
+/// REVERT-FAILING: without the departure gate on the delayed matchers, the
+/// "dies or is exiled" ability triggers.
+#[test]
+fn losing_to_zero_life_delayed_abilities_read_the_departure_as_leaving_the_game() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let bear = scenario.add_creature(P2, "P2 Bear", 2, 2).id();
+    let leaves = scenario
+        .add_creature(P0, "Leaves Marker", 0, 0)
+        .as_enchantment()
+        .id();
+    let dies_or_exiled = scenario
+        .add_creature(P0, "Dies Or Exiled Marker", 0, 0)
+        .as_enchantment()
+        .id();
+    scenario.with_life(P2, 0);
+    let mut runner = scenario.build();
+    install_delayed_gain_life(
+        &mut runner,
+        leaves,
+        DelayedTriggerCondition::WhenLeavesPlay { object_id: bear },
+    );
+    install_delayed_gain_life(
+        &mut runner,
+        dies_or_exiled,
+        DelayedTriggerCondition::WhenDiesOrExiled {
+            filter: TargetFilter::SpecificObject { id: bear },
+        },
+    );
+
+    runner
+        .act(GameAction::PassPriority)
+        .expect("state-based actions run");
+    assert!(runner.state().players[2].is_eliminated);
+    drive_trigger_prompts(&mut runner);
+    assert_delayed_departure_triggers(&runner, leaves, dies_or_exiled);
 }

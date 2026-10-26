@@ -8455,6 +8455,29 @@ pub(crate) fn collect_triggers_into_deferred(state: &mut GameState, events: &[Ga
     state.deferred_triggers.extend(pending);
 }
 
+/// CR 603.2 + CR 603.2c + CR 603.7: Collect the ordinary and delayed triggered
+/// abilities that `events[event_start..]` trigger into `state.deferred_triggers`,
+/// skipping occurrences a collector already claimed. For an action whose events
+/// no post-action pipeline scans (a concession, CR 104.3a): the same collect step
+/// the pipeline runs, without its dispatch.
+pub(crate) fn collect_unclaimed_triggers_into_deferred(
+    state: &mut GameState,
+    events: &[GameEvent],
+    event_start: usize,
+) {
+    let consumed = state.consumed_before_priority_trigger_events.clone();
+    let ordinary =
+        filter_already_collected_trigger_events_from(state, events, event_start, &consumed);
+    collect_triggers_into_deferred(state, &ordinary);
+    let delayed = unclaimed_trigger_events_from(
+        events,
+        event_start,
+        TriggerCollectionRequester::Delayed,
+        &consumed,
+    );
+    collect_unclaimed_delayed_triggers_into_deferred(state, events, &delayed);
+}
+
 /// Collect a completed SBA batch that paused on an SBA-owned player choice.
 ///
 /// The marker is a narrow scheduling ownership record, not a general queue
@@ -14627,13 +14650,15 @@ fn delayed_trigger_event_with_index(
                 .find(|(_, e)| matches!(e, GameEvent::PhaseChanged { phase: p } if p == phase))
                 .map(|(idx, event)| (idx, event.clone()))
         }
+        // CR 603.6c + CR 702.26k: a phased-in permanent leaving the game with its
+        // owner leaves the battlefield; a phased-out one triggers nothing.
         DelayedTriggerCondition::WhenLeavesPlay { object_id } => events
             .iter()
             .enumerate()
             .find(|(_, e)| {
                 matches!(e,
-                    GameEvent::ZoneChanged { object_id: id, from: Some(Zone::Battlefield), .. }
-                    if *id == *object_id
+                    GameEvent::ZoneChanged { object_id: id, from: Some(Zone::Battlefield), record, .. }
+                    if *id == *object_id && record.departure.observed_leaving_battlefield(false)
                 )
             })
             .map(|(idx, event)| (idx, event.clone())),
@@ -14675,6 +14700,7 @@ fn delayed_trigger_event_with_index(
             )
         }
         // "when [object] dies or is exiled" — zone change to graveyard OR exile from battlefield.
+        // CR 800.4a: an object that left the game with its owner was not exiled.
         DelayedTriggerCondition::WhenDiesOrExiled { filter } => events
             .iter()
             .enumerate()
@@ -14684,8 +14710,9 @@ fn delayed_trigger_event_with_index(
                     GameEvent::ZoneChanged {
                         from: Some(Zone::Battlefield),
                         to: Zone::Graveyard | Zone::Exile,
+                        record,
                         ..
-                    }
+                    } if record.departure.observed_leaving_battlefield(true)
                 ) && matches!(
                     e,
                     GameEvent::ZoneChanged { object_id, .. }
@@ -14787,9 +14814,15 @@ fn delayed_zone_change_event_with_index(
                     object_id,
                     from: event_from,
                     to: event_to,
-                    ..
+                    record,
                 } if from.is_none_or(|zone| *event_from == Some(zone))
                     && to.is_none_or(|zone| *event_to == zone)
+                    // CR 800.4a + CR 603.6c: an object that left the game with its
+                    // owner went to no zone; only a leaves-the-battlefield watcher
+                    // naming no destination sees it.
+                    && (record.departure.is_moved()
+                        || (from == Some(Zone::Battlefield)
+                            && record.departure.observed_leaving_battlefield(to.is_some())))
                     && delayed_zone_change_filter_matches(
                         state,
                         *object_id,

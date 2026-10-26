@@ -1702,6 +1702,20 @@ impl ZoneDeparture {
     pub fn left_game(&self) -> bool {
         !self.is_moved()
     }
+
+    /// CR 800.4a + CR 603.6c + CR 702.26k: whether an ability watching for an
+    /// object to leave the battlefield sees this departure from the battlefield.
+    /// `names_destination` is whether the ability also requires the object to go
+    /// to a particular zone. An object that left the game went to no zone, so only
+    /// an ability naming no destination sees it, and only when it was a phased-in
+    /// permanent.
+    pub fn observed_leaving_battlefield(&self, names_destination: bool) -> bool {
+        match self {
+            ZoneDeparture::Moved => true,
+            ZoneDeparture::LeftGame => !names_destination,
+            ZoneDeparture::LeftGamePhasedOut => false,
+        }
+    }
 }
 
 /// Deserialization shape of [`ZoneChangeRecord`]; a record saved without `arrival` loads with arrival equal to departure.
