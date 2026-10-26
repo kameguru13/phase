@@ -863,25 +863,7 @@ fn prune_pending_trigger_order(state: &mut GameState) {
 /// CR 800.4a: Remove deferred triggers controlled by eliminated players.
 fn prune_deferred_triggers_for_eliminated_players(state: &mut GameState) {
     let deferred = std::mem::take(&mut state.deferred_triggers);
-    let mut terminal_firings = Vec::new();
-    for context in deferred {
-        if state
-            .players
-            .iter()
-            .find(|player| player.id == context.pending.controller)
-            .is_some_and(|player| !player.is_eliminated)
-        {
-            state.deferred_triggers.push(context);
-        } else {
-            terminal_firings.push(context.firing());
-        }
-    }
-    for firing in terminal_firings {
-        crate::game::lifecycle::record_delayed_terminal(
-            firing,
-            crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
-        );
-    }
+    state.deferred_triggers = super::triggers::retire_departed_controller_contexts(state, deferred);
 }
 
 /// CR 603.3b: If prune collapsed an ordering pass into `deferred_triggers`

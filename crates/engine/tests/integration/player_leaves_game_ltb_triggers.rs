@@ -89,6 +89,16 @@ fn install_delayed_gain_life(
     marker: ObjectId,
     condition: DelayedTriggerCondition,
 ) {
+    install_delayed_gain_life_for(runner, P0, marker, condition);
+}
+
+/// [`install_delayed_gain_life`] for a delayed ability `controller` controls.
+fn install_delayed_gain_life_for(
+    runner: &mut GameRunner,
+    controller: PlayerId,
+    marker: ObjectId,
+    condition: DelayedTriggerCondition,
+) {
     runner
         .state_mut()
         .delayed_triggers
@@ -101,9 +111,9 @@ fn install_delayed_gain_life(
                 },
                 vec![],
                 marker,
-                P0,
+                controller,
             )),
-            P0,
+            controller,
             marker,
             true,
         ));
@@ -415,10 +425,12 @@ fn losing_to_zero_life_departing_observer_sees_the_other_permanents_that_leave_w
 /// permanent whose owner loses to a state-based action. "When it leaves the
 /// battlefield" sees it leave the game (the reach guard); "when it dies or is
 /// exiled" doesn't, since it did neither. No ordinary trigger opens a prompt on
-/// this board.
+/// this board. A delayed leaves-the-battlefield ability P2 controls triggers
+/// too, but isn't put on the stack (CR 800.4d).
 ///
 /// REVERT-FAILING: without the departure gate on the delayed matchers, the
-/// "dies or is exiled" ability triggers.
+/// "dies or is exiled" ability triggers; without retiring departed-controller
+/// delayed contexts, P2's delayed ability goes on the stack.
 #[test]
 fn losing_to_zero_life_delayed_abilities_read_the_departure_as_leaving_the_game() {
     let mut scenario = GameScenario::new_n_player(3, 42);
@@ -432,8 +444,18 @@ fn losing_to_zero_life_delayed_abilities_read_the_departure_as_leaving_the_game(
         .add_creature(P0, "Dies Or Exiled Marker", 0, 0)
         .as_enchantment()
         .id();
+    let p2_delayed_source = scenario
+        .add_creature(P1, "P2 Delayed Source", 0, 0)
+        .as_enchantment()
+        .id();
     scenario.with_life(P2, 0);
     let mut runner = scenario.build();
+    install_delayed_gain_life_for(
+        &mut runner,
+        P2,
+        p2_delayed_source,
+        DelayedTriggerCondition::WhenLeavesPlay { object_id: bear },
+    );
     install_delayed_gain_life(
         &mut runner,
         leaves,
@@ -453,4 +475,9 @@ fn losing_to_zero_life_delayed_abilities_read_the_departure_as_leaving_the_game(
     assert!(runner.state().players[2].is_eliminated);
     drive_trigger_prompts(&mut runner);
     assert_delayed_departure_triggers(&runner, leaves, dies_or_exiled);
+    assert_eq!(
+        triggers_from(&runner, p2_delayed_source),
+        0,
+        "CR 800.4d: a delayed ability the departed player would control isn't put on the stack"
+    );
 }

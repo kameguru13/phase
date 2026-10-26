@@ -979,16 +979,10 @@ impl PendingActivationTriggerCollection {
         for operation in self.operation_journal {
             let _ = TriggerCollectionSession::apply_operation(state, operation);
         }
-        for context in self.pending_contexts {
-            if super::players::is_alive(state, context.pending.controller) {
-                deferred_contexts.push(context);
-            } else {
-                crate::game::lifecycle::record_delayed_terminal(
-                    context.firing(),
-                    crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
-                );
-            }
-        }
+        deferred_contexts.extend(retire_departed_controller_contexts(
+            state,
+            self.pending_contexts,
+        ));
     }
 
     fn rebuild_staged_state(&self, state: &GameState) -> GameState {
@@ -6768,20 +6762,9 @@ fn collect_pending_triggers_with_collection(
     apply_trigger_doubling(state, &mut pending);
     pending = filter_auto_inert_noop_triggers(state, pending);
 
-    // CR 800.4d: a triggered ability that would be controlled by a player who
-    // has left the game isn't put on the stack. A departing permanent's own
-    // leaves-the-battlefield abilities look back to a controller who may have
-    // left with it (CR 603.10a), on every path that collects the departure.
-    let (live, departed): (Vec<_>, Vec<_>) = pending
-        .into_iter()
-        .partition(|context| super::players::is_alive(state, context.pending.controller));
-    for context in departed {
-        crate::game::lifecycle::record_delayed_terminal(
-            context.firing(),
-            crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
-        );
-    }
-    let mut pending = live;
+    // CR 800.4d: a departing permanent's own leaves-the-battlefield abilities
+    // look back to a controller who may have left with it (CR 603.10a).
+    let mut pending = retire_departed_controller_contexts(state, pending);
 
     // CR 603.3b + CR 101.4 + CR 805.6/805.7: Stack-placement order is full
     // APNAP turn order. Shared-team-turn formats rank/order by team while
@@ -8468,6 +8451,25 @@ pub(crate) fn handle_order_triggers(
 pub(crate) fn collect_triggers_into_deferred(state: &mut GameState, events: &[GameEvent]) {
     let pending = collect_pending_triggers(state, events);
     state.deferred_triggers.extend(pending);
+}
+
+/// CR 800.4d: a triggered ability that would be controlled by a player who has
+/// left the game isn't put on the stack. Retires each such context as
+/// `Eliminated` and returns the rest in their order.
+pub(crate) fn retire_departed_controller_contexts(
+    state: &GameState,
+    contexts: Vec<PendingTriggerContext>,
+) -> Vec<PendingTriggerContext> {
+    let (live, departed): (Vec<_>, Vec<_>) = contexts
+        .into_iter()
+        .partition(|context| super::players::is_alive(state, context.pending.controller));
+    for context in departed {
+        crate::game::lifecycle::record_delayed_terminal(
+            context.firing(),
+            crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
+        );
+    }
+    live
 }
 
 /// CR 603.2 + CR 603.2c + CR 603.7: Collect the ordinary and delayed triggered
@@ -14137,7 +14139,7 @@ fn collect_matching_delayed_triggers(
     }
 
     let mut consumed_events = Vec::new();
-    let mut pending: Vec<PendingTriggerContext> = to_fire
+    let pending: Vec<PendingTriggerContext> = to_fire
         .into_iter()
         .map(
             |(mut trigger, consume, trigger_events, removed_one_shot, matched_alternative)| {
@@ -14178,6 +14180,9 @@ fn collect_matching_delayed_triggers(
             },
         )
         .collect();
+    // CR 800.4d: a delayed ability whose controller left the game fires into
+    // nothing; its one-shot record is already gone.
+    let mut pending = retire_departed_controller_contexts(state, pending);
 
     // CR 603.3b + CR 101.4: APNAP stack-placement order for the firing batch.
     // Stable sort; the per-batch timestamp (state.turn_number) is constant, so it
