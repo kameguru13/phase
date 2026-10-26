@@ -264,14 +264,29 @@ fn losing_to_zero_life_triggers_leaves_the_battlefield_but_not_exile_for_owned_p
 }
 
 /// CR 104.3a + CR 104.1: a concession that ends the game puts nothing on the
-/// stack, though the conceding player's creature left the battlefield.
+/// stack, though the conceding player's creature left the battlefield. Nothing
+/// is collected at all: a one-shot delayed "when it leaves the battlefield"
+/// ability on that creature is still installed afterwards, since collecting it
+/// would have consumed it.
+///
+/// REVERT-FAILING: without the game-over guard on the concession's collection,
+/// the delayed ability is consumed.
 #[test]
 fn concession_that_ends_the_game_puts_no_trigger_on_the_stack() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     scenario.add_creature_from_oracle(P0, "Extractor Demon", 5, 5, EXTRACTOR_DEMON_ORACLE);
-    scenario.add_creature(P1, "P1 Bear", 2, 2);
+    let bear = scenario.add_creature(P1, "P1 Bear", 2, 2).id();
+    let marker = scenario
+        .add_creature(P0, "Leaves Marker", 0, 0)
+        .as_enchantment()
+        .id();
     let mut runner = scenario.build();
+    install_delayed_gain_life(
+        &mut runner,
+        marker,
+        DelayedTriggerCondition::WhenLeavesPlay { object_id: bear },
+    );
 
     runner
         .act(GameAction::Concede { player_id: P1 })
@@ -280,8 +295,15 @@ fn concession_that_ends_the_game_puts_no_trigger_on_the_stack() {
         runner.state().waiting_for,
         WaitingFor::GameOver { winner: Some(P0) }
     );
+    // Reach guard: the bear left the battlefield with its owner.
+    assert_eq!(zone(&runner, bear), Zone::Exile);
     assert!(runner.state().stack.is_empty());
     assert!(runner.state().deferred_triggers.is_empty());
+    assert_eq!(
+        runner.state().delayed_triggers.len(),
+        1,
+        "CR 104.1: the finished game collects nothing, so the one-shot delayed ability is not consumed"
+    );
 }
 
 /// CR 702.26k: a phased-out permanent owned by a leaving player also leaves the
