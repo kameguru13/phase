@@ -32220,9 +32220,9 @@ pub(crate) fn fold_activation_cost(
 /// empty as this step ends and that could be spent toward activating `source_id`'s ability
 /// `ability_index`? A unit counts when the activation's payment context allows it and it can pay
 /// some leg of the activation's mana cost: a generic leg takes any type, a shard only the types
-/// it names (CR 107.4). Units held past the step by an expiry ("you don't lose this mana") are
-/// not counted; mana a step-end handler such as Upwelling would keep still is, which errs toward
-/// answering yes. Read-only, for callers weighing whether waiting wastes floating mana; the
+/// it names (CR 107.4) unless a CR 609.4b spend-as-any-color permission applies. Mana kept until
+/// end of turn ("you don't lose this mana as steps and phases end") is not counted; mana a
+/// step-end handler such as Upwelling would keep still is, which errs toward answering yes. Read-only, for callers weighing whether waiting wastes floating mana; the
 /// payment pipeline stays the authority on whether the whole cost can actually be paid.
 pub fn pool_mana_can_pay_toward_activation(
     state: &GameState,
@@ -32243,17 +32243,27 @@ pub fn pool_mana_can_pay_toward_activation(
         .collect();
     let context = activation_payment_context(state, source_id, Some(ability_index));
     let ctx = context.as_payment_context();
+    let permission =
+        player_mana_spend_permission_for_payment(state, player, Some(source_id), Some(&ctx));
     state
         .players
         .iter()
         .find(|p| p.id == player)
         .is_some_and(|p| {
             p.mana_pool.count_where(|unit| {
-                unit.expiry.is_none()
+                // CR 500.5: everything but end-of-turn retention empties before the main
+                // phase; a mana-burn `EndOfPhaseGroup` mark lasts only to the beginning phase's end.
+                let empties = match unit.expiry {
+                    None
+                    | Some(crate::types::mana::ManaExpiry::EndOfPhaseGroup)
+                    | Some(crate::types::mana::ManaExpiry::EndOfCombat) => true,
+                    Some(crate::types::mana::ManaExpiry::EndOfTurn) => false,
+                };
+                empties
                     && mana_payment::mana_unit_permits_payment_context(unit, &ctx)
                     && (generic > 0
                         || requirements.iter().any(|requirement| {
-                            mana_payment::unit_can_pay_toward_shard(unit, requirement)
+                            mana_payment::unit_can_pay_toward_shard(unit, requirement, permission)
                         }))
             }) > 0
         })

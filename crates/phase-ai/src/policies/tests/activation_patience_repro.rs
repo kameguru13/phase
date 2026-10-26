@@ -569,11 +569,26 @@ fn retained_floating_mana_leaves_the_hold() {
         vec![ManaRestriction::OnlyForActivation],
     );
     unit.expiry = Some(ManaExpiry::EndOfTurn);
-    board.state.players[AI.0 as usize].mana_pool.add(unit);
+    let mut burning = board.state.clone();
+    board.state.players[AI.0 as usize]
+        .mana_pool
+        .add(unit.clone());
     board.pinger = staff;
     assert_eq!(
         score_and_reason(&verdict_for(&board)).1,
         "activation_patience_hold"
+    );
+    // Mana-burn retention (`EndOfPhaseGroup`) lasts only to the beginning phase's end, so it
+    // still empties before the main phase and stands patience down.
+    unit.expiry = Some(ManaExpiry::EndOfPhaseGroup);
+    burning.players[AI.0 as usize].mana_pool.add(unit);
+    let burning = Board {
+        state: burning,
+        pinger: staff,
+    };
+    assert_eq!(
+        score_and_reason(&verdict_for(&burning)).1,
+        "activation_patience_floating_mana"
     );
 }
 

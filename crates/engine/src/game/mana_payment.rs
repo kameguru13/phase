@@ -2365,21 +2365,27 @@ fn mana_type_to_color(mt: ManaType) -> Option<crate::types::mana::ManaColor> {
     }
 }
 
-/// Map a `ManaCostShard` to its payment requirement (CR 107.4).
 /// CR 107.4: Could one unit of shape `unit` pay toward `requirement` on its own, ignoring the
 /// payment context (check that with [`mana_unit_permits_payment_context`])? Life and two-generic
-/// alternatives count only for the mana half they offer.
-pub(crate) fn unit_can_pay_toward_shard(unit: &ManaShape, requirement: &ShardRequirement) -> bool {
+/// alternatives count only for the mana half they offer. CR 609.4b: `permission` (spend mana as
+/// though it were mana of any color or type) lets the unit stand in for a named type.
+pub(crate) fn unit_can_pay_toward_shard(
+    unit: &ManaShape,
+    requirement: &ShardRequirement,
+    permission: Option<crate::types::ability::ManaSpendPermission>,
+) -> bool {
+    let pays_as = |required: ManaType| {
+        unit.color == required
+            || permission.is_some_and(|permission| permission.allows_payment_as(required))
+    };
     match *requirement {
-        ShardRequirement::Single(color) | ShardRequirement::Phyrexian(color) => unit.color == color,
+        ShardRequirement::Single(color) | ShardRequirement::Phyrexian(color) => pays_as(color),
         ShardRequirement::Hybrid(a, b) | ShardRequirement::HybridPhyrexian(a, b) => {
-            unit.color == a || unit.color == b
+            pays_as(a) || pays_as(b)
         }
         // CR 107.4e: {C/color} takes colorless or the colored half.
-        ShardRequirement::ColorlessHybrid(color) => {
-            unit.color == ManaType::Colorless || unit.color == color
-        }
-        // CR 107.4e + CR 107.3: a {2/color} half and X take mana of any type.
+        ShardRequirement::ColorlessHybrid(color) => pays_as(ManaType::Colorless) || pays_as(color),
+        // CR 107.4e + CR 107.4b: a {2/color} half and X take mana of any type.
         ShardRequirement::TwoGenericHybrid(_)
         | ShardRequirement::TwoGenericHybridPhyrexian(_)
         | ShardRequirement::X => true,
@@ -2389,6 +2395,7 @@ pub(crate) fn unit_can_pay_toward_shard(unit: &ManaShape, requirement: &ShardReq
     }
 }
 
+/// Map a `ManaCostShard` to its payment requirement (CR 107.4).
 pub(crate) fn shard_to_mana_type(shard: ManaCostShard) -> ShardRequirement {
     match shard {
         ManaCostShard::White => ShardRequirement::Single(ManaType::White),
