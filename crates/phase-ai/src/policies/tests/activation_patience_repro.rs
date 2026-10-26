@@ -45,6 +45,7 @@
 
 use engine::game::zones::create_object;
 use engine::parser::oracle::parse_oracle_text;
+use engine::types::ability::ActivationRestriction;
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::{GameState, WaitingFor};
@@ -140,6 +141,31 @@ fn build_board(phase: Phase, ai_life: i32, opponent_life: i32) -> Board {
     Board { state, pinger }
 }
 
+/// A permanent carrying Phyrexian Arena's real, verified upkeep trigger. Card
+/// type is irrelevant to the predicate under test (it reads
+/// `trigger_definitions`, not `core_types`), so the shared `creature()` builder
+/// is reused rather than adding a second, enchantment-flavored one.
+fn add_upkeep_trigger_source(state: &mut GameState) {
+    let arena_trigger = parse_oracle_text(
+        "At the beginning of your upkeep, you draw a card and you lose 1 life.",
+        "Phyrexian Arena",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    )
+    .triggers
+    .into_iter()
+    .next()
+    .expect("Phyrexian Arena parses one triggered ability");
+    let arena = creature(state, &mut Ids(9_800), AI, "Phyrexian Arena", 0, 0, None);
+    state
+        .objects
+        .get_mut(&arena)
+        .unwrap()
+        .trigger_definitions
+        .push(arena_trigger);
+}
+
 fn verdict_for(board: &Board) -> PolicyVerdict {
     let config = AiConfig::default();
     let mut session = AiSession::empty();
@@ -220,16 +246,27 @@ fn a_lethal_line_overrides_patience() {
     assert_eq!(delta, 0.0);
 }
 
-/// Escape hatch: the report's own exception — "if the Grim Lavamancer is going
-/// to die or leave play before the AI draws a card". Under real pressure
-/// "wait" is not actually on offer, so the policy stands down.
+/// The report's "going to die or leave play" exception has no reading on the
+/// AI's own turn with an empty stack: nothing targets the source and no opponent
+/// attacks before the main phase. Low life alone (below `any_immediate_threat`'s
+/// 40%-of-starting-life floor) therefore no longer stands patience down.
 #[test]
-fn a_threatened_board_overrides_patience() {
-    // Below `any_immediate_threat`'s 40%-of-starting-life floor.
+fn low_life_alone_does_not_override_patience() {
     let board = build_board(Phase::Upkeep, 5, 20);
     let (delta, reason) = score_and_reason(&verdict_for(&board));
-    assert_eq!(reason, "activation_patience_threatened");
-    assert_eq!(delta, 0.0);
+    assert_eq!(reason, "activation_patience_hold");
+    assert!(delta < 0.0, "got {delta}");
+}
+
+/// A lethal intent alone does not make an activation part of the line: only
+/// the activation's own damage reaching a live opponent's life does (CR 104.3b).
+/// The ping here deals 1 to an opponent at 2, so it is held.
+#[test]
+fn a_ping_short_of_lethal_is_held() {
+    let board = build_board(Phase::Upkeep, 20, 2);
+    let (delta, reason) = score_and_reason(&verdict_for(&board));
+    assert_eq!(reason, "activation_patience_hold");
+    assert!(delta < 0.0, "got {delta}");
 }
 
 /// A mana ability is not deferrable (CR 605.1a — it does not use the stack, and
@@ -258,26 +295,61 @@ fn a_mana_ability_is_not_treated_as_deferrable() {
     assert_eq!(delta, 0.0);
 }
 
-/// Review finding (PR #8696): the module previously gated `Phase::Draw` on
-/// the theory that it was one of the turn's low-information windows. It is
-/// not — CR 117.3a / CR 504.1/504.2 mean the active player only receives
-/// priority in the draw step AFTER the turn-based draw (and its triggers)
-/// have been dealt with, so any draw-step priority is already post-draw. This
-/// pins the corrected behavior: activating during the draw step must be
-/// treated exactly like the main phase, not like upkeep.
+/// CR 504.1/504.2 + CR 500.1: draw-step priority comes after the draw, so waiting
+/// buys no information, but the precombat main phase follows with nothing in
+/// between, so waiting gives nothing up: the ability is still on offer there and
+/// what it would spend now stays free for sorcery-speed plays (CR 307.1). The
+/// draw step is held under its own reason, distinct from the upkeep's.
 #[test]
-fn phase_draw_is_not_gated() {
+fn the_draw_step_holds_for_the_main_phase() {
     let board = build_board(Phase::Draw, 20, 20);
     let (delta, reason) = score_and_reason(&verdict_for(&board));
-    assert_eq!(
-        reason, "activation_patience_na",
-        "the draw step is post-draw by the time priority is offered (CR 504.1/504.2), so it \
-         must not be treated as a low-information window"
-    );
+    assert_eq!(reason, "activation_patience_hold_for_main");
+    assert!(delta < 0.0, "got {delta}");
+}
+
+/// The draw step's case never rested on information, so an upkeep-trigger
+/// source (which disables only the upkeep window) does not stand it down.
+#[test]
+fn an_upkeep_trigger_source_does_not_disable_the_draw_step() {
+    let mut board = build_board(Phase::Draw, 20, 20);
+    add_upkeep_trigger_source(&mut board.state);
+    let (delta, reason) = score_and_reason(&verdict_for(&board));
+    assert_eq!(reason, "activation_patience_hold_for_main");
+    assert!(delta < 0.0, "got {delta}");
+}
+
+/// CR 602.5: an ability restricted to the upkeep can't be activated in the main
+/// phase, so it is not deferrable and patience stays silent.
+#[test]
+fn an_upkeep_only_ability_is_not_deferrable() {
+    let mut board = build_board(Phase::Upkeep, 20, 20);
+    Arc::make_mut(
+        &mut board
+            .state
+            .objects
+            .get_mut(&board.pinger)
+            .unwrap()
+            .abilities,
+    )[0]
+    .activation_restrictions
+    .push(ActivationRestriction::DuringYourUpkeep);
+    let (delta, reason) = score_and_reason(&verdict_for(&board));
+    assert_eq!(reason, "activation_patience_na");
     assert_eq!(delta, 0.0);
 }
 
-/// Review finding (PR #8696): escape hatch 3 had no test, unlike its two
+/// An opponent's draw step is a live response window for the AI, not a wait.
+#[test]
+fn a_deferrable_ping_is_not_held_during_the_opponents_draw_step() {
+    let mut board = build_board(Phase::Draw, 20, 20);
+    board.state.active_player = OPP;
+    let (delta, reason) = score_and_reason(&verdict_for(&board));
+    assert_eq!(reason, "activation_patience_na");
+    assert_eq!(delta, 0.0);
+}
+
+/// Review finding (PR #8696): the conditional escape hatch had no test, unlike its two
 /// siblings, AND its CR citation was wrong twice over — first as CR 603.4
 /// (a TRIGGERED ability's intervening-if), then, in a maintainer fixup, as
 /// CR 602.5 ("a player can't begin to activate a PROHIBITED ability" —
@@ -346,7 +418,7 @@ fn a_conditional_ability_overrides_patience() {
     assert_eq!(delta, 0.0);
 }
 
-/// Review finding (PR #8696): `is_low_information_window` treated EVERY
+/// Review finding (PR #8696): `is_low_information_window` (now `patient_window`) treated EVERY
 /// empty-stack `Phase::Upkeep` priority state as the pristine "nothing has
 /// happened yet" window. CR 503.1a queues "at the beginning of your upkeep"
 /// triggers onto the stack BEFORE the active player's first priority grant —
@@ -363,13 +435,13 @@ fn a_conditional_ability_overrides_patience() {
 /// to observe from a single `GameState` snapshot). Instead it is deliberately
 /// coarse in the safe direction: ANY permanent the AI controls with a printed
 /// "at the beginning of your upkeep" trigger (`TriggerMode::Phase` +
-/// `phase: Some(Phase::Upkeep)`) stands the whole gate down for the AI's
+/// `phase: Some(Phase::Upkeep)`) stands the upkeep window down for the AI's
 /// upkeep, because CR 503.1a guarantees such a trigger is ALREADY queued (and,
 /// by the time the stack is next empty, already resolved) before the
 /// genuinely pristine window — so that window is provably unreachable
 /// whenever one exists, and nothing is being given up by excluding it.
 #[test]
-fn an_upkeep_trigger_source_disables_the_whole_gate() {
+fn an_upkeep_trigger_source_disables_the_upkeep_window() {
     let mut ids = Ids::new();
     let mut state = GameState::new_two_player(4242);
     state.phase = Phase::Upkeep;
@@ -387,28 +459,7 @@ fn an_upkeep_trigger_source_disables_the_whole_gate() {
     );
     creature(&mut state, &mut ids, OPP, "Wall", 1, 5, None);
 
-    // A separate permanent carrying Phyrexian Arena's real, verified upkeep
-    // trigger. Card type is irrelevant to the predicate under test (it reads
-    // `trigger_definitions`, not `core_types`), so the shared `creature()`
-    // builder is reused rather than adding a second, enchantment-flavored one.
-    let arena_trigger = parse_oracle_text(
-        "At the beginning of your upkeep, you draw a card and you lose 1 life.",
-        "Phyrexian Arena",
-        &[],
-        &["Enchantment".to_string()],
-        &[],
-    )
-    .triggers
-    .into_iter()
-    .next()
-    .expect("Phyrexian Arena parses one triggered ability");
-    let arena = creature(&mut state, &mut ids, AI, "Phyrexian Arena", 0, 0, None);
-    state
-        .objects
-        .get_mut(&arena)
-        .unwrap()
-        .trigger_definitions
-        .push(arena_trigger);
+    add_upkeep_trigger_source(&mut state);
 
     state.players[AI.0 as usize].life = 20;
     state.players[OPP.0 as usize].life = 20;
@@ -425,7 +476,7 @@ fn an_upkeep_trigger_source_disables_the_whole_gate() {
     assert_eq!(delta, 0.0);
 }
 
-/// Review finding: `is_low_information_window` checked `phase`, `stack`, and
+/// Review finding: `is_low_information_window` (now `patient_window`) checked `phase`, `stack`, and
 /// `WaitingFor::Priority`, but never `state.active_player == ai_player`. CR
 /// 117.4 rotates priority among every living player in turn
 /// (`crates/engine/src/game/priority.rs`'s `priority_pass_participants`), so

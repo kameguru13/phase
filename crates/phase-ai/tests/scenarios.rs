@@ -131,6 +131,106 @@ fn saved_cosmic_crucible_mana_prompt_uses_an_issued_action_and_advances() {
     );
 }
 
+/// Saved positions mtg-bot's judge rated as clear mistakes (pattern "Timing: Priority"): the AI
+/// used a deferrable ability in its own upkeep or draw step, with an empty stack, instead of
+/// waiting for its precombat main phase. Returns the state, the acting seat, and that ability's
+/// activation, which the position must still offer (the reach guard).
+fn judged_early_activation(
+    gz: &[u8],
+    phase: Phase,
+    source_name: &str,
+) -> (engine::types::game_state::GameState, PlayerId, GameAction) {
+    let state = load_saved_game_state(&gunzip_fixture(gz)).expect("judged position deserializes");
+    let player = state.active_player;
+    assert_eq!(
+        state.phase, phase,
+        "reach: the capture is in the judged step"
+    );
+    assert!(state.stack.is_empty(), "reach: the stack is empty");
+    assert!(
+        matches!(state.waiting_for, WaitingFor::Priority { player: holder } if holder == player),
+        "reach: the active player holds priority"
+    );
+    let activation = engine::ai_support::AiDecisionContract::issue(&state, player)
+        .candidates
+        .into_iter()
+        .map(|candidate| candidate.action)
+        .find(|action| {
+            matches!(action, GameAction::ActivateAbility { source_id, .. }
+            if state.objects[source_id].name == source_name)
+        })
+        .unwrap_or_else(|| panic!("reach: {source_name}'s activation is offered"));
+    (state, player, activation)
+}
+
+/// The root ranking the chooser samples from (CR 117.3a: the AI holds priority) must put
+/// passing above the early activation, at the four-seat Hard configuration the games ran at.
+fn assert_pass_outranks(
+    state: &engine::types::game_state::GameState,
+    player: PlayerId,
+    activation: &GameAction,
+    message: &str,
+) {
+    let config = phase_ai::config::create_config_for_players(
+        AiDifficulty::Hard,
+        Platform::Native,
+        state.players.len() as u8,
+    )
+    .into_measurement(42);
+    let scores = phase_ai::score_candidates(state, player, &config);
+    let score = |action: &GameAction| {
+        scores
+            .iter()
+            .find(|(candidate, _)| candidate == action)
+            .map(|(_, score)| *score)
+            .unwrap_or_else(|| panic!("reach: {action:?} is scored"))
+    };
+    assert!(
+        score(&GameAction::PassPriority) > score(activation),
+        "{message}: {scores:?}"
+    );
+}
+
+/// Cryptbreaker ("{1}{B}, {T}, Discard a card: Create a 2/2 black Zombie creature token.") in
+/// the AI's own draw step: the main phase follows with nothing in between (CR 500.1), so the
+/// mana and card stay available for it there, and passing must rank first.
+#[test]
+fn judged_cryptbreaker_draw_step_activation_waits_for_the_main_phase() {
+    let (state, player, activation) = judged_early_activation(
+        include_bytes!("../fixtures/scenarios/judged-cryptbreaker-draw-step.json.gz"),
+        Phase::Draw,
+        "Cryptbreaker",
+    );
+    assert_pass_outranks(
+        &state,
+        player,
+        &activation,
+        "the AI must not activate Cryptbreaker in its draw step",
+    );
+}
+
+/// Karn's Bastion ("{4}, {T}: Proliferate.") in the AI's own upkeep at 14 life of 40: low life
+/// alone gives no reason to act before the main phase, since no opponent attacks first, and
+/// passing must rank first.
+#[test]
+fn judged_karns_bastion_upkeep_activation_waits_at_low_life() {
+    let (state, player, activation) = judged_early_activation(
+        include_bytes!("../fixtures/scenarios/judged-karns-bastion-upkeep.json.gz"),
+        Phase::Upkeep,
+        "Karn's Bastion",
+    );
+    assert_eq!(
+        state.players[player.0 as usize].life, 14,
+        "reach: the AI is below 40% of 40"
+    );
+    assert_pass_outranks(
+        &state,
+        player,
+        &activation,
+        "the AI must not activate Karn's Bastion in its upkeep",
+    );
+}
+
 #[test]
 fn scenario_prefers_opponent_target_over_self() {
     let mut runner = GameScenario::new().build();

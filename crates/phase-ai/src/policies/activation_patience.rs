@@ -15,16 +15,16 @@
 //! (`tactical_gate.rs`) has no upkeep variant, and `card_hints` gives every
 //! `ActivateAbility` a flat base score with no timing term at all.
 //!
-//! The draw step is deliberately NOT one of the gated windows, even though it
-//! looks like the same class. CR 117.3a and CR 504.1/504.2 (matched by the
-//! engine's own comment beside `execute_draw` in `crates/engine/src/game/turns.rs`):
-//! the active player receives priority during the draw step only AFTER the
-//! turn-based draw has been dealt with — a skipped draw still runs that step
-//! first. So whenever this policy could observe draw-step priority, the card
-//! is already in hand; gating there would hold an activation back for
-//! information the AI already has. The untap step is excluded for a stronger
-//! reason: CR 502.4 means no player ever receives priority in it at all, so
-//! `WaitingFor::Priority` cannot occur there to gate on.
+//! The draw step is gated for a different reason. CR 117.3a and CR 504.1/504.2
+//! (matched by the engine's own comment beside `execute_draw` in
+//! `crates/engine/src/game/turns.rs`): the active player receives priority
+//! during the draw step only AFTER the turn-based draw, so waiting there buys no
+//! information. But the precombat main phase follows with nothing in between
+//! (CR 500.1), so waiting gives nothing up either: the ability can still be
+//! activated there, and the mana and untapped creatures it would spend now are
+//! still free for the sorcery-speed plays only the main phase allows (CR 307.1).
+//! The untap step is excluded because CR 502.4 means no player ever receives
+//! priority in it at all, so `WaitingFor::Priority` cannot occur there to gate on.
 //!
 //! So this policy asks one question — **does waiting cost anything?** — and
 //! penalises the activation when the answer is no.
@@ -37,16 +37,18 @@
 //! that activating now enables a line the AI cannot see from the root. The
 //! penalty is sized to lose to a real payoff and win against an idle ping.
 //!
-//! ## The three escape hatches
+//! ## The two escape hatches
 //!
-//! The report names them: activate early when the source "is going to die or
-//! leave play before the AI draws a card", when the damage is part of a lethal
-//! line, and (implicitly) when the ability's own condition is met *now* and
-//! might not be later. Those are [`any_immediate_threat`], `PushLethal` /
-//! lethal-damage, and `ability.condition`, in that order below.
+//! The report names when to activate early: when the damage is part of a lethal
+//! line, and (implicitly) when the ability's own condition is met *now* and might
+//! not be later. Those are lethal damage and `ability.condition`, in that order
+//! below. Its third exception, a source that "is going to die or leave play
+//! before the AI draws a card", has no reading in these windows: both are the
+//! AI's own turn with an empty stack, so nothing is targeting the source and no
+//! opponent attacks before the main phase.
 
 use engine::game::mana_abilities;
-use engine::types::ability::{AbilityDefinition, AbilityTag};
+use engine::types::ability::{AbilityDefinition, AbilityTag, ActivationRestriction};
 use engine::types::actions::GameAction;
 use engine::types::game_state::{GameState, WaitingFor};
 use engine::types::identifiers::ObjectId;
@@ -57,8 +59,6 @@ use engine::types::triggers::TriggerMode;
 use super::anti_self_harm::extract_damage_amount;
 use super::context::PolicyContext;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
-use super::self_protection_classify::any_immediate_threat;
-use crate::eval::StrategicIntent;
 use crate::features::DeckFeatures;
 use crate::search::ability_is_temporary_combat_modifier;
 use engine::game::players;
@@ -110,37 +110,44 @@ fn ability_is_deferrable(ability: &AbilityDefinition) -> bool {
     !mana_abilities::is_mana_ability(ability)
         && !ability_is_temporary_combat_modifier(ability)
         && ability.ability_tag != Some(AbilityTag::Cycling)
+        // CR 602.5: an ability restricted to "your upkeep" can't be activated in the main
+        // phase, so waiting would give it up.
+        && !ability
+            .activation_restrictions
+            .contains(&ActivationRestriction::DuringYourUpkeep)
 }
 
-/// CR 503.1: the upkeep step has no turn-based actions of its own, so taken
-/// with an empty stack it is the turn's low-information window — nothing has
-/// been drawn, cast, or declared yet.
+/// The AI's own windows before its precombat main phase in which it holds priority with an empty
+/// stack, and why waiting for the main phase costs nothing there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatientWindow {
+    /// CR 503.1: the upkeep step has no turn-based actions of its own, so taken with an empty
+    /// stack it is the turn's low-information window: nothing has been drawn, cast, or declared.
+    Upkeep,
+    /// CR 504.1 + CR 504.2 + CR 500.1: the draw step's priority comes after the draw, and the
+    /// precombat main phase follows it with nothing in between. Waiting buys no information
+    /// here, but it gives nothing up either: every instant-speed use of the ability is still on
+    /// offer in the main phase, and the mana and untapped permanents it would spend now are
+    /// still there for the sorcery-speed plays (CR 307.1) that only the main phase allows.
+    Draw,
+}
+
+/// The [`PatientWindow`] `ai_player` holds priority in, if any.
 ///
-/// The draw step and the untap step are NOT included, and both exclusions are
-/// load-bearing rather than incidental — see the module doc for the CR
-/// citations. In short: any draw-step priority this predicate could see is
-/// already post-draw (CR 504.1/504.2), so gating there would be pointless: the
-/// AI has exactly the information waiting would have bought it. And the untap
-/// step never grants priority at all (CR 502.4), so a `Phase::Untap` arm here
-/// would be dead code that misleadingly reads as though it were a live window.
+/// The untap step is excluded because CR 502.4 means no player ever receives priority in it, so
+/// `WaitingFor::Priority` cannot occur there. The end step is the *patient* window itself, the
+/// one a held ability is being saved for (`FetchLandPatiencePolicy` treats it the same way).
 ///
-/// The end step is deliberately NOT here either, but for a different reason —
-/// it is the *patient* window, the one a held ability is being saved for, and
-/// `FetchLandPatiencePolicy` already treats it as the correct time to act.
-///
-/// # Why this must be `ai_player`'s OWN upkeep
+/// # Why this must be `ai_player`'s OWN turn
 ///
 /// CR 117.4 rotates priority among every living player in turn
 /// (`crates/engine/src/game/priority.rs`'s `priority_pass_participants`), not
 /// just the active player — so the AI can hold `WaitingFor::Priority` with an
-/// empty stack during an OPPONENT's upkeep too. The whole premise here is
-/// "wait, you haven't drawn yet" — which only describes the AI's OWN draw
-/// still being ahead of it. During an opponent's upkeep the AI's next draw is
-/// no closer for having waited, and deferring costs something real: this
-/// priority window is the AI's chance to act BEFORE the opponent's draw and
-/// combat, and passing it up to "wait for information" trades away a live
-/// interaction window for no informational gain at all. `state.active_player
-/// == ai_player` is therefore a hard requirement, not a refinement.
+/// empty stack during an OPPONENT's upkeep or draw step too. During an opponent's turn the AI's
+/// next draw and main phase are no closer for having waited, and deferring costs something
+/// real: this priority window is the AI's chance to act BEFORE the opponent's draw and
+/// combat, and passing it up trades away a live interaction window for nothing.
+/// `state.active_player == ai_player` is therefore a hard requirement, not a refinement.
 ///
 /// # Why `ai_player` must control no beginning-of-upkeep trigger
 ///
@@ -161,13 +168,22 @@ fn ability_is_deferrable(ability: &AbilityDefinition) -> bool {
 /// queued (and, by the time the stack is next empty, already resolved)
 /// before the truly first grant, so the pristine window this predicate wants
 /// is provably unreachable whenever one exists — there is no non-conservative
-/// case being given up.
-fn is_low_information_window(state: &GameState, ai_player: PlayerId) -> bool {
-    state.phase == Phase::Upkeep
-        && state.active_player == ai_player
-        && state.stack.is_empty()
-        && matches!(state.waiting_for, WaitingFor::Priority { .. })
-        && !controls_beginning_of_upkeep_trigger(state, ai_player)
+/// case being given up. The draw step needs no such guard, since its case never rested on
+/// information.
+fn patient_window(state: &GameState, ai_player: PlayerId) -> Option<PatientWindow> {
+    if state.active_player != ai_player
+        || !state.stack.is_empty()
+        || !matches!(state.waiting_for, WaitingFor::Priority { .. })
+    {
+        return None;
+    }
+    match state.phase {
+        Phase::Upkeep if !controls_beginning_of_upkeep_trigger(state, ai_player) => {
+            Some(PatientWindow::Upkeep)
+        }
+        Phase::Draw => Some(PatientWindow::Draw),
+        _ => None,
+    }
 }
 
 /// Does `player` control a permanent with a printed "at the beginning of your
@@ -192,13 +208,13 @@ fn controls_beginning_of_upkeep_trigger(state: &GameState, player: PlayerId) -> 
     })
 }
 
-/// Is this activation part of a line that can end the game now? CR 104.3b — a
-/// player at 0 or less life loses, so damage that reaches a live opponent's life
-/// total is never worth deferring.
+/// Does this activation's own damage end the game now? CR 104.3b — a player at 0
+/// or less life loses, so damage that reaches a live opponent's life total is
+/// never worth deferring.
+///
+/// A lethal intent alone does not make an activation part of the line: the line
+/// is still there in the precombat main phase, before any combat it depends on.
 fn is_lethal_line(ctx: &PolicyContext<'_>) -> bool {
-    if matches!(ctx.strategic_intent(), StrategicIntent::PushLethal) {
-        return true;
-    }
     let Some(damage) = extract_damage_amount(&ctx.effects()) else {
         return false;
     };
@@ -237,28 +253,21 @@ impl TacticalPolicy for ActivationPatiencePolicy {
             return na();
         };
 
-        if !is_low_information_window(ctx.state, ctx.ai_player) {
+        let Some(window) = patient_window(ctx.state, ctx.ai_player) else {
             return na();
-        }
+        };
 
         if !activation_is_deferrable(ctx.state, *source_id, *ability_index) {
             return na();
         }
 
-        // Escape hatch 1 — the source may not survive to the patient window, so
-        // "wait" is not actually on offer. Also covers life pressure and an
-        // opponent board that can act before the AI gets another window.
-        if any_immediate_threat(ctx.state, ctx.ai_player) {
-            return PolicyVerdict::neutral(PolicyReason::new("activation_patience_threatened"));
-        }
-
-        // Escape hatch 2 — a lethal line beats any information the AI could buy
+        // Escape hatch 1 — a lethal line beats any information the AI could buy
         // by waiting.
         if is_lethal_line(ctx) {
             return PolicyVerdict::neutral(PolicyReason::new("activation_patience_lethal_line"));
         }
 
-        // Escape hatch 3 — CR 608.2c: `ability.condition` on an ACTIVATED
+        // Escape hatch 2 — CR 608.2c: `ability.condition` on an ACTIVATED
         // ability (as opposed to a triggered ability's CR 603.4 intervening-if)
         // gates the PAYOFF at resolution, not the activation itself — CR 602.5
         // has no bearing here; per the Shelldock Isle ruling `condition_gated_
@@ -279,8 +288,11 @@ impl TacticalPolicy for ActivationPatiencePolicy {
         let patience = ctx.config.profile.interaction_patience;
         PolicyVerdict::score(
             -PATIENCE_PENALTY_BASE * (0.5 + patience),
-            PolicyReason::new("activation_patience_hold")
-                .with_fact("phase", ctx.state.phase as i64),
+            PolicyReason::new(match window {
+                PatientWindow::Upkeep => "activation_patience_hold",
+                PatientWindow::Draw => "activation_patience_hold_for_main",
+            })
+            .with_fact("phase", ctx.state.phase as i64),
         )
     }
 }
