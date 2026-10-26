@@ -192,8 +192,8 @@ fn assert_pass_outranks(
 }
 
 /// Cryptbreaker ("{1}{B}, {T}, Discard a card: Create a 2/2 black Zombie creature token.") in
-/// the AI's own draw step: the main phase follows with nothing in between (CR 500.1), so the
-/// mana and card stay available for it there, and passing must rank first.
+/// the AI's own draw step, with nothing happening as the main phase begins that an activation
+/// now could change: the mana and card stay available for it there, and passing must rank first.
 #[test]
 fn judged_cryptbreaker_draw_step_activation_waits_for_the_main_phase() {
     let (state, player, activation) = judged_early_activation(

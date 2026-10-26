@@ -166,6 +166,19 @@ fn add_upkeep_trigger_source(state: &mut GameState) {
         .push(arena_trigger);
 }
 
+/// An AI permanent carrying `subtype` (named after it), for the main-phase stand-down arms.
+fn add_subtyped_permanent(state: &mut GameState, subtype: &str) -> ObjectId {
+    let id = creature(state, &mut Ids(9_600), AI, subtype, 0, 0, None);
+    state
+        .objects
+        .get_mut(&id)
+        .unwrap()
+        .card_types
+        .subtypes
+        .push(subtype.to_string());
+    id
+}
+
 fn verdict_for(board: &Board) -> PolicyVerdict {
     let config = AiConfig::default();
     let mut session = AiSession::empty();
@@ -298,11 +311,12 @@ fn a_mana_ability_is_not_treated_as_deferrable() {
     assert_eq!(delta, 0.0);
 }
 
-/// CR 504.1/504.2 + CR 500.1: draw-step priority comes after the draw, so waiting
-/// buys no information, but the precombat main phase follows with nothing in
-/// between, so waiting gives nothing up: the ability is still on offer there and
-/// what it would spend now stays free for sorcery-speed plays (CR 307.1). The
-/// draw step is held under its own reason, distinct from the upkeep's.
+/// CR 504.1/504.2: draw-step priority comes after the draw, so waiting buys no
+/// information, but with nothing an activation now could change happening as the
+/// main phase begins, waiting gives nothing up: the ability is still on offer
+/// there and what it would spend now stays free for sorcery-speed plays
+/// (CR 307.1). The draw step is held under its own reason, distinct from the
+/// upkeep's.
 #[test]
 fn the_draw_step_holds_for_the_main_phase() {
     let board = build_board(Phase::Draw, 20, 20);
@@ -328,15 +342,90 @@ fn an_upkeep_trigger_source_does_not_disable_the_draw_step() {
 #[test]
 fn a_saga_stands_the_draw_step_down() {
     let mut board = build_board(Phase::Draw, 20, 20);
-    let saga = creature(&mut board.state, &mut Ids(9_600), AI, "Saga", 0, 0, None);
+    add_subtyped_permanent(&mut board.state, "Saga");
+    let (delta, reason) = score_and_reason(&verdict_for(&board));
+    assert_eq!(reason, "activation_patience_na");
+    assert_eq!(delta, 0.0);
+}
+
+/// A pristine upkeep runs straight into the main phase when the draw step is skipped
+/// (CR 614.10), so a Saga stands it down too.
+#[test]
+fn a_saga_stands_the_pristine_upkeep_down() {
+    let mut board = build_board(Phase::Upkeep, 20, 20);
+    add_subtyped_permanent(&mut board.state, "Saga");
+    let (delta, reason) = score_and_reason(&verdict_for(&board));
+    assert_eq!(reason, "activation_patience_na");
+    assert_eq!(delta, 0.0);
+}
+
+/// An upkeep whose triggers resolved is held for the main phase only while the main
+/// phase opens with nothing; a Saga stands it down.
+#[test]
+fn a_saga_stands_an_upkeep_with_triggers_down() {
+    let mut board = build_board(Phase::Upkeep, 20, 20);
+    add_upkeep_trigger_source(&mut board.state);
+    add_subtyped_permanent(&mut board.state, "Saga");
+    let (delta, reason) = score_and_reason(&verdict_for(&board));
+    assert_eq!(reason, "activation_patience_na");
+    assert_eq!(delta, 0.0);
+}
+
+/// CR 505.5: the main phase opens with a roll to visit the AI's Attractions, read
+/// through the engine's own `is_attraction_permanent`.
+#[test]
+fn an_attraction_stands_the_draw_step_down() {
+    let mut board = build_board(Phase::Draw, 20, 20);
+    let attraction = add_subtyped_permanent(&mut board.state, "Attraction");
+    assert!(
+        engine::game::attractions::is_attraction_permanent(&board.state.objects[&attraction]),
+        "premise: the engine reads this permanent as an Attraction"
+    );
+    let (delta, reason) = score_and_reason(&verdict_for(&board));
+    assert_eq!(reason, "activation_patience_na");
+    assert_eq!(delta, 0.0);
+}
+
+/// CR 505.3: the archenemy's main phase opens with a scheme set in motion.
+#[test]
+fn the_archenemy_is_not_held_in_its_draw_step() {
+    let mut board = build_board(Phase::Draw, 20, 20);
+    board.state.archenemy = Some(AI);
+    let (delta, reason) = score_and_reason(&verdict_for(&board));
+    assert_eq!(reason, "activation_patience_na");
+    assert_eq!(delta, 0.0);
+}
+
+/// CR 117.3a: a "beginning of your first main phase" trigger (Black Market, verified
+/// against MTGJSON) goes on the stack before the AI gets priority there, and a
+/// sacrifice or counter now could still feed it.
+#[test]
+fn a_precombat_main_trigger_stands_the_draw_step_down() {
+    let mut board = build_board(Phase::Draw, 20, 20);
+    let trigger = parse_oracle_text(
+        "At the beginning of your first main phase, add {B} for each charge counter on this enchantment.",
+        "Black Market",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    )
+    .triggers
+    .into_iter()
+    .next()
+    .expect("Black Market parses its main-phase trigger");
+    assert_eq!(
+        trigger.phase,
+        Some(Phase::PreCombatMain),
+        "premise: the trigger is a beginning-of-precombat-main trigger"
+    );
+    let market = add_subtyped_permanent(&mut board.state, "Black Market");
     board
         .state
         .objects
-        .get_mut(&saga)
+        .get_mut(&market)
         .unwrap()
-        .card_types
-        .subtypes
-        .push("Saga".to_string());
+        .trigger_definitions
+        .push(trigger);
     let (delta, reason) = score_and_reason(&verdict_for(&board));
     assert_eq!(reason, "activation_patience_na");
     assert_eq!(delta, 0.0);
@@ -502,7 +591,7 @@ fn an_upkeep_trigger_source_disables_the_upkeep_window_but_still_holds_for_main(
 
 /// Review finding: `is_low_information_window` (now `patient_window`) checked `phase`, `stack`, and
 /// `WaitingFor::Priority`, but never `state.active_player == ai_player`. CR
-/// 117.4 rotates priority among every living player in turn
+/// 117.3d passes priority to the next player in turn order
 /// (`crates/engine/src/game/priority.rs`'s `priority_pass_participants`), so
 /// the AI can hold `WaitingFor::Priority { player: AI }` with an empty stack
 /// during the OPPONENT's upkeep too — a perfectly normal instant-speed
@@ -518,7 +607,7 @@ fn a_deferrable_ping_is_not_held_during_the_opponents_upkeep() {
     let mut state = GameState::new_two_player(4242);
     state.phase = Phase::Upkeep;
     // The OPPONENT is active — it is their upkeep — but the AI is the one
-    // currently holding priority (CR 117.4's normal rotation).
+    // currently holding priority (CR 117.3d's normal rotation).
     state.active_player = OPP;
     state.priority_player = AI;
 

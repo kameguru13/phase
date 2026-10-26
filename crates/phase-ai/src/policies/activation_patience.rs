@@ -50,7 +50,7 @@
 //! AI's own turn with an empty stack, so nothing is targeting the source and no
 //! opponent attacks before the main phase.
 
-use engine::game::mana_abilities;
+use engine::game::{attractions, mana_abilities};
 use engine::types::ability::{AbilityDefinition, AbilityTag, ActivationRestriction};
 use engine::types::actions::GameAction;
 use engine::types::game_state::{GameState, WaitingFor};
@@ -182,14 +182,19 @@ fn patient_window(state: &GameState, ai_player: PlayerId) -> Option<PatientWindo
     {
         return None;
     }
-    match state.phase {
-        Phase::Upkeep if !controls_beginning_of_phase_trigger(state, ai_player, Phase::Upkeep) => {
-            Some(PatientWindow::Upkeep)
-        }
-        Phase::Upkeep | Phase::Draw if !main_phase_opens_with_events(state, ai_player) => {
-            Some(PatientWindow::BeforeMain)
-        }
-        _ => None,
+    // A main phase that opens with events stands both windows down: even a pristine upkeep can
+    // run straight into it when the draw step is skipped (CR 614.10).
+    if !matches!(state.phase, Phase::Upkeep | Phase::Draw)
+        || main_phase_opens_with_events(state, ai_player)
+    {
+        return None;
+    }
+    if state.phase == Phase::Upkeep
+        && !controls_beginning_of_phase_trigger(state, ai_player, Phase::Upkeep)
+    {
+        Some(PatientWindow::Upkeep)
+    } else {
+        Some(PatientWindow::BeforeMain)
     }
 }
 
@@ -198,18 +203,20 @@ fn patient_window(state: &GameState, ai_player: PlayerId) -> Option<PatientWindo
 /// and set a scheme in motion. CR 505.4: they put a lore counter on each of their Sagas.
 /// CR 505.5: they roll to visit their Attractions. CR 117.3a: "at the beginning of your
 /// precombat main phase" triggers go on the stack. Coarse in the safe direction, like
-/// [`controls_beginning_of_phase_trigger`]: any such permanent stands the window down.
+/// [`controls_beginning_of_phase_trigger`]: any such permanent stands the window down. Triggers
+/// worded "at the beginning of each of your main phases" (parsed without a phase) are not
+/// counted; today they only add mana, which the main phase does not need earlier.
+///
+/// Sagas are read the way `turns::add_lore_counters_to_sagas` reads them, and Attractions
+/// through the engine's own `is_attraction_permanent`.
 fn main_phase_opens_with_events(state: &GameState, player: PlayerId) -> bool {
     state.archenemy == Some(player)
         || controls_beginning_of_phase_trigger(state, player, Phase::PreCombatMain)
         || state.battlefield.iter().any(|&id| {
             state.objects.get(&id).is_some_and(|object| {
                 object.controller == player
-                    && object
-                        .card_types
-                        .subtypes
-                        .iter()
-                        .any(|subtype| subtype == "Saga" || subtype == "Attraction")
+                    && (object.card_types.subtypes.iter().any(|s| s == "Saga")
+                        || attractions::is_attraction_permanent(object))
             })
         })
 }
