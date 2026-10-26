@@ -27536,7 +27536,7 @@ fn chain_declared_slot_registry(clauses: &[ClauseIr]) -> DeclaredSlotRegistry {
 /// CR 601.2c + CR 608.2c: resolve a demonstrative referent phrase ("that
 /// creature") at the start of `phrase_lower` to the declared slot it names, by
 /// a UNIQUE noun match over every announced slot of the earlier clauses
-/// (`oracle_target::parse_definite_parent_reference`). Binds only when the
+/// (`declared_slot_named_by`). Binds only when the
 /// unique match lies in the numbered prefix; zero or several matches, a match
 /// past the prefix, an `Indeterminate` registry, or a modal mode give `None`.
 /// Returns the slot and the unconsumed remainder of `phrase_lower`.
@@ -27688,47 +27688,46 @@ struct ResolutionChoice<'a> {
     destination: Option<Zone>,
 }
 
-/// CR 115.10a + CR 608.2d + CR 701.23a: the resolution-time object choice clause
-/// `k` makes (an object chosen while the instruction is applied, which is not a
-/// target), with the zone its selection ends in when proven. `reader` bounds the
-/// later clauses whose continuations may complete a library search.
-fn clause_resolution_choice(
+/// CR 115.10a + CR 608.2d + CR 701.23a: the resolution-time object choices
+/// clause `k` makes (objects chosen while an instruction is applied, which are
+/// not targets), in node order, each with the zone its selection ends in when
+/// proven. `reader` bounds the later clauses whose continuations may complete a
+/// library search.
+fn clause_resolution_choices(
     clauses: &[ClauseIr],
     k: usize,
     reader: usize,
-) -> Option<ResolutionChoice<'_>> {
-    clause_nodes(&clauses[k])
-        .filter_map(|(effect, timing, _)| match effect {
-            Effect::ChangeZone {
-                destination,
-                target,
-                ..
-            } if crate::game::effects::effect_owns_resolution_zone_choice(effect, timing) => {
-                Some(ResolutionChoice {
-                    selection: target,
-                    destination: Some(*destination),
-                })
-            }
-            Effect::PutAtLibraryPosition { target, .. }
-                if crate::game::effects::effect_owns_resolution_zone_choice(effect, timing) =>
-            {
-                Some(ResolutionChoice {
-                    selection: target,
-                    destination: Some(Zone::Library),
-                })
-            }
-            // CR 701.23a + CR 115.10a: the found card is found while the search
-            // resolves (CR 701.23a); an object affected without the word "target"
-            // is not a target (CR 115.10a). Its destination is the
-            // `SearchDestination` continuation, from which assembly builds the
-            // delivering `ChangeZone`. That node does not exist yet at IR time.
-            Effect::SearchLibrary { filter, .. } => Some(ResolutionChoice {
-                selection: filter,
-                destination: search_result_destination(clauses, k, reader),
-            }),
-            _ => None,
-        })
-        .last()
+) -> impl Iterator<Item = ResolutionChoice<'_>> + '_ {
+    clause_nodes(&clauses[k]).filter_map(move |(effect, timing, _)| match effect {
+        Effect::ChangeZone {
+            destination,
+            target,
+            ..
+        } if crate::game::effects::effect_owns_resolution_zone_choice(effect, timing) => {
+            Some(ResolutionChoice {
+                selection: target,
+                destination: Some(*destination),
+            })
+        }
+        Effect::PutAtLibraryPosition { target, .. }
+            if crate::game::effects::effect_owns_resolution_zone_choice(effect, timing) =>
+        {
+            Some(ResolutionChoice {
+                selection: target,
+                destination: Some(Zone::Library),
+            })
+        }
+        // CR 701.23a + CR 115.10a: the found card is found while the search
+        // resolves (CR 701.23a); an object affected without the word "target"
+        // is not a target (CR 115.10a). Its destination is the
+        // `SearchDestination` continuation, from which assembly builds the
+        // delivering `ChangeZone`. That node does not exist yet at IR time.
+        Effect::SearchLibrary { filter, .. } => Some(ResolutionChoice {
+            selection: filter,
+            destination: search_result_destination(clauses, k, reader),
+        }),
+        _ => None,
+    })
 }
 
 /// CR 701.23a: the zone a library search clause `k` delivers its found card to,
@@ -27799,14 +27798,8 @@ fn selection_filter_admits_anaphor_noun(noun: &AnaphorNoun, filter: &TargetFilte
 /// CR 608.2c: whether any node of the clause reads its parent's target
 /// (`ParentTarget`, `ParentTargetController`, `ParentTargetOwner`, …).
 fn clause_refs_parent_target(clause: &ClauseIr) -> bool {
-    std::iter::once(&clause.parsed.effect)
-        .chain(
-            std::iter::successors(clause.parsed.sub_ability.as_deref(), |def| {
-                def.sub_ability.as_deref()
-            })
-            .map(|def| &*def.effect),
-        )
-        .any(crate::game::effects::effect_refs_parent_target)
+    clause_nodes(clause)
+        .any(|(effect, _, _)| crate::game::effects::effect_refs_parent_target(effect))
 }
 
 /// CR 115.1 + CR 608.2b: a target the choice clause itself announces besides
@@ -27855,9 +27848,9 @@ fn cross_choice_antecedent(
     {
         return CrossChoiceAntecedent::Unrelated;
     }
-    let Some((k, choice)) = (0..i)
+    let Some(k) = (0..i)
         .rev()
-        .find_map(|k| clause_resolution_choice(clauses, k, i).map(|choice| (k, choice)))
+        .find(|&k| clause_resolution_choices(clauses, k, i).next().is_some())
     else {
         return CrossChoiceAntecedent::Unrelated;
     };
@@ -27868,9 +27861,36 @@ fn cross_choice_antecedent(
     else {
         return CrossChoiceAntecedent::Unrelated;
     };
-    if selection_could_be_anaphor(&anaphor, &choice) {
-        return CrossChoiceAntecedent::Unrelated;
+    let verdict = announced_target_antecedent(clauses, i, k, &anaphor, body_scope);
+    // CR 110.1 + CR 608.2c: every resolution-time choice between the antecedent
+    // and the reader must exclude what the noun names; one that could select it
+    // may be the antecedent, so the binder declines. Without a proven producer,
+    // every earlier choice is checked.
+    let first_choice = match verdict {
+        CrossChoiceAntecedent::Unrelated => return verdict,
+        CrossChoiceAntecedent::Unproven => 0,
+        CrossChoiceAntecedent::Producer(p) => p + 1,
+    };
+    let choice_could_be_antecedent = (first_choice..i).any(|c| {
+        clause_resolution_choices(clauses, c, i)
+            .any(|choice| selection_could_be_anaphor(&anaphor, &choice))
+    });
+    if choice_could_be_antecedent {
+        CrossChoiceAntecedent::Unrelated
+    } else {
+        verdict
     }
+}
+
+/// CR 608.2c + CR 608.2b: the announced target clause `i`'s anaphor names,
+/// given `k`, the nearest earlier clause that makes a resolution-time choice.
+fn announced_target_antecedent(
+    clauses: &[ClauseIr],
+    i: usize,
+    k: usize,
+    anaphor: &DefiniteAnaphor,
+    body_scope: BodyScope,
+) -> CrossChoiceAntecedent {
     // A nearer announced target the noun names is inherited at runtime.
     if clauses[k + 1..i].iter().any(|clause| {
         matches!(clause.disposition, ClauseDisposition::Emit { .. })
@@ -27895,7 +27915,7 @@ fn cross_choice_antecedent(
     // CR 608.2b: the reader binds only when the producer's target is the sole
     // target the chain announces, so an empty group never falls back to
     // another object.
-    let Some(slot) = declared_slot_named_by(&anaphor, &registry).filter(|_| {
+    let Some(slot) = declared_slot_named_by(anaphor, &registry).filter(|_| {
         matches == 1
             && entries.len() == 1
             && !choice_clause_announces_other_target(&clauses[k])

@@ -705,3 +705,104 @@ fn search_announcing_player_target_fails_closed() {
         assert_eq!(node.reads_chosen_group, None, "{:?}", node.effect);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Rows 17-18: single-candidate zone choice; a farther choice as antecedent
+// ---------------------------------------------------------------------------
+
+/// Row 17 (verbatim). CR 608.2d: with one card in the graveyard, accepting the
+/// exile moves that card without a zone-choice prompt, and the 2 damage still
+/// goes to the target creature's controller.
+#[test]
+fn heated_argument_single_graveyard_card_exiles_without_prompt() {
+    let mut scenario = scenario(2);
+    let spell = add_instant(&mut scenario, "Heated Argument", HEATED_ARGUMENT);
+    let victim = scenario.add_creature(P1, "Victim", 8, 8).id();
+    let only = scenario
+        .add_creature_to_graveyard(P0, "Only Memory", 1, 1)
+        .id();
+    let mut runner = scenario.build();
+    let (p0_before, p1_before) = (life(&runner, P0), life(&runner, P1));
+    cast_to_optional(&mut runner, spell, victim);
+    decide_optional(&mut runner, true);
+    assert!(
+        !matches!(
+            runner.state().waiting_for,
+            WaitingFor::EffectZoneChoice { .. }
+        ),
+        "a single eligible card is moved without a prompt"
+    );
+    assert_resolved(&runner);
+
+    assert_eq!(runner.state().objects[&victim].damage_marked, 6);
+    assert_eq!(zone_of(&runner, only), Zone::Exile);
+    assert_eq!(
+        life(&runner, P1) - p1_before,
+        -2,
+        "the target creature's controller takes 2"
+    );
+    assert_eq!(life(&runner, P0) - p0_before, 0, "the caster takes nothing");
+}
+
+/// Row 18 (synthetic). CR 110.1 + CR 608.2c: "that creature" names the creature
+/// an earlier resolution-time choice put onto the battlefield, even when a
+/// nearer choice (the graveyard exile) cannot be a creature on the battlefield.
+/// Every choice between the announced target and the reader is checked, so the
+/// binder declines and no chosen-group link is written.
+#[test]
+fn farther_choice_to_battlefield_names_that_creature() {
+    for (text, label) in [
+        (
+            "Tap target creature. Search your library for a creature card, put it onto the battlefield, then shuffle. You may exile a card from your graveyard. If you do, put a +1/+1 counter on that creature.",
+            "search",
+        ),
+        (
+            "Tap target creature. You may put a creature card from your hand onto the battlefield. Exile a card from your graveyard. Put a +1/+1 counter on that creature.",
+            "hand put",
+        ),
+    ] {
+        let root = parse_instant(text, "Farther Probe");
+        let nodes = chain_nodes(&root);
+        assert!(
+            matches!(nodes[0].effect.as_ref(), Effect::SetTapState { .. }),
+            "{label}: the producer announces a target: {:?}",
+            nodes[0].effect
+        );
+        assert!(
+            nodes.iter().any(|node| match node.effect.as_ref() {
+                Effect::SearchLibrary { .. } => true,
+                Effect::ChangeZone {
+                    origin: Some(Zone::Hand),
+                    destination: Zone::Battlefield,
+                    ..
+                } => true,
+                _ => false,
+            }),
+            "{label}: the battlefield choice parses"
+        );
+        assert!(
+            nodes.iter().any(|node| matches!(
+                node.effect.as_ref(),
+                Effect::ChangeZone {
+                    origin: Some(Zone::Graveyard),
+                    destination: Zone::Exile,
+                    ..
+                }
+            )),
+            "{label}: the graveyard exile parses"
+        );
+        let reader = nodes.last().unwrap();
+        assert!(
+            matches!(
+                reader.effect.as_ref(),
+                Effect::PutCounter {
+                    target: TargetFilter::ParentTarget,
+                    ..
+                }
+            ),
+            "{label}: {:?}",
+            reader.effect
+        );
+        assert_no_chosen_group_link(&root);
+    }
+}

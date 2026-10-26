@@ -883,9 +883,9 @@ pub(crate) struct ClauseIr {
     /// The parsed effect clause (effect, duration, sub_ability from parse_effect_clause).
     /// Chain-local identity, assigned in source order by [`ClauseIrBuilder`].
     pub(crate) id: ClauseId,
-    /// One choose instruction and its mutually exclusive instead branch share this id,
-    /// or a single-object-target producer whose announced target a later anaphor
-    /// names across a resolution-time choice (`bind_anaphors_across_resolution_choices`).
+    /// One choose instruction and its mutually exclusive instead branch share this id.
+    /// A single-object-target producer whose announced target a later anaphor names
+    /// across a resolution-time choice also declares it (`bind_anaphors_across_resolution_choices`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) declares_chosen_clause: Option<ClauseId>,
     /// The exact choose instruction named by this selected-group consumer, or the
