@@ -4922,21 +4922,16 @@ fn waits_for_resolution_choice(waiting_for: &WaitingFor) -> bool {
     )
 }
 
-/// CR 601.2a-h: the object of the spell whose casting is in progress at the
-/// current prompt, if any — its face election (`ModalFaceChoice`), an
-/// announcement or target step carrying the `PendingCast` inline, or a payment
-/// step reading it from `GameState::pending_cast`.
+/// CR 601.2a-h: the object of the spell whose casting is in progress, if any —
+/// its face election (`ModalFaceChoice`, before any `PendingCast` exists), or
+/// the announcement held by any live `PendingCastOwner`.
 fn spell_cast_in_flight(state: &GameState) -> Option<ObjectId> {
     match &state.waiting_for {
         WaitingFor::ModalFaceChoice { object_id, .. } => Some(*object_id),
-        waiting_for => waiting_for
-            .pending_cast_ref()
-            .or_else(|| {
-                waiting_for
-                    .has_pending_cast()
-                    .then_some(state.pending_cast.as_deref())
-                    .flatten()
-            })
+        _ => state
+            .live_pending_cast_owners()
+            .first()
+            .and_then(|owner| state.pending_cast_at(*owner))
             .map(|pending| pending.object_id),
     }
 }

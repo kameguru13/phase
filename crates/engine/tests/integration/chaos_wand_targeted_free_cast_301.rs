@@ -16,6 +16,7 @@
 //! advertised target was then rejected and nothing was cast.
 
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::ability::TargetRef;
 use engine::types::actions::GameAction;
 use engine::types::game_state::{CastPaymentMode, WaitingFor};
@@ -24,6 +25,8 @@ use engine::types::mana::{ManaColor, ManaCost, ManaCostShard};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
+
+use crate::support::shared_card_db;
 
 const CHAOS_WAND: &str = "{4}, {T}: Target opponent exiles cards from the top of their library \
 until they exile an instant or sorcery card. You may cast that card without paying its mana \
@@ -241,4 +244,76 @@ fn chaos_wand_withdrawn_cast_bottoms_the_hit_with_the_misses() {
     assert!(p1_library[1..].contains(&miss));
     assert!(p1_library[1..].contains(&bolt));
     assert_eq!(runner.life(P1), 20);
+}
+
+/// CR 709.3a + CR 608.2g + CR 608.2c: a split-card hit with two castable halves
+/// first asks which half to cast. The exiled cards stay in exile through that
+/// choice, and are bottomed once Death is cast.
+#[test]
+fn chaos_wand_split_card_hit_waits_through_the_face_choice() {
+    let Some(db) = shared_card_db() else {
+        return;
+    };
+    let mut scenario = GameScenario::new_n_player(2, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let wand = scenario
+        .add_artifact_from_oracle(P0, "Chaos Wand", CHAOS_WAND)
+        .id();
+    for _ in 0..4 {
+        scenario.add_basic_land(P0, ManaColor::Blue);
+    }
+    // Death's target: a creature card in the caster's graveyard.
+    let bears = scenario.add_real_card(P0, "Grizzly Bears", Zone::Graveyard, db);
+    let unreached = scenario
+        .add_land_to_library_top(P1, "Unreached Island")
+        .id();
+    let life_death = scenario.add_real_card(P1, "Life", Zone::Library, db);
+    let miss = scenario.add_land_to_library_top(P1, "Exiled Island").id();
+
+    let mut runner = scenario.build();
+    engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
+    runner.state_mut().players[P1.0 as usize].library =
+        engine::im::vector![miss, life_death, unreached];
+
+    activate_to_cast_prompt(&mut runner, wand);
+    runner
+        .act(GameAction::DecideOptionalEffect { accept: true })
+        .expect("accept the free cast");
+
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::ModalFaceChoice { .. }
+        ),
+        "both halves are castable, so the free cast asks for a half, found {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(
+        runner.state().objects[&miss].zone,
+        Zone::Exile,
+        "CR 608.2c: the bottom instruction waits through the face choice"
+    );
+
+    runner
+        .act(GameAction::ChooseModalFace { back_face: true })
+        .expect("cast Death");
+    // CR 601.2c: Grizzly Bears is Death's only legal target, so electing the
+    // half finishes the cast with no target prompt. That leaves the face
+    // choice itself as the answer that must finish the Wand's resolution.
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "reach guard: Death is cast straight from the face choice, found {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(
+        runner.state().stack.last().map(|entry| entry.source_id),
+        Some(life_death),
+        "Death is on the stack targeting the only creature card in the graveyard"
+    );
+    assert_eq!(runner.state().objects[&life_death].zone, Zone::Stack);
+    let p1_library = library(&runner, P1);
+    assert_eq!(p1_library, vec![unreached, miss]);
+
+    runner.advance_until_stack_empty();
+    assert_eq!(runner.state().objects[&bears].zone, Zone::Battlefield);
 }
