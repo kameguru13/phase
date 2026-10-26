@@ -27864,12 +27864,14 @@ fn cross_choice_antecedent(
     let verdict = announced_target_antecedent(clauses, i, k, &anaphor, body_scope);
     // CR 110.1 + CR 608.2c: every resolution-time choice between the antecedent
     // and the reader must exclude what the noun names; one that could select it
-    // may be the antecedent, so the binder declines. Without a proven producer,
-    // every earlier choice is checked.
+    // may be the antecedent, so the binder declines. The producer's own clause
+    // is included: its head announces a Stack-timed target and is never a
+    // resolution-time choice, but a compound `sub_ability` joined to it by
+    // "and" can be. Without a proven producer, every earlier choice is checked.
     let first_choice = match verdict {
         CrossChoiceAntecedent::Unrelated => return verdict,
         CrossChoiceAntecedent::Unproven => 0,
-        CrossChoiceAntecedent::Producer(p) => p + 1,
+        CrossChoiceAntecedent::Producer(p) => p,
     };
     let choice_could_be_antecedent = (first_choice..i).any(|c| {
         clause_resolution_choices(clauses, c, i)

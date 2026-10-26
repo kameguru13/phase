@@ -806,3 +806,60 @@ fn farther_choice_to_battlefield_names_that_creature() {
         assert_no_chosen_group_link(&root);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Row 19: a choice inside the producer's own compound clause
+// ---------------------------------------------------------------------------
+
+/// Row 19 (synthetic). CR 110.1 + CR 608.2c: a resolution-time choice joined to
+/// the producer's own instruction by "and" is checked like one printed as its
+/// own sentence (row 18). The creature it puts onto the battlefield can be
+/// "that creature", so the binder declines and no chosen-group link is written.
+#[test]
+fn compound_choice_in_producer_clause_names_that_creature() {
+    let root = parse_instant(
+        "Tap target creature and put a creature card from your hand onto the battlefield. You may exile a card from your graveyard. If you do, put a +1/+1 counter on that creature.",
+        "Compound Probe",
+    );
+    let nodes = chain_nodes(&root);
+    assert!(
+        matches!(nodes[0].effect.as_ref(), Effect::SetTapState { .. }),
+        "the producer announces a target: {:?}",
+        nodes[0].effect
+    );
+    assert!(
+        nodes.iter().any(|node| matches!(
+            node.effect.as_ref(),
+            Effect::ChangeZone {
+                origin: Some(Zone::Hand),
+                destination: Zone::Battlefield,
+                ..
+            }
+        )),
+        "the compound hand-to-battlefield choice parses"
+    );
+    assert!(
+        nodes.iter().any(|node| matches!(
+            node.effect.as_ref(),
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Exile,
+                ..
+            }
+        )),
+        "the graveyard exile parses"
+    );
+    let reader = nodes.last().unwrap();
+    assert!(
+        matches!(
+            reader.effect.as_ref(),
+            Effect::PutCounter {
+                target: TargetFilter::ParentTarget,
+                ..
+            }
+        ),
+        "{:?}",
+        reader.effect
+    );
+    assert_no_chosen_group_link(&root);
+}
