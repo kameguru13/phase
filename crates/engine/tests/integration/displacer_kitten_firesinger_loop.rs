@@ -30,8 +30,8 @@ const FIRESINGER: &str = "Blazing Firesinger";
 
 /// Kitten on P0's battlefield, Firesinger cast from hand onto six Mountains and resolved, so it
 /// entered prepared through its own replacement; the stack is empty and three Mountains are
-/// untapped for the first copy.
-fn board() -> (GameRunner, ObjectId) {
+/// untapped for the first copy. `mode` is the game's loop detection.
+fn board(mode: LoopDetectionMode) -> (GameRunner, ObjectId) {
     let db = load_db().expect("the committed integration card fixture loads");
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
@@ -41,7 +41,7 @@ fn board() -> (GameRunner, ObjectId) {
         scenario.add_real_card(P0, "Mountain", Zone::Battlefield, db);
     }
     let mut runner = scenario.build();
-    runner.state_mut().loop_detection = LoopDetectionMode::Interactive;
+    runner.state_mut().loop_detection = mode;
     let card_id = runner.state().objects[&firesinger].card_id;
     runner
         .act(GameAction::CastSpell {
@@ -51,7 +51,7 @@ fn board() -> (GameRunner, ObjectId) {
             payment_mode: Default::default(),
         })
         .expect("Firesinger is castable for {2}{R}");
-    pass_until_stack_empty(&mut runner, firesinger);
+    pass_until_stack_empty(&mut runner, Some(firesinger));
     assert!(
         runner.state().objects[&firesinger].prepared.is_some(),
         "CR 722.3a: Firesinger enters prepared"
@@ -65,14 +65,14 @@ fn red(runner: &GameRunner) -> usize {
         .count_color(ManaType::Red)
 }
 
-/// Passes priority (answering Kitten's target with Firesinger) until the stack is empty or the
-/// engine offers the loop.
-fn pass_until_stack_empty(runner: &mut GameRunner, firesinger: ObjectId) {
+/// Passes priority, answering Kitten's "up to one target" with `kitten_target` (`None` declines
+/// it), until the stack is empty or the engine offers the loop.
+fn pass_until_stack_empty(runner: &mut GameRunner, kitten_target: Option<ObjectId>) {
     for _ in 0..16 {
         let action = match &runner.state().waiting_for {
             WaitingFor::LoopShortcut { .. } => return,
             WaitingFor::TriggerTargetSelection { .. } => GameAction::ChooseTarget {
-                target: Some(TargetRef::Object(firesinger)),
+                target: kitten_target.map(TargetRef::Object),
             },
             _ if runner.state().stack.is_empty() => return,
             _ => GameAction::PassPriority,
@@ -87,12 +87,13 @@ fn cycle(runner: &mut GameRunner, firesinger: ObjectId) {
     runner
         .act(GameAction::CastPreparedCopy { source: firesinger })
         .expect("the prepared Seething Song copy is castable");
-    pass_until_stack_empty(runner, firesinger);
+    pass_until_stack_empty(runner, Some(firesinger));
 }
 
 #[test]
 fn one_cycle_reprepares_firesinger_and_nets_two_red() {
-    let (mut runner, firesinger) = board();
+    // Detection off, so no offer interrupts the second cycle whose yield this measures.
+    let (mut runner, firesinger) = board(LoopDetectionMode::Off);
     let before = red(&runner);
     let incarnation = runner.state().objects[&firesinger].incarnation;
     runner
@@ -102,7 +103,7 @@ fn one_cycle_reprepares_firesinger_and_nets_two_red() {
         runner.state().objects[&firesinger].prepared.is_none(),
         "CR 722.3c + CR 601.2i: Firesinger stops being prepared as the copy becomes cast"
     );
-    pass_until_stack_empty(&mut runner, firesinger);
+    pass_until_stack_empty(&mut runner, Some(firesinger));
     let object = &runner.state().objects[&firesinger];
     assert_eq!(object.zone, Zone::Battlefield, "Kitten returned Firesinger");
     assert_ne!(
@@ -117,18 +118,16 @@ fn one_cycle_reprepares_firesinger_and_nets_two_red() {
     assert_eq!(red(&runner), before + 5, "Seething Song adds {{R}}x5");
     let after_first = red(&runner);
     cycle(&mut runner, firesinger);
-    if !matches!(runner.state().waiting_for, WaitingFor::LoopShortcut { .. }) {
-        assert_eq!(
-            red(&runner),
-            after_first + 2,
-            "a cycle paid from the pool nets {{R}}{{R}}"
-        );
-    }
+    assert_eq!(
+        red(&runner),
+        after_first + 2,
+        "a cycle paid from the pool nets {{R}}{{R}}"
+    );
 }
 
 #[test]
 fn interactive_mode_offers_the_red_mana_loop() {
-    let (mut runner, firesinger) = board();
+    let (mut runner, firesinger) = board(LoopDetectionMode::Interactive);
     for _ in 0..6 {
         if let WaitingFor::LoopShortcut {
             proposer,
@@ -151,5 +150,31 @@ fn interactive_mode_offers_the_red_mana_loop() {
     panic!(
         "CR 732.2a: the loop was never offered; waiting on {:?}",
         runner.state().waiting_for
+    );
+}
+
+/// Kitten's target declined: Firesinger stays unprepared after its copy is cast, so nothing can
+/// be cast again and no loop is offered.
+#[test]
+fn declining_kittens_target_offers_no_loop() {
+    let (mut runner, firesinger) = board(LoopDetectionMode::Interactive);
+    for _ in 0..3 {
+        if runner.state().objects[&firesinger].prepared.is_none() {
+            break;
+        }
+        runner
+            .act(GameAction::CastPreparedCopy { source: firesinger })
+            .expect("the prepared Seething Song copy is castable");
+        pass_until_stack_empty(&mut runner, None);
+    }
+    // Reach: the copy was cast and resolved.
+    assert_eq!(red(&runner), 5, "Seething Song resolved once");
+    assert!(
+        runner.state().objects[&firesinger].prepared.is_none(),
+        "CR 722.3c: Firesinger is unprepared once its copy is cast"
+    );
+    assert!(
+        !matches!(runner.state().waiting_for, WaitingFor::LoopShortcut { .. }),
+        "no loop is offered"
     );
 }

@@ -835,12 +835,18 @@ fn answered_choice(replay: &GameState, action: &GameAction) -> Option<PinnedDeci
 }
 
 /// The objects of `state` the period's plays cast: each cast card, and for a prepared copy cast,
-/// every copy linked to its prepared permanent wherever it is.
+/// the copy linked to its prepared permanent and the copy it cast, if that is still on the stack.
 ///
-/// CR 722.3c + CR 722.3d: each time the permanent becomes prepared its controller creates a new
-/// copy of its prepare spell in exile, and that copy carries the link onto the stack when cast,
-/// so a period that casts one and re-prepares the permanent holds a different copy in each frame.
+/// CR 722.3c + CR 400.7: each time the permanent becomes prepared its controller creates a new
+/// copy of its prepare spell in exile, so a period that casts one and re-prepares the permanent
+/// holds a different copy in each frame. The exiled copy is stripped only while its permanent is
+/// prepared on the battlefield, since only then does CR 722.3c make it a function of that
+/// permanent, which the frames still compare. CR 601.2a: the cast moves the copy to the stack,
+/// where a frame taken before it resolves still holds it.
 fn period_casts(state: &GameState, items: &[PeriodItem]) -> Vec<ObjectId> {
+    use crate::game::effects::prepare::{
+        is_retained_linked_prepared_copy, linked_prepared_copy_source,
+    };
     let mut casts = Vec::new();
     for item in items {
         match item.action {
@@ -849,7 +855,13 @@ fn period_casts(state: &GameState, items: &[PeriodItem]) -> Vec<ObjectId> {
                 state
                     .objects
                     .values()
-                    .filter(|object| object.prepared_copy_source == Some(source))
+                    .filter(|object| {
+                        let linked = linked_prepared_copy_source(object) == Some(source)
+                            && is_retained_linked_prepared_copy(state, object);
+                        let cast = object.zone == crate::types::zones::Zone::Stack
+                            && object.prepared_copy_source == Some(source);
+                        linked || cast
+                    })
                     .map(|object| object.id),
             ),
             _ => {}
