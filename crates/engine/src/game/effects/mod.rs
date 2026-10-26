@@ -4671,17 +4671,25 @@ pub(crate) fn can_inherit_parent_targets(sub: &ResolvedAbility) -> bool {
             && !effect_refs_parent_target(&sub.effect))
 }
 
+/// Whether a resolved sub-ability owns a resolution-time zone choice; see
+/// [`effect_owns_resolution_zone_choice`], the single authority shared with the
+/// parser's cross-choice antecedent binder.
+fn has_resolution_owned_zone_choice(sub: &ResolvedAbility) -> bool {
+    effect_owns_resolution_zone_choice(&sub.effect, sub.target_choice_timing)
+}
+
 /// CR 115.10 + CR 608.2d: a nontargeted zone choice announced while the effect
 /// resolves owns a fresh object choice instead of consuming an object selected
 /// by an earlier instruction. The explicit zone set is the provenance marker:
 /// it covers both scalar `InZone` (Broken Bond) and mixed `InAnyZone`
 /// (Worldsoul's Rage), while context references such as Beseech the Mirror's
 /// exile-linked card remain bound continuations rather than fresh choices.
-fn has_resolution_owned_zone_choice(sub: &ResolvedAbility) -> bool {
-    let (target, origin) = match &sub.effect {
-        Effect::ChangeZone { origin, target, .. }
-            if sub.target_choice_timing == TargetChoiceTiming::Resolution =>
-        {
+pub(crate) fn effect_owns_resolution_zone_choice(
+    effect: &Effect,
+    timing: TargetChoiceTiming,
+) -> bool {
+    let (target, origin) = match effect {
+        Effect::ChangeZone { origin, target, .. } if timing == TargetChoiceTiming::Resolution => {
             (target, *origin)
         }
         Effect::PutAtLibraryPosition { target, .. }
@@ -4694,7 +4702,7 @@ fn has_resolution_owned_zone_choice(sub: &ResolvedAbility) -> bool {
     let selection_zones = origin.map_or_else(|| target.extract_zones(), |zone| vec![zone]);
     !selection_zones.is_empty()
         && !target.is_context_ref()
-        && !effect_requires_parent_target_object(&sub.effect)
+        && !effect_requires_parent_target_object(effect)
 }
 
 /// Whether a child owns an object-selection slot independent of its parent's
