@@ -18,7 +18,7 @@ use engine::types::game_state::{
 };
 use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::log::{LogCategory, LogSegment};
-use engine::types::mana::{ManaColor, ManaType};
+use engine::types::mana::{ManaColor, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use phase_ai::auto_play::{run_ai_actions, run_ai_actions_bounded, run_driver_loop, DriverExit};
@@ -228,6 +228,64 @@ fn judged_karns_bastion_upkeep_activation_waits_at_low_life() {
         player,
         &activation,
         "the AI must not activate Karn's Bastion in its upkeep",
+    );
+}
+
+/// Staff of Domination ("{2}, {T}: You gain 1 life.") in the AI's own upkeep, with two
+/// Mountains untapped. With {C}{C} of activation-only mana floating (Thran Turbine's "This
+/// mana can't be spent to cast spells"), activating now spends mana that empties as the step
+/// ends (CR 500.5), so the production root score must not carry the patience hold it carries
+/// when only the lands could pay.
+#[test]
+fn floating_upkeep_mana_is_not_held_for_the_main_phase() {
+    use engine::types::mana::ManaRestriction;
+    let margin = |floating: bool| {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::Upkeep);
+        let staff = scenario
+            .add_artifact_from_oracle(P0, "Staff of Domination", "{2}, {T}: You gain 1 life.")
+            .id();
+        scenario.add_basic_land(P0, ManaColor::Red);
+        scenario.add_basic_land(P0, ManaColor::Red);
+        if floating {
+            scenario.with_mana_pool(
+                P0,
+                vec![
+                    ManaUnit::new(
+                        ManaType::Colorless,
+                        ObjectId(9_900),
+                        false,
+                        vec![ManaRestriction::OnlyForActivation]
+                    );
+                    2
+                ],
+            );
+        }
+        let runner = scenario.build();
+        let state = runner.state();
+        assert!(
+            matches!(state.waiting_for, WaitingFor::Priority { player } if player == P0)
+                && state.active_player == P0
+                && state.stack.is_empty(),
+            "reach: P0 holds priority in its own upkeep with an empty stack"
+        );
+        let config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(42);
+        let scores = phase_ai::score_candidates(state, P0, &config);
+        let score = |pick: &dyn Fn(&GameAction) -> bool| {
+            scores
+                .iter()
+                .find(|(action, _)| pick(action))
+                .map(|(_, score)| *score)
+                .unwrap_or_else(|| panic!("reach: candidate scored in {scores:?}"))
+        };
+        score(
+            &|action| matches!(action, GameAction::ActivateAbility { source_id, .. } if *source_id == staff),
+        ) - score(&|action| matches!(action, GameAction::PassPriority))
+    };
+    let (held, floating) = (margin(false), margin(true));
+    assert!(
+        floating > held,
+        "floating mana must lift the activation's margin over passing: held {held}, floating {floating}"
     );
 }
 

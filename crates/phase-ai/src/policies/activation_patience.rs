@@ -40,9 +40,11 @@
 //! that activating now enables a line the AI cannot see from the root. The
 //! penalty is sized to lose to a real payoff and win against an idle ping.
 //!
-//! ## The two escape hatches
+//! ## The three escape hatches
 //!
-//! The report names when to activate early: when the damage is part of a lethal
+//! Floating mana the activation could spend comes first: it empties as the step
+//! ends (CR 500.5), so for it waiting is not free. The report names the other two
+//! times to activate early: when the damage is part of a lethal
 //! line, and (implicitly) when the ability's own condition is met *now* and might
 //! not be later. Those are lethal damage and `ability.condition`, in that order
 //! below. Its third exception, a source that "is going to die or leave play
@@ -313,13 +315,26 @@ impl TacticalPolicy for ActivationPatiencePolicy {
             return na();
         }
 
-        // Escape hatch 1 — a lethal line beats any information the AI could buy
+        // Escape hatch 1 — CR 500.5: mana in the pool empties as this step ends, so
+        // when it could pay toward this activation (Thran Turbine's upkeep {C}{C},
+        // which can't be spent on spells) waiting destroys it rather than saving it
+        // for the main phase.
+        if engine::game::casting::pool_mana_can_pay_toward_activation(
+            ctx.state,
+            ctx.ai_player,
+            *source_id,
+            *ability_index,
+        ) {
+            return PolicyVerdict::neutral(PolicyReason::new("activation_patience_floating_mana"));
+        }
+
+        // Escape hatch 2 — a lethal line beats any information the AI could buy
         // by waiting.
         if is_lethal_line(ctx) {
             return PolicyVerdict::neutral(PolicyReason::new("activation_patience_lethal_line"));
         }
 
-        // Escape hatch 2 — CR 608.2c: `ability.condition` on an ACTIVATED
+        // Escape hatch 3 — CR 608.2c: `ability.condition` on an ACTIVATED
         // ability (as opposed to a triggered ability's CR 603.4 intervening-if)
         // gates the PAYOFF at resolution, not the activation itself — CR 602.5
         // has no bearing here; per the Shelldock Isle ruling `condition_gated_

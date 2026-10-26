@@ -471,6 +471,63 @@ fn a_delayed_main_phase_trigger_stands_the_draw_step_down() {
     assert_eq!(delta, 0.0);
 }
 
+/// CR 500.5: floating mana empties as the step ends, so when it could pay toward the
+/// activation, waiting destroys it (Thran Turbine's upkeep {C}{C}, which can't be spent
+/// on spells). Mana that can't pay for this activation, or an activation with no mana
+/// leg, leaves the hold in place.
+#[test]
+fn floating_mana_the_activation_could_spend_stands_patience_down() {
+    use engine::types::mana::{ManaRestriction, ManaType, ManaUnit};
+    let mut board = build_board(Phase::Upkeep, 20, 20);
+    let lifegain = creature(
+        &mut board.state,
+        &mut Ids(9_400),
+        AI,
+        "Staff",
+        0,
+        1,
+        Some("{2}, {T}: You gain 1 life."),
+    );
+    let float = |restriction: ManaRestriction| {
+        ManaUnit::new(
+            ManaType::Colorless,
+            ObjectId(9_900),
+            false,
+            vec![restriction],
+        )
+    };
+    let pool = &mut board.state.players[AI.0 as usize].mana_pool;
+    pool.add(float(ManaRestriction::OnlyForSpell));
+    let held = Board {
+        state: board.state.clone(),
+        pinger: lifegain,
+    };
+    assert_eq!(
+        score_and_reason(&verdict_for(&held)).1,
+        "activation_patience_hold",
+        "spell-only mana can't pay for the activation, so the hold stands"
+    );
+    board.state.players[AI.0 as usize]
+        .mana_pool
+        .add(float(ManaRestriction::OnlyForActivation));
+    let stands_down = Board {
+        state: board.state.clone(),
+        pinger: lifegain,
+    };
+    let (delta, reason) = score_and_reason(&verdict_for(&stands_down));
+    assert_eq!(reason, "activation_patience_floating_mana");
+    assert_eq!(delta, 0.0);
+    // The {T}-only ping has no mana leg, so the same floating mana doesn't stand it down.
+    let ping = Board {
+        state: board.state.clone(),
+        pinger: board.pinger,
+    };
+    assert_eq!(
+        score_and_reason(&verdict_for(&ping)).1,
+        "activation_patience_hold"
+    );
+}
+
 /// CR 602.5: an ability restricted to the upkeep can't be activated in the main
 /// phase, so it is not deferrable and patience stays silent.
 #[test]
