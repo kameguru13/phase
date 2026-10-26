@@ -1596,3 +1596,59 @@ fn spell_restricted_mana_cannot_pay_a_termination_cost() {
         "the successful special-action payment must end the effect and detach the Licid"
     );
 }
+
+// ── Issue #604: a creature-form Licid can attack ─────────────────────────────
+//
+// CR 303.4m: "An ability of a permanent that refers to the 'enchanted [object
+// or player]' refers to whatever object or player that permanent is attached
+// to, even if the permanent with the ability isn't an Aura." A Licid in its
+// creature form is attached to nothing, so its own "Enchanted creature can't
+// attack" does not restrict the Licid itself. The declare-attackers check used
+// to treat ANY local `CantAttack` static as self-restricting, ignoring its
+// `affected` filter, so Calming Licid could never attack.
+
+#[test]
+fn creature_form_calming_licid_can_attack() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let licid = scenario
+        .add_creature(P0, "Calming Licid", 2, 2)
+        .from_oracle_text(CALMING_LICID_ORACLE)
+        .id();
+    let mut runner = scenario.build();
+    runner.advance_to_combat();
+
+    assert!(
+        engine::game::combat::get_valid_attacker_ids(runner.state()).contains(&licid),
+        "CR 508.1a + CR 303.4m: an unattached Licid enchants nothing, so its \
+         \"Enchanted creature can't attack\" must not stop the Licid itself"
+    );
+    runner
+        .declare_attackers(&[(licid, CombatAttackTarget::Player(P1))])
+        .expect("issue #604: the creature-form Calming Licid must be able to attack");
+}
+
+#[test]
+fn attached_calming_licid_still_stops_its_host_from_attacking() {
+    // Positive control: once the Licid IS attached, "enchanted creature" names
+    // its host and the restriction applies.
+    let (mut runner, _licid, victim, _) = animated_calming_licid(0);
+    runner.advance_to_end_step();
+    runner.advance_to_upkeep();
+    runner.advance_to_combat();
+    assert_eq!(
+        runner.state().active_player,
+        P1,
+        "the victim's controller is attacking"
+    );
+    assert!(
+        !engine::game::combat::get_valid_attacker_ids(runner.state()).contains(&victim),
+        "CR 508.1c + CR 303.4b: the creature the Licid enchants can't attack"
+    );
+    assert!(
+        runner
+            .declare_attackers(&[(victim, CombatAttackTarget::Player(P0))])
+            .is_err(),
+        "CR 508.1c: declaring the enchanted creature as an attacker must be rejected"
+    );
+}
