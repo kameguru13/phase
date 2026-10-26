@@ -51,7 +51,9 @@
 //! opponent attacks before the main phase.
 
 use engine::game::{attractions, mana_abilities};
-use engine::types::ability::{AbilityDefinition, AbilityTag, ActivationRestriction};
+use engine::types::ability::{
+    AbilityDefinition, AbilityTag, ActivationRestriction, DelayedTriggerCondition,
+};
 use engine::types::actions::GameAction;
 use engine::types::game_state::{GameState, WaitingFor};
 use engine::types::identifiers::ObjectId;
@@ -202,7 +204,9 @@ fn patient_window(state: &GameState, ai_player: PlayerId) -> Option<PatientWindo
 /// priority in it, which an activation now could still change? CR 505.3: they are the archenemy
 /// and set a scheme in motion. CR 505.4: they put a lore counter on each of their Sagas.
 /// CR 505.5: they roll to visit their Attractions. CR 117.3a: "at the beginning of your
-/// precombat main phase" triggers go on the stack. Coarse in the safe direction, like
+/// precombat main phase" triggers go on the stack, and so do CR 603.7 delayed triggers set for
+/// the next precombat main phase (Mana Drain's "at the beginning of your next main phase").
+/// Coarse in the safe direction, like
 /// [`controls_beginning_of_phase_trigger`]: any such permanent stands the window down. Triggers
 /// worded "at the beginning of each of your main phases" (parsed without a phase) are not
 /// counted; today they only add mana, which the main phase does not need earlier.
@@ -212,6 +216,18 @@ fn patient_window(state: &GameState, ai_player: PlayerId) -> Option<PatientWindo
 fn main_phase_opens_with_events(state: &GameState, player: PlayerId) -> bool {
     state.archenemy == Some(player)
         || controls_beginning_of_phase_trigger(state, player, Phase::PreCombatMain)
+        || state
+            .delayed_triggers
+            .iter()
+            .any(|delayed| match delayed.condition {
+                DelayedTriggerCondition::AtNextPhase { phase } => phase == Phase::PreCombatMain,
+                DelayedTriggerCondition::AtNextPhaseForPlayer {
+                    phase,
+                    player: for_player,
+                    ..
+                } => phase == Phase::PreCombatMain && for_player == player,
+                _ => false,
+            })
         || state.battlefield.iter().any(|&id| {
             state.objects.get(&id).is_some_and(|object| {
                 object.controller == player

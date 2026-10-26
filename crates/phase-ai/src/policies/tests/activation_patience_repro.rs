@@ -431,6 +431,46 @@ fn a_precombat_main_trigger_stands_the_draw_step_down() {
     assert_eq!(delta, 0.0);
 }
 
+/// CR 603.7: a delayed trigger set for the AI's next precombat main phase fires as it
+/// begins (Mana Drain, "at the beginning of your next main phase"), so the draw step is
+/// not held; one set for an opponent's next main phase does not stand it down.
+#[test]
+fn a_delayed_main_phase_trigger_stands_the_draw_step_down() {
+    use engine::types::ability::{DelayedTriggerCondition, ResolvedAbility};
+    use engine::types::game_state::DelayedTrigger;
+    let delayed = |player| {
+        let effect = parse_oracle_text("Draw a card.", "Probe", &[], &["Sorcery".to_string()], &[])
+            .abilities
+            .into_iter()
+            .next()
+            .expect("a one-line spell parses")
+            .effect;
+        DelayedTrigger::new(
+            DelayedTriggerCondition::AtNextPhaseForPlayer {
+                phase: Phase::PreCombatMain,
+                player,
+                gate: Default::default(),
+                binding: Default::default(),
+            },
+            Box::new(ResolvedAbility::new(*effect, vec![], ObjectId(1), AI)),
+            AI,
+            ObjectId(1),
+            true,
+        )
+    };
+    let mut board = build_board(Phase::Draw, 20, 20);
+    board.state.delayed_triggers.push(delayed(OPP));
+    let (_, reason) = score_and_reason(&verdict_for(&board));
+    assert_eq!(
+        reason, "activation_patience_hold_for_main",
+        "an opponent's main phase is not the AI's"
+    );
+    board.state.delayed_triggers.push(delayed(AI));
+    let (delta, reason) = score_and_reason(&verdict_for(&board));
+    assert_eq!(reason, "activation_patience_na");
+    assert_eq!(delta, 0.0);
+}
+
 /// CR 602.5: an ability restricted to the upkeep can't be activated in the main
 /// phase, so it is not deferrable and patience stays silent.
 #[test]
