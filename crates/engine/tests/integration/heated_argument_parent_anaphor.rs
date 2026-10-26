@@ -10,7 +10,7 @@
 
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::parser::oracle::parse_oracle_text;
-use engine::types::ability::{AbilityDefinition, ControllerRef, Effect, TargetFilter};
+use engine::types::ability::{AbilityDefinition, ControllerRef, Effect, TargetFilter, TypeFilter};
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::game_state::WaitingFor;
@@ -862,4 +862,159 @@ fn compound_choice_in_producer_clause_names_that_creature() {
         reader.effect
     );
     assert_no_chosen_group_link(&root);
+}
+
+// ---------------------------------------------------------------------------
+// Rows 20-21: a selection whose card type could coexist with the noun's
+// ---------------------------------------------------------------------------
+
+/// Building-block fixture: a permanent card put onto the battlefield can be a
+/// creature.
+const PERMANENT_PUT_PROBE: &str = "Tap target creature. You may put a permanent card from your graveyard onto the battlefield. If you do, put a +1/+1 counter on that creature.";
+
+/// Building-block fixture: an artifact card put onto the battlefield can be an
+/// artifact creature.
+const ARTIFACT_PUT_PROBE: &str = "Tap target creature. You may put an artifact card from your graveyard onto the battlefield. If you do, put a +1/+1 counter on that creature.";
+
+/// Parser shape shared by rows 20-21: the producer taps a target, the choice
+/// puts a graveyard card whose filter is typed `selection_type` (never
+/// `Creature`) onto the battlefield, and the reader reads its parent target.
+/// CR 205.2b: such a card can still be a creature, so the binder declines and
+/// no chosen-group link is written.
+fn assert_overlapping_selection_declines(text: &str, selection_type: TypeFilter) {
+    let root = parse_instant(text, "Overlap Probe");
+    let nodes = chain_nodes(&root);
+    assert!(
+        matches!(nodes[0].effect.as_ref(), Effect::SetTapState { .. }),
+        "the producer announces a target: {:?}",
+        nodes[0].effect
+    );
+    assert!(
+        matches!(
+            nodes[1].effect.as_ref(),
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Battlefield,
+                target: TargetFilter::Typed(tf),
+                ..
+            } if tf.type_filters.contains(&selection_type)
+                && !tf.type_filters.contains(&TypeFilter::Creature)
+        ),
+        "the {selection_type:?} graveyard-to-battlefield choice parses: {:?}",
+        nodes[1].effect
+    );
+    let reader = nodes.last().unwrap();
+    assert!(
+        matches!(
+            reader.effect.as_ref(),
+            Effect::PutCounter {
+                target: TargetFilter::ParentTarget,
+                ..
+            }
+        ),
+        "{:?}",
+        reader.effect
+    );
+    assert_no_chosen_group_link(&root);
+}
+
+/// Row 20 (synthetic). CR 205.2b: a permanent card is not proven a noncreature
+/// by its `Permanent` type, so "that creature" could be the put card.
+#[test]
+fn permanent_card_selection_could_be_that_creature() {
+    assert_overlapping_selection_declines(PERMANENT_PUT_PROBE, TypeFilter::Permanent);
+}
+
+/// Row 21 (synthetic). CR 205.2b: an artifact card can be an artifact
+/// creature, so "that creature" could be the put card.
+#[test]
+fn artifact_card_selection_could_be_that_creature() {
+    assert_overlapping_selection_declines(ARTIFACT_PUT_PROBE, TypeFilter::Artifact);
+}
+
+/// Row 21 at runtime (synthetic). CR 205.2b + CR 608.2c: the artifact creature
+/// card put onto the battlefield is "that creature" and gets the counter; the
+/// tapped target does not.
+#[test]
+fn artifact_creature_put_from_graveyard_gets_the_counter() {
+    let mut scenario = scenario(2);
+    let spell = add_instant(&mut scenario, "Overlap Probe", ARTIFACT_PUT_PROBE);
+    let victim = scenario.add_creature(P1, "Victim", 8, 8).id();
+    let construct = scenario
+        .add_creature_to_graveyard(P0, "Grave Construct", 2, 2)
+        .as_artifact_creature()
+        .id();
+    let golem = scenario
+        .add_creature_to_graveyard(P0, "Grave Golem", 2, 2)
+        .as_artifact_creature()
+        .id();
+    let mut runner = scenario.build();
+    cast_to_optional(&mut runner, spell, victim);
+    decide_optional(&mut runner, true);
+    choose_zone_card(&mut runner, construct);
+    assert_resolved(&runner);
+
+    assert!(runner.state().objects[&victim].tapped);
+    assert_eq!(zone_of(&runner, construct), Zone::Battlefield);
+    assert_eq!(zone_of(&runner, golem), Zone::Graveyard);
+    assert_eq!(counters(&runner, construct, CounterType::Plus1Plus1), 1);
+    assert_eq!(counters(&runner, victim, CounterType::Plus1Plus1), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Row 22: a selection whose filter explicitly excludes the noun
+// ---------------------------------------------------------------------------
+
+/// Building-block fixture: a noncreature permanent card cannot be "that
+/// creature".
+const NONCREATURE_PUT_PROBE: &str = "Tap target creature. You may put a noncreature permanent card from your graveyard onto the battlefield. If you do, put a +1/+1 counter on that creature.";
+
+/// Row 22 (synthetic). CR 608.2c: a selection filtered as
+/// noncreature explicitly excludes the noun, so even on the battlefield it is
+/// not "that creature". The binder links the reader to the tapped target, which
+/// gets the counter; the put artifact does not.
+#[test]
+fn noncreature_selection_to_battlefield_reads_target() {
+    let root = parse_instant(NONCREATURE_PUT_PROBE, "Noncreature Probe");
+    let nodes = chain_nodes(&root);
+    assert!(
+        matches!(
+            nodes[1].effect.as_ref(),
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Battlefield,
+                target: TargetFilter::Typed(tf),
+                ..
+            } if tf.type_filters.contains(&TypeFilter::Non(Box::new(TypeFilter::Creature)))
+        ),
+        "the noncreature graveyard-to-battlefield choice parses: {:?}",
+        nodes[1].effect
+    );
+    let group = root
+        .declares_chosen_group
+        .expect("the targeting instruction declares the anaphor's group");
+    assert_eq!(nodes.last().unwrap().reads_chosen_group, Some(group));
+
+    let mut scenario = scenario(2);
+    let spell = add_instant(&mut scenario, "Noncreature Probe", NONCREATURE_PUT_PROBE);
+    let victim = scenario.add_creature(P1, "Victim", 8, 8).id();
+    let relic = scenario
+        .add_creature_to_graveyard(P0, "Grave Relic", 0, 0)
+        .as_artifact()
+        .id();
+    let idol = scenario
+        .add_creature_to_graveyard(P0, "Grave Idol", 0, 0)
+        .as_artifact()
+        .id();
+    let mut runner = scenario.build();
+    cast_to_optional(&mut runner, spell, victim);
+    decide_optional(&mut runner, true);
+    choose_zone_card(&mut runner, relic);
+    assert_resolved(&runner);
+
+    assert!(runner.state().objects[&victim].tapped);
+    assert_eq!(zone_of(&runner, relic), Zone::Battlefield);
+    assert_eq!(zone_of(&runner, idol), Zone::Graveyard);
+    assert_eq!(counters(&runner, victim, CounterType::Plus1Plus1), 1);
+    assert_eq!(counters(&runner, relic, CounterType::Plus1Plus1), 0);
 }

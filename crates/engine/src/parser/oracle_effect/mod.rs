@@ -109,8 +109,7 @@ use super::oracle_target::{
     parse_event_context_ref, parse_fight_target, parse_target, parse_target_with_ctx,
     parse_target_with_disjunctive_restriction, parse_target_with_syntax, parse_type_phrase_folding,
     parse_type_phrase_folding_with_ctx, resolve_singular_exiled_card_target,
-    typed_filter_admits_anaphor_noun, unique_slot_for_anaphor, AnaphorNoun, AnaphorZoneClass,
-    DefiniteAnaphor, TargetSyntax,
+    unique_slot_for_anaphor, AnaphorNoun, AnaphorZoneClass, DefiniteAnaphor, TargetSyntax,
 };
 use super::oracle_util::{
     contains_possessive, first_sentence, has_unconsumed_conditional, parse_count_expr,
@@ -27753,8 +27752,12 @@ fn search_result_destination(clauses: &[ClauseIr], k: usize, reader: usize) -> O
 }
 
 /// CR 110.1 + CR 400.1 + CR 608.2c: whether the object a resolution-time choice
-/// selects could be what the anaphor's noun phrase names. An unproven
-/// destination counts as "could be", so the binder declines.
+/// selects could be what the anaphor's noun phrase names; "could be" makes the
+/// binder decline. An unproven destination could be anything. A "that card"
+/// anaphor could be any selection, and "that permanent" any selection put onto
+/// the battlefield. Any other noun is ruled out only by a proven axis: the
+/// selection's zone class differs from the anaphor's, or its filter explicitly
+/// excludes the noun (`selection_filter_excludes_anaphor_noun`).
 fn selection_could_be_anaphor(anaphor: &DefiniteAnaphor, choice: &ResolutionChoice<'_>) -> bool {
     let Some(destination) = choice.destination else {
         return true;
@@ -27773,26 +27776,49 @@ fn selection_could_be_anaphor(anaphor: &DefiniteAnaphor, choice: &ResolutionChoi
         }
         noun => {
             anaphor.zone_class == selection_class
-                && selection_filter_admits_anaphor_noun(noun, choice.selection)
+                && !selection_filter_excludes_anaphor_noun(noun, choice.selection)
         }
     }
 }
 
-/// CR 205.3: whether a choice's selection filter names the anaphor's noun —
-/// its type filters carry the noun's type or subtype
-/// (`typed_filter_admits_anaphor_noun`). An untyped or card-only filter, and
-/// any filter shape this walk does not read, could name anything and admits it.
-fn selection_filter_admits_anaphor_noun(noun: &AnaphorNoun, filter: &TargetFilter) -> bool {
+/// CR 205.2b: whether a choice's selection filter explicitly excludes the
+/// anaphor's noun. An object with more than one card type satisfies criteria
+/// for any of them, so a filter that merely lacks the noun's type proves
+/// nothing: a `Permanent` or `Artifact` selection can be a creature. Only an
+/// explicit negation excludes — a `Non(<noun type or subtype>)` type filter, or
+/// for a "token" noun the `NonToken` property — on a typed filter, on any leg of
+/// a conjunction, or on every leg of a non-empty disjunction. Every other filter
+/// shape does not exclude the noun.
+fn selection_filter_excludes_anaphor_noun(noun: &AnaphorNoun, filter: &TargetFilter) -> bool {
     match filter {
-        TargetFilter::Typed(tf) => {
-            tf.type_filters.is_empty()
-                || tf.type_filters == [TypeFilter::Card]
-                || typed_filter_admits_anaphor_noun(noun, tf)
-        }
-        TargetFilter::Or { filters } | TargetFilter::And { filters } => filters
+        TargetFilter::Typed(tf) => match noun {
+            AnaphorNoun::Type(noun_type) => tf.type_filters.iter().any(|type_filter| {
+                let TypeFilter::Non(negated) = type_filter else {
+                    return false;
+                };
+                match (negated.as_ref(), noun_type) {
+                    (TypeFilter::Subtype(negated_sub), TypeFilter::Subtype(noun_sub)) => {
+                        negated_sub.eq_ignore_ascii_case(noun_sub)
+                    }
+                    (negated, noun_type) => negated == noun_type,
+                }
+            }),
+            // CR 111.1: a token is an object property, excluded by `NonToken`.
+            AnaphorNoun::Token => tf
+                .properties
+                .iter()
+                .any(|p| matches!(p, FilterProp::NonToken)),
+        },
+        TargetFilter::And { filters } => filters
             .iter()
-            .any(|inner| selection_filter_admits_anaphor_noun(noun, inner)),
-        _ => true,
+            .any(|inner| selection_filter_excludes_anaphor_noun(noun, inner)),
+        TargetFilter::Or { filters } => {
+            !filters.is_empty()
+                && filters
+                    .iter()
+                    .all(|inner| selection_filter_excludes_anaphor_noun(noun, inner))
+        }
+        _ => false,
     }
 }
 

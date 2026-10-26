@@ -2435,7 +2435,7 @@ pub(super) fn slot_matches_anaphor(
 /// CR 205.3 + CR 111.1: whether a typed filter carries the anaphor noun's
 /// matching axis — core-type membership, subtype equality, or the token object
 /// property.
-pub(super) fn typed_filter_admits_anaphor_noun(noun: &AnaphorNoun, tf: &TypedFilter) -> bool {
+fn typed_filter_admits_anaphor_noun(noun: &AnaphorNoun, tf: &TypedFilter) -> bool {
     match noun {
         AnaphorNoun::Type(TypeFilter::Subtype(sub)) => tf
             .get_subtype()
