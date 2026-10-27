@@ -1204,6 +1204,69 @@ fn a_not_yet_prompted_player_leaving_is_dropped_from_the_walk() {
     assert_settled(state);
 }
 
+/// T9b. CR 800.4a + CR 101.4 + CR 117.3b: the last chooser of a spell's batch
+/// leaves at their own prompt. The departure sacrifices the collected batch,
+/// the spell resolves once, and priority never names the departed player; the
+/// active player receives it.
+#[test]
+fn a_spells_batch_settled_by_its_last_choosers_departure_never_gives_them_priority() {
+    let mut board = blood_at_p1s_prompt();
+    let mut events = choose(&mut board.runner, &[board.c1a]);
+    assert_eq!(
+        prompt_cards(board.runner.state()),
+        (P2, set(&[board.c2a, board.c2b])),
+        "reach: P2 is the last chooser"
+    );
+    assert_eq!(
+        carrier_selections(board.runner.state()),
+        vec![(P0, vec![board.c0a]), (P1, vec![board.c1a])],
+        "reach: P0's and P1's choices are collected, nothing is sacrificed yet"
+    );
+
+    events.extend(concede(&mut board.runner, P2));
+    let state = board.runner.state();
+    assert!(
+        engine::game::players::is_alive(state, state.priority_player),
+        "CR 800.4a: priority never names a player who has left, got {:?}",
+        state.priority_player
+    );
+    if let Some(acting) = state.waiting_for.acting_player() {
+        assert!(
+            engine::game::players::is_alive(state, acting),
+            "CR 800.4a: the departed player is never asked, got {:?}",
+            state.waiting_for
+        );
+    }
+    assert!(
+        !matches!(state.waiting_for, WaitingFor::EffectZoneChoice { .. }),
+        "the batch is settled, got {:?}",
+        state.waiting_for
+    );
+    assert!(state.pending_player_scope_sacrifice_choice.is_none());
+
+    events.extend(run_until_settled(&mut board.runner, |_| None));
+    let state = board.runner.state();
+    assert_eq!(sacrificed_count(&events, board.c0a), 1);
+    assert_eq!(sacrificed_count(&events, board.c1a), 1);
+    assert_eq!(state.objects[&board.c0a].zone, Zone::Graveyard);
+    assert_eq!(state.objects[&board.c1a].zone, Zone::Graveyard);
+    assert_eq!(state.objects[&board.c0b].zone, Zone::Battlefield);
+    assert_eq!(state.objects[&board.c1b].zone, Zone::Battlefield);
+    for id in [board.c2a, board.c2b] {
+        assert_eq!(sacrificed_count(&events, id), 0);
+        assert_eq!(state.objects[&id].zone, Zone::Exile);
+    }
+    assert_eq!(state.objects[&board.blood].zone, Zone::Graveyard);
+    assert_eq!(stack_resolved_count(&events, board.blood), 1);
+    assert_eq!(
+        state.waiting_for,
+        WaitingFor::Priority { player: P0 },
+        "CR 117.3b: the active player receives priority"
+    );
+    assert_eq!(state.priority_player, P0);
+    assert_settled(state);
+}
+
 /// T10. CR 608.2c: after a concession mid-collection, a later and unrelated
 /// sacrifice prompt (Diabolic Edict) never picks up Innocent Blood's choices.
 #[test]
