@@ -559,12 +559,63 @@ fn drive_combo_basalt_rings() {
         "the certificate must name colorless mana (got {:?})",
         cert.unbounded
     );
+    // The steady cycle's yield, measured the same way: +{C} per copied untap.
+    let (mut board, cycle) =
+        corpus::basalt_rings_board(card_db()).expect("reach: the Basalt + Rings board builds");
+    let mut probe = LoopProbe::new(&mut board.runner);
+    assert_eq!(
+        cycle.run(&mut probe, true),
+        Some(true),
+        "reach: first cycle"
+    );
+    let _ = probe.iteration_delta();
+    assert_eq!(
+        cycle.run(&mut probe, true),
+        Some(true),
+        "reach: steady cycle"
+    );
+    assert_eq!(
+        probe.iteration_delta().mana[5],
+        1,
+        "{{C}}x6 in for {{3}} + {{2}} out nets one colorless mana"
+    );
 }
 
 /// Control: declining Rings' {2} leaves one tap ({C}x3) per {3} untap, a net-zero cycle, so the
-/// copy is what makes the loop net-positive and no certificate stands without it.
+/// copy is what makes the loop net-positive and no certificate stands without it. The declined
+/// path is driven first with reach guards, so a broken setup or action fails here rather than
+/// passing as "no loop".
 #[test]
 fn drive_combo_basalt_rings_requires_the_copy() {
+    let (mut board, cycle) =
+        corpus::basalt_rings_board(card_db()).expect("reach: the Basalt + Rings board builds");
+    let mut probe = LoopProbe::new(&mut board.runner);
+    // The first cycle taps Monolith from untapped; steady cycles start and end with it tapped.
+    assert_eq!(
+        cycle.run(&mut probe, false),
+        Some(true),
+        "reach: the first declined cycle completes after Rings' prompt"
+    );
+    let _ = probe.iteration_delta();
+    assert_eq!(
+        cycle.run(&mut probe, false),
+        Some(true),
+        "reach: a steady declined cycle reaches and declines Rings' prompt, then completes"
+    );
+    let delta = probe.iteration_delta();
+    let state = probe.runner().state();
+    assert!(
+        matches!(state.waiting_for, WaitingFor::Priority { .. }) && state.stack.is_empty(),
+        "reach: the cycle ends at an empty-stack priority window"
+    );
+    assert!(
+        state.objects[&cycle.monolith].tapped,
+        "reach: Monolith ends the cycle tapped"
+    );
+    assert_eq!(
+        delta.mana[5], 0,
+        "one {{3}} untap for one {{C}}x3 tap nets no colorless mana"
+    );
     assert!(
         corpus::drive_basalt_rings(card_db(), false).is_none(),
         "without the copied untap the cycle is net-zero, so no loop is certified"

@@ -1730,61 +1730,89 @@ pub(crate) fn drive_offline_basalt_rings(db: &CardDatabase) -> Option<LoopCertif
 /// [`drive_offline_basalt_rings`] answering Rings' "you may pay {2}" with `copy`. Declining
 /// leaves one tap per {3} untap, so no loop stands.
 pub(crate) fn drive_basalt_rings(db: &CardDatabase, copy: bool) -> Option<LoopCertificate> {
+    let (board, cycle) = basalt_rings_board(db)?;
+    run_combo(board, |probe| {
+        let _ = cycle.run(probe, copy);
+    })
+}
+
+/// The Basalt Monolith + Rings of Brighthearth board and the cycle that drives it.
+pub(crate) fn basalt_rings_board(db: &CardDatabase) -> Option<(ComboBoard, BasaltRingsCycle)> {
     let board = build_board(db, CORPUS[3].cards)?;
     let monolith = board.ids[0];
     let untap_idx = ability_index_where(board.runner.state(), monolith, is_untap_effect)?;
     let tap_idx = ability_index_where(board.runner.state(), monolith, is_mana_effect)?;
-    run_combo(board, |probe| {
+    Some((
+        board,
+        BasaltRingsCycle {
+            monolith,
+            untap_idx,
+            tap_idx,
+        },
+    ))
+}
+
+/// One Basalt Monolith + Rings of Brighthearth cycle: tap Monolith if it is untapped, activate
+/// its untap, answer Rings' "you may pay {2}", and tap Monolith whenever it is untapped while P0
+/// holds priority, until the stack is empty.
+pub(crate) struct BasaltRingsCycle {
+    pub(crate) monolith: ObjectId,
+    untap_idx: usize,
+    tap_idx: usize,
+}
+
+impl BasaltRingsCycle {
+    /// Drives one cycle, answering Rings' prompt with `copy`. `Some(answered)` when the cycle
+    /// reached an empty-stack priority window, `answered` saying whether Rings' prompt came;
+    /// `None` when an action was refused or an unexpected prompt appeared.
+    pub(crate) fn run(&self, probe: &mut LoopProbe, copy: bool) -> Option<bool> {
         let tapped = |probe: &LoopProbe| {
             probe
                 .runner()
                 .state()
                 .objects
-                .get(&monolith)
+                .get(&self.monolith)
                 .is_some_and(|object| object.tapped)
         };
         let activate = |probe: &mut LoopProbe, ability_index: usize| {
             probe
                 .act(GameAction::ActivateAbility {
-                    source_id: monolith,
+                    source_id: self.monolith,
                     ability_index,
                     payment_mode: crate::types::game_state::CastPaymentMode::Auto,
                 })
-                .is_ok()
+                .ok()
         };
-        if !tapped(probe) && !activate(probe, tap_idx) {
-            return;
+        if !tapped(probe) {
+            activate(probe, self.tap_idx)?;
         }
-        if !activate(probe, untap_idx) {
-            return;
-        }
+        activate(probe, self.untap_idx)?;
+        let mut answered = false;
         for _ in 0..32 {
             let state = probe.runner().state();
             let action = match &state.waiting_for {
                 // CR 605.3a: tap the untapped Monolith for mana whenever P0 holds priority,
                 // including between the copy and the original untap resolving.
                 WaitingFor::Priority { .. } if !tapped(probe) => {
-                    if !activate(probe, tap_idx) {
-                        return;
-                    }
+                    activate(probe, self.tap_idx)?;
                     continue;
                 }
-                WaitingFor::Priority { .. } if state.stack.is_empty() => return,
+                WaitingFor::Priority { .. } if state.stack.is_empty() => return Some(answered),
                 WaitingFor::Priority { .. } | WaitingFor::ManaPayment { .. } => {
                     GameAction::PassPriority
                 }
                 // Rings' "you may pay {2}": accepting copies the untap.
                 WaitingFor::OptionalEffectChoice { .. } => {
+                    answered = true;
                     GameAction::DecideOptionalEffect { accept: copy }
                 }
                 WaitingFor::CopyRetarget { .. } => GameAction::KeepAllCopyTargets,
-                _ => return,
+                _ => return None,
             };
-            if probe.act(action).is_err() {
-                return;
-            }
+            probe.act(action).ok()?;
         }
-    })
+        None
+    }
 }
 
 /// #47 SPIKE FEEDER + ARCHANGEL OF THUNE — infinite +1/+1 counters + life. Spike
