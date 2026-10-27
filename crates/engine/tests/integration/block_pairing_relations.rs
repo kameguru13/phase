@@ -880,15 +880,104 @@ fn alms_beast_grants_lifelink_only_to_its_partner() {
 // ── Trigger ordering (CR 603.3b) ────────────────────────────────────────
 
 const REVEILLARK: &str = "Flying\nWhen this creature leaves the battlefield, return up to two target creature cards with power 2 or less from your graveyard to the battlefield.";
+const DRIVER_OF_THE_DEAD: &str = "When this creature dies, return target creature card with mana value 2 or less from your graveyard to the battlefield.";
+const CATHEDRAL_MEMBRANE: &str = "({W/P} can be paid with either {W} or 2 life.)\nDefender\nWhen this creature dies during combat, it deals 6 damage to each creature it blocked this combat.";
+
+/// CR 603.3b: the two dies triggers of `sources` must reach their
+/// `controller` as an ordering choice. Orders them so `first` resolves first
+/// (CR 405.3: index 0 is placed first and resolves last).
+fn order_so_first_resolves(
+    runner: &mut GameRunner,
+    controller: PlayerId,
+    sources: [ObjectId; 2],
+    first: ObjectId,
+) {
+    pass_until(runner, "both sources die", |state| {
+        matches!(state.waiting_for, WaitingFor::OrderTriggers { .. })
+            || (sources
+                .iter()
+                .all(|id| state.objects[id].zone == Zone::Graveyard)
+                && state.stack.len() >= 2)
+    });
+    let WaitingFor::OrderTriggers { player, triggers } = runner.state().waiting_for.clone() else {
+        panic!(
+            "CR 603.3b: the two dies triggers must be ordered by their controller, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(
+        player, controller,
+        "the sources' controller orders the triggers"
+    );
+    let mut ordered: Vec<_> = triggers.iter().map(|t| t.source_id).collect();
+    ordered.sort();
+    let mut expected = sources.to_vec();
+    expected.sort();
+    assert_eq!(ordered, expected, "one trigger from each source");
+
+    let last = triggers
+        .iter()
+        .position(|t| t.source_id != first)
+        .expect("the other trigger");
+    runner
+        .act(GameAction::OrderTriggers {
+            order: vec![last, 1 - last],
+        })
+        .expect("order the dies triggers");
+}
+
+/// Resolve the stack. A returning trigger's controller returns `card`
+/// whenever it is a legal target, and otherwise makes the least choice the
+/// trigger allows.
+fn resolve_returning(runner: &mut GameRunner, card: ObjectId) {
+    for _ in 0..64 {
+        if runner.state().stack.is_empty()
+            && matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
+        {
+            return;
+        }
+        match runner.state().waiting_for.clone() {
+            WaitingFor::TriggerTargetSelection { target_slots, .. } => {
+                let card_target = TargetRef::Object(card);
+                let targets = if target_slots
+                    .iter()
+                    .any(|slot| slot.legal_targets.contains(&card_target))
+                {
+                    vec![card_target]
+                } else if target_slots.iter().all(|slot| slot.optional) {
+                    vec![]
+                } else {
+                    target_slots
+                        .iter()
+                        .find_map(|slot| slot.legal_targets.first().cloned())
+                        .into_iter()
+                        .collect()
+                };
+                runner
+                    .act(GameAction::SelectTargets { targets })
+                    .expect("choose the returning trigger's targets");
+            }
+            WaitingFor::OrderTriggers { triggers, .. } => {
+                let order = (0..triggers.len()).collect();
+                runner
+                    .act(GameAction::OrderTriggers { order })
+                    .expect("order triggers");
+            }
+            WaitingFor::Priority { .. } => {
+                runner.act(GameAction::PassPriority).expect("pass priority");
+            }
+            other => panic!("resolving the dies triggers: unexpected prompt {other:?}"),
+        }
+    }
+    panic!("the stack never emptied");
+}
 
 /// O1: two Abu Ja'fars attack; Reveillark blocks one and Grizzly Bears the
 /// other, and both Abu Ja'fars die together. Each dies trigger destroys a
 /// different creature (its own last known pairing), so the order is
 /// observable: if the Bears trigger resolves first, Reveillark's leaves
-/// trigger can return the Bears; if Reveillark's resolves first, the Bears
-/// aren't in the graveyard yet. CR 603.3b lets the controller choose the
-/// order, so the engine must prompt rather than order them itself.
-/// `bears_first` picks which trigger resolves first. Returns the Bears' zone.
+/// trigger (CR 603.6c) can return the Bears; if Reveillark's resolves first,
+/// the Bears aren't in the graveyard yet. Returns the Bears' zone.
 fn two_abu_jafars_dying_together(bears_first: bool) -> Zone {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
@@ -909,71 +998,10 @@ fn two_abu_jafars_dying_together(bears_first: bool) -> Zone {
         &[abu_r, abu_b],
         &[(reveillark, abu_r), (bears, abu_b)],
     );
-    pass_until(&mut runner, "both Abu Ja'fars die", |state| {
-        matches!(state.waiting_for, WaitingFor::OrderTriggers { .. })
-            || (state.objects[&abu_r].zone == Zone::Graveyard && state.stack.len() >= 2)
-    });
-    let WaitingFor::OrderTriggers { player, triggers } = runner.state().waiting_for.clone() else {
-        panic!(
-            "CR 603.3b: the two dies triggers must be ordered by their controller, got {:?}",
-            runner.state().waiting_for
-        );
-    };
-    assert_eq!(player, P0, "Abu Ja'fars' controller orders the triggers");
-    let mut sources: Vec<_> = triggers.iter().map(|t| t.source_id).collect();
-    sources.sort();
-    let mut expected = vec![abu_r, abu_b];
-    expected.sort();
-    assert_eq!(sources, expected, "one trigger from each Abu Ja'far");
+    let first = if bears_first { abu_b } else { abu_r };
+    order_so_first_resolves(&mut runner, P0, [abu_r, abu_b], first);
+    resolve_returning(&mut runner, bears);
 
-    // CR 405.3: index 0 is placed first and resolves last.
-    let first_to_resolve = if bears_first { abu_b } else { abu_r };
-    let last = triggers
-        .iter()
-        .position(|t| t.source_id != first_to_resolve)
-        .expect("the other trigger");
-    let top = 1 - last;
-    runner
-        .act(GameAction::OrderTriggers {
-            order: vec![last, top],
-        })
-        .expect("order the dies triggers");
-
-    for _ in 0..64 {
-        if runner.state().stack.is_empty()
-            && matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
-        {
-            break;
-        }
-        match runner.state().waiting_for.clone() {
-            // Reveillark's controller returns the Bears whenever they're a legal
-            // target, and returns nothing otherwise.
-            WaitingFor::TriggerTargetSelection { target_slots, .. } => {
-                let bears_target = TargetRef::Object(bears);
-                let targets = if target_slots
-                    .iter()
-                    .any(|slot| slot.legal_targets.contains(&bears_target))
-                {
-                    vec![bears_target]
-                } else {
-                    vec![]
-                };
-                runner
-                    .act(GameAction::SelectTargets { targets })
-                    .expect("choose Reveillark's targets");
-            }
-            WaitingFor::OrderTriggers { triggers, .. } => {
-                let order = (0..triggers.len()).collect();
-                runner
-                    .act(GameAction::OrderTriggers { order })
-                    .expect("order triggers");
-            }
-            WaitingFor::Priority { .. } => {
-                runner.act(GameAction::PassPriority).expect("pass priority");
-            }
-            other => panic!("resolving the dies triggers: unexpected prompt {other:?}"),
-        }
-    }
     assert_zone(
         &runner,
         &[reveillark],
@@ -994,5 +1022,57 @@ fn two_abu_jafars_dying_together_let_their_controller_order_the_triggers() {
         two_abu_jafars_dying_together(false),
         Zone::Graveyard,
         "Reveillark's trigger resolved before the Bears were destroyed"
+    );
+}
+
+/// O2: Driver of the Dead and a 1/1 deathtouch creature attack; a Cathedral
+/// Membrane blocks each, and both Membranes die in combat. Each dies trigger
+/// deals 6 damage to the creature that Membrane blocked, so the same order
+/// question arises as in O1, through damage and state-based actions
+/// (CR 704.5g): only if the 1/1 dies first can Driver of the Dead's dies
+/// trigger return it. Returns the deathtouch creature's zone.
+fn two_cathedral_membranes_dying_together(stinger_first: bool) -> Zone {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let driver = scenario
+        .add_creature_from_oracle(P0, "Driver of the Dead", 3, 2, DRIVER_OF_THE_DEAD)
+        .id();
+    let stinger = scenario
+        .add_creature_from_oracle(P0, "Deathtouch Stinger", 1, 1, "Deathtouch")
+        .id();
+    let membrane_d = scenario
+        .add_creature_from_oracle(P1, "Cathedral Membrane", 0, 3, CATHEDRAL_MEMBRANE)
+        .id();
+    let membrane_s = scenario
+        .add_creature_from_oracle(P1, "Cathedral Membrane", 0, 3, CATHEDRAL_MEMBRANE)
+        .id();
+    let mut runner = scenario.build();
+
+    attack_and_block(
+        &mut runner,
+        &[driver, stinger],
+        &[(membrane_d, driver), (membrane_s, stinger)],
+    );
+    let first = if stinger_first {
+        membrane_s
+    } else {
+        membrane_d
+    };
+    order_so_first_resolves(&mut runner, P1, [membrane_d, membrane_s], first);
+    resolve_returning(&mut runner, stinger);
+    zone(&runner, stinger)
+}
+
+#[test]
+fn two_cathedral_membranes_dying_together_let_their_controller_order_the_triggers() {
+    assert_eq!(
+        two_cathedral_membranes_dying_together(true),
+        Zone::Battlefield,
+        "the 1/1 died first, then Driver of the Dead's dies trigger returned it"
+    );
+    assert_eq!(
+        two_cathedral_membranes_dying_together(false),
+        Zone::Graveyard,
+        "Driver of the Dead's trigger resolved before the 1/1 died"
     );
 }

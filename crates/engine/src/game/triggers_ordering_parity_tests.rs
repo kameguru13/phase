@@ -338,10 +338,18 @@ const BATCH_GENUINE_ROWS: &[&str] = &[
     // ITS OWN departure row's block pairings (CR 608.2h), so the members destroy
     // different creatures, and a leaves trigger one resolution sets off resolves
     // before the next (Reveillark returning the creature the other Abu Ja'far
-    // destroyed, CR 603.3): the outcome differs by order (CR 603.3b intended
-    // prompt). Runtime pin: two_abu_jafars_dying_together_let_their_controller_
-    // order_the_triggers (`reads_source_combat_pairing` refuses the batch).
+    // destroyed, CR 603.6c): the outcome differs by order (CR 603.3b intended
+    // prompt). `reads_source_combat_pairing` refuses the batch. Runtime pin:
+    // two_abu_jafars_dying_together_let_their_controller_order_the_triggers
     "abu ja'far",
+    // Dies during combat (self_ref): DamageAll{6, creatures with CombatRelation{
+    // BlockedBySubject{ThisCombat}, subject: Source}} (AST measured). Each
+    // co-departing Membrane damages the attacker IT blocked, the attacker dies to
+    // state-based actions between the two resolutions, and a leaves trigger it
+    // sets off resolves before the next (CR 603.6c): same shape as Abu Ja'far.
+    // Runtime pin:
+    // two_cathedral_membranes_dying_together_let_their_controller_order_the_triggers
+    "cathedral membrane",
 ];
 
 /// R3 HIGH-1 (PR #5072 review): SAME-EVENT GENUINE member-bound order-dependence —

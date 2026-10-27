@@ -23176,7 +23176,8 @@ impl TargetFilter {
     /// "blocked by this creature") at any structural position. Each source
     /// answers from its own pairings, so two otherwise identical abilities from
     /// different sources name different creatures. Mirrors
-    /// [`Self::queries_keyword_kind`]'s recursion.
+    /// [`Self::queries_keyword_kind`]'s recursion, and also descends `AnyOf` /
+    /// `Not` props.
     pub fn names_source_combat_partners(&self) -> bool {
         fn prop_names_source_partners(prop: &FilterProp) -> bool {
             match prop {

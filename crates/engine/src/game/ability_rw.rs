@@ -642,7 +642,7 @@ pub(crate) struct RwProfile {
     /// their combat relation to the member's own source ("destroy all creatures
     /// blocking or blocked by it"). A departed source answers from its own
     /// departure row, so co-departing members touch different creatures, and
-    /// what each one sets off (a leaves trigger, CR 603.3) lands between them:
+    /// what each one sets off (a leaves trigger, CR 603.6c) lands between them:
     /// the order is observable. A subset of `reads_member_bound`, kept apart so
     /// the batch depth can prompt on it alone. `drop_writes` keeps it (a read).
     reads_source_combat_pairing: bool,
@@ -1163,7 +1163,7 @@ pub(crate) fn profiles_conflict(p: &RwProfile, s: &GroupStructure) -> bool {
     // Co-departing members whose resolution names creatures by their own source's
     // block pairings (each Abu Ja'far destroys its own last known partners) are
     // distinct functions, and what one resolution sets off (Reveillark's leaves
-    // trigger, CR 603.3) resolves before the next: the order is observable. The
+    // trigger, CR 603.6c) resolves before the next: the order is observable. The
     // freeze/feed rows below can't see it, since each source's departure row is
     // order-stable but names different creatures. Prompt fail-closed.
     if !s.same_event && p.reads_source_combat_pairing {
@@ -4744,6 +4744,9 @@ fn damage_writes(target: &TargetFilter) -> RwProfile {
         p.writes_membership_external_zones.merge(ZoneSpan::Any);
     }
     flag_legacy_write_target(&mut p, target);
+    // CR 509.1g + CR 603.3b: damage to the source's own combat partners
+    // ("each creature it blocked this combat") is per member.
+    p.reads_source_combat_pairing |= target.names_source_combat_partners();
     p
 }
 
@@ -4830,6 +4833,10 @@ fn rw_effect(
             // CR 704.5g: SBA deaths move battlefield → graveyard (fail-closed Any).
             p.writes_membership_external_zones.merge(ZoneSpan::Any);
             flag_legacy_write_target(&mut p, target);
+            // CR 509.1g + CR 603.3b: damage to the source's own combat partners
+            // (Cathedral Membrane's "each creature it blocked this combat") is
+            // per member.
+            p.reads_source_combat_pairing |= target.names_source_combat_partners();
             if player_filter.is_some() {
                 p.merge(life_writes());
             }
