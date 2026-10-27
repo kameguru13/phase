@@ -104,9 +104,9 @@ fn corpus_partition_is_locked() {
         .filter(|&i| corpus::row(i).deferral.is_some())
         .collect();
 
-    assert_eq!(driven.len(), 23, "23 driven rows");
+    assert_eq!(driven.len(), 24, "24 driven rows");
     assert_eq!(gated.len(), 5, "5 gated rows");
-    assert_eq!(deferred.len(), 34, "34 deferred rows");
+    assert_eq!(deferred.len(), 33, "33 deferred rows");
 
     assert!(driven.is_disjoint(&gated), "driven ∩ gated must be empty");
     assert!(
@@ -543,6 +543,32 @@ fn drive_combo_11_selvala_staff() {
     let cert = corpus::drive_offline_selvala_staff(card_db())
         .expect("Selvala + Staff of Domination must confirm infinite mana");
     assert_combo(12, &cert);
+}
+
+/// BASALT MONOLITH + RINGS OF BRIGHTHEARTH — infinite colorless mana: Rings copies the untap
+/// (CR 707.10), so a steady cycle taps Monolith twice ({C}x6) for one {3} untap and one {2}
+/// copy, +{C} net.
+#[test]
+fn drive_combo_basalt_rings() {
+    let cert = corpus::drive_offline_basalt_rings(card_db())
+        .expect("Basalt Monolith + Rings must confirm infinite colorless mana");
+    assert_combo(3, &cert);
+    assert!(
+        cert.unbounded
+            .contains(&ResourceAxis::Mana(ManaType::Colorless)),
+        "the certificate must name colorless mana (got {:?})",
+        cert.unbounded
+    );
+}
+
+/// Control: declining Rings' {2} leaves one tap ({C}x3) per {3} untap, a net-zero cycle, so the
+/// copy is what makes the loop net-positive and no certificate stands without it.
+#[test]
+fn drive_combo_basalt_rings_requires_the_copy() {
+    assert!(
+        corpus::drive_basalt_rings(card_db(), false).is_none(),
+        "without the copied untap the cycle is net-zero, so no loop is certified"
+    );
 }
 
 /// D2 KILO, APOGEE MIND + FREED + RELIC OF LEGENDS — infinite proliferate triggers.
