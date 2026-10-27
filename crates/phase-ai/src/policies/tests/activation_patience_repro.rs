@@ -686,6 +686,79 @@ fn retained_floating_mana_leaves_the_hold() {
     );
 }
 
+/// A permanent `owner` controls carrying the first trigger parsed from `text`.
+fn add_trigger_permanent(state: &mut GameState, owner: PlayerId, name: &str, text: &str) {
+    let trigger = parse_oracle_text(text, name, &[], &["Artifact".to_string()], &[])
+        .triggers
+        .into_iter()
+        .next()
+        .expect("the trigger text parses");
+    let id = creature(state, &mut Ids(8_900), owner, name, 0, 1, None);
+    state
+        .objects
+        .get_mut(&id)
+        .unwrap()
+        .trigger_definitions
+        .push(trigger);
+}
+
+/// CR 117.3a + CR 603.4: an opponent's Blinkmoth Urn ("At the beginning of each player's first
+/// main phase, if this artifact is untapped, that player adds {C} for each artifact they
+/// control.", verified against MTGJSON) fires in the AI's main phase too, and Voltaic Key's
+/// untap ("{1}, {T}: Untap target artifact.") only helps before it does. An opponent's "your"
+/// trigger (Black Market) fires on its controller's turn only, so it leaves the hold in place.
+#[test]
+fn an_opponents_each_player_main_phase_trigger_stands_the_draw_step_down() {
+    let mut board = build_board(Phase::Draw, 20, 20);
+    board.pinger = creature(
+        &mut board.state,
+        &mut Ids(8_800),
+        AI,
+        "Voltaic Key",
+        0,
+        1,
+        Some("{1}, {T}: Untap target artifact."),
+    );
+    add_trigger_permanent(
+        &mut board.state,
+        OPP,
+        "Black Market",
+        "At the beginning of your first main phase, add {B} for each charge counter on this enchantment.",
+    );
+    assert_eq!(
+        score_and_reason(&verdict_for(&board)).1,
+        "activation_patience_hold_for_main",
+        "an opponent's \"your\" main-phase trigger doesn't fire in the AI's main phase"
+    );
+    add_trigger_permanent(
+        &mut board.state,
+        OPP,
+        "Blinkmoth Urn",
+        "At the beginning of each player's first main phase, if this artifact is untapped, that player adds {C} for each artifact they control.",
+    );
+    let (delta, reason) = score_and_reason(&verdict_for(&board));
+    assert_eq!(reason, "activation_patience_na");
+    assert_eq!(delta, 0.0);
+}
+
+/// CR 503.1a: an opponent's "each player's upkeep" trigger (Sulfuric Vortex, verified against
+/// MTGJSON) also resolves in the AI's upkeep before the stack next empties, so that upkeep is no
+/// longer the pristine window; it is still held for the main phase.
+#[test]
+fn an_opponents_each_player_upkeep_trigger_ends_the_pristine_upkeep() {
+    let mut board = build_board(Phase::Upkeep, 20, 20);
+    add_trigger_permanent(
+        &mut board.state,
+        OPP,
+        "Sulfuric Vortex",
+        "At the beginning of each player's upkeep, this enchantment deals 2 damage to that player.",
+    );
+    assert_eq!(
+        score_and_reason(&verdict_for(&board)).1,
+        "activation_patience_hold_for_main"
+    );
+}
+
 /// CR 602.5: an ability restricted to the upkeep can't be activated in the main
 /// phase, so it is not deferrable and patience stays silent.
 #[test]

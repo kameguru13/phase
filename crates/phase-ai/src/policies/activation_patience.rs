@@ -158,7 +158,7 @@ enum PatientWindow {
 /// combat, and passing it up trades away a live interaction window for nothing.
 /// `state.active_player == ai_player` is therefore a hard requirement, not a refinement.
 ///
-/// # Why `ai_player` must control no beginning-of-upkeep trigger
+/// # Why no beginning-of-upkeep trigger may reach `ai_player`'s upkeep
 ///
 /// CR 503.1a: "at the beginning of your upkeep" triggers are put on the stack
 /// BEFORE the active player ever receives priority for the step — and once
@@ -171,7 +171,8 @@ enum PatientWindow {
 /// unguarded, that second window reads as identically "nothing has happened
 /// yet" as the pristine first one, even when the resolved trigger drew a
 /// card (Phyrexian Arena), scried, or revealed information. Excluding it
-/// whenever `ai_player` controls ANY such trigger source is deliberately
+/// whenever ANY such trigger fires in `ai_player`'s upkeep (its own "your" triggers and
+/// anyone's "each player's" triggers) is deliberately
 /// coarse rather than trying to classify which triggers are
 /// information-producing: CR 503.1a guarantees such a trigger is ALREADY
 /// queued (and, by the time the stack is next empty, already resolved)
@@ -194,7 +195,7 @@ fn patient_window(state: &GameState, ai_player: PlayerId) -> Option<PatientWindo
         return None;
     }
     if state.phase == Phase::Upkeep
-        && !controls_beginning_of_phase_trigger(state, ai_player, Phase::Upkeep)
+        && !beginning_of_phase_trigger_reaches(state, ai_player, Phase::Upkeep)
     {
         Some(PatientWindow::Upkeep)
     } else {
@@ -209,7 +210,7 @@ fn patient_window(state: &GameState, ai_player: PlayerId) -> Option<PatientWindo
 /// precombat main phase" triggers go on the stack, and so do CR 603.7 delayed triggers set for
 /// the next precombat main phase (Mana Drain's "at the beginning of your next main phase").
 /// Coarse in the safe direction, like
-/// [`controls_beginning_of_phase_trigger`]: any such permanent stands the window down. Triggers
+/// [`beginning_of_phase_trigger_reaches`]: any such permanent stands the window down. Triggers
 /// worded "at the beginning of each of your main phases" (parsed without a phase) are not
 /// counted; today they only add mana, which the main phase does not need earlier.
 ///
@@ -217,7 +218,7 @@ fn patient_window(state: &GameState, ai_player: PlayerId) -> Option<PatientWindo
 /// through the engine's own `is_attraction_permanent`.
 fn main_phase_opens_with_events(state: &GameState, player: PlayerId) -> bool {
     state.archenemy == Some(player)
-        || controls_beginning_of_phase_trigger(state, player, Phase::PreCombatMain)
+        || beginning_of_phase_trigger_reaches(state, player, Phase::PreCombatMain)
         || state
             .delayed_triggers
             .iter()
@@ -246,25 +247,31 @@ fn main_phase_opens_with_events(state: &GameState, player: PlayerId) -> bool {
         })
 }
 
-/// Does `player` control a permanent with a printed "at the beginning of your
-/// `phase`" trigger (CR 503.1a for the upkeep, CR 117.3a in general)? Deliberately NOT gated
-/// on the trigger
-/// currently functioning — `Definitions::iter_unchecked` is the sanctioned
-/// classification-only accessor (engine runtime paths use the CR-gated
-/// `functioning_*` helpers instead; this is neither, so a source under a
-/// static suppression still counts). That is the safe direction: this
-/// predicate exists only to EXCLUDE a window from patience-gating, so
-/// over-including a source that could not actually have fired only means the
-/// policy declines to nudge a few boards it safely could have — never the
-/// reverse.
-fn controls_beginning_of_phase_trigger(state: &GameState, player: PlayerId, phase: Phase) -> bool {
+/// Does a printed "at the beginning of [phase]" trigger that fires on `player`'s turn sit on any
+/// battlefield permanent (CR 503.1a for the upkeep, CR 117.3a in general)? A "your" trigger counts
+/// for its controller only; an "each player's" trigger (Blinkmoth Urn) counts for every player,
+/// whoever controls it, through the engine's `phase_trigger_scoped_to_turn_of`. Deliberately NOT
+/// gated on the trigger currently functioning or on its intervening-if (CR 603.4: an activation
+/// now may be what makes it true) — `Definitions::iter_unchecked` is the sanctioned
+/// classification-only accessor (engine runtime paths use the CR-gated `functioning_*` helpers
+/// instead; this is neither, so a source under a static suppression still counts). That is the
+/// safe direction: this predicate exists only to EXCLUDE a window from patience-gating, so
+/// over-including a source that could not actually have fired only means the policy declines to
+/// nudge a few boards it safely could have — never the reverse.
+fn beginning_of_phase_trigger_reaches(state: &GameState, player: PlayerId, phase: Phase) -> bool {
     state.battlefield.iter().any(|&id| {
         state.objects.get(&id).is_some_and(|object| {
-            object.controller == player
-                && object.trigger_definitions.iter_unchecked().any(|entry| {
-                    let def = entry.definition();
-                    def.mode == TriggerMode::Phase && def.phase == Some(phase)
-                })
+            object.trigger_definitions.iter_unchecked().any(|entry| {
+                let def = entry.definition();
+                def.mode == TriggerMode::Phase
+                    && def.phase == Some(phase)
+                    && engine::game::triggers::phase_trigger_scoped_to_turn_of(
+                        state,
+                        def,
+                        object.controller,
+                        player,
+                    )
+            })
         })
     })
 }
