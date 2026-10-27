@@ -15334,14 +15334,13 @@ this spell's mana cost.\nDestroy target attacking creature without flying.",
             );
         }
 
-        for (name, keywords, types, text) in [
-            (
+        {
+            let (name, keywords, types, text) = (
                 "Mirror Shield",
                 &["Equip"][..],
                 &["Artifact"][..],
                 "Equipped creature gets +0/+2 and has hexproof and \"Whenever a creature with deathtouch blocks or becomes blocked by this creature, destroy that creature.\"\nEquip {2} ({2}: Attach to target creature you control. Equip only as a sorcery.)",
-            ),
-        ] {
+            );
             // Reach guard: the bare recognizer DOES match inside the verb phrase,
             // so only the verb skip keeps the detector silent. The audit reads the
             // self-reference-normalized text, where the card name is "~".
