@@ -1359,6 +1359,7 @@ mod player_action_recording_after_choice;
 mod player_hexproof_shroud_grants;
 mod player_scope_created_token_union;
 mod player_scope_linked_exile_batch;
+mod player_scope_sacrifice_carrier;
 mod ponder_decline_shuffle_regression;
 mod power_fist_combat_damage_regression;
 mod power_leak_dynamic_prevention;
