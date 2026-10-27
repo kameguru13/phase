@@ -1043,6 +1043,7 @@ cargo run -p phase-engine --bin coverage-report -- data \
 | `Replacement_Instead` | " instead" present but no replacement definition emitted or the detector has a false positive because the AST represented the replacement through another supported structure |
 | `ActivateOnlyDuring` / `ActivateLimit` | activation timing/limit phrase not bound to a restriction slot |
 | `APNAP` | "starting with you" / "in turn order" not bound to order metadata |
+| `CombatPairingRelation` | postnominal "blocking or blocked by <it\|~\|this creature\|target creature>" / "blocked by <it\|~\|this creature>" (recognized by `oracle_target::parse_block_pairing_clause`) not represented as the `CombatRelation` its form denotes (`BlockingOrBlockedBy` / `BlockedBySubject { scope: None }`) — typically a bare "it" with no `SelfRef` antecedent; verb phrases ("becomes blocked by ~") are skipped |
 | `target-fallback:` | secondary class — `parse_target` couldn't classify a noun phrase, or a downstream chomping loop encountered an unmatched filter suffix |
 
 Current `card-data.json` stores parse warnings as structured diagnostics, not legacy strings:
