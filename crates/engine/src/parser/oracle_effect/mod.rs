@@ -27747,15 +27747,18 @@ fn node_resolution_choice<'a>(
 /// CR 701.23a: the zone a library search clause `k` delivers its found card to,
 /// read from the `SearchDestination` continuation on the search clause itself
 /// (`intrinsic`) or on a later clause before `reader` (`followup`). `Some` only
-/// when at least one destination is printed and every one agrees.
+/// when at least one destination is printed and every one agrees. A search in
+/// the reader clause itself (`k == reader`) has no such later clause.
 fn search_result_destination(clauses: &[ClauseIr], k: usize, reader: usize) -> Option<Zone> {
     let mut destinations = clauses[k]
         .disposition
         .intrinsic()
         .into_iter()
         .chain(
-            clauses[k + 1..reader]
+            clauses
                 .iter()
+                .take(reader)
+                .skip(k + 1)
                 .filter_map(|clause| clause.disposition.followup()),
         )
         .filter_map(|continuation| match continuation {
@@ -28204,6 +28207,76 @@ fn bind_anaphors_across_resolution_choices(clauses: &mut [ClauseIr], body_scope:
                 clauses[i].reads_chosen_clause = Some(group);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cross_choice_compound_reader_tests {
+    use super::{bind_anaphors_across_resolution_choices, parse_effect_chain_ir};
+    use super::{search_result_destination, BodyScope, ParseContext};
+    use crate::types::ability::{AbilityDefinition, AbilityKind, Effect, TargetFilter};
+
+    /// Parser IR shape only (no resolution). CR 608.2c + CR 701.23a: a library
+    /// search joined into the reader clause ahead of its "that creature" read is
+    /// a resolution-time choice whose destination this chain never prints, so the
+    /// binder declines. Its follow-up scan covers no clause when the search sits
+    /// in the reader clause itself (`k == reader`).
+    ///
+    /// No Oracle text reaches this shape through `parse_oracle_text`: the chunk
+    /// splitter gives every "search your library …" instruction its own clause.
+    /// The reader clause is therefore built from parsed parts: the search becomes
+    /// its head and the original stun-counter read its `sub_ability`.
+    #[test]
+    fn search_inside_reader_clause_before_its_read_declines() {
+        let mut ir = parse_effect_chain_ir(
+            "Tap target creature. You may exile a card from your graveyard. If you do, put a stun counter on that creature.",
+            AbilityKind::Spell,
+            &mut ParseContext::default(),
+        );
+        let clauses = &mut ir.clauses;
+        assert_eq!(clauses.len(), 3, "{clauses:?}");
+        let (producer, reader) = (0, 2);
+        // Reach guard: unspliced, the binder links the reader to the producer.
+        let producer_id = clauses[producer].id;
+        assert_eq!(clauses[producer].declares_chosen_clause, Some(producer_id));
+        assert_eq!(clauses[reader].reads_chosen_clause, Some(producer_id));
+
+        let search = parse_effect_chain_ir(
+            "Search your library for a card.",
+            AbilityKind::Spell,
+            &mut ParseContext::default(),
+        )
+        .clauses
+        .remove(0)
+        .parsed
+        .effect;
+        assert!(matches!(search, Effect::SearchLibrary { .. }), "{search:?}");
+
+        clauses[producer].declares_chosen_clause = None;
+        clauses[reader].reads_chosen_clause = None;
+        let read = std::mem::replace(&mut clauses[reader].parsed.effect, search);
+        assert!(
+            matches!(
+                read,
+                Effect::PutCounter {
+                    target: TargetFilter::ParentTarget,
+                    ..
+                }
+            ),
+            "{read:?}"
+        );
+        clauses[reader].parsed.sub_ability =
+            Some(Box::new(AbilityDefinition::new(AbilityKind::Spell, read)));
+
+        bind_anaphors_across_resolution_choices(clauses, BodyScope::WholeAbility);
+        assert!(
+            matches!(clauses[reader].parsed.effect, Effect::SearchLibrary { .. }),
+            "the reader clause is left as is: {:?}",
+            clauses[reader].parsed.effect
+        );
+        assert_eq!(clauses[reader].reads_chosen_clause, None);
+        assert_eq!(clauses[producer].declares_chosen_clause, None);
+        assert_eq!(search_result_destination(clauses, reader, reader), None);
     }
 }
 
