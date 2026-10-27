@@ -583,3 +583,76 @@ fn concession_journal_records_and_replays_the_departure() {
         );
     }
 }
+
+const ACT_OF_AGGRESSION_ORACLE: &str = "Gain control of target creature an opponent controls \
+     until end of turn. Untap that creature. It gains haste until end of turn.";
+
+/// CR 603.10a + CR 603.3a + CR 800.4a + CR 800.4d: P2 steals P0's Extractor
+/// Demon with a real control-changing spell, then concedes while owning a bear.
+/// The bear leaves the game before P2's control effects end, so the stolen
+/// Demon's leaves-the-battlefield ability looks back to a source P2 controlled:
+/// P2 controls that trigger, and it isn't put on the stack. Control then
+/// reverts and the Demon stays with P0, which puts no trigger of its own on the
+/// stack for the bear. P0's other Demon is the reach guard: it sees the bear
+/// leave and triggers under P0.
+///
+/// REVERT-FAILING: collecting the departure against the post-revert board gives
+/// the stolen Demon's trigger to P0.
+#[test]
+fn concession_after_stealing_an_observer_retires_the_stolen_observers_trigger() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let stolen_demon = scenario
+        .add_creature_from_oracle(P0, "Extractor Demon", 5, 5, EXTRACTOR_DEMON_ORACLE)
+        .id();
+    let p0_demon = scenario
+        .add_creature_from_oracle(P0, "Extractor Demon", 5, 5, EXTRACTOR_DEMON_ORACLE)
+        .id();
+    let bear = scenario.add_creature(P2, "P2 Bear", 2, 2).id();
+    let aggression = scenario
+        .add_spell_to_hand_from_oracle(P2, "Act of Aggression", true, ACT_OF_AGGRESSION_ORACLE)
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+
+    // P0 and P1 pass; P2 receives priority and steals the Demon.
+    for _ in 0..2 {
+        runner
+            .act(GameAction::PassPriority)
+            .expect("priority passes to P2");
+    }
+    assert_eq!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { player: P2 }
+    );
+    runner
+        .cast(aggression)
+        .target_object(stolen_demon)
+        .resolve();
+    // Reach guard: the control effect is live.
+    assert_eq!(runner.state().objects[&stolen_demon].controller, P2);
+    assert!(runner.state().stack.is_empty());
+
+    runner
+        .act(GameAction::Concede { player_id: P2 })
+        .expect("P2 concedes");
+    assert_eq!(zone(&runner, bear), Zone::Exile);
+    assert_eq!(
+        runner.state().objects[&stolen_demon].controller,
+        P0,
+        "CR 800.4a: the control effect ended and the Demon reverted to P0"
+    );
+    assert_eq!(zone(&runner, stolen_demon), Zone::Battlefield);
+
+    drive_trigger_prompts(&mut runner);
+    assert_eq!(
+        triggers_from(&runner, p0_demon),
+        1,
+        "CR 603.6c: P0's own Demon sees the bear leave the game"
+    );
+    assert_eq!(
+        triggers_from(&runner, stolen_demon),
+        0,
+        "CR 603.3a + CR 800.4d: the stolen Demon's trigger was P2's, and P2 left"
+    );
+}

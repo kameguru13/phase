@@ -306,6 +306,16 @@ fn eliminate_players(
         })
         .flatten();
 
+    // CR 603.10a + CR 603.3a: the observers of the departure as they were
+    // immediately before it. The leaving players' objects leave before their
+    // control effects end (CR 800.4a), so an observer a leaving player stole
+    // controlled its leaves-the-battlefield ability when it triggered, and that
+    // ability is retired with its controller (CR 800.4d) rather than handed to
+    // the observer's owner once control reverts.
+    let looked_back_observers = (departure_triggers == DepartureTriggers::CollectedByDeparture
+        && !leaving_set.is_empty())
+    .then(|| super::triggers::ImmediatelyBeforeObservers::latch(state));
+
     for &player in players_to_eliminate {
         // Skip if already eliminated (e.g. a teammate eliminated alongside an
         // earlier loser in this same batch).
@@ -332,6 +342,7 @@ fn eliminate_players(
         return;
     }
     mark_left_game_departures_simultaneous(state, events, first_event, first_record);
+    let departure_end = events.len();
 
     // CR 800.4a: after ALL owned-exiles, end control effects the leaving players
     // control and exile anything still under a leaver's control. Runs ONCE over
@@ -434,7 +445,12 @@ fn eliminate_players(
     // left (CR 800.4d) and the drain puts the rest on the stack together. CR 104.1:
     // once the game is over, nothing triggered goes on the stack.
     if departure_triggers == DepartureTriggers::CollectedByDeparture && game_over_winner.is_none() {
-        super::triggers::collect_unclaimed_triggers_into_deferred(state, events, first_event);
+        super::triggers::collect_unclaimed_triggers_into_deferred(
+            state,
+            events,
+            first_event,
+            looked_back_observers.map(|observers| (observers, departure_end)),
+        );
     }
 
     // CR 603.3b + CR 800.4a: Always resolve in-flight trigger-ordering work

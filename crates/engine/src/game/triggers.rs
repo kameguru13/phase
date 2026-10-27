@@ -2605,9 +2605,7 @@ pub(crate) fn allocate_logical_zone_change_group(
     state: &mut GameState,
     announced_members: &[ObjectId],
 ) -> LogicalZoneChangeGroup {
-    let mut immediately_before_state = state.clone();
-    super::layers::flush_layers(&mut immediately_before_state);
-    reconcile_off_zone_keyword_triggers(&mut immediately_before_state);
+    let immediately_before_state = immediately_before_projection(state);
     let mut group = state.allocate_logical_zone_change_group(announced_members);
     latch_logical_zone_change_group_immediately_before(&immediately_before_state, &mut group);
     group
@@ -8472,19 +8470,91 @@ pub(crate) fn retire_departed_controller_contexts(
     live
 }
 
+/// CR 603.10: the game as it was immediately before an event, with layers
+/// flushed and off-zone keyword triggers reconciled: the authority that
+/// look-back triggers read their sources from. Shared by the logical
+/// zone-change owner and the player-leaves-game procedure.
+fn immediately_before_projection(state: &GameState) -> GameState {
+    let mut immediately_before_state = state.clone();
+    super::layers::flush_layers(&mut immediately_before_state);
+    reconcile_off_zone_keyword_triggers(&mut immediately_before_state);
+    immediately_before_state
+}
+
+/// CR 603.10 + CR 603.10a + CR 603.3a: the observers of an event batch as they
+/// were immediately before it, latched before the batch happens. A
+/// leaves-the-battlefield ability looks back in time: it triggers, and its
+/// controller is the player who controlled its source, as the source appeared
+/// immediately before the event, even when a later step of the same procedure
+/// changes that control (CR 800.4a ends control effects after the departing
+/// player's objects have left).
+pub(crate) struct ImmediatelyBeforeObservers {
+    state: GameState,
+}
+
+impl ImmediatelyBeforeObservers {
+    pub(crate) fn latch(state: &GameState) -> Self {
+        Self {
+            state: immediately_before_projection(state),
+        }
+    }
+
+    /// Collect the ordinary triggered abilities `events` trigger, matched
+    /// against the latched observers, into `state.deferred_triggers`. The
+    /// collector's ledger operations are replayed onto `state`, and a context
+    /// whose controller has left the game is retired against `state`
+    /// (CR 800.4d), the same commit an announcement-local collection makes.
+    fn collect_into_deferred(mut self, state: &mut GameState, events: &[GameEvent]) {
+        let mut session = TriggerCollectionSession::transactional(
+            TriggerCollectionOverlay::default(),
+            Vec::new(),
+        );
+        let contexts = collect_pending_triggers_with_collection(
+            &mut self.state,
+            events,
+            LogicalZoneTriggerCollection::Ordinary,
+            &mut session,
+        );
+        for operation in session.into_operation_journal() {
+            let _ = TriggerCollectionSession::apply_operation(state, operation);
+        }
+        let live = retire_departed_controller_contexts(state, contexts);
+        state.deferred_triggers.extend(live);
+    }
+}
+
 /// CR 603.2 + CR 603.2c + CR 603.7: Collect the ordinary and delayed triggered
 /// abilities that `events[event_start..]` trigger into `state.deferred_triggers`,
 /// skipping occurrences a collector already claimed. For an action whose events
 /// no post-action pipeline scans (a concession, CR 104.3a): the same collect step
 /// the pipeline runs, without its dispatch.
+///
+/// `looked_back` names the observers latched before `events[event_start..split]`
+/// happened; ordinary triggers of that prefix are matched against them
+/// (CR 603.10a), the rest against the live game. Delayed abilities carry their
+/// controller from creation and are matched live.
 pub(crate) fn collect_unclaimed_triggers_into_deferred(
     state: &mut GameState,
     events: &[GameEvent],
     event_start: usize,
+    looked_back: Option<(ImmediatelyBeforeObservers, usize)>,
 ) {
     let consumed = state.consumed_before_priority_trigger_events.clone();
+    let live_start = match looked_back {
+        Some((observers, split)) => {
+            let looked_back_events = filter_already_collected_trigger_events_from(
+                state,
+                &events[..split],
+                event_start,
+                &consumed,
+            );
+            observers.collect_into_deferred(state, &looked_back_events);
+            split
+        }
+        None => event_start,
+    };
     let ordinary =
-        filter_already_collected_trigger_events_from(state, events, event_start, &consumed);
+        filter_already_collected_trigger_events_from(state, events, live_start, &consumed);
     collect_triggers_into_deferred(state, &ordinary);
     let delayed = unclaimed_trigger_events_from(
         events,
