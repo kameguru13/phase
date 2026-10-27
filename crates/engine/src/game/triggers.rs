@@ -8523,9 +8523,18 @@ impl ImmediatelyBeforeObservers {
     }
 }
 
-/// CR 800.4a: a zone change in which an object left the game with its owner.
-fn event_left_the_game(event: &GameEvent) -> bool {
-    matches!(event, GameEvent::ZoneChanged { record, .. } if record.departure.left_game())
+/// CR 603.10: the events of a player's departure that the abilities they
+/// trigger look back on: an object leaving the game with its owner
+/// (CR 603.10a: leaves-the-battlefield abilities are the only ones that see it),
+/// an Aura or Equipment becoming unattached from it (CR 603.10c), and a
+/// permanent phasing out (CR 603.10b). Everything else, such as the monarch or
+/// the initiative changing hands, is checked immediately after it.
+fn departure_event_looks_back(event: &GameEvent) -> bool {
+    match event {
+        GameEvent::ZoneChanged { record, .. } => record.departure.left_game(),
+        GameEvent::Unattached { .. } | GameEvent::PermanentPhasedOut { .. } => true,
+        _ => false,
+    }
 }
 
 /// CR 603.2 + CR 603.2c + CR 603.7: Collect the ordinary and delayed triggered
@@ -8535,8 +8544,9 @@ fn event_left_the_game(event: &GameEvent) -> bool {
 /// the pipeline runs, without its dispatch.
 ///
 /// `looked_back` names the observers latched before `events[event_start..split]`
-/// happened; the departures of that prefix (objects that left the game) are
-/// matched against them (CR 603.10a), every other event against the live game.
+/// happened; that prefix's look-back events (objects leaving the game and
+/// becoming unattached, CR 603.10a + CR 603.10c) are matched against them,
+/// every other event against the live game.
 /// Delayed abilities carry their controller from creation and are matched live.
 pub(crate) fn collect_unclaimed_triggers_into_deferred(
     state: &mut GameState,
@@ -8548,11 +8558,11 @@ pub(crate) fn collect_unclaimed_triggers_into_deferred(
     let mut ordinary =
         filter_already_collected_trigger_events_from(state, events, event_start, &consumed);
     if let Some((observers, split)) = looked_back {
-        // CR 603.10 + CR 603.10a: only a departure is looked back on. An object
-        // that left the game is seen only by leaves-the-battlefield abilities,
-        // which look back; every other event of the prefix (the monarch or the
-        // initiative changing hands, the player leaving) is checked against
-        // the game immediately after it, like the rest.
+        // CR 603.10: only the departure's look-back events are matched against
+        // the observers as they were before it (`departure_event_looks_back`);
+        // every other event of the prefix (the monarch or the initiative
+        // changing hands, the player leaving) is checked against the game
+        // immediately after it, like the rest.
         let looked_back_events: Vec<GameEvent> = filter_already_collected_trigger_events_from(
             state,
             &events[..split],
@@ -8560,7 +8570,7 @@ pub(crate) fn collect_unclaimed_triggers_into_deferred(
             &consumed,
         )
         .into_iter()
-        .filter(event_left_the_game)
+        .filter(departure_event_looks_back)
         .collect();
         ordinary.retain(|event| !looked_back_events.contains(event));
         observers.collect_into_deferred(state, &looked_back_events);

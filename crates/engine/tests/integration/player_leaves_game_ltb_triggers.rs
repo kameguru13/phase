@@ -800,3 +800,90 @@ fn concession_with_a_paused_spell_does_not_exile_it() {
         "CR 800.4a: only the bear P0 controlled was exiled; Harsh Mercy left the game"
     );
 }
+
+const WORD_OF_SEIZING_ORACLE: &str =
+    "Untap target permanent and gain control of it until end of turn.";
+const GRAFTED_WARGEAR_ORACLE: &str = "Equipped creature gets +3/+2.\n\
+     Whenever this Equipment becomes unattached from a permanent, sacrifice that permanent.\n\
+     Equip {0}";
+
+/// CR 603.10c + CR 603.3a + CR 800.4a + CR 800.4d: on P2's turn, P2 steals P0's
+/// Grafted Wargear with Word of Seizing, equips it to P2's bear, and concedes.
+/// The bear leaves the game and the Wargear becomes unattached in the same
+/// event that ends P2's control effects. "Becomes unattached" looks back in
+/// time, so the ability is P2's, the Wargear's controller immediately before,
+/// and it isn't put on the stack; the Wargear then reverts to P0.
+///
+/// REVERT-FAILING: reading the departure's `Unattached` event against the
+/// post-revert board gives the Wargear's trigger to P0.
+#[test]
+fn concession_after_stealing_equipment_retires_its_unattach_trigger() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    for player in [P0, P1, P2] {
+        scenario.with_library_top(player, &["Forest", "Forest", "Forest"]);
+    }
+    let wargear = scenario
+        .add_artifact_from_oracle(P0, "Grafted Wargear", GRAFTED_WARGEAR_ORACLE)
+        .with_subtypes(vec!["Equipment"])
+        .id();
+    let bear = scenario.add_creature(P2, "P2 Bear", 2, 2).id();
+    let seizing = scenario
+        .add_spell_to_hand_from_oracle(P2, "Word of Seizing", true, WORD_OF_SEIZING_ORACLE)
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+
+    // Advance to P2's main phase (P0, then P1, then P2 in turn order).
+    for _ in 0..2 {
+        runner.advance_to_upkeep();
+        runner.advance_to_phase(Phase::PreCombatMain);
+    }
+    assert_eq!(runner.state().active_player, P2, "reach guard: P2's turn");
+
+    runner.cast(seizing).target_object(wargear).resolve();
+    assert_eq!(runner.state().objects[&wargear].controller, P2);
+    let equip = runner.state().objects[&wargear]
+        .abilities
+        .iter()
+        .position(|ability| {
+            ability
+                .description
+                .as_deref()
+                .is_some_and(|description| description.contains("Equip"))
+        })
+        .expect("Grafted Wargear carries an Equip ability");
+    runner
+        .activate(wargear, equip)
+        .target_object(bear)
+        .resolve();
+    // Reach guard: P2's Wargear is attached to P2's bear.
+    assert_eq!(
+        runner.state().objects[&wargear].attached_to,
+        Some(engine::game::game_object::AttachTarget::Object(bear))
+    );
+    assert!(runner.state().stack.is_empty());
+
+    runner
+        .act(GameAction::Concede { player_id: P2 })
+        .expect("P2 concedes");
+    assert_eq!(zone(&runner, bear), Zone::Exile);
+    assert_eq!(
+        runner.state().objects[&wargear].attached_to,
+        None,
+        "the Wargear became unattached"
+    );
+    assert_eq!(
+        runner.state().objects[&wargear].controller,
+        P0,
+        "CR 800.4a: the control effect ended and the Wargear reverted to P0"
+    );
+
+    drive_trigger_prompts(&mut runner);
+    assert_eq!(
+        triggers_from(&runner, wargear),
+        0,
+        "CR 603.10c + CR 800.4d: the unattach trigger was P2's, and P2 left"
+    );
+    assert!(runner.state().deferred_triggers.is_empty());
+}
