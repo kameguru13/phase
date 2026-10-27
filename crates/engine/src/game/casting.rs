@@ -32217,76 +32217,23 @@ pub(crate) fn fold_activation_cost(
 }
 
 /// CR 106.4 + CR 106.6 + CR 500.5 + CR 602.2b: Does `player`'s mana pool hold mana that will
-/// empty as this step ends and that could be spent toward activating `source_id`'s ability
-/// `ability_index`?
-///
-/// The cost read is the one the payment pipeline will demand: CR 601.2f folds in cost increases
-/// and reductions (Suppression Field's "{2} more") through the feasibility fold, and a disjunctive
-/// cost (Granite Shard's "{3}, {T} or {R}, {T}") contributes each branch the affordability
-/// authority would offer. A unit counts when the activation's payment context allows it and it
-/// can pay some mana leg of one of those costs: a generic leg takes any type, a shard only the
-/// types it names (CR 107.4) unless a CR 609.4b spend-as-any-color permission applies. Mana kept
-/// until end of turn ("you don't lose this mana as steps and phases end") is not counted; mana a
-/// step-end handler such as Upwelling would keep still is, which errs toward answering yes.
-/// Read-only, for callers weighing whether waiting wastes floating mana.
-pub fn pool_mana_can_pay_toward_activation(
+/// empty as this step ends and that the activation of `source_id`'s ability `ability_index` is
+/// allowed to spend? Eligibility is the payment pipeline's own
+/// (`mana_payment::mana_unit_permits_payment_context` over the activation's payment context), so
+/// restrictions such as "spend this mana only to cast spells" are honoured. Whether the unit
+/// matches one of the cost's shards is deliberately not asked: answering that a second time would
+/// duplicate the payment authority, and the effective cost can depend on targets and modes not yet
+/// chosen. Mana kept until end of turn ("you don't lose this mana as steps and phases end") is
+/// not counted; mana a step-end handler such as Upwelling would keep still is. Every gap errs
+/// toward yes, for callers that use it to stand down a preference to wait.
+pub fn pool_has_expiring_mana_for_activation(
     state: &GameState,
     player: PlayerId,
     source_id: ObjectId,
     ability_index: usize,
 ) -> bool {
-    let Some(mut ability_def) = activation_ability_definition(state, source_id, ability_index)
-    else {
-        return false;
-    };
-    let life = ActivationLifeWindow::for_payment_mode(player, source_id, CastPaymentMode::Auto);
-    fold_activation_cost_for_feasibility(
-        state,
-        &mut ability_def,
-        player,
-        source_id,
-        ability_index,
-        &life,
-    );
-    let Some(cost) = ability_def.cost else {
-        return false;
-    };
-    let costs = match find_one_of_cost(&cost) {
-        Some(branches) => payable_one_of_activation_branches(
-            state,
-            player,
-            source_id,
-            &cost,
-            branches,
-            ability_index,
-            CastPaymentMode::Auto,
-        )
-        .iter()
-        .filter_map(|branch| cost.resolve_first_one_of(branch))
-        .collect(),
-        None => vec![cost],
-    };
-    // Each mana leg as (generic, shard requirements).
-    let legs: Vec<(u32, Vec<_>)> = costs
-        .iter()
-        .filter_map(|cost| match activation_mana_component(cost) {
-            ManaCost::Cost { shards, generic } if generic > 0 || !shards.is_empty() => Some((
-                generic,
-                shards
-                    .iter()
-                    .map(|shard| mana_payment::shard_to_mana_type(*shard))
-                    .collect(),
-            )),
-            _ => None,
-        })
-        .collect();
-    if legs.is_empty() {
-        return false;
-    }
     let context = activation_payment_context(state, source_id, Some(ability_index));
     let ctx = context.as_payment_context();
-    let permission =
-        player_mana_spend_permission_for_payment(state, player, Some(source_id), Some(&ctx));
     state
         .players
         .iter()
@@ -32301,18 +32248,7 @@ pub fn pool_mana_can_pay_toward_activation(
                     | Some(crate::types::mana::ManaExpiry::EndOfCombat) => true,
                     Some(crate::types::mana::ManaExpiry::EndOfTurn) => false,
                 };
-                empties
-                    && mana_payment::mana_unit_permits_payment_context(unit, &ctx)
-                    && legs.iter().any(|(generic, requirements)| {
-                        *generic > 0
-                            || requirements.iter().any(|requirement| {
-                                mana_payment::unit_can_pay_toward_shard(
-                                    unit,
-                                    requirement,
-                                    permission,
-                                )
-                            })
-                    })
+                empties && mana_payment::mana_unit_permits_payment_context(unit, &ctx)
             }) > 0
         })
 }

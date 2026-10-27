@@ -42,7 +42,7 @@
 //!
 //! ## The three escape hatches
 //!
-//! Floating mana the activation could spend comes first: it empties as the step
+//! Floating mana the activation may spend comes first: it empties as the step
 //! ends (CR 500.5), so for it waiting is not free. The report names the other two
 //! times to activate early: when the damage is part of a lethal
 //! line, and (implicitly) when the ability's own condition is met *now* and might
@@ -330,10 +330,11 @@ impl TacticalPolicy for ActivationPatiencePolicy {
         }
 
         // Escape hatch 1 — CR 500.5: mana in the pool empties as this step ends, so
-        // when it could pay toward this activation (Thran Turbine's upkeep {C}{C},
-        // which can't be spent on spells) waiting destroys it rather than saving it
-        // for the main phase.
-        if engine::game::casting::pool_mana_can_pay_toward_activation(
+        // when this activation may spend it (Thran Turbine's upkeep {C}{C}, which can't
+        // be spent on spells) waiting can destroy it rather than save it for the main
+        // phase. The engine answers eligibility only; whether this cost would actually
+        // use the mana is left to the payment pipeline, and the hatch errs toward acting.
+        if engine::game::casting::pool_has_expiring_mana_for_activation(
             ctx.state,
             ctx.ai_player,
             *source_id,

@@ -471,10 +471,11 @@ fn a_delayed_main_phase_trigger_stands_the_draw_step_down() {
     assert_eq!(delta, 0.0);
 }
 
-/// CR 500.5: floating mana empties as the step ends, so when it could pay toward the
-/// activation, waiting destroys it (Thran Turbine's upkeep {C}{C}, which can't be spent
-/// on spells). Mana that can't pay for this activation, or an activation with no mana
-/// leg, leaves the hold in place.
+/// CR 500.5 + CR 106.6: floating mana empties as the step ends, so when the activation may
+/// spend it (Thran Turbine's upkeep {C}{C}, which can't be spent on spells) waiting can
+/// destroy it. Mana this activation isn't allowed to spend (spell-only) leaves the hold in
+/// place; the hatch asks eligibility only, so whether the cost would use the mana (a {T}-only
+/// ping, an {R} leg) is left to the payment pipeline and errs toward acting.
 #[test]
 fn floating_mana_the_activation_could_spend_stands_patience_down() {
     use engine::types::mana::{ManaRestriction, ManaType, ManaUnit};
@@ -517,16 +518,15 @@ fn floating_mana_the_activation_could_spend_stands_patience_down() {
     let (delta, reason) = score_and_reason(&verdict_for(&stands_down));
     assert_eq!(reason, "activation_patience_floating_mana");
     assert_eq!(delta, 0.0);
-    // The {T}-only ping has no mana leg, so the same floating mana doesn't stand it down.
+    // Eligibility only: the {T}-only ping and an {R} pinger also stand down.
     let ping = Board {
         state: board.state.clone(),
         pinger: board.pinger,
     };
     assert_eq!(
         score_and_reason(&verdict_for(&ping)).1,
-        "activation_patience_hold"
+        "activation_patience_floating_mana"
     );
-    // CR 107.4a: floating {C} can't pay an {R} leg, so a red pinger is still held.
     let red_pinger = creature(
         &mut board.state,
         &mut Ids(9_300),
@@ -542,8 +542,87 @@ fn floating_mana_the_activation_could_spend_stands_patience_down() {
     };
     assert_eq!(
         score_and_reason(&verdict_for(&red)).1,
-        "activation_patience_hold",
-        "colorless mana can't pay {{R}}"
+        "activation_patience_floating_mana"
+    );
+}
+
+/// The case from review: two opponents each controlling Kopala, Warden of Waves ("Abilities
+/// your opponents activate that target a Merfolk you control cost {2} more to activate.",
+/// verified against MTGJSON) raise the Sorcerer's {T} ping by {2} per Merfolk target. With
+/// {C}{C} floating, whatever target is chosen, the mana empties as the step ends (CR 500.5),
+/// so patience stands down without the query having to price any target assignment.
+#[test]
+fn floating_mana_stands_patience_down_under_target_dependent_taxes() {
+    use engine::types::mana::{ManaType, ManaUnit};
+    let mut ids = Ids::new();
+    let mut state = GameState::new(engine::types::format::FormatConfig::standard(), 3, 4242);
+    state.phase = Phase::Draw;
+    state.active_player = AI;
+    state.priority_player = AI;
+    let pinger = creature(
+        &mut state,
+        &mut ids,
+        AI,
+        "Prodigal Sorcerer",
+        1,
+        1,
+        Some("{T}: This creature deals 1 damage to any target."),
+    );
+    for opponent in [PlayerId(1), PlayerId(2)] {
+        let kopala = creature(
+            &mut state,
+            &mut ids,
+            opponent,
+            "Kopala, Warden of Waves",
+            2,
+            2,
+            None,
+        );
+        state
+            .objects
+            .get_mut(&kopala)
+            .unwrap()
+            .card_types
+            .subtypes
+            .push("Merfolk".to_string());
+        let tax = parse_oracle_text(
+            "Abilities your opponents activate that target a Merfolk you control cost {2} more to activate.",
+            "Kopala, Warden of Waves",
+            &[],
+            &["Creature".to_string()],
+            &["Merfolk".to_string()],
+        )
+        .statics
+        .into_iter()
+        .next()
+        .expect("Kopala parses its cost increase");
+        state
+            .objects
+            .get_mut(&kopala)
+            .unwrap()
+            .static_definitions
+            .push(tax);
+    }
+    state.waiting_for = WaitingFor::Priority { player: AI };
+    let mut board = Board { state, pinger };
+    assert_eq!(
+        score_and_reason(&verdict_for(&board)).1,
+        "activation_patience_hold_for_main",
+        "reach: with nothing floating the taxed ping is held"
+    );
+    for _ in 0..2 {
+        board.state.players[AI.0 as usize]
+            .mana_pool
+            .add(ManaUnit::new(
+                ManaType::Colorless,
+                ObjectId(9_900),
+                false,
+                vec![],
+            ));
+    }
+    assert_eq!(
+        score_and_reason(&verdict_for(&board)).1,
+        "activation_patience_floating_mana"
     );
 }
 
@@ -588,26 +667,11 @@ fn floating_mana_payable_by_one_branch_of_an_or_cost_stands_patience_down() {
 
 /// CR 601.2f + CR 602.2b: Suppression Field ("Activated abilities cost {2} more to activate
 /// unless they're mana abilities.", verified against MTGJSON) turns the printed {T}-only ping
-/// into {2}, {T}, so floating {C}{C} could pay it and stands patience down.
+/// into {2}, {T}; with {C}{C} floating the taxed ping stands patience down.
 #[test]
 fn floating_mana_that_pays_a_cost_increase_stands_patience_down() {
     use engine::types::mana::{ManaType, ManaUnit};
     let mut board = build_board(Phase::Upkeep, 20, 20);
-    for _ in 0..2 {
-        board.state.players[AI.0 as usize]
-            .mana_pool
-            .add(ManaUnit::new(
-                ManaType::Colorless,
-                ObjectId(9_900),
-                false,
-                vec![],
-            ));
-    }
-    assert_eq!(
-        score_and_reason(&verdict_for(&board)).1,
-        "activation_patience_hold",
-        "reach: untaxed, the {{T}}-only ping has no mana leg for the floating mana"
-    );
     let field = creature(
         &mut board.state,
         &mut Ids(9_000),
@@ -635,6 +699,21 @@ fn floating_mana_that_pays_a_cost_increase_stands_patience_down() {
         .unwrap()
         .static_definitions
         .push(tax);
+    assert_eq!(
+        score_and_reason(&verdict_for(&board)).1,
+        "activation_patience_hold",
+        "reach: with nothing floating the taxed ping is held"
+    );
+    for _ in 0..2 {
+        board.state.players[AI.0 as usize]
+            .mana_pool
+            .add(ManaUnit::new(
+                ManaType::Colorless,
+                ObjectId(9_900),
+                false,
+                vec![],
+            ));
+    }
     assert_eq!(
         score_and_reason(&verdict_for(&board)).1,
         "activation_patience_floating_mana"
