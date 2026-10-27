@@ -47,7 +47,7 @@ struct Outcome {
     forest_tapped: bool,
     life_delta: i32,
     hand_delta: i32,
-    offered_search: bool,
+    search_offers: usize,
     prompts: Vec<String>,
 }
 
@@ -129,7 +129,8 @@ fn run(route: Route, accept: bool) -> Outcome {
     }
 
     let mut prompts = Vec::new();
-    let mut offered_search = false;
+    let mut search_offers = 0;
+    let mut settled = false;
     for _ in 0..32 {
         let waiting = runner.state().waiting_for.clone();
         prompts.push(format!("{waiting:?}").chars().take(60).collect::<String>());
@@ -150,7 +151,7 @@ fn run(route: Route, accept: bool) -> Outcome {
                     .expect("sacrificing Heaped Harvest must succeed");
             }
             WaitingFor::OptionalEffectChoice { .. } => {
-                offered_search = true;
+                search_offers += 1;
                 runner
                     .act(GameAction::DecideOptionalEffect { accept })
                     .expect("answering the optional search must succeed");
@@ -166,7 +167,10 @@ fn run(route: Route, accept: bool) -> Outcome {
                     })
                     .expect("choosing the Forest must succeed");
             }
-            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => break,
+            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => {
+                settled = true;
+                break;
+            }
             WaitingFor::Priority { .. } => {
                 runner
                     .act(GameAction::PassPriority)
@@ -175,9 +179,18 @@ fn run(route: Route, accept: bool) -> Outcome {
             other => panic!("unexpected prompt: {other:?}; trail so far: {prompts:?}"),
         }
     }
-    runner.advance_until_stack_empty();
-
+    // A stalled resolution (e.g. a prompt that keeps re-opening) must fail
+    // here rather than leave a half-resolved state for the assertions below.
+    assert!(
+        settled,
+        "resolution never settled within the prompt budget; trail: {prompts:?}"
+    );
     let state = runner.state();
+    assert!(
+        state.stack.is_empty() && matches!(state.waiting_for, WaitingFor::Priority { .. }),
+        "resolution must finish with an empty stack at priority; got {:?}",
+        state.waiting_for
+    );
     let player = &state.players[P0.0 as usize];
     Outcome {
         harvest_zone: state.objects.get(&harvest).map(|obj| obj.zone),
@@ -185,7 +198,7 @@ fn run(route: Route, accept: bool) -> Outcome {
         forest_tapped: state.objects[&forest].tapped,
         life_delta: player.life - life_before,
         hand_delta: player.hand.len() as i32 - hand_before,
-        offered_search,
+        search_offers,
         prompts,
     }
 }
@@ -196,10 +209,10 @@ fn assert_searched(outcome: &Outcome, case: &str) {
         Some(Zone::Graveyard),
         "reach-guard: {case} — Heaped Harvest must have been sacrificed"
     );
-    assert!(
-        outcome.offered_search,
-        "CR 603.10a + CR 603.5: {case} — the sacrifice trigger must offer its optional search; \
-         prompts: {:?}",
+    assert_eq!(
+        outcome.search_offers, 1,
+        "CR 603.10a + CR 603.5: {case} — the sacrifice trigger must offer its optional search \
+         exactly once; prompts: {:?}",
         outcome.prompts
     );
     assert_eq!(
@@ -244,14 +257,18 @@ fn declining_the_search_leaves_the_land_in_the_library() {
         Some(Zone::Graveyard),
         "reach-guard: Heaped Harvest must have been sacrificed"
     );
-    assert!(
-        outcome.offered_search,
-        "reach-guard: the trigger must reach its optional choice; prompts: {:?}",
+    assert_eq!(
+        outcome.search_offers, 1,
+        "reach-guard: the trigger must reach its optional choice exactly once; prompts: {:?}",
         outcome.prompts
     );
     assert_eq!(
         outcome.forest_zone,
         Zone::Library,
         "declining the search must not move the land"
+    );
+    assert_eq!(
+        outcome.hand_delta, 1,
+        "reach-guard: Eviscerator's Insight still resolves after the decline (drew two)"
     );
 }
