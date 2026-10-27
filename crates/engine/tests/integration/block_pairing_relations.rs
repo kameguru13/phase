@@ -876,3 +876,123 @@ fn alms_beast_grants_lifelink_only_to_its_partner() {
     );
     assert_eq!(runner.life(P1), p1_before, "every attacker was blocked");
 }
+
+// ── Trigger ordering (CR 603.3b) ────────────────────────────────────────
+
+const REVEILLARK: &str = "Flying\nWhen this creature leaves the battlefield, return up to two target creature cards with power 2 or less from your graveyard to the battlefield.";
+
+/// O1: two Abu Ja'fars attack; Reveillark blocks one and Grizzly Bears the
+/// other, and both Abu Ja'fars die together. Each dies trigger destroys a
+/// different creature (its own last known pairing), so the order is
+/// observable: if the Bears trigger resolves first, Reveillark's leaves
+/// trigger can return the Bears; if Reveillark's resolves first, the Bears
+/// aren't in the graveyard yet. CR 603.3b lets the controller choose the
+/// order, so the engine must prompt rather than order them itself.
+/// `bears_first` picks which trigger resolves first. Returns the Bears' zone.
+fn two_abu_jafars_dying_together(bears_first: bool) -> Zone {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let abu_r = scenario
+        .add_creature_from_oracle(P0, "Abu Ja'far", 0, 1, ABU_JAFAR)
+        .id();
+    let abu_b = scenario
+        .add_creature_from_oracle(P0, "Abu Ja'far", 0, 1, ABU_JAFAR)
+        .id();
+    let reveillark = scenario
+        .add_creature_from_oracle(P1, "Reveillark", 4, 3, REVEILLARK)
+        .id();
+    let bears = scenario.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    let mut runner = scenario.build();
+
+    attack_and_block(
+        &mut runner,
+        &[abu_r, abu_b],
+        &[(reveillark, abu_r), (bears, abu_b)],
+    );
+    pass_until(&mut runner, "both Abu Ja'fars die", |state| {
+        matches!(state.waiting_for, WaitingFor::OrderTriggers { .. })
+            || (state.objects[&abu_r].zone == Zone::Graveyard && state.stack.len() >= 2)
+    });
+    let WaitingFor::OrderTriggers { player, triggers } = runner.state().waiting_for.clone() else {
+        panic!(
+            "CR 603.3b: the two dies triggers must be ordered by their controller, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(player, P0, "Abu Ja'fars' controller orders the triggers");
+    let mut sources: Vec<_> = triggers.iter().map(|t| t.source_id).collect();
+    sources.sort();
+    let mut expected = vec![abu_r, abu_b];
+    expected.sort();
+    assert_eq!(sources, expected, "one trigger from each Abu Ja'far");
+
+    // CR 405.3: index 0 is placed first and resolves last.
+    let first_to_resolve = if bears_first { abu_b } else { abu_r };
+    let last = triggers
+        .iter()
+        .position(|t| t.source_id != first_to_resolve)
+        .expect("the other trigger");
+    let top = 1 - last;
+    runner
+        .act(GameAction::OrderTriggers {
+            order: vec![last, top],
+        })
+        .expect("order the dies triggers");
+
+    for _ in 0..64 {
+        if runner.state().stack.is_empty()
+            && matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
+        {
+            break;
+        }
+        match runner.state().waiting_for.clone() {
+            // Reveillark's controller returns the Bears whenever they're a legal
+            // target, and returns nothing otherwise.
+            WaitingFor::TriggerTargetSelection { target_slots, .. } => {
+                let bears_target = TargetRef::Object(bears);
+                let targets = if target_slots
+                    .iter()
+                    .any(|slot| slot.legal_targets.contains(&bears_target))
+                {
+                    vec![bears_target]
+                } else {
+                    vec![]
+                };
+                runner
+                    .act(GameAction::SelectTargets { targets })
+                    .expect("choose Reveillark's targets");
+            }
+            WaitingFor::OrderTriggers { triggers, .. } => {
+                let order = (0..triggers.len()).collect();
+                runner
+                    .act(GameAction::OrderTriggers { order })
+                    .expect("order triggers");
+            }
+            WaitingFor::Priority { .. } => {
+                runner.act(GameAction::PassPriority).expect("pass priority");
+            }
+            other => panic!("resolving the dies triggers: unexpected prompt {other:?}"),
+        }
+    }
+    assert_zone(
+        &runner,
+        &[reveillark],
+        Zone::Graveyard,
+        "blocking an Abu Ja'far",
+    );
+    zone(&runner, bears)
+}
+
+#[test]
+fn two_abu_jafars_dying_together_let_their_controller_order_the_triggers() {
+    assert_eq!(
+        two_abu_jafars_dying_together(true),
+        Zone::Battlefield,
+        "Bears destroyed first, then Reveillark's leaves trigger returns them"
+    );
+    assert_eq!(
+        two_abu_jafars_dying_together(false),
+        Zone::Graveyard,
+        "Reveillark's trigger resolved before the Bears were destroyed"
+    );
+}

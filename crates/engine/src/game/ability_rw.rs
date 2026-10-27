@@ -103,12 +103,13 @@
 use crate::types::ability::FilterProp;
 use crate::types::ability::{
     AbilityCondition, AbilityDefinition, AttachCardinality, AttachSelection, AttachmentReferent,
-    AttackSubject, AttackedYouScope, CardTypeSetSource, ContinuousModification, ControllerRef,
-    Duration, Effect, GuessSubject, KeeperConstraint, ModalChoice, MultiTargetSpec, NameStickerSet,
-    ObjectProperty, ObjectScope, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef,
-    ReciprocalZoneChoiceRole, RepeatContinuation, ReplacementDefinition, ResolvedAbility,
-    StaticCondition, StaticDefinition, TargetFilter, TriggerCondition, TriggerDefinition,
-    TurnJournalKind, TypeFilter, TypedFilter, ZoneChoiceCandidateSource, ZoneRef,
+    AttackSubject, AttackedYouScope, CardTypeSetSource, CombatRelationSubject,
+    ContinuousModification, ControllerRef, Duration, Effect, GuessSubject, KeeperConstraint,
+    ModalChoice, MultiTargetSpec, NameStickerSet, ObjectProperty, ObjectScope, PlayerFilter,
+    PlayerScope, PtValue, QuantityExpr, QuantityRef, ReciprocalZoneChoiceRole, RepeatContinuation,
+    ReplacementDefinition, ResolvedAbility, StaticCondition, StaticDefinition, TargetFilter,
+    TriggerCondition, TriggerDefinition, TurnJournalKind, TypeFilter, TypedFilter,
+    ZoneChoiceCandidateSource, ZoneRef,
 };
 use crate::types::game_state::TargetSelectionConstraint;
 use crate::types::zones::Zone;
@@ -637,6 +638,14 @@ pub(crate) struct RwProfile {
     /// single-bit read fact (precedent: `legacy_batch_prompt`); `drop_writes` keeps
     /// it (a read).
     reads_member_bound: bool,
+    /// CR 509.1g + CR 608.2h + CR 603.3b: the resolution names creatures by
+    /// their combat relation to the member's own source ("destroy all creatures
+    /// blocking or blocked by it"). A departed source answers from its own
+    /// departure row, so co-departing members touch different creatures, and
+    /// what each one sets off (a leaves trigger, CR 603.3) lands between them:
+    /// the order is observable. A subset of `reads_member_bound`, kept apart so
+    /// the batch depth can prompt on it alone. `drop_writes` keeps it (a read).
+    reads_source_combat_pairing: bool,
     /// CR 613.4b-c: the scopes at which the profile reads live power/toughness
     /// after layer 7c. A `BasePower` read shares the ObjectPt axis for ordinary
     /// conflicts, but ObjectCounters feed only these live subsets. Keeping the
@@ -728,6 +737,7 @@ impl RwProfile {
             reads_event_live: false,
             legacy_batch_prompt: false,
             reads_member_bound: false,
+            reads_source_combat_pairing: false,
             current_pt_reads: CurrentPtReads::default(),
             writes_self: KindSet::EMPTY,
             writes_external: KindSet::EMPTY,
@@ -772,6 +782,9 @@ impl RwProfile {
         // CR 603.10a: an unclassified subtree may consult a per-member binding ⇒
         // fail-closed (refuses batch-T1).
         p.reads_member_bound = true;
+        // `reads_source_combat_pairing` stays false: it is a positive structural
+        // fact about a classified filter, and an unclassified subtree is already
+        // fail-closed through `reads_member_bound` and the feed rows.
         p.current_pt_reads = CurrentPtReads::SOURCE.merge(CurrentPtReads::BOARD);
         p
     }
@@ -784,6 +797,7 @@ impl RwProfile {
         self.reads_event_live |= o.reads_event_live;
         self.legacy_batch_prompt |= o.legacy_batch_prompt;
         self.reads_member_bound |= o.reads_member_bound;
+        self.reads_source_combat_pairing |= o.reads_source_combat_pairing;
         self.current_pt_reads = self.current_pt_reads.merge(o.current_pt_reads);
         self.writes_self = self.writes_self.union(o.writes_self);
         self.writes_external = self.writes_external.union(o.writes_external);
@@ -1144,6 +1158,16 @@ pub(crate) fn profiles_conflict(p: &RwProfile, s: &GroupStructure) -> bool {
     }
     if s.all_same_source && !p.reads_event_live {
         return false;
+    }
+    // CR 603.3b + CR 608.2h: the batch-depth source-combat-pairing discriminator.
+    // Co-departing members whose resolution names creatures by their own source's
+    // block pairings (each Abu Ja'far destroys its own last known partners) are
+    // distinct functions, and what one resolution sets off (Reveillark's leaves
+    // trigger, CR 603.3) resolves before the next: the order is observable. The
+    // freeze/feed rows below can't see it, since each source's departure row is
+    // order-stable but names different creatures. Prompt fail-closed.
+    if !s.same_event && p.reads_source_combat_pairing {
+        return true;
     }
     // CR 603.3b batch T1 (PR-6.75 c5): in a controller-uniform co-departure group of
     // normalized-identical members, a resolution that consults neither its source
@@ -1775,6 +1799,7 @@ fn flag_member_bound_write_target(p: &mut RwProfile, target: &TargetFilter) {
     if member_bound_target_filter(target) {
         p.reads_member_bound = true;
     }
+    p.reads_source_combat_pairing |= target.names_source_combat_partners();
 }
 
 // ---------------------------------------------------------------------------
@@ -2867,13 +2892,26 @@ fn member_bound_filter_prop(p: &FilterProp) -> bool {
         FilterProp::AttachedTo {
             to: AttachmentReferent::Host { filter },
         } => member_bound_target_filter(filter),
+        // CR 509.1g + CR 608.2h + CR 603.3b: a source-subject combat relation reads
+        // that member's own pairings (live combat, or its departure row's
+        // `block_pairs` once it has left) or its own block-history records, so
+        // two co-triggering sources touch different creatures and are not one
+        // shared function. Two Abu Ja'fars dying together must prompt. A
+        // parent-target subject is a declared target, closed by the target gate.
+        FilterProp::CombatRelation {
+            relation: _,
+            subject: CombatRelationSubject::Source,
+        } => true,
+        FilterProp::CombatRelation {
+            relation: _,
+            subject: CombatRelationSubject::ParentTarget,
+        } => false,
         FilterProp::Token
         | FilterProp::NonToken
         | FilterProp::RepresentedByCard
         | FilterProp::WasPlayed
         | FilterProp::Blocking
         | FilterProp::BlockingSource
-        | FilterProp::CombatRelation { .. }
         | FilterProp::BlockStatus { .. }
         | FilterProp::AttackingAlone
         | FilterProp::BlockingAlone
@@ -4010,6 +4048,7 @@ fn board_membership_read(filter: &TargetFilter) -> RwProfile {
     // CR 603.10a (PR-6.75 c5): a read whose filter names a per-member-bound set /
     // attachment / chosen referent is member-distinct ⇒ refuses batch-T1.
     p.reads_member_bound |= member_bound_target_filter(filter);
+    p.reads_source_combat_pairing |= filter.names_source_combat_partners();
     p
 }
 

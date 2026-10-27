@@ -23171,6 +23171,38 @@ impl TargetFilter {
         }
     }
 
+    /// CR 509.1g + CR 608.2h: True when this filter names creatures by their
+    /// combat relation to the resolving source ("blocking or blocked by it",
+    /// "blocked by this creature") at any structural position. Each source
+    /// answers from its own pairings, so two otherwise identical abilities from
+    /// different sources name different creatures. Mirrors
+    /// [`Self::queries_keyword_kind`]'s recursion.
+    pub fn names_source_combat_partners(&self) -> bool {
+        fn prop_names_source_partners(prop: &FilterProp) -> bool {
+            match prop {
+                FilterProp::CombatRelation {
+                    subject: CombatRelationSubject::Source,
+                    ..
+                } => true,
+                FilterProp::AnyOf { props } => props.iter().any(prop_names_source_partners),
+                FilterProp::Not { prop } => prop_names_source_partners(prop),
+                _ => false,
+            }
+        }
+        match self {
+            TargetFilter::Typed(TypedFilter { properties, .. }) => {
+                properties.iter().any(prop_names_source_partners)
+            }
+            TargetFilter::And { filters } | TargetFilter::Or { filters } => filters
+                .iter()
+                .any(TargetFilter::names_source_combat_partners),
+            TargetFilter::Not { filter } | TargetFilter::TrackedSetFiltered { filter, .. } => {
+                filter.names_source_combat_partners()
+            }
+            _ => false,
+        }
+    }
+
     pub fn contains_source_attachment_host(&self) -> bool {
         match self {
             TargetFilter::Typed(TypedFilter { properties, .. }) => properties

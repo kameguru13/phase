@@ -333,6 +333,15 @@ const BATCH_GENUINE_ROWS: &[&str] = &[
     // #5719 — the Draw was Unimplemented until the quantity channel bound Intensity,
     // and the sweep skips Unimplemented-bearing triggers.
     "great desert hellion",
+    // Dies (self_ref): DestroyAll{creatures with CombatRelation{BlockingOrBlockedBy,
+    // subject: Source}} (AST measured). Each co-departing Abu Ja'far answers from
+    // ITS OWN departure row's block pairings (CR 608.2h), so the members destroy
+    // different creatures, and a leaves trigger one resolution sets off resolves
+    // before the next (Reveillark returning the creature the other Abu Ja'far
+    // destroyed, CR 603.3): the outcome differs by order (CR 603.3b intended
+    // prompt). Runtime pin: two_abu_jafars_dying_together_let_their_controller_
+    // order_the_triggers (`reads_source_combat_pairing` refuses the batch).
+    "abu ja'far",
 ];
 
 /// R3 HIGH-1 (PR #5072 review): SAME-EVENT GENUINE member-bound order-dependence —
