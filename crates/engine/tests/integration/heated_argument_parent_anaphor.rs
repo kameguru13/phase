@@ -1238,3 +1238,117 @@ fn selection_moved_after_choice_could_be_that_creature() {
         assert_no_chosen_group_link(&root);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Rows 26-27: an instruction that is not a recognised zone choice or search
+// ---------------------------------------------------------------------------
+
+/// Building-block fixture: a dig that may put a creature card onto the
+/// battlefield, before the graveyard exile.
+const DIG_PUT_PROBE: &str = "Tap target creature. Look at the top four cards of your library. You may put a creature card from among them onto the battlefield. Put the rest on the bottom of your library in a random order. You may exile a card from your graveyard. If you do, put a +1/+1 counter on that creature.";
+
+/// Parser shape shared by rows 26-27: the producer taps a target creature, an
+/// instruction that is neither a zone choice nor a library search
+/// (`is_selection` finds it) may put a creature onto the battlefield, a
+/// graveyard exile makes a resolution-time zone choice, and the reader reads its
+/// parent target. CR 608.2c: the binder links a reader only when every
+/// instruction between the target and the reader provably hands it no object
+/// the noun names, so it declines here and no chosen-group link is written.
+fn assert_unrecognised_selection_declines(
+    text: &str,
+    label: &str,
+    is_selection: fn(&Effect) -> bool,
+) {
+    let root = parse_instant(text, "Selection Probe");
+    let nodes = chain_nodes(&root);
+    assert!(
+        matches!(nodes[0].effect.as_ref(), Effect::SetTapState { .. }),
+        "{label}: the producer announces a target: {:?}",
+        nodes[0].effect
+    );
+    assert!(
+        nodes.iter().any(|node| is_selection(node.effect.as_ref())),
+        "{label}: the intervening instruction parses"
+    );
+    assert!(
+        nodes.iter().any(|node| matches!(
+            node.effect.as_ref(),
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Exile,
+                ..
+            }
+        )),
+        "{label}: the graveyard exile parses"
+    );
+    let reader = nodes.last().unwrap();
+    assert!(
+        is_parent_counter(reader.effect.as_ref()),
+        "{label}: {:?}",
+        reader.effect
+    );
+    assert_no_chosen_group_link(&root);
+}
+
+fn is_battlefield_dig(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::Dig {
+            destination: Some(Zone::Battlefield),
+            filter: TargetFilter::Typed(tf),
+            ..
+        } if tf.type_filters.contains(&TypeFilter::Creature)
+    )
+}
+
+/// Row 26 (synthetic). CR 608.2c + CR 110.1: the creature card a dig puts onto
+/// the battlefield from among the looked-at cards can be "that creature". A dig
+/// is not a zone choice or search the binder can rule out, so it declines.
+#[test]
+fn dig_to_battlefield_across_resolution_choice_could_be_that_creature() {
+    assert_unrecognised_selection_declines(DIG_PUT_PROBE, "dig", is_battlefield_dig);
+}
+
+/// Row 27 (synthetic). CR 608.2c + CR 115.10a: a card revealed until a match
+/// and put onto the battlefield, a card chosen from a hand and put onto the
+/// battlefield, and a discovered card cast from exile can each be "that
+/// creature". None is a zone choice or search the binder can rule out, so it
+/// declines.
+#[test]
+fn unrecognised_selection_across_resolution_choice_could_be_that_creature() {
+    for (text, label, is_selection) in [
+        (
+            "Tap target creature. Reveal cards from the top of your library until you reveal a creature card. Put that card onto the battlefield and the rest on the bottom of your library in a random order. You may exile a card from your graveyard. If you do, put a +1/+1 counter on that creature.",
+            "reveal until",
+            (|effect| {
+                matches!(
+                    effect,
+                    Effect::RevealUntil {
+                        kept_destination: Zone::Battlefield,
+                        ..
+                    }
+                )
+            }) as fn(&Effect) -> bool,
+        ),
+        (
+            "Tap target creature. Choose a creature card in your hand. Put that card onto the battlefield. You may exile a card from your graveyard. If you do, put a +1/+1 counter on that creature.",
+            "choose from hand",
+            |effect| {
+                matches!(
+                    effect,
+                    Effect::ChooseFromZone {
+                        zone: Zone::Hand,
+                        ..
+                    }
+                )
+            },
+        ),
+        (
+            "Tap target creature. Discover 3. You may exile a card from your graveyard. If you do, put a +1/+1 counter on that creature.",
+            "discover",
+            |effect| matches!(effect, Effect::Discover { .. }),
+        ),
+    ] {
+        assert_unrecognised_selection_declines(text, label, is_selection);
+    }
+}

@@ -27906,45 +27906,55 @@ fn cross_choice_antecedent(
         return CrossChoiceAntecedent::Unrelated;
     };
     let verdict = announced_target_antecedent(clauses, i, k, &anaphor, body_scope);
-    // CR 110.1 + CR 608.2c: every object selected between the antecedent and
-    // the reader must be provably not what the noun names; one that could be
-    // may be the antecedent, so the binder declines. The producer's own clause
-    // is included: its head announces a Stack-timed target and is never a
-    // resolution-time choice, but a compound `sub_ability` joined to it by
-    // "and" can be. Without a proven producer, every earlier node is checked.
-    let first_choice = match verdict {
+    // CR 110.1 + CR 608.2c: every instruction between the antecedent and the
+    // reader must provably hand the reader no object the noun could name; one
+    // that could may be the antecedent, so the binder declines. The producer's
+    // own clause is included past its head: a compound `sub_ability` joined to
+    // it by "and" can make a choice. Without a proven producer, every earlier
+    // node is checked.
+    let scan_start = match verdict {
         CrossChoiceAntecedent::Unrelated => return verdict,
-        CrossChoiceAntecedent::Unproven => 0,
-        CrossChoiceAntecedent::Producer(p) => p,
+        CrossChoiceAntecedent::Unproven => ScanStart::ChainStart,
+        CrossChoiceAntecedent::Producer(p) => ScanStart::AfterProducerHead(p),
     };
-    if intervening_selection_could_be_anaphor(clauses, first_choice, i, &anaphor) {
+    if intervening_object_could_be_anaphor(clauses, scan_start, i, &anaphor) {
         CrossChoiceAntecedent::Unrelated
     } else {
         verdict
     }
 }
 
-/// CR 608.2c + CR 115.10a + CR 608.2h: whether an object selected after clause
-/// `first` begins and before `reader`'s anaphor is read could be what the
-/// anaphor names. The walk covers every node of clauses `first..=reader` up to
-/// the reader clause's last node that reads its parent's target, and answers
-/// "could be" when:
-/// - a zone choice or library search could select the noun
-///   (`selection_could_be_anaphor`);
-/// - a node selects an object outside the chain's declared target slots
-///   (`node_selects_undeclared_object`), which this binder cannot place;
-/// - after a zone choice or search, a node acts on an object the chain handed
-///   it (`node_acts_on_chain_referent`) and that object, wherever the node
-///   leaves it, could be what the noun names. The object may be the selection,
-///   and moving it changes what it is when the reader runs, so the zone the
-///   choice delivered it to no longer proves its class.
-fn intervening_selection_could_be_anaphor(
+/// Where [`intervening_object_could_be_anaphor`] starts its walk.
+#[derive(Clone, Copy)]
+enum ScanStart {
+    /// Every node of the chain: no producer is proven.
+    ChainStart,
+    /// The node after this clause's head: the head announces the producer's
+    /// target, the antecedent itself.
+    AfterProducerHead(usize),
+}
+
+/// CR 608.2c + CR 115.10a + CR 400.7: whether an instruction applied after the
+/// antecedent is announced and before `reader`'s anaphor is read could hand the
+/// reader an object the anaphor names. The walk covers every node from
+/// `scan_start` up to the reader clause's last node that reads its parent's
+/// target, and fails closed: a node answers "could not" only when it is
+/// - a zone choice or library search whose selection is proven not to be the
+///   noun (`selection_could_be_anaphor`), or
+/// - an instruction proven to hand the reader no such object
+///   (`node_hands_no_anaphor_object`, over the one classification
+///   `effects::instruction_object_reach`).
+fn intervening_object_could_be_anaphor(
     clauses: &[ClauseIr],
-    first: usize,
+    scan_start: ScanStart,
     reader: usize,
     anaphor: &DefiniteAnaphor,
 ) -> bool {
-    let nodes: Vec<(usize, &Effect, TargetChoiceTiming)> = (first..=reader)
+    let (first_clause, skipped_nodes) = match scan_start {
+        ScanStart::ChainStart => (0, 0),
+        ScanStart::AfterProducerHead(producer) => (producer, 1),
+    };
+    let nodes: Vec<(usize, &Effect, TargetChoiceTiming)> = (first_clause..=reader)
         .flat_map(|c| clause_nodes(&clauses[c]).map(move |(effect, timing, _)| (c, effect, timing)))
         .collect();
     let reader_node = nodes
@@ -27954,32 +27964,77 @@ fn intervening_selection_could_be_anaphor(
         })
         .unwrap_or(nodes.len());
     let mut after_choice = false;
-    for &(c, effect, timing) in &nodes[..reader_node] {
+    for &(c, effect, timing) in nodes.get(skipped_nodes..reader_node).unwrap_or_default() {
         if let Some(choice) = node_resolution_choice(clauses, c, reader, effect, timing) {
             if selection_could_be_anaphor(anaphor, &choice) {
                 return true;
             }
             after_choice = true;
-        } else if node_selects_undeclared_object(effect, timing) {
+        } else if !node_hands_no_anaphor_object(effect, timing, after_choice, anaphor) {
             return true;
-        } else if after_choice && node_acts_on_chain_referent(effect) {
-            // CR 400.7 + CR 608.2c: the handed object may be the selection. A
-            // `ChangeZone` proves where it ends up; any other instruction on it
-            // leaves its zone unproven. Its own filter is not known here, so
-            // it excludes no noun (`TargetFilter::Any`).
-            let moved = ResolutionChoice {
-                selection: &TargetFilter::Any,
-                destination: match effect {
-                    Effect::ChangeZone { destination, .. } => Some(*destination),
-                    _ => None,
-                },
-            };
-            if selection_could_be_anaphor(anaphor, &moved) {
-                return true;
-            }
         }
     }
     false
+}
+
+/// CR 608.2c + CR 115.10a + CR 400.7: whether a node that makes no recognised
+/// zone choice or library search is proven to hand a later anaphor no object
+/// it could name. `after_choice` says a recognised choice ran earlier in the
+/// walk, so an object the chain hands this node may be that choice's selection.
+///
+/// An instruction that touches no object (`NoObject`) hands none. One that acts
+/// on its one slot (`Slot`) hands none when the slot is
+/// - a stack-declared target: the registry already counts every announced
+///   target (`announced_target_antecedent`);
+/// - a player (`filter_names_only_players`);
+/// - an object an earlier instruction handed the chain
+///   (`node_acts_on_chain_referent`), before any choice; after one, that
+///   object may be the selection and moving it changes what it is when the
+///   reader runs, so only a `ChangeZone` destination that rules the noun out
+///   proves it.
+///
+/// Every other slot, such as a described population ("sacrifice a creature",
+/// "put a +1/+1 counter on a creature you control") chosen while the
+/// instruction is applied, and every `Unclassified` instruction (a dig, a
+/// reveal, a token, a draw, …) could hand the reader its referent.
+fn node_hands_no_anaphor_object(
+    effect: &Effect,
+    timing: TargetChoiceTiming,
+    after_choice: bool,
+    anaphor: &DefiniteAnaphor,
+) -> bool {
+    use crate::game::effects::InstructionObjectReach;
+    let filter = match crate::game::effects::instruction_object_reach(effect) {
+        InstructionObjectReach::NoObject => return true,
+        InstructionObjectReach::Unclassified => return false,
+        InstructionObjectReach::Slot(filter) => filter,
+    };
+    if timing == TargetChoiceTiming::Stack
+        && triggers::extract_target_filter_from_effect(effect).is_some()
+    {
+        return true;
+    }
+    if filter_names_only_players(filter) {
+        return true;
+    }
+    if filter.names_enumerable_population() || !node_acts_on_chain_referent(effect) {
+        return false;
+    }
+    if !after_choice {
+        return true;
+    }
+    // CR 400.7 + CR 608.2c: the handed object may be the selection. A
+    // `ChangeZone` proves where it ends up; any other instruction on it leaves
+    // its zone unproven. Its own filter is not known here, so it excludes no
+    // noun (`TargetFilter::Any`).
+    let moved = ResolutionChoice {
+        selection: &TargetFilter::Any,
+        destination: match effect {
+            Effect::ChangeZone { destination, .. } => Some(*destination),
+            _ => None,
+        },
+    };
+    !selection_could_be_anaphor(anaphor, &moved)
 }
 
 /// CR 608.2c: whether a node acts on an object an earlier instruction of the
@@ -27994,21 +28049,44 @@ fn node_acts_on_chain_referent(effect: &Effect) -> bool {
         )
 }
 
-/// CR 115.10a + CR 608.2d: whether a node that is not a zone choice or library
-/// search selects an object while its instruction is applied, outside the
-/// chain's stack-declared target slots: "sacrifice a creature" (CR 701.21a),
-/// "return a creature you control to its owner's hand", or a resolution-timed
-/// choice of a described object. Its filter names a population
-/// (`TargetFilter::names_enumerable_population`) and the node either is
-/// resolution-timed or surfaces no stack-time target slot
-/// (`triggers::extract_target_filter_from_effect`). Such an object is affected,
-/// not targeted, and can be a later "that <noun>"'s referent.
-fn node_selects_undeclared_object(effect: &Effect, timing: TargetChoiceTiming) -> bool {
-    effect
-        .target_filter()
-        .is_some_and(TargetFilter::names_enumerable_population)
-        && (timing == TargetChoiceTiming::Resolution
-            || triggers::extract_target_filter_from_effect(effect).is_none())
+/// CR 102.1 + CR 109.1: whether a slot filter names only players, so the
+/// instruction acting on it touches no object (a player is not an object). A conjunction or disjunction
+/// qualifies only when every leg does; any filter not listed may name an
+/// object.
+fn filter_names_only_players(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            !filters.is_empty() && filters.iter().all(filter_names_only_players)
+        }
+        leaf => {
+            leaf.is_player_scope()
+                || leaf.denotes_player_target()
+                || leaf.chosen_player_index().is_some()
+                || matches!(
+                    leaf,
+                    TargetFilter::ScopedPlayer
+                        | TargetFilter::Opponent
+                        | TargetFilter::Owner
+                        | TargetFilter::SourceController
+                        | TargetFilter::OriginalController
+                        | TargetFilter::TriggeringPlayer
+                        | TargetFilter::TriggeringSpellController
+                        | TargetFilter::TriggeringSpellOwner
+                        | TargetFilter::TriggeringSourceController
+                        | TargetFilter::EventTargetController
+                        | TargetFilter::DeclaredPlayer { .. }
+                        | TargetFilter::SpecificPlayer { .. }
+                        | TargetFilter::ParentTargetController
+                        | TargetFilter::ParentTargetOwner
+                        | TargetFilter::SourceChosenPlayer
+                        | TargetFilter::PostReplacementSourceController
+                        | TargetFilter::PostReplacementDamageTargetOwner
+                        | TargetFilter::DefendingPlayer
+                        | TargetFilter::Neighbor { .. }
+                        | TargetFilter::PlayerWhoChoseLabel { .. }
+                )
+        }
+    }
 }
 
 /// CR 608.2c + CR 608.2b: the announced target clause `i`'s anaphor names,
