@@ -228,7 +228,14 @@ fn main_phase_opens_with_events(state: &GameState, player: PlayerId) -> bool {
                     player: for_player,
                     ..
                 } => phase == Phase::PreCombatMain && for_player == player,
-                _ => false,
+                DelayedTriggerCondition::AtBeginningOfAddedPhase { .. }
+                | DelayedTriggerCondition::WhenLeavesPlay { .. }
+                | DelayedTriggerCondition::WhenDies { .. }
+                | DelayedTriggerCondition::WhenLeavesPlayFiltered { .. }
+                | DelayedTriggerCondition::WhenEntersBattlefield { .. }
+                | DelayedTriggerCondition::WhenDiesOrExiled { .. }
+                | DelayedTriggerCondition::WheneverEvent { .. }
+                | DelayedTriggerCondition::WhenNextEvent { .. } => false,
             })
         || state.battlefield.iter().any(|&id| {
             state.objects.get(&id).is_some_and(|object| {

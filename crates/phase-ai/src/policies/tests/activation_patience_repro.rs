@@ -547,6 +547,51 @@ fn floating_mana_the_activation_could_spend_stands_patience_down() {
     );
 }
 
+/// An "or" cost offers each branch's mana as a way to pay, so floating mana that one branch's
+/// mana leg takes stands patience down.
+#[test]
+fn floating_mana_payable_by_one_branch_of_an_or_cost_stands_patience_down() {
+    use engine::types::ability::AbilityCost;
+    use engine::types::mana::{ManaRestriction, ManaType, ManaUnit};
+    let mut board = build_board(Phase::Upkeep, 20, 20);
+    let source = creature(
+        &mut board.state,
+        &mut Ids(9_100),
+        AI,
+        "Either Way",
+        0,
+        1,
+        Some("{2}, {T}: You gain 1 life."),
+    );
+    let ability =
+        &mut Arc::make_mut(&mut board.state.objects.get_mut(&source).unwrap().abilities)[0];
+    let mana_leg = ability
+        .cost
+        .take()
+        .expect("premise: the ability has a cost");
+    ability.cost = Some(AbilityCost::OneOf {
+        costs: vec![
+            AbilityCost::PayLife {
+                amount: engine::types::ability::QuantityExpr::Fixed { value: 2 },
+            },
+            mana_leg,
+        ],
+    });
+    board.state.players[AI.0 as usize]
+        .mana_pool
+        .add(ManaUnit::new(
+            ManaType::Colorless,
+            ObjectId(9_900),
+            false,
+            vec![ManaRestriction::OnlyForActivation],
+        ));
+    board.pinger = source;
+    assert_eq!(
+        score_and_reason(&verdict_for(&board)).1,
+        "activation_patience_floating_mana"
+    );
+}
+
 /// CR 500.5 + CR 614.17: mana kept past the step ("you don't lose this mana as steps and
 /// phases end") is still there in the main phase, so it doesn't stand patience down.
 #[test]

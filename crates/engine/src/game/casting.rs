@@ -32230,17 +32230,28 @@ pub fn pool_mana_can_pay_toward_activation(
     source_id: ObjectId,
     ability_index: usize,
 ) -> bool {
-    let Some(ManaCost::Cost { shards, generic }) =
-        activation_ability_definition(state, source_id, ability_index)
-            .and_then(|ability| ability.cost)
-            .map(|cost| activation_mana_component(&cost))
+    let Some(cost) =
+        activation_ability_definition(state, source_id, ability_index).and_then(|a| a.cost)
     else {
         return false;
     };
-    let requirements: Vec<_> = shards
-        .iter()
-        .map(|shard| mana_payment::shard_to_mana_type(*shard))
+    // Each way the cost can be paid, as (generic, shard requirements): one per `OneOf` branch.
+    let legs: Vec<(u32, Vec<_>)> = payable_mana_legs(&cost)
+        .into_iter()
+        .filter_map(|leg| match leg {
+            ManaCost::Cost { shards, generic } => Some((
+                generic,
+                shards
+                    .iter()
+                    .map(|shard| mana_payment::shard_to_mana_type(*shard))
+                    .collect(),
+            )),
+            _ => None,
+        })
         .collect();
+    if legs.is_empty() {
+        return false;
+    }
     let context = activation_payment_context(state, source_id, Some(ability_index));
     let ctx = context.as_payment_context();
     let permission =
@@ -32261,12 +32272,34 @@ pub fn pool_mana_can_pay_toward_activation(
                 };
                 empties
                     && mana_payment::mana_unit_permits_payment_context(unit, &ctx)
-                    && (generic > 0
-                        || requirements.iter().any(|requirement| {
-                            mana_payment::unit_can_pay_toward_shard(unit, requirement, permission)
-                        }))
+                    && legs.iter().any(|(generic, requirements)| {
+                        *generic > 0
+                            || requirements.iter().any(|requirement| {
+                                mana_payment::unit_can_pay_toward_shard(
+                                    unit,
+                                    requirement,
+                                    permission,
+                                )
+                            })
+                    })
             }) > 0
         })
+}
+
+/// The mana legs of each way an activation cost can be paid: the summed mana of the cost, or of
+/// each `OneOf` branch, since an "or" cost lets the payer choose which to pay.
+fn payable_mana_legs(cost: &AbilityCost) -> Vec<ManaCost> {
+    match cost {
+        AbilityCost::OneOf { costs } => costs.iter().flat_map(payable_mana_legs).collect(),
+        _ => {
+            let mana = activation_mana_component(cost);
+            if mana == ManaCost::zero() {
+                Vec::new()
+            } else {
+                vec![mana]
+            }
+        }
+    }
 }
 
 /// The mana an activation cost demands: the sum of its mana legs, for the

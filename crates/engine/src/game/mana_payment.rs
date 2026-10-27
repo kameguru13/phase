@@ -2390,7 +2390,7 @@ pub(crate) fn unit_can_pay_toward_shard(
         | ShardRequirement::TwoGenericHybridPhyrexian(_)
         | ShardRequirement::X => true,
         // CR 107.4h: {S} takes mana from a snow source.
-        ShardRequirement::Snow => unit.supertype == Some(crate::types::mana::ManaSupertype::Snow),
+        ShardRequirement::Snow => unit.is_snow(),
         ShardRequirement::TwoOrMoreColorSource => unit.source_could_produce_two_or_more_colors,
     }
 }
