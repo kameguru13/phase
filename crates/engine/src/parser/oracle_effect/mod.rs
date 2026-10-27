@@ -27697,7 +27697,22 @@ fn clause_resolution_choices(
     k: usize,
     reader: usize,
 ) -> impl Iterator<Item = ResolutionChoice<'_>> + '_ {
-    clause_nodes(&clauses[k]).filter_map(move |(effect, timing, _)| match effect {
+    clause_nodes(&clauses[k]).filter_map(move |(effect, timing, _)| {
+        node_resolution_choice(clauses, k, reader, effect, timing)
+    })
+}
+
+/// CR 115.10a + CR 608.2d + CR 701.23a: the resolution-time object choice one
+/// node of clause `k` makes, if it is a zone choice or a library search (see
+/// [`clause_resolution_choices`]).
+fn node_resolution_choice<'a>(
+    clauses: &'a [ClauseIr],
+    k: usize,
+    reader: usize,
+    effect: &'a Effect,
+    timing: TargetChoiceTiming,
+) -> Option<ResolutionChoice<'a>> {
+    match effect {
         Effect::ChangeZone {
             destination,
             target,
@@ -27726,7 +27741,7 @@ fn clause_resolution_choices(
             destination: search_result_destination(clauses, k, reader),
         }),
         _ => None,
-    })
+    }
 }
 
 /// CR 701.23a: the zone a library search clause `k` delivers its found card to,
@@ -27781,7 +27796,7 @@ fn selection_could_be_anaphor(anaphor: &DefiniteAnaphor, choice: &ResolutionChoi
     }
 }
 
-/// CR 205.2b: whether a choice's selection filter explicitly excludes the
+/// CR 205.2b + CR 608.2c: whether a choice's selection filter explicitly excludes the
 /// anaphor's noun. An object with more than one card type satisfies criteria
 /// for any of them, so a filter that merely lacks the noun's type proves
 /// nothing: a `Permanent` or `Artifact` selection can be a creature. Only an
@@ -27789,6 +27804,8 @@ fn selection_could_be_anaphor(anaphor: &DefiniteAnaphor, choice: &ResolutionChoi
 /// for a "token" noun the `NonToken` property — on a typed filter, on any leg of
 /// a conjunction, or on every leg of a non-empty disjunction. Every other filter
 /// shape does not exclude the noun.
+/// A selection the text itself calls non-<noun> is not that noun's referent
+/// under the rules of English (CR 608.2c), even if the object later gains the type.
 fn selection_filter_excludes_anaphor_noun(noun: &AnaphorNoun, filter: &TargetFilter) -> bool {
     match filter {
         TargetFilter::Typed(tf) => match noun {
@@ -27889,26 +27906,109 @@ fn cross_choice_antecedent(
         return CrossChoiceAntecedent::Unrelated;
     };
     let verdict = announced_target_antecedent(clauses, i, k, &anaphor, body_scope);
-    // CR 110.1 + CR 608.2c: every resolution-time choice between the antecedent
-    // and the reader must exclude what the noun names; one that could select it
+    // CR 110.1 + CR 608.2c: every object selected between the antecedent and
+    // the reader must be provably not what the noun names; one that could be
     // may be the antecedent, so the binder declines. The producer's own clause
     // is included: its head announces a Stack-timed target and is never a
     // resolution-time choice, but a compound `sub_ability` joined to it by
-    // "and" can be. Without a proven producer, every earlier choice is checked.
+    // "and" can be. Without a proven producer, every earlier node is checked.
     let first_choice = match verdict {
         CrossChoiceAntecedent::Unrelated => return verdict,
         CrossChoiceAntecedent::Unproven => 0,
         CrossChoiceAntecedent::Producer(p) => p,
     };
-    let choice_could_be_antecedent = (first_choice..i).any(|c| {
-        clause_resolution_choices(clauses, c, i)
-            .any(|choice| selection_could_be_anaphor(&anaphor, &choice))
-    });
-    if choice_could_be_antecedent {
+    if intervening_selection_could_be_anaphor(clauses, first_choice, i, &anaphor) {
         CrossChoiceAntecedent::Unrelated
     } else {
         verdict
     }
+}
+
+/// CR 608.2c + CR 115.10a + CR 608.2h: whether an object selected after clause
+/// `first` begins and before `reader`'s anaphor is read could be what the
+/// anaphor names. The walk covers every node of clauses `first..=reader` up to
+/// the reader clause's last node that reads its parent's target, and answers
+/// "could be" when:
+/// - a zone choice or library search could select the noun
+///   (`selection_could_be_anaphor`);
+/// - a node selects an object outside the chain's declared target slots
+///   (`node_selects_undeclared_object`), which this binder cannot place;
+/// - after a zone choice or search, a node acts on an object the chain handed
+///   it (`node_acts_on_chain_referent`) and that object, wherever the node
+///   leaves it, could be what the noun names. The object may be the selection,
+///   and moving it changes what it is when the reader runs, so the zone the
+///   choice delivered it to no longer proves its class.
+fn intervening_selection_could_be_anaphor(
+    clauses: &[ClauseIr],
+    first: usize,
+    reader: usize,
+    anaphor: &DefiniteAnaphor,
+) -> bool {
+    let nodes: Vec<(usize, &Effect, TargetChoiceTiming)> = (first..=reader)
+        .flat_map(|c| clause_nodes(&clauses[c]).map(move |(effect, timing, _)| (c, effect, timing)))
+        .collect();
+    let reader_node = nodes
+        .iter()
+        .rposition(|&(c, effect, _)| {
+            c == reader && crate::game::effects::effect_refs_parent_target(effect)
+        })
+        .unwrap_or(nodes.len());
+    let mut after_choice = false;
+    for &(c, effect, timing) in &nodes[..reader_node] {
+        if let Some(choice) = node_resolution_choice(clauses, c, reader, effect, timing) {
+            if selection_could_be_anaphor(anaphor, &choice) {
+                return true;
+            }
+            after_choice = true;
+        } else if node_selects_undeclared_object(effect, timing) {
+            return true;
+        } else if after_choice && node_acts_on_chain_referent(effect) {
+            // CR 400.7 + CR 608.2c: the handed object may be the selection. A
+            // `ChangeZone` proves where it ends up; any other instruction on it
+            // leaves its zone unproven. Its own filter is not known here, so
+            // it excludes no noun (`TargetFilter::Any`).
+            let moved = ResolutionChoice {
+                selection: &TargetFilter::Any,
+                destination: match effect {
+                    Effect::ChangeZone { destination, .. } => Some(*destination),
+                    _ => None,
+                },
+            };
+            if selection_could_be_anaphor(anaphor, &moved) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// CR 608.2c: whether a node acts on an object an earlier instruction of the
+/// chain handed it: its parent's object itself ("return it to the battlefield",
+/// `effect_requires_parent_target_object`) or the chain's tracked set ("those
+/// cards"). After a resolution-time choice, that object may be the selection.
+fn node_acts_on_chain_referent(effect: &Effect) -> bool {
+    crate::game::effects::effect_requires_parent_target_object(effect)
+        || matches!(
+            effect.target_filter(),
+            Some(TargetFilter::TrackedSet { .. } | TargetFilter::TrackedSetFiltered { .. })
+        )
+}
+
+/// CR 115.10a + CR 608.2d: whether a node that is not a zone choice or library
+/// search selects an object while its instruction is applied, outside the
+/// chain's stack-declared target slots: "sacrifice a creature" (CR 701.21a),
+/// "return a creature you control to its owner's hand", or a resolution-timed
+/// choice of a described object. Its filter names a population
+/// (`TargetFilter::names_enumerable_population`) and the node either is
+/// resolution-timed or surfaces no stack-time target slot
+/// (`triggers::extract_target_filter_from_effect`). Such an object is affected,
+/// not targeted, and can be a later "that <noun>"'s referent.
+fn node_selects_undeclared_object(effect: &Effect, timing: TargetChoiceTiming) -> bool {
+    effect
+        .target_filter()
+        .is_some_and(TargetFilter::names_enumerable_population)
+        && (timing == TargetChoiceTiming::Resolution
+            || triggers::extract_target_filter_from_effect(effect).is_none())
 }
 
 /// CR 608.2c + CR 608.2b: the announced target clause `i`'s anaphor names,

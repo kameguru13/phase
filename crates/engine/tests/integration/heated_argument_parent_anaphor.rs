@@ -10,7 +10,9 @@
 
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::parser::oracle::parse_oracle_text;
-use engine::types::ability::{AbilityDefinition, ControllerRef, Effect, TargetFilter, TypeFilter};
+use engine::types::ability::{
+    AbilityDefinition, BounceSelection, ControllerRef, Effect, TargetFilter, TypeFilter,
+};
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::game_state::WaitingFor;
@@ -1017,4 +1019,222 @@ fn noncreature_selection_to_battlefield_reads_target() {
     assert_eq!(zone_of(&runner, idol), Zone::Graveyard);
     assert_eq!(counters(&runner, victim, CounterType::Plus1Plus1), 1);
     assert_eq!(counters(&runner, relic, CounterType::Plus1Plus1), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Rows 23-24: an object selected outside a zone choice or library search
+// ---------------------------------------------------------------------------
+
+/// Parser shape shared by rows 23-24: the producer announces a creature target,
+/// a graveyard exile makes a resolution-time zone choice, another instruction
+/// selects an object without the word "target" (`is_selection` finds it), and
+/// the reader reads its parent target. CR 115.10a + CR 608.2c: that selected
+/// object can be the reader's "that creature", so the binder declines and no
+/// chosen-group link is written.
+fn assert_intervening_selection_declines(
+    text: &str,
+    label: &str,
+    is_selection: fn(&Effect) -> bool,
+    is_reader: fn(&Effect) -> bool,
+) {
+    let root = parse_instant(text, "Selection Probe");
+    let nodes = chain_nodes(&root);
+    assert!(
+        matches!(
+            nodes[0].effect.as_ref(),
+            Effect::DealDamage {
+                target: TargetFilter::Typed(_),
+                ..
+            } | Effect::SetTapState {
+                target: TargetFilter::Typed(_),
+                ..
+            }
+        ),
+        "{label}: the producer announces a creature target: {:?}",
+        nodes[0].effect
+    );
+    assert!(
+        nodes.iter().any(|node| matches!(
+            node.effect.as_ref(),
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Exile,
+                ..
+            }
+        )),
+        "{label}: the graveyard exile parses"
+    );
+    assert!(
+        nodes.iter().any(|node| is_selection(node.effect.as_ref())),
+        "{label}: the intervening selection parses"
+    );
+    let reader = nodes.last().unwrap();
+    assert!(
+        is_reader(reader.effect.as_ref()),
+        "{label}: {:?}",
+        reader.effect
+    );
+    assert_no_chosen_group_link(&root);
+}
+
+fn is_sacrifice(effect: &Effect) -> bool {
+    matches!(effect, Effect::Sacrifice { .. })
+}
+
+fn is_controller_damage(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::DealDamage {
+            target: TargetFilter::ParentTargetController,
+            ..
+        }
+    )
+}
+
+fn is_parent_counter(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::PutCounter {
+            target: TargetFilter::ParentTarget,
+            ..
+        }
+    )
+}
+
+/// Row 23 (synthetic). CR 701.21a + CR 608.2c: a sacrificed creature can be
+/// "that creature" (Grab the Reins: "Sacrifice a creature. Grab the Reins deals
+/// damage equal to that creature's power to any target."), wherever the
+/// sacrifice sits between the announced target and the reader.
+#[test]
+fn sacrifice_across_resolution_choice_could_be_that_creature() {
+    for (text, label) in [
+        (
+            "Selection Probe deals 6 damage to target creature. Sacrifice a creature. You may exile a card from your graveyard. If you do, Selection Probe deals 2 damage to that creature's controller.",
+            "sacrifice before the exile",
+        ),
+        (
+            "Selection Probe deals 6 damage to target creature. You may exile a card from your graveyard. If you do, sacrifice a creature, then Selection Probe deals 2 damage to that creature's controller.",
+            "sacrifice after the exile",
+        ),
+    ] {
+        assert_intervening_selection_declines(text, label, is_sacrifice, is_controller_damage);
+    }
+}
+
+/// Row 24 (synthetic). CR 115.10a + CR 608.2c: a creature returned without the
+/// word "target" is chosen while the instruction is applied and can be "that
+/// creature", before or after the exile.
+#[test]
+fn untargeted_return_across_resolution_choice_could_be_that_creature() {
+    for (text, label) in [
+        (
+            "Tap target creature. Return a creature you control to its owner's hand. You may exile a card from your graveyard. If you do, put a stun counter on that creature.",
+            "return before the exile",
+        ),
+        (
+            "Tap target creature. You may exile a card from your graveyard. If you do, return a creature you control to its owner's hand. Put a stun counter on that creature.",
+            "return after the exile",
+        ),
+    ] {
+        assert_intervening_selection_declines(
+            text,
+            label,
+            |effect| {
+                matches!(
+                    effect,
+                    Effect::Bounce {
+                        selection: BounceSelection::AtResolution,
+                        ..
+                    }
+                )
+            },
+            is_parent_counter,
+        );
+    }
+}
+
+/// Row 24b (synthetic). CR 115.10a + CR 608.2d: the recipient of "put a +1/+1
+/// counter on a creature you control" is chosen without the word "target" while
+/// the instruction is applied, and can be "that creature". Before this row the
+/// reader failed closed; the binder now declines.
+#[test]
+fn counter_recipient_choice_across_resolution_choice_could_be_that_creature() {
+    assert_intervening_selection_declines(
+        "Tap target creature. You may exile a card from your graveyard. If you do, put a +1/+1 counter on a creature you control. Put a stun counter on that creature.",
+        "counter recipient",
+        |effect| {
+            matches!(
+                effect,
+                Effect::PutCounter {
+                    target: TargetFilter::Typed(tf),
+                    ..
+                } if tf.type_filters.contains(&TypeFilter::Creature)
+            )
+        },
+        is_parent_counter,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Row 25: the selection is moved again before the reader
+// ---------------------------------------------------------------------------
+
+/// Row 25 (synthetic). CR 110.1 + CR 608.2c: the exiled creature card is
+/// returned to the battlefield before the reader, so it is a creature on the
+/// battlefield when "that creature" is read and can be its referent. The zone
+/// the exile delivered it to no longer proves its class; the binder declines
+/// and no chosen-group link is written.
+#[test]
+fn selection_moved_after_choice_could_be_that_creature() {
+    for (text, label) in [
+        (
+            "Tap target creature. You may exile a creature card from your graveyard, then return it to the battlefield. If you do, put a +1/+1 counter on that creature.",
+            "then return it",
+        ),
+        (
+            "Tap target creature. You may exile a creature card from your graveyard. If you do, return it to the battlefield. Put a +1/+1 counter on that creature.",
+            "if you do, return it",
+        ),
+    ] {
+        let root = parse_instant(text, "Return Probe");
+        let nodes = chain_nodes(&root);
+        assert!(
+            matches!(nodes[0].effect.as_ref(), Effect::SetTapState { .. }),
+            "{label}: the producer announces a target: {:?}",
+            nodes[0].effect
+        );
+        assert!(
+            matches!(
+                nodes[1].effect.as_ref(),
+                Effect::ChangeZone {
+                    origin: Some(Zone::Graveyard),
+                    destination: Zone::Exile,
+                    target: TargetFilter::Typed(tf),
+                    ..
+                } if tf.type_filters.contains(&TypeFilter::Creature)
+            ),
+            "{label}: the graveyard exile parses: {:?}",
+            nodes[1].effect
+        );
+        assert!(
+            matches!(
+                nodes[2].effect.as_ref(),
+                Effect::ChangeZone {
+                    origin: None,
+                    destination: Zone::Battlefield,
+                    target: TargetFilter::ParentTarget | TargetFilter::TrackedSet { .. },
+                    ..
+                }
+            ),
+            "{label}: the exiled card is returned: {:?}",
+            nodes[2].effect
+        );
+        let reader = nodes.last().unwrap();
+        assert!(
+            is_parent_counter(reader.effect.as_ref()),
+            "{label}: {:?}",
+            reader.effect
+        );
+        assert_no_chosen_group_link(&root);
+    }
 }

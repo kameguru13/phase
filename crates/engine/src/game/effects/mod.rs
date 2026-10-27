@@ -15386,8 +15386,8 @@ pub(crate) fn effect_refs_parent_target(effect: &Effect) -> bool {
 /// CR 608.2c + CR 608.2h: Whether a later instruction needs the parent object
 /// itself, rather than only its move-time controller/owner metadata. Used when
 /// deciding whether a resolution-time private-zone choice owns a fresh
-/// object-selection slot.
-fn effect_requires_parent_target_object(effect: &Effect) -> bool {
+/// object-selection slot, and by the parser's cross-choice antecedent binder.
+pub(crate) fn effect_requires_parent_target_object(effect: &Effect) -> bool {
     effect_parent_ref_slots(effect)
         .iter()
         .any(|filter| filter_requires_parent_target_object(filter))
