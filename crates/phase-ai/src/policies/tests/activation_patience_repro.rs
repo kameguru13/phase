@@ -547,45 +547,94 @@ fn floating_mana_the_activation_could_spend_stands_patience_down() {
     );
 }
 
-/// An "or" cost offers each branch's mana as a way to pay, so floating mana that one branch's
-/// mana leg takes stands patience down.
+/// Granite Shard ("{3}, {T} or {R}, {T}: This artifact deals 1 damage to any target.",
+/// verified against MTGJSON) in the AI's own draw step with {R} floating: the {R} branch is a
+/// way to pay, so the floating mana stands patience down instead of emptying first.
 #[test]
 fn floating_mana_payable_by_one_branch_of_an_or_cost_stands_patience_down() {
     use engine::types::ability::AbilityCost;
-    use engine::types::mana::{ManaRestriction, ManaType, ManaUnit};
-    let mut board = build_board(Phase::Upkeep, 20, 20);
-    let source = creature(
+    use engine::types::mana::{ManaType, ManaUnit};
+    let mut board = build_board(Phase::Draw, 20, 20);
+    let shard = creature(
         &mut board.state,
         &mut Ids(9_100),
         AI,
-        "Either Way",
+        "Granite Shard",
         0,
         1,
-        Some("{2}, {T}: You gain 1 life."),
+        Some("{3}, {T} or {R}, {T}: This artifact deals 1 damage to any target."),
     );
-    let ability =
-        &mut Arc::make_mut(&mut board.state.objects.get_mut(&source).unwrap().abilities)[0];
-    let mana_leg = ability
-        .cost
-        .take()
-        .expect("premise: the ability has a cost");
-    ability.cost = Some(AbilityCost::OneOf {
-        costs: vec![
-            AbilityCost::PayLife {
-                amount: engine::types::ability::QuantityExpr::Fixed { value: 2 },
-            },
-            mana_leg,
-        ],
-    });
+    assert!(
+        matches!(
+            board.state.objects[&shard].abilities[0].cost,
+            Some(AbilityCost::OneOf { .. })
+        ),
+        "premise: Granite Shard's cost parses as an \"or\" cost"
+    );
+    board.pinger = shard;
+    assert_eq!(
+        score_and_reason(&verdict_for(&board)).1,
+        "activation_patience_hold_for_main",
+        "reach: with nothing floating the Shard is held"
+    );
     board.state.players[AI.0 as usize]
         .mana_pool
-        .add(ManaUnit::new(
-            ManaType::Colorless,
-            ObjectId(9_900),
-            false,
-            vec![ManaRestriction::OnlyForActivation],
-        ));
-    board.pinger = source;
+        .add(ManaUnit::new(ManaType::Red, ObjectId(9_900), false, vec![]));
+    assert_eq!(
+        score_and_reason(&verdict_for(&board)).1,
+        "activation_patience_floating_mana"
+    );
+}
+
+/// CR 601.2f + CR 602.2b: Suppression Field ("Activated abilities cost {2} more to activate
+/// unless they're mana abilities.", verified against MTGJSON) turns the printed {T}-only ping
+/// into {2}, {T}, so floating {C}{C} could pay it and stands patience down.
+#[test]
+fn floating_mana_that_pays_a_cost_increase_stands_patience_down() {
+    use engine::types::mana::{ManaType, ManaUnit};
+    let mut board = build_board(Phase::Upkeep, 20, 20);
+    for _ in 0..2 {
+        board.state.players[AI.0 as usize]
+            .mana_pool
+            .add(ManaUnit::new(
+                ManaType::Colorless,
+                ObjectId(9_900),
+                false,
+                vec![],
+            ));
+    }
+    assert_eq!(
+        score_and_reason(&verdict_for(&board)).1,
+        "activation_patience_hold",
+        "reach: untaxed, the {{T}}-only ping has no mana leg for the floating mana"
+    );
+    let field = creature(
+        &mut board.state,
+        &mut Ids(9_000),
+        OPP,
+        "Suppression Field",
+        0,
+        1,
+        None,
+    );
+    let tax = parse_oracle_text(
+        "Activated abilities cost {2} more to activate unless they're mana abilities.",
+        "Suppression Field",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    )
+    .statics
+    .into_iter()
+    .next()
+    .expect("Suppression Field parses its cost increase");
+    board
+        .state
+        .objects
+        .get_mut(&field)
+        .unwrap()
+        .static_definitions
+        .push(tax);
     assert_eq!(
         score_and_reason(&verdict_for(&board)).1,
         "activation_patience_floating_mana"

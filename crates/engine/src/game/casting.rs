@@ -32218,28 +32218,59 @@ pub(crate) fn fold_activation_cost(
 
 /// CR 106.4 + CR 106.6 + CR 500.5 + CR 602.2b: Does `player`'s mana pool hold mana that will
 /// empty as this step ends and that could be spent toward activating `source_id`'s ability
-/// `ability_index`? A unit counts when the activation's payment context allows it and it can pay
-/// some leg of the activation's mana cost: a generic leg takes any type, a shard only the types
-/// it names (CR 107.4) unless a CR 609.4b spend-as-any-color permission applies. Mana kept until
-/// end of turn ("you don't lose this mana as steps and phases end") is not counted; mana a
-/// step-end handler such as Upwelling would keep still is, which errs toward answering yes. Read-only, for callers weighing whether waiting wastes floating mana; the
-/// payment pipeline stays the authority on whether the whole cost can actually be paid.
+/// `ability_index`?
+///
+/// The cost read is the one the payment pipeline will demand: CR 601.2f folds in cost increases
+/// and reductions (Suppression Field's "{2} more") through the feasibility fold, and a disjunctive
+/// cost (Granite Shard's "{3}, {T} or {R}, {T}") contributes each branch the affordability
+/// authority would offer. A unit counts when the activation's payment context allows it and it
+/// can pay some mana leg of one of those costs: a generic leg takes any type, a shard only the
+/// types it names (CR 107.4) unless a CR 609.4b spend-as-any-color permission applies. Mana kept
+/// until end of turn ("you don't lose this mana as steps and phases end") is not counted; mana a
+/// step-end handler such as Upwelling would keep still is, which errs toward answering yes.
+/// Read-only, for callers weighing whether waiting wastes floating mana.
 pub fn pool_mana_can_pay_toward_activation(
     state: &GameState,
     player: PlayerId,
     source_id: ObjectId,
     ability_index: usize,
 ) -> bool {
-    let Some(cost) =
-        activation_ability_definition(state, source_id, ability_index).and_then(|a| a.cost)
+    let Some(mut ability_def) = activation_ability_definition(state, source_id, ability_index)
     else {
         return false;
     };
-    // Each way the cost can be paid, as (generic, shard requirements): one per `OneOf` branch.
-    let legs: Vec<(u32, Vec<_>)> = payable_mana_legs(&cost)
-        .into_iter()
-        .filter_map(|leg| match leg {
-            ManaCost::Cost { shards, generic } => Some((
+    let life = ActivationLifeWindow::for_payment_mode(player, source_id, CastPaymentMode::Auto);
+    fold_activation_cost_for_feasibility(
+        state,
+        &mut ability_def,
+        player,
+        source_id,
+        ability_index,
+        &life,
+    );
+    let Some(cost) = ability_def.cost else {
+        return false;
+    };
+    let costs = match find_one_of_cost(&cost) {
+        Some(branches) => payable_one_of_activation_branches(
+            state,
+            player,
+            source_id,
+            &cost,
+            branches,
+            ability_index,
+            CastPaymentMode::Auto,
+        )
+        .iter()
+        .filter_map(|branch| cost.resolve_first_one_of(branch))
+        .collect(),
+        None => vec![cost],
+    };
+    // Each mana leg as (generic, shard requirements).
+    let legs: Vec<(u32, Vec<_>)> = costs
+        .iter()
+        .filter_map(|cost| match activation_mana_component(cost) {
+            ManaCost::Cost { shards, generic } if generic > 0 || !shards.is_empty() => Some((
                 generic,
                 shards
                     .iter()
@@ -32284,22 +32315,6 @@ pub fn pool_mana_can_pay_toward_activation(
                     })
             }) > 0
         })
-}
-
-/// The mana legs of each way an activation cost can be paid: the summed mana of the cost, or of
-/// each `OneOf` branch, since an "or" cost lets the payer choose which to pay.
-fn payable_mana_legs(cost: &AbilityCost) -> Vec<ManaCost> {
-    match cost {
-        AbilityCost::OneOf { costs } => costs.iter().flat_map(payable_mana_legs).collect(),
-        _ => {
-            let mana = activation_mana_component(cost);
-            if mana == ManaCost::zero() {
-                Vec::new()
-            } else {
-                vec![mana]
-            }
-        }
-    }
 }
 
 /// The mana an activation cost demands: the sum of its mana legs, for the
