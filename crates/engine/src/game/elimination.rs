@@ -307,11 +307,11 @@ fn eliminate_players(
         .flatten();
 
     // CR 603.10a + CR 603.3a: the observers of the departure as they were
-    // immediately before it. The leaving players' objects leave before their
-    // control effects end (CR 800.4a), so an observer a leaving player stole
-    // controlled its leaves-the-battlefield ability when it triggered, and that
-    // ability is retired with its controller (CR 800.4d) rather than handed to
-    // the observer's owner once control reverts.
+    // immediately before it. The leaving players' objects leave the game in the
+    // same event that ends their control effects (CR 800.4a); a look-back
+    // ability reads its source as it was immediately before that event, so an
+    // observer a leaving player stole triggers under that player and is retired
+    // with them (CR 800.4d) rather than handed to its owner.
     let looked_back_observers = (departure_triggers == DepartureTriggers::CollectedByDeparture
         && !leaving_set.is_empty())
     .then(|| super::triggers::ImmediatelyBeforeObservers::latch(state));

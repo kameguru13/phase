@@ -430,8 +430,10 @@ fn assert_departing_observer_sees_the_others(departure: Departure) {
         .all(|entry| entry.controller == P0));
 }
 
-/// REVERT-FAILING: without marking the departure simultaneous, the departing
-/// Demon doesn't see the others and triggers zero times.
+/// Pins the co-departure reading. On the concession path the look-back latch
+/// already keeps the departing Demon on the battlefield; on the state-based
+/// action path it is the simultaneity stamp (CR 603.10a) that lets it see the
+/// others.
 #[test]
 fn concession_departing_observer_sees_the_other_permanents_that_leave_with_it() {
     assert_departing_observer_sees_the_others(Departure::Concession);
@@ -589,8 +591,9 @@ const ACT_OF_AGGRESSION_ORACLE: &str = "Gain control of target creature an oppon
 
 /// CR 603.10a + CR 603.3a + CR 800.4a + CR 800.4d: P2 steals P0's Extractor
 /// Demon with a real control-changing spell, then concedes while owning a bear.
-/// The bear leaves the game before P2's control effects end, so the stolen
-/// Demon's leaves-the-battlefield ability looks back to a source P2 controlled:
+/// The bear leaves the game in the same event that ends P2's control effects
+/// (CR 800.4a), and the stolen Demon's leaves-the-battlefield ability looks back
+/// to its source as it was immediately before that event, which P2 controlled:
 /// P2 controls that trigger, and it isn't put on the stack. Control then
 /// reverts and the Demon stays with P0, which puts no trigger of its own on the
 /// stack for the bear. P0's other Demon is the reach guard: it sees the bear
@@ -654,5 +657,79 @@ fn concession_after_stealing_an_observer_retires_the_stolen_observers_trigger() 
         triggers_from(&runner, stolen_demon),
         0,
         "CR 603.3a + CR 800.4d: the stolen Demon's trigger was P2's, and P2 left"
+    );
+}
+
+const BECOME_MONARCH_ORACLE: &str = "Whenever you become the monarch, you gain 1 life.";
+
+/// CR 603.10 + CR 725.4: only the departure is looked back on. When the monarch
+/// concedes, the active player becomes the monarch as the conceding player
+/// leaves, and a "whenever you become the monarch" ability is checked against
+/// the game immediately after: a creature P2 owned already left with P2, so it
+/// doesn't trigger, though P0 controlled it.
+///
+/// Pins that the look-back latch reads only the departure, not the rest of the
+/// player-leaves-game events.
+#[test]
+fn concession_monarch_observer_that_left_with_its_owner_does_not_trigger() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let watcher = scenario
+        .add_creature_from_oracle(P2, "Monarch Watcher", 2, 2, BECOME_MONARCH_ORACLE)
+        .controlled_by(P0)
+        .id();
+    let mut runner = scenario.build();
+    runner.state_mut().monarch = Some(P2);
+
+    runner
+        .act(GameAction::Concede { player_id: P2 })
+        .expect("P2 concedes");
+    // Reach guard: the monarchy passed to P0 and the watcher left the game.
+    assert_eq!(runner.state().monarch, Some(P0));
+    assert_eq!(zone(&runner, watcher), Zone::Exile);
+
+    drive_trigger_prompts(&mut runner);
+    assert_eq!(triggers_from(&runner, watcher), 0);
+}
+
+/// CR 603.10 + CR 725.4 + CR 800.4a: P2 steals P0's "whenever you become the
+/// monarch" creature with a real control-changing spell, is the monarch, and
+/// concedes. Immediately after, P0 controls the creature again and is the
+/// monarch, so its ability triggers under P0.
+///
+/// Pins that the look-back latch reads only the departure: read against the
+/// latched observers, the creature would still be P2's and be retired with P2.
+#[test]
+fn concession_monarch_observer_that_reverted_to_the_new_monarch_triggers() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let watcher = scenario
+        .add_creature_from_oracle(P0, "Monarch Watcher", 2, 2, BECOME_MONARCH_ORACLE)
+        .id();
+    let aggression = scenario
+        .add_spell_to_hand_from_oracle(P2, "Act of Aggression", true, ACT_OF_AGGRESSION_ORACLE)
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id();
+    let mut runner = scenario.build();
+    for _ in 0..2 {
+        runner
+            .act(GameAction::PassPriority)
+            .expect("priority passes to P2");
+    }
+    runner.cast(aggression).target_object(watcher).resolve();
+    assert_eq!(runner.state().objects[&watcher].controller, P2);
+    runner.state_mut().monarch = Some(P2);
+
+    runner
+        .act(GameAction::Concede { player_id: P2 })
+        .expect("P2 concedes");
+    assert_eq!(runner.state().monarch, Some(P0));
+    assert_eq!(runner.state().objects[&watcher].controller, P0);
+
+    drive_trigger_prompts(&mut runner);
+    assert_eq!(
+        triggers_from(&runner, watcher),
+        1,
+        "CR 725.4: P0 controls the watcher and became the monarch"
     );
 }
