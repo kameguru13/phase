@@ -1352,3 +1352,108 @@ fn unrecognised_selection_across_resolution_choice_could_be_that_creature() {
         assert_unrecognised_selection_declines(text, label, is_selection);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Row 28: the reader clause reads its parent beyond the noun anaphor
+// ---------------------------------------------------------------------------
+
+/// Parser shape shared by rows 28 and 28b: the producer taps a target creature,
+/// a graveyard exile makes a resolution-time zone choice, and the last node is
+/// the reader (`is_reader`). CR 608.2c: the chosen-group link re-stamps every
+/// parent-target read of the reader clause, so the binder links it only when
+/// the noun anaphor is the clause's one parent read; here it is not, so the
+/// binder declines and no chosen-group link is written.
+fn assert_extra_parent_read_declines(text: &str, label: &str, is_reader: fn(&Effect) -> bool) {
+    let root = parse_instant(text, "Pronoun Probe");
+    let nodes = chain_nodes(&root);
+    assert!(
+        matches!(
+            nodes[0].effect.as_ref(),
+            Effect::SetTapState {
+                target: TargetFilter::Typed(_),
+                ..
+            }
+        ),
+        "{label}: the producer announces a creature target: {:?}",
+        nodes[0].effect
+    );
+    assert!(
+        matches!(
+            nodes[1].effect.as_ref(),
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Exile,
+                ..
+            }
+        ),
+        "{label}: the graveyard exile parses: {:?}",
+        nodes[1].effect
+    );
+    let reader = nodes.last().unwrap();
+    assert!(
+        is_reader(reader.effect.as_ref()),
+        "{label}: {:?}",
+        reader.effect
+    );
+    assert_no_chosen_group_link(&root);
+}
+
+/// Row 28 (synthetic). CR 608.2c: a bare object pronoun in the reader clause
+/// ("it") can name the card the exile selected, and re-stamping the clause
+/// would point that read at the announced target too. Covers a pronoun subject
+/// ("it deals", which the parsed node does not carry as a damage source), a
+/// pronoun and the anaphor read by one node ("gains control of it": the pronoun
+/// is its target, the anaphor its recipient), and a node reading its parent
+/// through two target-filter slots ("attach it to that creature").
+#[test]
+fn bare_pronoun_in_reader_across_resolution_choice_declines() {
+    for (text, label, is_reader) in [
+        (
+            "Tap target creature. You may exile a card from your graveyard. If you do, it deals 2 damage to that creature's controller.",
+            "it deals",
+            is_controller_damage as fn(&Effect) -> bool,
+        ),
+        (
+            "Tap target creature. You may exile a card from your graveyard. If you do, that creature's controller gains control of it.",
+            "gains control of it",
+            |effect| {
+                matches!(
+                    effect,
+                    Effect::GiveControl {
+                        target: TargetFilter::ParentTarget,
+                        recipient: TargetFilter::ParentTargetController,
+                    }
+                )
+            },
+        ),
+        (
+            "Tap target creature. You may exile a card from your graveyard. If you do, attach it to that creature.",
+            "attach it",
+            |effect| {
+                matches!(
+                    effect,
+                    Effect::Attach {
+                        attachment: TargetFilter::ParentTarget,
+                        target: TargetFilter::ParentTarget,
+                        ..
+                    }
+                )
+            },
+        ),
+    ] {
+        assert_extra_parent_read_declines(text, label, is_reader);
+    }
+}
+
+/// Row 28b (synthetic, preservation). CR 608.2c + CR 115.10a: "return it to its
+/// owner's hand" acts on the object the exile handed the chain and leaves its
+/// zone unproven, so the stun counter's "that creature" could name it and the
+/// binder declines.
+#[test]
+fn returned_pronoun_before_reader_across_resolution_choice_declines() {
+    assert_extra_parent_read_declines(
+        "Tap target creature. You may exile a card from your graveyard. If you do, return it to its owner's hand and put a stun counter on that creature.",
+        "return it and put",
+        is_parent_counter,
+    );
+}

@@ -27905,6 +27905,9 @@ fn cross_choice_antecedent(
     else {
         return CrossChoiceAntecedent::Unrelated;
     };
+    if !reader_reads_parent_only_through_anaphor(reader, &reader_lower) {
+        return CrossChoiceAntecedent::Unrelated;
+    }
     let verdict = announced_target_antecedent(clauses, i, k, &anaphor, body_scope);
     // CR 110.1 + CR 608.2c: every instruction between the antecedent and the
     // reader must provably hand the reader no object the noun could name; one
@@ -27922,6 +27925,39 @@ fn cross_choice_antecedent(
     } else {
         verdict
     }
+}
+
+/// CR 608.2c: whether the reader clause's only read of its parent's target is
+/// the one its noun anaphor makes. The chosen-group link re-stamps the targets
+/// of the whole reader clause, so a second read would be re-pointed at the
+/// announced target too. Fails closed:
+/// - exactly one node of the clause may read its parent's target, through
+///   exactly one target-filter slot (`effects::effect_parent_ref_slot_count`);
+/// - the clause's text may contain no bare object pronoun, possessive
+///   included ("return it", "its owner's hand", "it deals"), which can name the
+///   object the intervening selection handed the chain. This also covers a
+///   parent read the slot count does not reach (a control recipient, a damage
+///   source, a quantity's object scope), which the printed text expresses as a
+///   pronoun.
+fn reader_reads_parent_only_through_anaphor(reader: &ClauseIr, reader_lower: &str) -> bool {
+    let mut parent_reads = clause_nodes(reader)
+        .map(|(effect, _, _)| crate::game::effects::effect_parent_ref_slot_count(effect))
+        .filter(|&count| count > 0);
+    parent_reads.next() == Some(1)
+        && parent_reads.next().is_none()
+        && nom_primitives::scan_at_word_boundaries(reader_lower, parse_bare_object_pronoun)
+            .is_none()
+}
+
+/// A bare object pronoun at the start of lowercase `input`: an object-recipient
+/// pronoun (`nom_primitives::parse_object_recipient_pronoun`) or the possessive
+/// "its"/"their".
+fn parse_bare_object_pronoun(input: &str) -> OracleResult<'_, &str> {
+    alt((
+        nom_primitives::parse_object_recipient_pronoun,
+        terminated(alt((tag("its"), tag("their"))), tag(" ")),
+    ))
+    .parse(input)
 }
 
 /// Where [`intervening_object_could_be_anaphor`] starts its walk.

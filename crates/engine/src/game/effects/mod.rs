@@ -15739,9 +15739,17 @@ pub(crate) fn publish_battlefield_object_for_pending_continuation(
 /// surfaces `SearchLibrary::target_player`, so iterated-search variants are
 /// covered through the same single path.
 pub(crate) fn effect_refs_parent_target(effect: &Effect) -> bool {
+    effect_parent_ref_slot_count(effect) > 0
+}
+
+/// CR 608.2c: how many of the effect's target-filter slots (the ones
+/// [`effect_refs_parent_target`] scans) read its parent's target. The parser's
+/// cross-choice antecedent binder links a reader only when exactly one does.
+pub(crate) fn effect_parent_ref_slot_count(effect: &Effect) -> usize {
     effect_parent_ref_slots(effect)
         .iter()
-        .any(|filter| filter_refs_parent_target(filter))
+        .filter(|filter| filter_refs_parent_target(filter))
+        .count()
 }
 
 /// CR 608.2c + CR 608.2h: Whether a later instruction needs the parent object
