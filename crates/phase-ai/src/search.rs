@@ -3441,8 +3441,9 @@ enum RootDecisionContext {
     StackResponse,
     /// The AI's own Upkeep or Draw step, holding priority on an empty stack.
     /// CR 102.1 + CR 723.3: "own turn" is the active player (a controlled player is still the
-    /// active player). CR 117.1a: no noninstant spell can be cast here, so every candidate is a
-    /// "now vs. in my main phase" choice that the short beam rarely sees past. CR 501.1 +
+    /// active player). CR 117.1a: absent a flash-style permission (CR 702.8a), no noninstant
+    /// spell can be cast here, so most candidates are a "now vs. in my main phase" choice that
+    /// the short beam rarely sees past. CR 501.1 +
     /// CR 502.4: the untap step grants no priority, so Upkeep and Draw are the beginning
     /// phase's only priority windows. Timing policies need their verdict to survive the root
     /// weight here (phase-rs/phase#10334).
