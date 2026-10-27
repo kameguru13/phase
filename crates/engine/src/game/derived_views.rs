@@ -5571,6 +5571,7 @@ mod tests {
                 recorded_turn_number: 0,
                 is_suspected: false,
                 was_prepared: false,
+                departure: crate::types::game_state::ZoneDeparture::Moved,
             }),
         };
         let ability = ResolvedAbility::new(

@@ -519,6 +519,7 @@ fn on_shortcut_byte_identical_to_pre_pr7_golden() {
         // `block_pairs` joined `ZoneChangeRecord` after the golden was cut; no
         // creature in this fixture is in combat, so every record's is empty.
         .replace(", block_pairs: []", "")
+        .replace(", departure: Moved", "")
         // `attack_target` was added to the combat status after the golden was cut;
         // no combat is live in this fixture, so its derived value is None (CR 506.3).
         .replace(", attack_target: None", "")
