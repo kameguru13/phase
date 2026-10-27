@@ -678,6 +678,9 @@ fn concession_monarch_observer_that_left_with_its_owner_does_not_trigger() {
         .add_creature_from_oracle(P2, "Monarch Watcher", 2, 2, BECOME_MONARCH_ORACLE)
         .controlled_by(P0)
         .id();
+    let own_watcher = scenario
+        .add_creature_from_oracle(P0, "P0 Monarch Watcher", 2, 2, BECOME_MONARCH_ORACLE)
+        .id();
     let mut runner = scenario.build();
     runner.state_mut().monarch = Some(P2);
 
@@ -689,6 +692,11 @@ fn concession_monarch_observer_that_left_with_its_owner_does_not_trigger() {
     assert_eq!(zone(&runner, watcher), Zone::Exile);
 
     drive_trigger_prompts(&mut runner);
+    assert_eq!(
+        triggers_from(&runner, own_watcher),
+        1,
+        "reach guard: P0's own watcher sees P0 become the monarch"
+    );
     assert_eq!(triggers_from(&runner, watcher), 0);
 }
 
@@ -731,5 +739,64 @@ fn concession_monarch_observer_that_reverted_to_the_new_monarch_triggers() {
         triggers_from(&runner, watcher),
         1,
         "CR 725.4: P0 controls the watcher and became the monarch"
+    );
+}
+
+const HARSH_MERCY_ORACLE: &str = "Each player chooses a creature type. Destroy all creatures that aren't of a type chosen this way. They can't be regenerated.";
+const EXILE_FROM_ANYWHERE_ORACLE: &str =
+    "Whenever a card is put into exile from anywhere, you gain 1 life.";
+
+/// CR 800.4a + CR 608.2n: P0's Harsh Mercy is paused on P0's own creature-type
+/// choice when P0 concedes. The spell leaves the game with its owner; it is not
+/// exiled, so P1's "put into exile from anywhere" watcher doesn't see it. The
+/// reach guard is the creature P1 owns and P0 controlled, which is exiled once
+/// P0's control ends and which the watcher does see.
+///
+/// REVERT-FAILING: moving the paused spell without its leave-the-game departure
+/// reports it as exiled and the watcher triggers for it too.
+#[test]
+fn concession_with_a_paused_spell_does_not_exile_it() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let mercy = scenario
+        .add_spell_to_hand_from_oracle(P0, "Harsh Mercy", false, HARSH_MERCY_ORACLE)
+        .with_mana_cost(engine::types::mana::ManaCost::zero())
+        .id();
+    let watcher = scenario
+        .add_creature_from_oracle(P1, "Exile Watcher", 1, 1, EXILE_FROM_ANYWHERE_ORACLE)
+        .id();
+    let borrowed = scenario
+        .add_creature(P1, "P1 Bear", 2, 2)
+        .controlled_by(P0)
+        .id();
+    let mut runner = scenario.build();
+
+    runner.cast(mercy).commit();
+    for _ in 0..12 {
+        if !matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("pass priority to resolve Harsh Mercy");
+    }
+    // Reach guard: the spell is resolving, paused on a player's choice.
+    assert!(
+        !matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "Harsh Mercy pauses on a creature-type choice: {:?}",
+        runner.state().waiting_for
+    );
+
+    runner
+        .act(GameAction::Concede { player_id: P0 })
+        .expect("P0 concedes");
+    assert_eq!(zone(&runner, mercy), Zone::Exile);
+    assert_eq!(zone(&runner, borrowed), Zone::Exile);
+
+    drive_trigger_prompts(&mut runner);
+    assert_eq!(
+        triggers_from(&runner, watcher),
+        1,
+        "CR 800.4a: only the bear P0 controlled was exiled; Harsh Mercy left the game"
     );
 }

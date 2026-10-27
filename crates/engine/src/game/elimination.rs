@@ -959,27 +959,37 @@ fn exile_owned_objects_on_player_left_game(
     to_exile.dedup();
 
     for id in to_exile {
-        // CR 603.6c + CR 702.26k: a phased-in permanent leaving the game with its
-        // owner triggers leaves-the-battlefield abilities; a phased-out one
-        // doesn't cause zone-change abilities to trigger.
-        let departure = if state
-            .objects
-            .get(&id)
-            .is_some_and(|obj| obj.is_phased_out_permanent())
-        {
-            ZoneDeparture::LeftGamePhasedOut
-        } else {
-            ZoneDeparture::LeftGame
-        };
-        // The move's record carries the departure from the moment it is built
-        // (and journaled); see `GameState::leaving_game_departure`.
-        state.leaving_game_departure = Some(LeavingGameDeparture {
-            object_id: id,
-            departure,
-        });
-        move_object_for_player_left_game(state, id, player, events);
-        state.leaving_game_departure = None;
+        move_owned_object_leaving_game(state, id, player, events);
     }
+}
+
+/// CR 800.4a: an object `owner` owns leaves the game with them. The move's record
+/// carries the departure from the moment it is built (and journaled); see
+/// `GameState::leaving_game_departure`.
+fn move_owned_object_leaving_game(
+    state: &mut GameState,
+    object_id: crate::types::identifiers::ObjectId,
+    owner: PlayerId,
+    events: &mut Vec<GameEvent>,
+) {
+    // CR 603.6c + CR 702.26k: a phased-in permanent leaving the game with its
+    // owner triggers leaves-the-battlefield abilities; a phased-out one doesn't
+    // cause zone-change abilities to trigger.
+    let departure = if state
+        .objects
+        .get(&object_id)
+        .is_some_and(|obj| obj.is_phased_out_permanent())
+    {
+        ZoneDeparture::LeftGamePhasedOut
+    } else {
+        ZoneDeparture::LeftGame
+    };
+    state.leaving_game_departure = Some(LeavingGameDeparture {
+        object_id,
+        departure,
+    });
+    move_object_for_player_left_game(state, object_id, owner, events);
+    state.leaving_game_departure = None;
 }
 
 /// CR 800.4a + CR 603.10a: everything the leaving players own leaves the game at
@@ -1935,7 +1945,8 @@ fn finish_abandoned_source_bound_resolution_carrier(
             .map(|object| object.owner)
             .filter(|owner| leaving_set.contains(owner));
         if let Some(leaver) = owner {
-            move_object_for_player_left_game(state, spell.id, leaver, events);
+            // CR 800.4a: the spell leaves the game with its owner; it is not exiled.
+            move_owned_object_leaving_game(state, spell.id, leaver, events);
         }
     }
     crate::game::stack::abandon_active_resolution_carrier(
