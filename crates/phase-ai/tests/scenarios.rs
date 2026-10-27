@@ -289,6 +289,75 @@ fn floating_upkeep_mana_is_not_held_for_the_main_phase() {
     );
 }
 
+/// Words of Worship ("{1}: The next time you would draw a card this turn, you gain 5 life
+/// instead.") in the AI's own upkeep after Phyrexian Arena's trigger, with one Plains untapped.
+/// CR 614.4: the replacement must exist before the draw step's draw, so the production root
+/// score must not carry the patience hold there. The reference is the same board with one
+/// colorless mana floating, which stands patience down through its own escape hatch, so the
+/// two margins must agree. (The draw-step control, where the replacement is held, is pinned at
+/// the policy level in `activation_patience_repro.rs`.)
+#[test]
+fn a_draw_replacement_is_not_held_in_the_upkeep() {
+    let margin = |phase: Phase, floating: bool| {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(phase);
+        scenario.add_enchantment_from_oracle(
+            P0,
+            "Phyrexian Arena",
+            "At the beginning of your upkeep, you draw a card and you lose 1 life.",
+        );
+        let words = scenario
+            .add_enchantment_from_oracle(
+                P0,
+                "Words of Worship",
+                "{1}: The next time you would draw a card this turn, you gain 5 life instead.",
+            )
+            .id();
+        scenario.add_basic_land(P0, ManaColor::White);
+        // A library, so the draw the replacement skips isn't a draw from an empty library.
+        scenario.with_library_top(P0, &["Plains"; 5]);
+        if floating {
+            scenario.with_mana_pool(
+                P0,
+                vec![ManaUnit::new(
+                    ManaType::Colorless,
+                    ObjectId(9_900),
+                    false,
+                    vec![],
+                )],
+            );
+        }
+        let runner = scenario.build();
+        let state = runner.state();
+        assert!(
+            matches!(state.waiting_for, WaitingFor::Priority { player } if player == P0)
+                && state.active_player == P0
+                && state.stack.is_empty(),
+            "reach: P0 holds priority in its own {phase:?} with an empty stack"
+        );
+        let config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(42);
+        let scores = phase_ai::score_candidates(state, P0, &config);
+        let score = |pick: &dyn Fn(&GameAction) -> bool| {
+            scores
+                .iter()
+                .find(|(action, _)| pick(action))
+                .map(|(_, score)| *score)
+                .unwrap_or_else(|| panic!("reach: candidate scored in {scores:?}"))
+        };
+        score(
+            &|action| matches!(action, GameAction::ActivateAbility { source_id, .. } if *source_id == words),
+        ) - score(&|action| matches!(action, GameAction::PassPriority))
+    };
+    // At Hard the patience hold moves the root margin by about 0.17 (its -1.68 verdict times the
+    // 0.1 root tactical weight); with the draw replacement exempt, the floating-mana reference
+    // must agree with the unfloated board well inside that.
+    let held = margin(Phase::Upkeep, true) - margin(Phase::Upkeep, false);
+    assert!(
+        held.abs() < 0.08,
+        "the upkeep must not hold the draw replacement (reference minus board: {held})"
+    );
+}
+
 #[test]
 fn scenario_prefers_opponent_target_over_self() {
     let mut runner = GameScenario::new().build();

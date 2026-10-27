@@ -838,6 +838,53 @@ fn an_opponents_each_player_upkeep_trigger_ends_the_pristine_upkeep() {
     );
 }
 
+/// CR 614.4: Words of Worship ("{1}: The next time you would draw a card this turn, you gain
+/// 5 life instead.", verified against MTGJSON) must be activated before the draw it replaces.
+/// In the upkeep — pristine or after Phyrexian Arena's trigger — the draw step's draw is still
+/// ahead, so patience stands down; in the draw step that draw has happened and it is held.
+#[test]
+fn a_draw_replacement_is_not_held_while_the_draw_is_ahead() {
+    use engine::types::ability::Effect;
+    let words = |board: &mut Board| {
+        let id = creature(
+            &mut board.state,
+            &mut Ids(8_700),
+            AI,
+            "Words of Worship",
+            0,
+            1,
+            Some("{1}: The next time you would draw a card this turn, you gain 5 life instead."),
+        );
+        assert!(
+            matches!(
+                *board.state.objects[&id].abilities[0].effect,
+                Effect::CreateDrawReplacement { .. }
+            ),
+            "premise: Words of Worship parses as a draw replacement"
+        );
+        board.pinger = id;
+    };
+    let mut pristine = build_board(Phase::Upkeep, 20, 20);
+    words(&mut pristine);
+    assert_eq!(
+        score_and_reason(&verdict_for(&pristine)).1,
+        "activation_patience_draw_replacement"
+    );
+    let mut after_trigger = build_board(Phase::Upkeep, 20, 20);
+    add_upkeep_trigger_source(&mut after_trigger.state);
+    words(&mut after_trigger);
+    let (delta, reason) = score_and_reason(&verdict_for(&after_trigger));
+    assert_eq!(reason, "activation_patience_draw_replacement");
+    assert_eq!(delta, 0.0);
+    let mut draw_step = build_board(Phase::Draw, 20, 20);
+    words(&mut draw_step);
+    assert_eq!(
+        score_and_reason(&verdict_for(&draw_step)).1,
+        "activation_patience_hold_for_main",
+        "control: once the draw is behind, the replacement can wait"
+    );
+}
+
 /// CR 602.5: an ability restricted to the upkeep can't be activated in the main
 /// phase, so it is not deferrable and patience stays silent.
 #[test]

@@ -40,11 +40,12 @@
 //! that activating now enables a line the AI cannot see from the root. The
 //! penalty is sized to lose to a real payoff and win against an idle ping.
 //!
-//! ## The three escape hatches
+//! ## The escape hatches
 //!
 //! Floating mana the activation may spend comes first: it empties as the step
-//! ends (CR 500.5), so for it waiting is not free. The report names the other two
-//! times to activate early: when the damage is part of a lethal
+//! ends (CR 500.5), so for it waiting is not free. A draw replacement made in the
+//! upkeep comes next: it must exist before the draw it replaces (CR 614.4). The
+//! report names the other two times to activate early: when the damage is part of a lethal
 //! line, and (implicitly) when the ability's own condition is met *now* and might
 //! not be later. Those are lethal damage and `ability.condition`, in that order
 //! below. Its third exception, a source that "is going to die or leave play
@@ -54,7 +55,7 @@
 
 use engine::game::{attractions, mana_abilities};
 use engine::types::ability::{
-    AbilityDefinition, AbilityTag, ActivationRestriction, DelayedTriggerCondition,
+    AbilityDefinition, AbilityTag, ActivationRestriction, DelayedTriggerCondition, Effect,
 };
 use engine::types::actions::GameAction;
 use engine::types::game_state::{GameState, WaitingFor};
@@ -343,13 +344,28 @@ impl TacticalPolicy for ActivationPatiencePolicy {
             return PolicyVerdict::neutral(PolicyReason::new("activation_patience_floating_mana"));
         }
 
-        // Escape hatch 2 — a lethal line beats any information the AI could buy
+        // Escape hatch 2 — CR 614.4: a draw replacement ("the next time you would draw a
+        // card this turn", the Words cycle) must exist before the draw it replaces, so in the
+        // upkeep, with the draw step's turn-based draw still ahead, waiting for the main phase
+        // forfeits it.
+        if ctx.state.phase == Phase::Upkeep
+            && ctx
+                .effects()
+                .iter()
+                .any(|effect| matches!(effect, Effect::CreateDrawReplacement { .. }))
+        {
+            return PolicyVerdict::neutral(PolicyReason::new(
+                "activation_patience_draw_replacement",
+            ));
+        }
+
+        // Escape hatch 3 — a lethal line beats any information the AI could buy
         // by waiting.
         if is_lethal_line(ctx) {
             return PolicyVerdict::neutral(PolicyReason::new("activation_patience_lethal_line"));
         }
 
-        // Escape hatch 3 — CR 608.2c: `ability.condition` on an ACTIVATED
+        // Escape hatch 4 — CR 608.2c: `ability.condition` on an ACTIVATED
         // ability (as opposed to a triggered ability's CR 603.4 intervening-if)
         // gates the PAYOFF at resolution, not the activation itself — CR 602.5
         // has no bearing here; per the Shelldock Isle ruling `condition_gated_
