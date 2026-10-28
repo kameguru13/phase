@@ -3021,7 +3021,7 @@ mod tests {
     /// payloads its resolution carries. Barge In's `Pump` plus trample grant, and Arm the
     /// Cathars' three `Pump`s plus vigilance grant, price as Giant Growth's single `Pump` does:
     /// the trick penalty out of combat, the combat bonus in DeclareAttackers. Arm the Cathars is a
-    /// sorcery, so only its own precombat main phase is a window it can be cast in.
+    /// sorcery, so it is priced in its controller's precombat main phase, a window it can be cast in (CR 307.1).
     #[test]
     fn effect_timing_prices_a_multi_payload_trick_once() {
         let barge_in = trick_payloads(BARGE_IN, "Barge In", CoreType::Instant);
