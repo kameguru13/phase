@@ -8,6 +8,7 @@ use engine::types::player::PlayerId;
 
 use crate::cast_facts::{cast_facts_for_action, CastFacts};
 use crate::eval::opponent_battlefield_creature_threat_value;
+use crate::policies::effect_classify::effect_is_combat_trick_payload;
 use crate::policies::hand_disruption::disruption_window_score;
 #[cfg(test)]
 use engine::types::game_state::CastPaymentMode;
@@ -54,7 +55,7 @@ pub(crate) fn should_play_now_with_facts(
                 .any(|effect| matches!(effect, Effect::DealDamage { .. }));
             let has_pump = immediate_effects
                 .iter()
-                .any(|effect| matches!(effect, Effect::Pump { .. }));
+                .any(|effect| effect_is_combat_trick_payload(effect));
             let has_counter = immediate_effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::Counter { .. }));
@@ -677,5 +678,159 @@ mod tests {
             score >= 0.7,
             "expected proactive tutor priority, got {score}"
         );
+    }
+
+    // ---- D1: a non-protective until-end-of-turn GenericEffect pump is timed like a pump ----
+
+    const COORDINATED_ASSAULT: &str = "Up to two target creatures each get +1/+0 and gain first strike until end of turn. (They deal combat damage before creatures without first strike.)";
+    const GIANT_GROWTH: &str = "Target creature gets +3/+3 until end of turn.";
+    const UNLEASH_FURY: &str = "Double the power of target creature until end of turn.";
+    const DWARVEN_SONG: &str = "One or more target creatures become red until end of turn.";
+    const HEROIC_INTERVENTION: &str =
+        "Permanents you control gain hexproof and indestructible until end of turn.";
+    const ADAMANT_WILL: &str = "Target creature gets +2/+2 and gains indestructible until end of turn. (Damage and effects that say \"destroy\" don't destroy it.)";
+
+    /// An instant in P0's hand built from its verbatim Oracle text; returns its cast action.
+    fn oracle_instant(state: &mut GameState, name: &str, oracle_text: &str) -> GameAction {
+        let abilities = engine::parser::oracle::parse_oracle_text(
+            oracle_text,
+            name,
+            &[],
+            &["Instant".to_string()],
+            &[],
+        )
+        .abilities;
+        let card_id = add_spell_to_hand(state, PlayerId(0), name, CoreType::Instant, abilities);
+        let object_id = state
+            .objects
+            .values()
+            .find(|object| object.card_id == card_id)
+            .map(|object| object.id)
+            .expect("the spell is in hand");
+        GameAction::CastSpell {
+            object_id,
+            card_id,
+            targets: Vec::new(),
+            payment_mode: CastPaymentMode::Auto,
+        }
+    }
+
+    fn hint_in(phase: Phase, combat: bool, name: &str, oracle_text: &str) -> f64 {
+        let mut state = make_state();
+        state.phase = phase;
+        if combat {
+            state.combat = Some(engine::game::combat::CombatState::default());
+        }
+        let action = oracle_instant(&mut state, name, oracle_text);
+        should_play_now(&state, &action, PlayerId(0))
+    }
+
+    /// CR 611.2a + CR 514.2: Coordinated Assault's until-end-of-turn `GenericEffect` pump and
+    /// Unleash Fury's doubled power (CR 701.10b: +X/+0) both end at cleanup like Giant Growth's
+    /// "+3/+3 until end of turn", so the hint times all three alike: low in the Draw step, high
+    /// in combat, near zero in the End step. Dwarven Song is not a pump.
+    #[test]
+    fn should_play_now_times_a_generic_effect_pump_like_a_pump() {
+        for (phase, combat) in [
+            (Phase::Draw, false),
+            (Phase::DeclareAttackers, true),
+            (Phase::End, false),
+        ] {
+            let gg = hint_in(phase, combat, "Giant Growth", GIANT_GROWTH);
+            let ca = hint_in(phase, combat, "Coordinated Assault", COORDINATED_ASSAULT);
+            let uf = hint_in(phase, combat, "Unleash Fury", UNLEASH_FURY);
+            assert_eq!(
+                ca, gg,
+                "{phase:?}: Coordinated Assault must time as Giant Growth"
+            );
+            assert_eq!(uf, gg, "{phase:?}: Unleash Fury must time as Giant Growth");
+            if phase == Phase::DeclareAttackers {
+                assert_ne!(
+                    hint_in(phase, combat, "Dwarven Song", DWARVEN_SONG),
+                    gg,
+                    "{phase:?}: a colour change is not timed as a pump"
+                );
+            }
+        }
+    }
+
+    /// CR 702.11b + CR 702.12b: hexproof and indestructible pay off against removal in any
+    /// phase, so a protective grant is not timed like a pump. In the AI's End step, and in the
+    /// opponent's main phase with its Murder on the stack, Heroic Intervention and Adamant Will
+    /// read as Dwarven Song.
+    #[test]
+    fn should_play_now_does_not_time_a_protective_grant_like_a_pump() {
+        let end = |name, oracle_text| hint_in(Phase::End, false, name, oracle_text);
+        let ds = end("Dwarven Song", DWARVEN_SONG);
+        let gg = end("Giant Growth", GIANT_GROWTH);
+        assert_eq!(
+            end("Coordinated Assault", COORDINATED_ASSAULT),
+            gg,
+            "reach: the pump timing fires in the End step"
+        );
+        assert_ne!(gg, ds, "reach: the pump timing differs from the default");
+        assert_eq!(end("Heroic Intervention", HEROIC_INTERVENTION), ds);
+        assert_eq!(end("Adamant Will", ADAMANT_WILL), ds);
+
+        let under_murder = |name, oracle_text| {
+            let mut state = make_state();
+            state.active_player = PlayerId(1);
+            let next_id = state.next_object_id;
+            let victim = create_object(
+                &mut state,
+                CardId(next_id),
+                PlayerId(0),
+                "Victim".to_string(),
+                Zone::Battlefield,
+            );
+            state
+                .objects
+                .get_mut(&victim)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Creature);
+            let next_id = state.next_object_id;
+            let murder = create_object(
+                &mut state,
+                CardId(next_id),
+                PlayerId(1),
+                "Murder".to_string(),
+                Zone::Stack,
+            );
+            let effect = (*engine::parser::oracle::parse_oracle_text(
+                "Destroy target creature.",
+                "Murder",
+                &[],
+                &["Instant".to_string()],
+                &[],
+            )
+            .abilities[0]
+                .effect)
+                .clone();
+            state
+                .stack
+                .push_back(engine::types::game_state::StackEntry {
+                    id: murder,
+                    source_id: murder,
+                    controller: PlayerId(1),
+                    kind: engine::types::game_state::StackEntryKind::Spell {
+                        ability: Some(Box::new(engine::types::ability::ResolvedAbility::new(
+                            effect,
+                            vec![engine::types::ability::TargetRef::Object(victim)],
+                            murder,
+                            PlayerId(1),
+                        ))),
+                        card_id: CardId(murder.0),
+                        casting_variant: Default::default(),
+                        actual_mana_spent: 0,
+                    },
+                });
+            let action = oracle_instant(&mut state, name, oracle_text);
+            should_play_now(&state, &action, PlayerId(0))
+        };
+        let ds = under_murder("Dwarven Song", DWARVEN_SONG);
+        assert_eq!(under_murder("Heroic Intervention", HEROIC_INTERVENTION), ds);
+        assert_eq!(under_murder("Adamant Will", ADAMANT_WILL), ds);
     }
 }

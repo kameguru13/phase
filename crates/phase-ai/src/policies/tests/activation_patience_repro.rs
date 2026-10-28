@@ -180,6 +180,11 @@ fn add_subtyped_permanent(state: &mut GameState, subtype: &str) -> ObjectId {
 }
 
 fn verdict_for(board: &Board) -> PolicyVerdict {
+    verdict_for_ability(board, 0)
+}
+
+/// [`verdict_for`] for the pinger's ability at `ability_index`.
+fn verdict_for_ability(board: &Board, ability_index: usize) -> PolicyVerdict {
     let config = AiConfig::default();
     let mut session = AiSession::empty();
     session.features.insert(AI, Default::default());
@@ -190,7 +195,7 @@ fn verdict_for(board: &Board) -> PolicyVerdict {
     let candidate = CandidateAction {
         action: GameAction::ActivateAbility {
             source_id: board.pinger,
-            ability_index: 0,
+            ability_index,
             payment_mode: engine::types::game_state::CastPaymentMode::Auto,
         },
         metadata: ActionMetadata::for_actor(Some(AI), TacticalClass::Ability),
@@ -883,6 +888,267 @@ fn a_draw_replacement_is_not_held_while_the_draw_is_ahead() {
         "activation_patience_hold_for_main",
         "control: once the draw is behind, the replacement can wait"
     );
+}
+
+const SENSEIS_DIVINING_TOP: &str = "{1}: Look at the top three cards of your library, then put them back in any order.\n{T}: Draw a card, then put this artifact on top of its owner's library.";
+const WATCHFUL_AUTOMATON: &str =
+    "{2}{U}: Scry 1. (Look at the top card of your library. You may put that card on the bottom.)";
+
+/// Put `name` (built from its verbatim Oracle text) on the AI's battlefield as the board's
+/// activation source.
+fn set_arranger(board: &mut Board, name: &str, oracle_text: &str) -> ObjectId {
+    let id = creature(
+        &mut board.state,
+        &mut Ids(8_800),
+        AI,
+        name,
+        1,
+        1,
+        Some(oracle_text),
+    );
+    board.pinger = id;
+    id
+}
+
+/// The arrangement shapes the hatch reads (CR 701.22a scry, CR 701.25a surveil, CR 701.20e a
+/// look-and-reorder dig): each on the AI's own library.
+fn arranges_own_library_top(effect: &engine::types::ability::Effect) -> bool {
+    use engine::types::ability::{Effect, TargetFilter};
+    matches!(
+        effect,
+        Effect::Scry {
+            target: TargetFilter::Controller,
+            ..
+        } | Effect::Surveil {
+            target: TargetFilter::Controller,
+            ..
+        } | Effect::Dig {
+            player: TargetFilter::Controller,
+            destination: Some(Zone::Library),
+            rest_destination: Some(Zone::Library),
+            keep_count: None,
+            keep_count_expr: None,
+            ..
+        }
+    )
+}
+
+/// CR 504.1 + CR 121.1: the draw step's draw takes the top card, and in the upkeep it is still
+/// ahead. An arrangement of the top of the AI's own library that the AI can activate again
+/// before that draw (every cost category mana, life or energy, and no activation cap) chooses
+/// the card it takes, and waiting forfeits that choice, so it is not held. An arrangement that
+/// taps its source (CR 502.3) or is capped (CR 602.5b, CR 702.177a exhaust) arranges one draw
+/// per cycle wherever it is made, so it is held like any other activation. In the draw step
+/// the draw is behind and every arrangement is held.
+#[test]
+fn a_repeatable_library_top_arrangement_is_not_held_while_the_draw_is_ahead() {
+    use engine::types::ability::{AbilityCost, CostCategory, QuantityExpr};
+
+    struct Row {
+        label: &'static str,
+        name: &'static str,
+        oracle_text: &'static str,
+        ability_index: usize,
+        after_trigger: bool,
+        phase: Phase,
+        edit: Option<fn(&mut engine::types::ability::AbilityDefinition)>,
+        categories: &'static [CostCategory],
+        arranges: bool,
+        expected: &'static str,
+    }
+    let row = |label, name, oracle_text, expected| Row {
+        label,
+        name,
+        oracle_text,
+        ability_index: 0,
+        after_trigger: false,
+        phase: Phase::Upkeep,
+        edit: None,
+        categories: &[CostCategory::ManaOnly],
+        arranges: true,
+        expected,
+    };
+    let rows = [
+        // Positives: repeatable arrangements in the upkeep.
+        row(
+            "Top ability 0 (Dig reorder), pristine upkeep",
+            "Sensei's Divining Top",
+            SENSEIS_DIVINING_TOP,
+            "activation_patience_library_top",
+        ),
+        row(
+            "Watchful Automaton (Scry), pristine upkeep",
+            "Watchful Automaton",
+            WATCHFUL_AUTOMATON,
+            "activation_patience_library_top",
+        ),
+        Row {
+            after_trigger: true,
+            ..row(
+                "Rummaging Wizard (Surveil), upkeep after a trigger",
+                "Rummaging Wizard",
+                "{2}{U}: Surveil 1. (Look at the top card of your library. You may put that card into your graveyard.)",
+                "activation_patience_library_top",
+            )
+        },
+        Row {
+            // The fixture parses without MTGJSON's keyword list, so its "Flying, trample" line
+            // takes slot 0 and the printed Surveil ability is at index 1 here.
+            ability_index: 1,
+            categories: &[CostCategory::PaysLife],
+            ..row(
+                "Doom Whisperer (PaysLife), pristine upkeep",
+                "Doom Whisperer",
+                "Flying, trample\nPay 2 life: Surveil 2. (Look at the top two cards of your library, then put any number of them into your graveyard and the rest on top of your library in any order.)",
+                "activation_patience_library_top",
+            )
+        },
+        Row {
+            edit: Some(|ability| {
+                ability.cost = Some(AbilityCost::PayEnergy {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                });
+            }),
+            categories: &[CostCategory::PaysEnergy],
+            ..row(
+                "Watchful Automaton paying energy, pristine upkeep",
+                "Watchful Automaton",
+                WATCHFUL_AUTOMATON,
+                "activation_patience_library_top",
+            )
+        },
+        // Held negatives: once per cycle, or capped.
+        Row {
+            categories: &[CostCategory::ManaOnly, CostCategory::TapsSelf],
+            ..row(
+                "Crystal Ball (taps its source), pristine upkeep",
+                "Crystal Ball",
+                "{1}, {T}: Scry 2. (Look at the top two cards of your library, then put any number of them on the bottom and the rest on top in any order.)",
+                "activation_patience_hold",
+            )
+        },
+        Row {
+            // As for Doom Whisperer, the unlisted "Defender" keyword line takes slot 0.
+            ability_index: 1,
+            after_trigger: true,
+            categories: &[CostCategory::ManaOnly, CostCategory::TapsSelf],
+            ..row(
+                "Coastal Bulwark (taps its source), upkeep after a trigger",
+                "Coastal Bulwark",
+                "Defender\nThis creature gets +2/+0 as long as you control an Island.\n{2}, {T}: Surveil 1. (Look at the top card of your library. You may put that card into your graveyard.)",
+                "activation_patience_hold_for_main",
+            )
+        },
+        Row {
+            ability_index: 1,
+            ..row(
+                "Audacious Knuckleblade ability 1 (exhaust), pristine upkeep",
+                "Audacious Knuckleblade",
+                "Exhaust — {2}{G}: Seek a card named Audacious Knuckleblade and put it onto the battlefield tapped.\nExhaust — {1}{U}: Surveil 2, then untap this creature.\nExhaust — {R}: Creatures you control gain haste until end of turn.",
+                "activation_patience_hold",
+            )
+        },
+        Row {
+            edit: Some(|ability| {
+                ability
+                    .activation_restrictions
+                    .push(ActivationRestriction::OnlyOnceEachTurn);
+            }),
+            ..row(
+                "Watchful Automaton, once each turn, pristine upkeep",
+                "Watchful Automaton",
+                WATCHFUL_AUTOMATON,
+                "activation_patience_hold",
+            )
+        },
+        Row {
+            edit: Some(|ability| {
+                ability
+                    .activation_restrictions
+                    .push(ActivationRestriction::MaxTimesEachTurn { count: 2 });
+            }),
+            ..row(
+                "Watchful Automaton, at most twice each turn, pristine upkeep",
+                "Watchful Automaton",
+                WATCHFUL_AUTOMATON,
+                "activation_patience_hold",
+            )
+        },
+        // Siblings and boundaries.
+        Row {
+            phase: Phase::Draw,
+            ..row(
+                "Top ability 0 in the draw step (the draw is behind)",
+                "Sensei's Divining Top",
+                SENSEIS_DIVINING_TOP,
+                "activation_patience_hold_for_main",
+            )
+        },
+        Row {
+            ability_index: 1,
+            categories: &[CostCategory::TapsSelf],
+            arranges: false,
+            ..row(
+                "Top ability 1 (a draw, not an arrangement), pristine upkeep",
+                "Sensei's Divining Top",
+                SENSEIS_DIVINING_TOP,
+                "activation_patience_hold",
+            )
+        },
+        Row {
+            arranges: false,
+            ..row(
+                "Elemental Augury (target player's library), pristine upkeep",
+                "Elemental Augury",
+                "{3}: Look at the top three cards of target player's library, then put them back in any order.",
+                "activation_patience_hold",
+            )
+        },
+    ];
+
+    for row in rows {
+        let mut board = build_board(row.phase, 20, 20);
+        if row.after_trigger {
+            add_upkeep_trigger_source(&mut board.state);
+        }
+        let id = set_arranger(&mut board, row.name, row.oracle_text);
+        if let Some(edit) = row.edit {
+            edit(
+                &mut Arc::make_mut(&mut board.state.objects.get_mut(&id).unwrap().abilities)
+                    [row.ability_index],
+            );
+        }
+        let ability = &board.state.objects[&id].abilities[row.ability_index];
+        assert_eq!(
+            arranges_own_library_top(&ability.effect),
+            row.arranges,
+            "{}: premise: the effect is (or is not) an own-library arrangement, got {:?}",
+            row.label,
+            ability.effect
+        );
+        assert_eq!(
+            ability.cost_categories(),
+            row.categories,
+            "{}: premise: cost categories",
+            row.label
+        );
+        if row.name == "Audacious Knuckleblade" {
+            assert!(
+                ability
+                    .activation_restrictions
+                    .contains(&ActivationRestriction::OnlyOnce),
+                "{}: premise: exhaust parses as an only-once restriction (CR 702.177a)",
+                row.label
+            );
+        }
+        let (delta, reason) = score_and_reason(&verdict_for_ability(&board, row.ability_index));
+        assert_eq!(reason, row.expected, "{}", row.label);
+        if row.expected == "activation_patience_library_top" {
+            assert_eq!(delta, 0.0, "{}", row.label);
+        } else {
+            assert!(delta < 0.0, "{}: held, got {delta}", row.label);
+        }
+    }
 }
 
 /// CR 602.5: an ability restricted to the upkeep can't be activated in the main

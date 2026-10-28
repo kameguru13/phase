@@ -15,8 +15,7 @@ use engine::ai_support::{
     validated_candidate_actions_for_semantic_owner, AiDecisionContract, TargetedExchangeVerdict,
 };
 use engine::types::ability::{
-    AbilityCost, AbilityDefinition, ContinuousModification, Duration, Effect, ResolvedAbility,
-    StaticDefinition, TargetFilter, TargetRef,
+    AbilityCost, AbilityDefinition, Effect, ResolvedAbility, TargetFilter, TargetRef,
 };
 use engine::types::actions::{AlternativeCastDecision, GameAction, MulliganChoice};
 use engine::types::card_type::CoreType;
@@ -30,7 +29,6 @@ use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaCost, ManaType};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
-use engine::types::statics::StaticMode;
 use engine::types::zones::Zone;
 
 use crate::card_value::{cmp_keep, intrinsic_value, keep_key};
@@ -41,15 +39,18 @@ use crate::combat_ai::{
 };
 use crate::config::{AiConfig, PlannerMode, ThreatAwareness};
 use crate::context::AiContext;
+use crate::eval;
 use crate::features::DeckFeatures;
 use crate::plan::{PlanSnapshot, PlanState};
 use crate::planner::{
     prepare_payment_candidates, BeamContinuationPlanner, PlannerServices, PreparedCandidate,
-    RankedCandidate, RungStat, SearchBudget,
+    RankedCandidate, RootTacticalScore, RungStat, SearchBudget,
 };
 use crate::policies::context::{PolicyContext, SearchDepth};
 use crate::policies::copy_value::score_legend_rule_keep;
-use crate::policies::effect_classify::{aura_polarity, EffectPolarity};
+use crate::policies::effect_classify::{
+    ability_is_temporary_combat_modifier, aura_polarity, EffectPolarity,
+};
 use crate::policies::strategy_helpers::{cmp_sacrifice, sacrifice_key};
 
 use crate::policies::tutor::score_search_choice_selection;
@@ -1197,61 +1198,6 @@ fn target_filter_interacts_with_stack(filter: &TargetFilter) -> bool {
         filter,
         TargetFilter::StackSpell | TargetFilter::StackAbility { .. }
     ) || filter.extract_zones().contains(&Zone::Stack)
-}
-
-pub(crate) fn ability_is_temporary_combat_modifier(ability: &AbilityDefinition) -> bool {
-    ability_effect_is_temporary_combat_modifier(ability)
-        && ability
-            .sub_ability
-            .as_deref()
-            .is_none_or(ability_is_temporary_combat_modifier)
-        && ability
-            .else_ability
-            .as_deref()
-            .is_none_or(ability_is_temporary_combat_modifier)
-        && ability
-            .mode_abilities
-            .iter()
-            .all(ability_is_temporary_combat_modifier)
-}
-
-fn ability_effect_is_temporary_combat_modifier(ability: &AbilityDefinition) -> bool {
-    match &*ability.effect {
-        Effect::Pump { .. } => matches!(ability.duration, Some(Duration::UntilEndOfTurn)),
-        effect => effect_is_temporary_combat_modifier(effect),
-    }
-}
-
-fn effect_is_temporary_combat_modifier(effect: &Effect) -> bool {
-    match effect {
-        Effect::GenericEffect {
-            static_abilities,
-            duration: Some(Duration::UntilEndOfTurn),
-            ..
-        } => static_abilities
-            .iter()
-            .all(static_definition_is_temporary_combat_modifier),
-        _ => false,
-    }
-}
-
-fn static_definition_is_temporary_combat_modifier(static_def: &StaticDefinition) -> bool {
-    matches!(static_def.mode, StaticMode::Continuous)
-        && static_def
-            .modifications
-            .iter()
-            .all(continuous_modification_is_temporary_combat_modifier)
-}
-
-fn continuous_modification_is_temporary_combat_modifier(
-    modification: &ContinuousModification,
-) -> bool {
-    matches!(
-        modification,
-        ContinuousModification::AddPower { .. }
-            | ContinuousModification::AddToughness { .. }
-            | ContinuousModification::AddKeyword { .. }
-    )
 }
 
 fn low_value_empty_stack_phase(phase: Phase) -> bool {
@@ -3454,15 +3400,16 @@ fn rank_root_payment_candidates(
                 })
                 .and_then(|prepared_candidate| prepared_candidate.payment_successor.clone())
                 .map_or_else(
-                    || RankedCandidate::new(gated_candidate.candidate.clone(), direct),
+                    || RankedCandidate::new(gated_candidate.candidate.clone(), direct.weighted),
                     |successor| {
                         RankedCandidate::with_payment_successor(
                             gated_candidate.candidate.clone(),
-                            direct,
+                            direct.weighted,
                             successor,
                         )
                     },
-                );
+                )
+                .with_deferral(direct.deferral);
             if let Some((_, witness)) = continuation_witnesses
                 .iter()
                 .find(|(action, _)| action == &gated_candidate.candidate.action)
@@ -3493,14 +3440,13 @@ fn score_existing_root_candidate(
     decision: &engine::ai_support::AiDecisionContext,
     candidate: &crate::tactical_gate::GatedCandidate,
     services: &PlannerServices<'_>,
-) -> f64 {
-    services.tactical_score(
-        state,
-        decision,
-        &candidate.candidate,
-        services.ai_player,
-        SearchDepth::Root,
-    ) + candidate.penalty
+) -> RootTacticalScore {
+    let score =
+        services.root_tactical_score(state, decision, &candidate.candidate, services.ai_player);
+    RootTacticalScore {
+        weighted: score.weighted + candidate.penalty,
+        deferral: score.deferral,
+    }
 }
 
 /// Add only reducer-certified fetch-then-cast terminal value to a current root
@@ -4034,6 +3980,76 @@ fn score_candidates_core_for_root(
     }
 }
 
+/// One root candidate's line in a rung: a searched continuation, or a fixed score for a
+/// rejected or unsimulatable candidate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RootLine {
+    Searched { continuation: f64 },
+    Unsearched { score: f64 },
+}
+
+/// One root candidate's entry in a rung, before it is flattened to `(action, score)`.
+#[derive(Debug, Clone)]
+struct RootRungScore {
+    action: GameAction,
+    line: RootLine,
+    /// `RankedCandidate::root_tactical` at the rung's tactical weight.
+    tactical: f64,
+    /// `RankedCandidate::deferral`: present when ActivationPatience holds this activation.
+    deferral: Option<f64>,
+}
+
+impl RootRungScore {
+    fn score(&self) -> f64 {
+        match self.line {
+            RootLine::Searched { continuation } => continuation + self.tactical,
+            RootLine::Unsearched { score } => score,
+        }
+    }
+}
+
+/// The continuation a line can lend or receive: finite, and not a finished game.
+fn open_continuation(line: &RootLine) -> Option<f64> {
+    match *line {
+        RootLine::Searched { continuation }
+            if continuation.is_finite() && eval::terminal_outcome(continuation).is_none() =>
+        {
+            Some(continuation)
+        }
+        RootLine::Searched { .. } | RootLine::Unsearched { .. } => None,
+    }
+}
+
+/// CR 117.1b: an activated ability can be activated whenever its controller has priority, and
+/// CR 117.3a gives the active player priority again as the main phase begins. So when
+/// ActivationPatience holds an activation for a later window, passing now keeps that
+/// activation on offer: PassPriority's continuation is at least the best continuation among
+/// the held siblings in the same rung. That holds only between unfinished lines. CR 104.1: a
+/// game ends immediately when a player wins, so a held line that wins does not wait — passing
+/// hands the opponents priority (CR 117.3d) before it recurs — and a pass whose own line loses
+/// never reaches the window the activation was held for. The lent value is exactly a
+/// sibling's own continuation; every non-Pass score is untouched.
+fn lend_deferral_witness(rung: &mut [RootRungScore]) {
+    let Some(best) = rung
+        .iter()
+        .filter(|entry| entry.deferral.is_some())
+        .filter_map(|entry| open_continuation(&entry.line))
+        .reduce(f64::max)
+    else {
+        return;
+    };
+    for entry in rung
+        .iter_mut()
+        .filter(|entry| matches!(entry.action, GameAction::PassPriority))
+    {
+        if let Some(own) = open_continuation(&entry.line) {
+            if own < best {
+                entry.line = RootLine::Searched { continuation: best };
+            }
+        }
+    }
+}
+
 /// Runs rung-0..=ceiling iterative deepening over the pre-ranked root beam.
 /// Extracted from `score_candidates_core` so tests can construct
 /// `PlannerServices`, run the loop, and inspect witness state (`rung_stats`,
@@ -4041,9 +4057,11 @@ fn score_candidates_core_for_root(
 /// `search_value` calls. The pre-rung tactical-only floor, the rung loop, and
 /// the acceptance logic all live here; `score_candidates_core` just delegates.
 ///
-/// PV threading (D2) and the rung witness (D3) are the only additions over the
-/// pre-extraction behavior; both are no-ops for `rung_stats`/ordering when the
-/// beam is a single candidate or the killers are empty.
+/// PV threading (D2), the rung witness (D3) and the deferral witness
+/// ([`lend_deferral_witness`]) are the only additions over the pre-extraction
+/// behavior; the first two are no-ops for `rung_stats`/ordering when the beam is
+/// a single candidate or the killers are empty, and the deferral witness is a
+/// no-op when no candidate carries a `deferral`.
 ///
 /// `state` becomes one tracked search root for the whole call, shared by every
 /// rung, so a rung reuses the root successors and the positions below them
@@ -4093,7 +4111,7 @@ fn run_iterative_deepening(
             rollout_depth: config.search.rollout_depth,
         };
 
-        let mut rung_scored = Vec::with_capacity(ranked.len());
+        let mut rung_lines = Vec::with_capacity(ranked.len());
         let mut completed = true;
         for r in &ranked {
             // Rungs >= 1 may bail mid-rung (interior search is expensive) and
@@ -4103,10 +4121,12 @@ fn run_iterative_deepening(
                 completed = false;
                 break;
             }
-            let score = if r.score == f64::NEG_INFINITY {
+            let line = if r.score == f64::NEG_INFINITY {
                 // A policy Reject: `continuation + score * tactical_weight` is −∞
                 // for every finite continuation, so the simulation cannot change it.
-                f64::NEG_INFINITY
+                RootLine::Unsearched {
+                    score: f64::NEG_INFINITY,
+                }
             } else if let Some((child, sim)) = services.successor_edge(
                 Some(root),
                 state,
@@ -4118,14 +4138,31 @@ fn run_iterative_deepening(
                     .continuation_witness
                     .filter(|witness| witness.is_finite())
                     .map_or(cont, |witness| cont.max(witness));
-                continuation + (r.score * tactical_weight)
+                RootLine::Searched { continuation }
             } else {
                 // Action failed simulation — same penalty as origin/main so the
                 // AI prefers any valid alternative.
-                r.score - 1000.0
+                RootLine::Unsearched {
+                    score: r.score - 1000.0,
+                }
             };
-            rung_scored.push((r.candidate.action.clone(), score));
+            rung_lines.push(RootRungScore {
+                action: r.candidate.action.clone(),
+                line,
+                tactical: r.root_tactical(tactical_weight),
+                deferral: r.deferral,
+            });
         }
+        if completed {
+            lend_deferral_witness(&mut rung_lines);
+        }
+        let rung_scored: Vec<(GameAction, f64)> = rung_lines
+            .into_iter()
+            .map(|entry| {
+                let score = entry.score();
+                (entry.action, score)
+            })
+            .collect();
 
         // "Fully completed" also requires the deadline to be live after the
         // LAST candidate: expiry mid-final-evaluation is invisible to the
@@ -5484,6 +5521,7 @@ mod tests {
     use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
     use engine::types::phase::Phase;
     use engine::types::replacements::ReplacementEvent;
+    use engine::types::statics::StaticMode;
     use engine::types::triggers::TriggerMode;
     use engine::types::zones::Zone;
     use rand::rngs::SmallRng;
@@ -19917,7 +19955,25 @@ one on the bottom of your library.";
         for player in &mut state.players {
             player.life = 20;
         }
+        add_libraries(&mut state, 5);
         (state, pinger)
+    }
+
+    /// `count` vanilla cards in every player's library, so a line that reaches a draw draws
+    /// instead of decking (CR 704.5b).
+    fn add_libraries(state: &mut GameState, count: usize) {
+        let players: Vec<PlayerId> = state.players.iter().map(|player| player.id).collect();
+        for player in players {
+            for _ in 0..count {
+                create_object(
+                    state,
+                    CardId(state.next_object_id),
+                    player,
+                    "Library Card".to_string(),
+                    Zone::Library,
+                );
+            }
+        }
     }
 
     /// Hard, measurement mode, rung 0 only (BeamOnly): each root candidate's
@@ -19936,8 +19992,16 @@ one on the bottom of your library.";
         policies: Vec<Box<dyn TacticalPolicy>>,
         config: &AiConfig,
     ) -> Vec<(GameAction, f64)> {
+        score_with_registry(state, PolicyRegistry::for_tests(policies), config)
+    }
+
+    fn score_with_registry(
+        state: &GameState,
+        registry: PolicyRegistry,
+        config: &AiConfig,
+    ) -> Vec<(GameAction, f64)> {
         let mut session = AiSession::from_game(state);
-        session.policy_registry_override = Some(Arc::new(PolicyRegistry::for_tests(policies)));
+        session.policy_registry_override = Some(Arc::new(registry));
         score_candidates_with_session(state, P0, config, &Arc::new(session))
     }
 
@@ -19950,16 +20014,18 @@ one on the bottom of your library.";
     }
 
     /// Root-only timing verdict on one source's activations: it cannot fire in
-    /// the continuation, so a paired run isolates the root weight.
+    /// the continuation, so a paired run isolates the root weight. `id` is the
+    /// policy it reports as.
     struct RootTimingStub {
         source: ObjectId,
+        id: PolicyId,
     }
 
     const ROOT_TIMING_STUB_DELTA: f64 = 1.2;
 
     impl TacticalPolicy for RootTimingStub {
         fn id(&self) -> PolicyId {
-            PolicyId::ActivationPatience
+            self.id
         }
 
         fn decision_kinds(&self) -> &'static [DecisionKind] {
@@ -20007,9 +20073,13 @@ one on the bottom of your library.";
             let ping = ping_action(pinger);
             let pass = GameAction::PassPriority;
             let control = score_with(&state, vec![], &cfg);
+            // Any policy except `DEFERRAL_POLICY`, whose root verdict is unweighted.
             let timed = score_with(
                 &state,
-                vec![Box::new(RootTimingStub { source: pinger })],
+                vec![Box::new(RootTimingStub {
+                    source: pinger,
+                    id: PolicyId::EffectTiming,
+                })],
                 &cfg,
             );
             for scored in [&control, &timed] {
@@ -20032,41 +20102,724 @@ one on the bottom of your library.";
         }
     }
 
-    /// phase-rs/phase#10334: the real `ActivationPatiencePolicy` verdict in the
-    /// AI's own Upkeep reaches the searched root score at 0.35 of its raw
-    /// (heuristic-branch, unweighted) contribution.
+    // ---- Deferral witness and full-strength patience at the own Upkeep/Draw root ----
+
+    const WELLWISHER: &str = "{T}: You gain 1 life for each Elf on the battlefield.";
+    const LOBBER_CREW: &str = "Defender\n{T}: This creature deals 1 damage to each opponent.\nWhenever you cast a multicolored spell, untap this creature.";
+    const BALDUVIAN_HYDRA: &str = "This creature enters with X +1/+0 counters on it.\nRemove a +1/+0 counter from this creature: Prevent the next 1 damage that would be dealt to it this turn.\n{R}{R}{R}: Put a +1/+0 counter on this creature. Activate only during your upkeep.";
+    const COORDINATED_ASSAULT: &str = "Up to two target creatures each get +1/+0 and gain first strike until end of turn. (They deal combat damage before creatures without first strike.)";
+
+    fn activate(source_id: ObjectId, ability_index: usize) -> GameAction {
+        GameAction::ActivateAbility {
+            source_id,
+            ability_index,
+            payment_mode: CastPaymentMode::Auto,
+        }
+    }
+
+    /// An AI enchantment with the Saga subtype and no chapter abilities: CR 505.4 opens the
+    /// main phase with a lore counter on it, and CR 714.4 never sacrifices it.
+    fn add_saga(state: &mut GameState, controller: PlayerId) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(state.next_object_id),
+            controller,
+            "Saga".to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Enchantment);
+        obj.card_types.subtypes.push("Saga".to_string());
+        obj.base_card_types = obj.card_types.clone();
+        id
+    }
+
+    /// `timing_window_board`'s shape with Wellwisher ("{T}: You gain 1 life for each Elf on the
+    /// battlefield.", an Elf 1/1, not summoning sick) in place of the pinger.
+    fn wellwisher_board(phase: Phase) -> (GameState, ObjectId) {
+        let mut state = make_state();
+        state.phase = phase;
+        state.active_player = P0;
+        state.priority_player = P0;
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+        let wellwisher = add_creature(&mut state, P0, 1, 1);
+        let abilities = engine::parser::oracle::parse_oracle_text(
+            WELLWISHER,
+            "Wellwisher",
+            &[],
+            &["Creature".to_string()],
+            &["Elf".to_string()],
+        )
+        .abilities;
+        let obj = state.objects.get_mut(&wellwisher).unwrap();
+        obj.summoning_sick = false;
+        obj.card_types.subtypes.push("Elf".to_string());
+        obj.base_card_types = obj.card_types.clone();
+        *Arc::make_mut(&mut obj.abilities) = abilities;
+        // U1 fallback: more Elves, so the activation gains more life than tapping its source
+        // costs and the held line beats Pass's own in the Draw step too.
+        for _ in 0..WELLWISHER_EXTRA_ELVES {
+            let elf = add_creature(&mut state, P0, 1, 1);
+            let obj = state.objects.get_mut(&elf).unwrap();
+            obj.card_types.subtypes.push("Elf".to_string());
+            obj.base_card_types = obj.card_types.clone();
+        }
+        add_creature(&mut state, P1, 1, 5);
+        for player in &mut state.players {
+            player.life = 20;
+        }
+        add_libraries(&mut state, 5);
+        (state, wellwisher)
+    }
+
+    /// Vanilla Elves beside Wellwisher in [`wellwisher_board`].
+    const WELLWISHER_EXTRA_ELVES: usize = 5;
+
+    /// The four root scorings the patience rows compare: searched (`s`) and heuristic (`h`),
+    /// without (`0`) and with (`1`) `ActivationPatiencePolicy`, at the board's own root weight.
+    struct PatienceRoots {
+        s0: Vec<(GameAction, f64)>,
+        s1: Vec<(GameAction, f64)>,
+        h0: Vec<(GameAction, f64)>,
+        h1: Vec<(GameAction, f64)>,
+        tw: f64,
+    }
+
+    impl PatienceRoots {
+        fn score(state: &GameState, config: &AiConfig) -> Self {
+            use crate::policies::activation_patience::ActivationPatiencePolicy;
+            let with =
+                || -> Vec<Box<dyn TacticalPolicy>> { vec![Box::new(ActivationPatiencePolicy)] };
+            let mut heuristic = config.clone();
+            heuristic.search.enabled = false;
+            Self {
+                s0: score_with(state, vec![], config),
+                s1: score_with(state, with(), config),
+                h0: score_with(state, vec![], &heuristic),
+                h1: score_with(state, with(), &heuristic),
+                tw: RootDecisionContext::classify(state, P0).tactical_weight(),
+            }
+        }
+
+        /// Reach guard: every run scored every action in `actions`.
+        fn assert_scored(&self, label: &str, actions: &[&GameAction]) {
+            for scored in [&self.s0, &self.s1, &self.h0, &self.h1] {
+                for action in actions {
+                    assert!(
+                        scored
+                            .iter()
+                            .any(|(scored_action, _)| scored_action == *action),
+                        "{label}: reach: {action:?} scored, got {scored:?}"
+                    );
+                }
+            }
+        }
+
+        /// Rung 0's continuation for `action` without the policy (V1: the override registry
+        /// does not reach it): the searched score minus its weighted tactical term.
+        fn cont(&self, action: &GameAction) -> f64 {
+            score_of(&self.s0, action) - score_of(&self.h0, action) * self.tw
+        }
+
+        /// The policy's raw (heuristic-branch) contribution to `action`.
+        fn ap(&self, action: &GameAction) -> f64 {
+            score_of(&self.h1, action) - score_of(&self.h0, action)
+        }
+    }
+
+    /// The searched root in the AI's own Upkeep and Draw step on an empty stack applies
+    /// `ActivationPatiencePolicy`'s verdict at full strength (`RankedCandidate::root_tactical`):
+    /// the root margin moves by exactly the heuristic branch's raw delta. Outside the policy's
+    /// window (the main phase; an upkeep whose main phase opens with a Saga's lore counter,
+    /// CR 505.4) the verdict is silent and nothing moves.
     #[test]
-    fn own_upkeep_root_carries_activation_patience_at_0_35() {
-        use crate::policies::activation_patience::ActivationPatiencePolicy;
+    fn own_upkeep_and_draw_root_carry_activation_patience_at_full_strength() {
         use crate::policies::registry::NUDGE_MAX;
 
-        let (state, pinger) = timing_window_board(Phase::Upkeep, P0);
-        let ping = ping_action(pinger);
-        let pass = GameAction::PassPriority;
-        let with = || -> Vec<Box<dyn TacticalPolicy>> { vec![Box::new(ActivationPatiencePolicy)] };
+        let cfg = hard_rung0_config();
+        for (label, phase, saga, held) in [
+            ("own Upkeep", Phase::Upkeep, false, true),
+            ("own Draw", Phase::Draw, false, true),
+            ("own PreCombatMain", Phase::PreCombatMain, false, false),
+            ("own Upkeep with a Saga", Phase::Upkeep, true, false),
+        ] {
+            let (mut state, pinger) = timing_window_board(phase, P0);
+            if saga {
+                add_saga(&mut state, P0);
+            }
+            let ping = ping_action(pinger);
+            let pass = GameAction::PassPriority;
+            let roots = PatienceRoots::score(&state, &cfg);
+            roots.assert_scored(label, &[&ping, &pass]);
+            let d_h = score_of(&roots.h0, &ping) - score_of(&roots.h1, &ping);
+            let d_s = score_of(&roots.s0, &ping) - score_of(&roots.s1, &ping);
+            if held {
+                assert!(
+                    d_h > NUDGE_MAX,
+                    "{label}: reach: activation patience holds the ping at preference band or higher, got {d_h}"
+                );
+                assert!(
+                    (d_s - d_h).abs() < 1e-9,
+                    "{label}: the root margin {d_s} must be the full raw patience {d_h}"
+                );
+            } else {
+                assert_eq!(d_h, 0.0, "{label}: patience is silent outside its window");
+                assert_eq!(d_s, 0.0, "{label}: the root does not move the ping");
+                assert_eq!(
+                    score_of(&roots.s0, &pass),
+                    score_of(&roots.s1, &pass),
+                    "{label}: the root does not move Pass"
+                );
+            }
+        }
+    }
 
-        let mut heur = hard_rung0_config();
-        heur.search.enabled = false;
-        let heur_without = score_with(&state, vec![], &heur);
-        let heur_with = score_with(&state, with(), &heur);
-        let d_h = score_of(&heur_without, &ping) - score_of(&heur_with, &ping);
-        assert!(
-            d_h > NUDGE_MAX,
-            "reach-guard: activation patience must fire at preference band or higher, got {d_h}"
-        );
+    /// CR 117.1b: when ActivationPatience holds Wellwisher's activation in the AI's own Upkeep
+    /// or Draw step, passing keeps that activation on offer, so PassPriority's continuation is
+    /// at least the held line's (`lend_deferral_witness`). Every non-Pass score is untouched:
+    /// Wellwisher keeps its own continuation, with the hold at full strength.
+    #[test]
+    fn pass_inherits_a_held_activations_continuation_in_own_upkeep_and_draw() {
+        use crate::policies::registry::NUDGE_MAX;
 
         let cfg = hard_rung0_config();
-        let search_without = score_with(&state, vec![], &cfg);
-        let search_with = score_with(&state, with(), &cfg);
-        assert_eq!(
-            score_of(&search_without, &pass),
-            score_of(&search_with, &pass),
-            "pairing control: patience must not move Pass"
-        );
-        let d_s = score_of(&search_without, &ping) - score_of(&search_with, &ping);
+        for phase in [Phase::Upkeep, Phase::Draw] {
+            let (state, wellwisher) = wellwisher_board(phase);
+            let held = activate(wellwisher, 0);
+            let pass = GameAction::PassPriority;
+            let roots = PatienceRoots::score(&state, &cfg);
+            roots.assert_scored(&format!("{phase:?}"), &[&held, &pass]);
+            assert_eq!(
+                roots.tw, 0.35,
+                "{phase:?}: premise: the own Upkeep/Draw weight"
+            );
+
+            let (cont_held, cont_pass) = (roots.cont(&held), roots.cont(&pass));
+            assert!(
+                cont_held - cont_pass > 1e-6,
+                "{phase:?}: reach: the held line {cont_held} beats Pass's own {cont_pass}"
+            );
+            let ap_held = roots.ap(&held);
+            assert!(
+                ap_held < -NUDGE_MAX,
+                "{phase:?}: reach: patience holds Wellwisher, got {ap_held}"
+            );
+            assert_eq!(
+                roots.ap(&pass),
+                0.0,
+                "{phase:?}: patience never scores Pass itself"
+            );
+
+            let pass_tactical = score_of(&roots.h0, &pass) * roots.tw;
+            let s1_pass = score_of(&roots.s1, &pass);
+            assert!(
+                (s1_pass - (cont_held.max(cont_pass) + pass_tactical)).abs() < 1e-9,
+                "{phase:?}: Pass {s1_pass} inherits the held continuation {cont_held}"
+            );
+            let s1_held = score_of(&roots.s1, &held);
+            let own = cont_held + score_of(&roots.h0, &held) * roots.tw + ap_held;
+            assert!(
+                (s1_held - own).abs() < 1e-9,
+                "{phase:?}: Wellwisher {s1_held} keeps its own line, hold at full strength ({own})"
+            );
+        }
+    }
+
+    /// Only an open line that ActivationPatience holds lends Pass its continuation. A better
+    /// line the policy does not hold lends nothing: an upkeep-only ability (CR 602.5, Balduvian
+    /// Hydra), a Draw step whose main phase opens with a Saga's lore counter (CR 505.4), and the
+    /// main phase. A held line that wins the game lends nothing either: Lobber Crew's 1 damage
+    /// to each opponent at 1 life ends the game (CR 704.5a + CR 104.2a), which waiting cannot
+    /// inherit, because passing hands the opponents priority first (CR 117.3d).
+    #[test]
+    fn pass_inherits_nothing_from_a_line_activation_patience_does_not_hold_or_that_ends_the_game() {
+        use crate::policies::registry::NUDGE_MAX;
+        use engine::types::ability::ActivationRestriction;
+
+        let pass = GameAction::PassPriority;
+        let cfg = hard_rung0_config();
+
+        // (a) Balduvian Hydra's {R}{R}{R}: Put a +1/+0 counter on this creature. Activate only
+        // during your upkeep.
+        let hydra_board = || {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::Upkeep);
+            let hydra = scenario
+                .add_creature_from_oracle(P0, "Balduvian Hydra", 0, 1, BALDUVIAN_HYDRA)
+                .id();
+            for _ in 0..3 {
+                scenario.add_basic_land(P0, ManaColor::Red);
+            }
+            scenario.add_creature(P1, "Wall", 1, 5);
+            let mut runner = scenario.build();
+            add_libraries(runner.state_mut(), 5);
+            let state = runner.state().clone();
+            let index = state.objects[&hydra]
+                .abilities
+                .iter()
+                .position(|ability| {
+                    ability
+                        .activation_restrictions
+                        .contains(&ActivationRestriction::DuringYourUpkeep)
+                })
+                .expect("premise: Balduvian Hydra parses an upkeep-only ability");
+            (state, activate(hydra, index))
+        };
+        let wellwisher_with_saga = || {
+            let (mut state, wellwisher) = wellwisher_board(Phase::Draw);
+            add_saga(&mut state, P0);
+            (state, activate(wellwisher, 0))
+        };
+        let wellwisher_in_main = || {
+            let (state, wellwisher) = wellwisher_board(Phase::PreCombatMain);
+            (state, activate(wellwisher, 0))
+        };
+        let open_rows: [(&str, (GameState, GameAction)); 3] = [
+            ("(a) Balduvian Hydra, own Upkeep", hydra_board()),
+            ("(b) Wellwisher + Saga, own Draw", wellwisher_with_saga()),
+            ("(c) Wellwisher, own PreCombatMain", wellwisher_in_main()),
+        ];
+        for (label, (state, line)) in open_rows {
+            let roots = PatienceRoots::score(&state, &cfg);
+            roots.assert_scored(label, &[&line, &pass]);
+            assert!(
+                roots.cont(&line) - roots.cont(&pass) > 1e-6,
+                "{label}: reach: the line {} beats Pass's own {}",
+                roots.cont(&line),
+                roots.cont(&pass)
+            );
+            assert_eq!(
+                roots.ap(&line),
+                0.0,
+                "{label}: reach: patience does not hold it"
+            );
+            assert_eq!(
+                score_of(&roots.s1, &pass),
+                score_of(&roots.s0, &pass),
+                "{label}: Pass inherits nothing"
+            );
+        }
+
+        // (d) Lobber Crew, three players, both opponents at 1 life.
+        let mut state = GameState::new(FormatConfig::free_for_all(), 3, 42);
+        state.turn_number = 2;
+        state.phase = Phase::Upkeep;
+        state.active_player = P0;
+        state.priority_player = P0;
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+        let crew = add_creature(&mut state, P0, 0, 4);
+        let abilities = engine::parser::oracle::parse_oracle_text(
+            LOBBER_CREW,
+            "Lobber Crew",
+            &["Defender".to_string()],
+            &["Creature".to_string()],
+            &["Goblin".to_string(), "Warrior".to_string()],
+        )
+        .abilities;
+        let index = abilities
+            .iter()
+            .position(|ability| matches!(*ability.effect, Effect::DamageEachPlayer { .. }))
+            .expect("premise: Lobber Crew parses its damage-each-opponent activation");
+        let obj = state.objects.get_mut(&crew).unwrap();
+        obj.summoning_sick = false;
+        *Arc::make_mut(&mut obj.abilities) = abilities;
+        for opponent in [PlayerId(1), PlayerId(2)] {
+            add_creature(&mut state, opponent, 1, 5);
+            state.players[opponent.0 as usize].life = 1;
+        }
+        add_libraries(&mut state, 5);
+        let mut cfg3 =
+            create_config_for_players(AiDifficulty::Hard, Platform::Native, 3).into_measurement(7);
+        cfg3.search.planner_mode = PlannerMode::BeamOnly;
+        cfg3.search.determinization_samples = 0;
+        let lob = activate(crew, index);
+        let roots = PatienceRoots::score(&state, &cfg3);
+        let label = "(d) Lobber Crew, both opponents at 1";
         assert!(
-            (d_s - 0.35 * d_h).abs() < 1e-9,
-            "own-upkeep root margin {d_s} must be 0.35 x raw patience {d_h}"
+            roots.s0.len() >= 2 && roots.s1.len() >= 2,
+            "{label}: reach: certified lethal did not pre-empt root scoring, got {:?}",
+            roots.s1
+        );
+        roots.assert_scored(label, &[&lob, &pass]);
+        assert!(
+            roots.ap(&lob) < -NUDGE_MAX,
+            "{label}: reach: patience holds Lobber Crew, got {}",
+            roots.ap(&lob)
+        );
+        assert_eq!(
+            eval::terminal_outcome(roots.cont(&lob)),
+            Some(eval::TerminalOutcome::Won),
+            "{label}: reach: the held line wins the game (continuation {})",
+            roots.cont(&lob)
+        );
+        assert!(
+            score_of(&roots.s1, &lob) > score_of(&roots.s1, &pass),
+            "{label}: the winning line still outranks Pass"
+        );
+        assert_eq!(
+            score_of(&roots.s1, &pass),
+            score_of(&roots.s0, &pass),
+            "{label}: Pass inherits nothing from a won line"
+        );
+    }
+
+    /// The witness also holds on a searched rung. Two `run_iterative_deepening` runs with
+    /// ceiling 1 over the same empty registry search identical trees (V5): R1's beam is R0's in
+    /// R0's order and differs only in Wellwisher's `deferral`, taken from a root-only
+    /// `RootTimingStub` reporting as ActivationPatience. At rung 1 Pass inherits Wellwisher's
+    /// continuation, and Wellwisher moves by the deferral alone.
+    #[test]
+    fn deferral_witness_holds_on_a_searched_rung() {
+        let (state, wellwisher) = wellwisher_board(Phase::Upkeep);
+        let held = activate(wellwisher, 0);
+        let pass = GameAction::PassPriority;
+        let tw = 0.35;
+        let mut config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(7);
+        config.search.planner_mode = PlannerMode::BeamPlusRollout;
+        config.search.max_depth = 2;
+        config.search.determinization_samples = 0;
+
+        let empty = PolicyRegistry::for_tests(vec![]);
+        let stub = PolicyRegistry::for_tests(vec![Box::new(RootTimingStub {
+            source: wellwisher,
+            id: PolicyId::ActivationPatience,
+        })]);
+        let r0 = build_root_beam(&state, &PlannerServices::new_default(P0, &config, &empty));
+        let r1_ranked = build_root_beam(&state, &PlannerServices::new_default(P0, &config, &stub));
+        assert_eq!(
+            r0.len(),
+            r1_ranked.len(),
+            "both beams hold the same candidates"
+        );
+        let r1: Vec<RankedCandidate> = r0
+            .iter()
+            .map(|r| {
+                r1_ranked
+                    .iter()
+                    .find(|candidate| candidate.candidate.action == r.candidate.action)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("{:?} absent from R1's beam", r.candidate.action))
+            })
+            .collect();
+        for (left, right) in r0.iter().zip(&r1) {
+            assert_eq!(left.candidate.action, right.candidate.action);
+            assert_eq!(left.score.to_bits(), right.score.to_bits());
+            assert_eq!(left.deferral, None);
+            let expected = (left.candidate.action == held).then_some(-ROOT_TIMING_STUB_DELTA);
+            assert_eq!(right.deferral, expected, "{:?}", right.candidate.action);
+        }
+        let tactical = |action: &GameAction| {
+            r0.iter()
+                .find(|r| &r.candidate.action == action)
+                .map(|r| r.score)
+                .unwrap_or_else(|| panic!("reach: {action:?} in the beam"))
+        };
+        let (tactical_held, tactical_pass) = (tactical(&held), tactical(&pass));
+
+        let mut services0 = PlannerServices::new_default(P0, &config, &empty);
+        let s0 = run_iterative_deepening(&state, r0, tw, &config, &mut services0);
+        let mut services1 = PlannerServices::new_default(P0, &config, &empty);
+        let s1 = run_iterative_deepening(&state, r1, tw, &config, &mut services1);
+        for services in [&services0, &services1] {
+            assert_eq!(services.rung_stats.len(), 2, "rungs 0 and 1 ran");
+            assert!(
+                services.rung_stats.iter().all(|r| r.completed),
+                "every rung completed"
+            );
+            let rung1 = &services.rung_stats[1];
+            assert!(
+                rung1.nodes_used > 0 && rung1.nodes_used < rung1.max_nodes,
+                "rung 1 searched within its budget: {rung1:?}"
+            );
+        }
+
+        let cont = |action: &GameAction, tactical: f64| score_of(&s0, action) - tactical * tw;
+        let (cont_held, cont_pass) = (cont(&held, tactical_held), cont(&pass, tactical_pass));
+        assert!(
+            cont_held - cont_pass > 1e-6,
+            "reach: at rung 1 the held line {cont_held} beats Pass's own {cont_pass}"
+        );
+        assert!(
+            (score_of(&s1, &held) - score_of(&s0, &held) + ROOT_TIMING_STUB_DELTA).abs() < 1e-9,
+            "Wellwisher moves by its deferral alone"
+        );
+        assert!(
+            (score_of(&s1, &pass) - (cont_held + tactical_pass * tw)).abs() < 1e-9,
+            "Pass inherits the held continuation at rung 1"
+        );
+    }
+
+    fn line_entry(
+        action: GameAction,
+        line: RootLine,
+        tactical: f64,
+        deferral: Option<f64>,
+    ) -> RootRungScore {
+        RootRungScore {
+            action,
+            line,
+            tactical,
+            deferral,
+        }
+    }
+
+    /// The rung's scores after `lend_deferral_witness`, as bits so NaN compares.
+    fn lent_bits(mut rung: Vec<RootRungScore>) -> Vec<u64> {
+        lend_deferral_witness(&mut rung);
+        rung.iter().map(|entry| entry.score().to_bits()).collect()
+    }
+
+    fn unlent_bits(rung: &[RootRungScore]) -> Vec<u64> {
+        rung.iter().map(|entry| entry.score().to_bits()).collect()
+    }
+
+    /// `lend_deferral_witness` lends Pass the best continuation among held lines, and only
+    /// between open lines: finite, searched, and not a finished game (`eval::terminal_outcome`).
+    #[test]
+    fn lend_deferral_witness_lends_only_between_open_lines() {
+        use RootLine::{Searched, Unsearched};
+        let pass = |line| line_entry(GameAction::PassPriority, line, 0.2, None);
+        let holder = |id, line| line_entry(activate(ObjectId(id), 0), line, 0.5, Some(-1.0));
+        let plain = |line| line_entry(activate(ObjectId(30), 0), line, 0.5, None);
+        let searched = |continuation| Searched { continuation };
+
+        let unchanged: Vec<(&str, Vec<RootRungScore>)> = vec![
+            (
+                "(i) no holder",
+                vec![pass(searched(1.0)), plain(searched(9.0))],
+            ),
+            (
+                "(ii) holder below Pass",
+                vec![pass(searched(5.0)), holder(10, searched(3.0))],
+            ),
+            (
+                "(v) rejected holder",
+                vec![
+                    pass(searched(1.0)),
+                    holder(
+                        10,
+                        Unsearched {
+                            score: f64::NEG_INFINITY,
+                        },
+                    ),
+                ],
+            ),
+            (
+                "(vi) unsimulated holder",
+                vec![
+                    pass(searched(1.0)),
+                    holder(10, Unsearched { score: -999.5 }),
+                ],
+            ),
+            (
+                "(vii) rejected Pass",
+                vec![
+                    pass(Unsearched {
+                        score: f64::NEG_INFINITY,
+                    }),
+                    holder(10, searched(4.0)),
+                ],
+            ),
+            (
+                "(viii) no Pass",
+                vec![holder(10, searched(4.0)), plain(searched(1.0))],
+            ),
+            (
+                "(x) lost Pass",
+                vec![pass(searched(eval::LOSS_SCORE)), holder(10, searched(4.0))],
+            ),
+            (
+                "(xi) won Pass",
+                vec![pass(searched(eval::WIN_SCORE)), holder(10, searched(4.0))],
+            ),
+            (
+                "(xii) NaN holder",
+                vec![pass(searched(1.0)), holder(10, searched(f64::NAN))],
+            ),
+            (
+                "(ix') only a won holder",
+                vec![pass(searched(1.0)), holder(10, searched(eval::WIN_SCORE))],
+            ),
+        ];
+        for (label, rung) in unchanged {
+            let before = unlent_bits(&rung);
+            assert_eq!(lent_bits(rung), before, "{label}: nothing is lent");
+        }
+
+        let lifted = [
+            (
+                "(iii) holder above Pass",
+                vec![pass(searched(1.0)), holder(10, searched(4.0))],
+                4.0,
+            ),
+            (
+                "(iv) two holders: the max",
+                vec![
+                    pass(searched(1.0)),
+                    holder(10, searched(4.0)),
+                    holder(11, searched(6.0)),
+                ],
+                6.0,
+            ),
+            (
+                "(ix) a won holder and an open one: the open one",
+                vec![
+                    pass(searched(1.0)),
+                    holder(10, searched(eval::WIN_SCORE)),
+                    holder(11, searched(5.0)),
+                ],
+                5.0,
+            ),
+        ];
+        for (label, rung, lent) in lifted {
+            let others = unlent_bits(&rung[1..]);
+            let mut after = rung;
+            lend_deferral_witness(&mut after);
+            assert_eq!(
+                after[0].score(),
+                lent + 0.2,
+                "{label}: Pass gets {lent} + its tactical"
+            );
+            assert_eq!(
+                unlent_bits(&after[1..]),
+                others,
+                "{label}: non-Pass untouched"
+            );
+        }
+    }
+
+    /// The P1 hatch at the root: Sensei's Divining Top's "{1}: Look at the top three cards of
+    /// your library, then put them back in any order." in the AI's own Upkeep chooses the card
+    /// the draw step's draw takes (CR 504.1 + CR 121.1), and its cost is mana only, so patience
+    /// does not hold it: no full-strength term and no lending. Top is tapped, so its "{T}:
+    /// Draw a card" ability cannot be paid and no other held donor exists. In the Draw step the
+    /// draw is behind and the same activation is held at full strength.
+    #[test]
+    fn own_upkeep_root_neither_holds_nor_lends_a_library_top_arrangement() {
+        use crate::policies::registry::NUDGE_MAX;
+
+        let top_board = |phase: Phase| {
+            let db = shared_integration_card_db();
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(phase);
+            let top = scenario.add_real_card(P0, "Sensei's Divining Top", Zone::Battlefield, db);
+            scenario.add_real_card(P0, "Island", Zone::Battlefield, db);
+            let mut runner = scenario.build();
+            rehydrate_game_from_card_db(runner.state_mut(), db);
+            let state = runner.state_mut();
+            state.objects.get_mut(&top).unwrap().tapped = true;
+            add_libraries(state, 5);
+            assert!(
+                matches!(state.waiting_for, WaitingFor::Priority { player } if player == P0)
+                    && state.active_player == P0
+                    && state.stack.is_empty(),
+                "reach: P0 holds priority in its own {phase:?} on an empty stack"
+            );
+            (runner.state().clone(), top)
+        };
+        let cfg = hard_rung0_config();
+        let pass = GameAction::PassPriority;
+        for phase in [Phase::Upkeep, Phase::Draw] {
+            let (state, top) = top_board(phase);
+            let arrange = activate(top, 0);
+            let roots = PatienceRoots::score(&state, &cfg);
+            roots.assert_scored(&format!("{phase:?}"), &[&arrange, &pass]);
+            for scored in [&roots.s0, &roots.s1] {
+                assert!(
+                    !scored.iter().any(|(action, _)| matches!(
+                        action,
+                        GameAction::ActivateAbility { source_id, ability_index: 1, .. }
+                            if *source_id == top
+                    )),
+                    "{phase:?}: reach: tapped Top's draw ability is not on offer, got {scored:?}"
+                );
+            }
+            if phase == Phase::Upkeep {
+                assert_eq!(
+                    roots.ap(&arrange),
+                    0.0,
+                    "the upkeep arrangement is not held"
+                );
+                assert_eq!(score_of(&roots.s1, &arrange), score_of(&roots.s0, &arrange));
+                assert_eq!(
+                    score_of(&roots.s1, &pass),
+                    score_of(&roots.s0, &pass),
+                    "nothing is lent to Pass"
+                );
+            } else {
+                let d_h = -roots.ap(&arrange);
+                assert!(
+                    d_h > NUDGE_MAX,
+                    "reach: in the Draw step the arrangement is held, got {d_h}"
+                );
+                let d_s = score_of(&roots.s0, &arrange) - score_of(&roots.s1, &arrange);
+                assert!(
+                    (d_s - d_h).abs() < 1e-9,
+                    "the Draw-step hold applies at full strength: {d_s} vs {d_h}"
+                );
+            }
+        }
+    }
+
+    /// D1 at the root (the mtg-bot Coordinated Assault regression): in the AI's own Draw step
+    /// EffectTiming prices Coordinated Assault's until-end-of-turn `GenericEffect` pump as a
+    /// combat trick (CR 611.2a + CR 514.2), and the searched root carries that verdict at the
+    /// own-Draw weight 0.35.
+    #[test]
+    fn own_draw_root_prices_a_generic_effect_pump_like_a_pump() {
+        use crate::policies::registry::NUDGE_MAX;
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::Draw);
+        let assault = scenario
+            .add_spell_to_hand_from_oracle(P0, "Coordinated Assault", true, COORDINATED_ASSAULT)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 0,
+            })
+            .id();
+        scenario.add_basic_land(P0, ManaColor::Red);
+        scenario.add_basic_land(P0, ManaColor::Green);
+        scenario.add_creature(P0, "Bear", 2, 2);
+        scenario.add_creature(P1, "Bear", 2, 2);
+        let mut runner = scenario.build();
+        add_libraries(runner.state_mut(), 5);
+        let state = runner.state().clone();
+        assert!(
+            matches!(
+                *state.objects[&assault].abilities[0].effect,
+                Effect::GenericEffect {
+                    duration: Some(Duration::UntilEndOfTurn),
+                    ..
+                }
+            ),
+            "premise: Coordinated Assault parses as an until-end-of-turn GenericEffect"
+        );
+
+        let effect_timing = || PolicyRegistry::default_subset_for_tests(&[PolicyId::EffectTiming]);
+        let cfg = hard_rung0_config();
+        let mut heuristic = cfg.clone();
+        heuristic.search.enabled = false;
+        let cast_score = |scored: &[(GameAction, f64)]| {
+            scored
+                .iter()
+                .find(|(action, _)| {
+                    matches!(action, GameAction::CastSpell { object_id, .. } if *object_id == assault)
+                })
+                .map(|(_, score)| *score)
+                .unwrap_or_else(|| panic!("reach: Coordinated Assault's CastSpell is scored, got {scored:?}"))
+        };
+        let d_heuristic = cast_score(&score_with_registry(&state, effect_timing(), &heuristic))
+            - cast_score(&score_with(&state, vec![], &heuristic));
+        assert!(
+            d_heuristic < -NUDGE_MAX,
+            "EffectTiming prices Coordinated Assault as a trick in the own Draw step, got {d_heuristic}"
+        );
+        let d_searched = cast_score(&score_with_registry(&state, effect_timing(), &cfg))
+            - cast_score(&score_with(&state, vec![], &cfg));
+        assert!(
+            (d_searched - 0.35 * d_heuristic).abs() < 1e-9,
+            "the own-Draw root carries the verdict at 0.35: {d_searched} vs {d_heuristic}"
         );
     }
 }

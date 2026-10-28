@@ -19,7 +19,9 @@ use crate::features::DeckFeatures;
 
 use super::activation::turn_only;
 use super::context::{collect_ability_effects, PolicyContext};
-use super::effect_classify::{extract_target_filter, targets_creatures_only};
+use super::effect_classify::{
+    effect_is_combat_trick_payload, extract_target_filter, targets_creatures_only,
+};
 use super::registry::{
     DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy, STRONG_MAX,
 };
@@ -44,7 +46,7 @@ impl EffectTimingPolicy {
                 Effect::Destroy { .. } => removal_score(ctx),
                 Effect::DealDamage { .. } => burn_score(ctx),
                 Effect::Counter { .. } => counterspell_score(ctx),
-                Effect::Pump { .. } | Effect::DoublePT { .. } => combat_trick_score(ctx),
+                effect if effect_is_combat_trick_payload(effect) => combat_trick_score(ctx),
                 _ => 0.0,
             };
         }
@@ -414,7 +416,7 @@ fn removal_score(ctx: &PolicyContext<'_>) -> f64 {
                     .map(|a| {
                         collect_ability_effects(a)
                             .iter()
-                            .any(|e| matches!(e, Effect::Pump { .. } | Effect::DoublePT { .. }))
+                            .any(|e| effect_is_combat_trick_payload(e))
                     })
                     .unwrap_or(false)
         }) {
@@ -557,6 +559,7 @@ fn threatened_own_spell_value(state: &GameState, ai_player: PlayerId) -> f64 {
 }
 
 fn combat_trick_score(ctx: &PolicyContext<'_>) -> f64 {
+    // CR 514.2: until-end-of-turn effects end in the cleanup step.
     // Pump effects expire at cleanup — casting outside combat has no lasting impact.
     // Penalty must exceed max search continuation bonus to prevent selection.
     if matches!(
@@ -2586,5 +2589,298 @@ mod tests {
             removal >= 0.3,
             "the removal mode must earn removal_score at the mode prompt, got {removal}"
         );
+    }
+
+    // ---- D1: a non-protective until-end-of-turn GenericEffect pump is a combat trick ----
+
+    const COORDINATED_ASSAULT: &str = "Up to two target creatures each get +1/+0 and gain first strike until end of turn. (They deal combat damage before creatures without first strike.)";
+    const GIANT_GROWTH: &str = "Target creature gets +3/+3 until end of turn.";
+    const UNLEASH_FURY: &str = "Double the power of target creature until end of turn.";
+    const DWARVEN_SONG: &str = "One or more target creatures become red until end of turn.";
+    const HEROIC_INTERVENTION: &str =
+        "Permanents you control gain hexproof and indestructible until end of turn.";
+    const ADAMANT_WILL: &str = "Target creature gets +2/+2 and gains indestructible until end of turn. (Damage and effects that say \"destroy\" don't destroy it.)";
+    const MURDER: &str = "Destroy target creature.";
+    const MOTHER_OF_RUNES: &str = "{T}: Target creature you control gains protection from the color of your choice until end of turn.";
+    const WELLWISHER: &str = "{T}: You gain 1 life for each Elf on the battlefield.";
+
+    fn parsed(oracle_text: &str, name: &str, core_type: &str) -> Vec<AbilityDefinition> {
+        engine::parser::oracle::parse_oracle_text(
+            oracle_text,
+            name,
+            &[],
+            &[core_type.to_string()],
+            &[],
+        )
+        .abilities
+    }
+
+    /// The first ability's effect of an instant parsed from `oracle_text`.
+    fn instant_effect(oracle_text: &str, name: &str) -> Effect {
+        (*parsed(oracle_text, name, "Instant")[0].effect).clone()
+    }
+
+    /// An instant in `controller`'s hand, built from its verbatim Oracle text.
+    fn oracle_instant(
+        state: &mut GameState,
+        controller: PlayerId,
+        name: &str,
+        oracle_text: &str,
+    ) -> ObjectId {
+        let abilities = parsed(oracle_text, name, "Instant");
+        let id = create_object(
+            state,
+            CardId(state.next_object_id),
+            controller,
+            name.to_string(),
+            Zone::Hand,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Instant);
+        obj.abilities = std::sync::Arc::new(abilities);
+        id
+    }
+
+    /// A creature on `controller`'s battlefield, able to tap, built from its verbatim Oracle text.
+    fn oracle_creature(
+        state: &mut GameState,
+        controller: PlayerId,
+        name: &str,
+        oracle_text: &str,
+    ) -> ObjectId {
+        let abilities = parsed(oracle_text, name, "Creature");
+        let id = creature(state, controller, name);
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.power = Some(1);
+        obj.toughness = Some(1);
+        obj.summoning_sick = false;
+        obj.abilities = std::sync::Arc::new(abilities);
+        id
+    }
+
+    fn cast_candidate(state: &GameState, object_id: ObjectId) -> CandidateAction {
+        CandidateAction {
+            action: GameAction::CastSpell {
+                object_id,
+                card_id: state.objects[&object_id].card_id,
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::Auto,
+            },
+            metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Spell),
+        }
+    }
+
+    fn activate_candidate(source_id: ObjectId) -> CandidateAction {
+        CandidateAction {
+            action: GameAction::ActivateAbility {
+                source_id,
+                ability_index: 0,
+                payment_mode: CastPaymentMode::Auto,
+            },
+            metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Ability),
+        }
+    }
+
+    /// The registry-scaled EffectTiming delta for `candidate`.
+    fn timing_delta(state: &GameState, candidate: &CandidateAction) -> f64 {
+        match effect_timing_verdict(state, candidate, &AiConfig::default()) {
+            PolicyVerdict::Score { delta, .. } => delta,
+            PolicyVerdict::Reject { reason } => panic!("EffectTiming rejected: {}", reason.kind),
+        }
+    }
+
+    /// P0 holds priority on an empty stack in `phase` of `active`'s turn, with a creature on each
+    /// side. Turn 5, so the turn-phase activation is 1.0.
+    fn d1_board(phase: Phase, active: PlayerId) -> GameState {
+        let mut state = GameState::new_two_player(42);
+        state.turn_number = 5;
+        state.phase = phase;
+        state.active_player = active;
+        state.priority_player = P0;
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+        creature(&mut state, P0, "Own Bear");
+        creature(&mut state, PlayerId(1), "Opposing Bear");
+        state
+    }
+
+    /// CR 611.2a + CR 514.2: Coordinated Assault's "+1/+0 and gain first strike until end of
+    /// turn" (an until-end-of-turn `GenericEffect`, not a `Pump`) and Giant Growth's "+3/+3
+    /// until end of turn" both end at cleanup, so EffectTiming prices them the same: the trick
+    /// penalty in the own Draw step, the combat bonus in DeclareAttackers. Unleash Fury's
+    /// doubled power (CR 701.10b: +X/+0) reads as Giant Growth does. Dwarven Song's colour
+    /// change is not a trick in either row.
+    #[test]
+    fn effect_timing_prices_a_generic_effect_pump_as_a_combat_trick() {
+        assert!(
+            matches!(
+                instant_effect(COORDINATED_ASSAULT, "Coordinated Assault"),
+                Effect::GenericEffect {
+                    duration: Some(Duration::UntilEndOfTurn),
+                    ..
+                }
+            ),
+            "premise: Coordinated Assault parses as an until-end-of-turn GenericEffect"
+        );
+        assert!(
+            matches!(
+                instant_effect(UNLEASH_FURY, "Unleash Fury"),
+                Effect::DoublePT { .. }
+            ),
+            "premise: Unleash Fury parses as DoublePT"
+        );
+        assert!(
+            matches!(
+                instant_effect(GIANT_GROWTH, "Giant Growth"),
+                Effect::Pump { .. }
+            ),
+            "premise: Giant Growth parses as Pump"
+        );
+
+        for (phase, combat) in [(Phase::Draw, false), (Phase::DeclareAttackers, true)] {
+            let mut state = d1_board(phase, P0);
+            if combat {
+                state.combat = Some(CombatState::default());
+            }
+            let ca = oracle_instant(&mut state, P0, "Coordinated Assault", COORDINATED_ASSAULT);
+            let gg = oracle_instant(&mut state, P0, "Giant Growth", GIANT_GROWTH);
+            let uf = oracle_instant(&mut state, P0, "Unleash Fury", UNLEASH_FURY);
+            let ds = oracle_instant(&mut state, P0, "Dwarven Song", DWARVEN_SONG);
+            let d = |id| timing_delta(&state, &cast_candidate(&state, id));
+            let (d_ca, d_gg, d_uf, d_ds) = (d(ca), d(gg), d(uf), d(ds));
+            assert!(
+                (d_ca - d_gg).abs() < 1e-9,
+                "{phase:?}: Coordinated Assault {d_ca} must price as Giant Growth {d_gg}"
+            );
+            assert!(
+                (d_uf - d_gg).abs() < 1e-9,
+                "{phase:?}: Unleash Fury {d_uf} must price as Giant Growth {d_gg}"
+            );
+            if combat {
+                assert!(d_gg > 0.0, "{phase:?}: the combat bonus fires, got {d_gg}");
+            } else {
+                assert!(d_gg < 0.0, "{phase:?}: the trick penalty fires, got {d_gg}");
+            }
+            assert_eq!(d_ds, 0.0, "{phase:?}: a colour change is not a trick");
+        }
+    }
+
+    /// CR 608.2b: removal that kills a creature an opposing until-end-of-turn pump targets
+    /// leaves the pump with nothing to do, so an opposing Coordinated Assault on the stack earns
+    /// the AI's Murder the same response bonus as an opposing Giant Growth. The AI's own pump on
+    /// the stack earns nothing.
+    #[test]
+    fn removal_answers_an_opposing_generic_effect_pump_on_the_stack() {
+        let murder_delta = |stack: Option<(PlayerId, &str, &str)>| {
+            let mut state = d1_board(Phase::PreCombatMain, PlayerId(1));
+            let murder = oracle_instant(&mut state, P0, "Murder", MURDER);
+            let own_target = creature(&mut state, P0, "Own Pump Target");
+            let opposing_target = creature(&mut state, PlayerId(1), "Opposing Pump Target");
+            if let Some((controller, name, oracle_text)) = stack {
+                let target = if controller == P0 {
+                    own_target
+                } else {
+                    opposing_target
+                };
+                push_spell(
+                    &mut state,
+                    controller,
+                    1,
+                    None,
+                    instant_effect(oracle_text, name),
+                    vec![TargetRef::Object(target)],
+                );
+            }
+            timing_delta(&state, &cast_candidate(&state, murder))
+        };
+        let empty = murder_delta(None);
+        let gg_bonus = murder_delta(Some((PlayerId(1), "Giant Growth", GIANT_GROWTH))) - empty;
+        assert!(
+            gg_bonus > 0.0,
+            "reach: an opposing Giant Growth on the stack earns removal a bonus, got {gg_bonus}"
+        );
+        let ca_bonus = murder_delta(Some((
+            PlayerId(1),
+            "Coordinated Assault",
+            COORDINATED_ASSAULT,
+        ))) - empty;
+        assert!(
+            (ca_bonus - gg_bonus).abs() < 1e-9,
+            "an opposing Coordinated Assault earns the Giant Growth bonus {gg_bonus}, got {ca_bonus}"
+        );
+        let own_ca = murder_delta(Some((P0, "Coordinated Assault", COORDINATED_ASSAULT))) - empty;
+        assert!(
+            own_ca.abs() < 1e-9,
+            "the AI's own pump on the stack earns nothing, got {own_ca}"
+        );
+    }
+
+    /// CR 702.11b + CR 702.12b + CR 702.16b: hexproof, indestructible and protection pay off
+    /// against removal in any phase, so a protective grant is not priced as a combat trick,
+    /// whoever it affects. With an opposing Murder on the stack in the opponent's main phase,
+    /// and in the AI's own End step, Heroic Intervention and Adamant Will price as Dwarven Song,
+    /// and Mother of Runes' activation as Wellwisher's, while Coordinated Assault takes the
+    /// trick penalty on the same boards.
+    #[test]
+    fn effect_timing_does_not_price_a_protective_grant_as_a_combat_trick() {
+        use crate::policies::effect_classify::effect_is_temporary_combat_modifier;
+        use crate::policies::self_protection_classify::{
+            effect_has_defensive_payload, is_self_protection_effect,
+        };
+
+        let adamant = instant_effect(ADAMANT_WILL, "Adamant Will");
+        assert!(
+            effect_is_temporary_combat_modifier(&adamant) && effect_has_defensive_payload(&adamant),
+            "premise: Adamant Will is a temporary combat modifier with a protective payload, so \
+             the protective exclusion is what refuses it: {adamant:?}"
+        );
+        assert!(
+            !is_self_protection_effect(&adamant),
+            "premise: Adamant Will is not self-scoped, so the boundary must be scope-free"
+        );
+
+        let under_murder = || {
+            let mut state = d1_board(Phase::PreCombatMain, PlayerId(1));
+            let victim = creature(&mut state, P0, "Victim");
+            push_spell(
+                &mut state,
+                PlayerId(1),
+                3,
+                None,
+                instant_effect(MURDER, "Murder"),
+                vec![TargetRef::Object(victim)],
+            );
+            state
+        };
+        let boards = [
+            ("opponent's main phase, Murder on the stack", under_murder()),
+            ("own End step", d1_board(Phase::End, P0)),
+        ];
+        for (label, mut state) in boards {
+            let hi = oracle_instant(&mut state, P0, "Heroic Intervention", HEROIC_INTERVENTION);
+            let aw = oracle_instant(&mut state, P0, "Adamant Will", ADAMANT_WILL);
+            let ds = oracle_instant(&mut state, P0, "Dwarven Song", DWARVEN_SONG);
+            let ca = oracle_instant(&mut state, P0, "Coordinated Assault", COORDINATED_ASSAULT);
+            let mor = oracle_creature(&mut state, P0, "Mother of Runes", MOTHER_OF_RUNES);
+            let ww = oracle_creature(&mut state, P0, "Wellwisher", WELLWISHER);
+            let cast = |id| timing_delta(&state, &cast_candidate(&state, id));
+            let activate = |id| timing_delta(&state, &activate_candidate(id));
+            let d_ds = cast(ds);
+            assert!(
+                cast(ca) < d_ds - 1.5,
+                "{label}: reach: the trick penalty fires on this board"
+            );
+            assert!(
+                (cast(hi) - d_ds).abs() < 1e-9,
+                "{label}: Heroic Intervention must price as Dwarven Song"
+            );
+            assert!(
+                (cast(aw) - d_ds).abs() < 1e-9,
+                "{label}: Adamant Will must price as Dwarven Song"
+            );
+            assert!(
+                (activate(mor) - activate(ww)).abs() < 1e-9,
+                "{label}: Mother of Runes' activation must price as Wellwisher's"
+            );
+        }
     }
 }

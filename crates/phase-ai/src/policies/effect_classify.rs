@@ -2,10 +2,10 @@ use engine::game::filter::{matches_target_filter, FilterContext};
 use engine::game::game_object::GameObject;
 use engine::game::quantity::try_resolve_quantity_in_source_context;
 use engine::types::ability::{
-    AbilityDefinition, AbilityKind, ContinuousModification, ControllerRef, Effect, EffectScope,
-    PerpetualGrantModification, PerpetualModification, PlayerFilter, PtValue, QuantityExpr,
-    ResolvedAbility, SubAbilityLink, TapStateChange, TargetChoiceTiming, TargetFilter, TargetRef,
-    TriggerDefinition, TypeFilter,
+    AbilityDefinition, AbilityKind, ContinuousModification, ControllerRef, Duration, Effect,
+    EffectScope, PerpetualGrantModification, PerpetualModification, PlayerFilter, PtValue,
+    QuantityExpr, ResolvedAbility, StaticDefinition, SubAbilityLink, TapStateChange,
+    TargetChoiceTiming, TargetFilter, TargetRef, TriggerDefinition, TypeFilter,
 };
 use engine::types::counter::CounterType;
 use engine::types::game_state::{CastingVariant, GameState, WaitingFor};
@@ -17,6 +17,7 @@ use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
 
 use super::context::PolicyContext;
+use super::self_protection_classify::effect_has_defensive_payload;
 
 /// Player-impact magnitude above which target selection has a directional
 /// preference rather than falling back to the spell's broader polarity.
@@ -2012,6 +2013,84 @@ fn filter_excludes_parent_target(filter: &TargetFilter) -> bool {
     match filter {
         TargetFilter::Not { filter: inner } => matches!(inner.as_ref(), TargetFilter::ParentTarget),
         TargetFilter::And { filters } => filters.iter().any(filter_excludes_parent_target),
+        _ => false,
+    }
+}
+
+/// CR 611.2a + CR 514.2: a continuous effect from resolution lasts as stated, and "until end of
+/// turn" effects end in the cleanup step, so a P/T (CR 613.4c) or keyword grant that lasts until
+/// end of turn is a combat-window effect.
+pub(crate) fn ability_is_temporary_combat_modifier(ability: &AbilityDefinition) -> bool {
+    ability_effect_is_temporary_combat_modifier(ability)
+        && ability
+            .sub_ability
+            .as_deref()
+            .is_none_or(ability_is_temporary_combat_modifier)
+        && ability
+            .else_ability
+            .as_deref()
+            .is_none_or(ability_is_temporary_combat_modifier)
+        && ability
+            .mode_abilities
+            .iter()
+            .all(ability_is_temporary_combat_modifier)
+}
+
+fn ability_effect_is_temporary_combat_modifier(ability: &AbilityDefinition) -> bool {
+    match &*ability.effect {
+        Effect::Pump { .. } => matches!(ability.duration, Some(Duration::UntilEndOfTurn)),
+        effect => effect_is_temporary_combat_modifier(effect),
+    }
+}
+
+pub(crate) fn effect_is_temporary_combat_modifier(effect: &Effect) -> bool {
+    match effect {
+        Effect::GenericEffect {
+            static_abilities,
+            duration: Some(Duration::UntilEndOfTurn),
+            ..
+        } => static_abilities
+            .iter()
+            .all(static_definition_is_temporary_combat_modifier),
+        _ => false,
+    }
+}
+
+fn static_definition_is_temporary_combat_modifier(static_def: &StaticDefinition) -> bool {
+    matches!(static_def.mode, StaticMode::Continuous)
+        && static_def
+            .modifications
+            .iter()
+            .all(continuous_modification_is_temporary_combat_modifier)
+}
+
+fn continuous_modification_is_temporary_combat_modifier(
+    modification: &ContinuousModification,
+) -> bool {
+    matches!(
+        modification,
+        ContinuousModification::AddPower { .. }
+            | ContinuousModification::AddToughness { .. }
+            | ContinuousModification::AddKeyword { .. }
+    )
+}
+
+/// The payload of a combat trick, read one effect at a time: a P/T change (`Pump`,
+/// `DoublePT`) or an until-end-of-turn `GenericEffect` made only of P/T and keyword
+/// modifications (`effect_is_temporary_combat_modifier`), whose value is bound to the
+/// combat window (CR 611.2a + CR 514.2). A `GenericEffect` that also grants a protective
+/// quality is not one: hexproof, indestructible, protection and shroud (CR 702.11b,
+/// CR 702.12b, CR 702.16b, CR 702.18a) pay off against removal in any phase.
+/// `Pump`/`DoublePT` carry their duration on the ability, not the effect, so at this
+/// granularity they are accepted as the effect-timing and hint call sites always have;
+/// the ability-level [`ability_is_temporary_combat_modifier`] stays the authority where
+/// the definition is in hand.
+pub(crate) fn effect_is_combat_trick_payload(effect: &Effect) -> bool {
+    match effect {
+        Effect::Pump { .. } | Effect::DoublePT { .. } => true,
+        Effect::GenericEffect { .. } => {
+            effect_is_temporary_combat_modifier(effect) && !effect_has_defensive_payload(effect)
+        }
         _ => false,
     }
 }
