@@ -643,10 +643,10 @@ pub(crate) struct RwProfile {
     /// blocking or blocked by it"). A departed source answers from its own
     /// departure row, so co-departing members touch different creatures, and
     /// what each one sets off (a leaves trigger, CR 603.6c) lands between them:
-    /// the order is observable. Set wherever such a filter is profiled as a
-    /// write target or membership read, so the batch depth can prompt on it
-    /// alone; the same-event depth answers through `reads_member_bound`.
-    /// `drop_writes` keeps it (a read).
+    /// the order is observable. Always set together with `reads_member_bound`
+    /// (`flag_source_combat_pairing`), which answers the same-event depth; kept
+    /// apart so the batch depth can prompt on it alone. `drop_writes` keeps it
+    /// (a read).
     reads_source_combat_pairing: bool,
     /// CR 613.4b-c: the scopes at which the profile reads live power/toughness
     /// after layer 7c. A `BasePower` read shares the ObjectPt axis for ordinary
@@ -1801,7 +1801,29 @@ fn flag_member_bound_write_target(p: &mut RwProfile, target: &TargetFilter) {
     if member_bound_target_filter(target) {
         p.reads_member_bound = true;
     }
-    p.reads_source_combat_pairing |= target.names_source_combat_partners();
+    flag_source_combat_pairing(p, target);
+}
+
+/// CR 509.1g + CR 608.2h + CR 603.3b: when `target` names creatures by their
+/// combat relation to the resolving source ("blocking or blocked by it", "each
+/// creature it blocked this combat"), each member reads its own source's
+/// pairings: member-bound at both depths, and the batch-depth
+/// `reads_source_combat_pairing` row. Read through the exhaustive
+/// `filter_contains_filter_prop` walker, so a relation nested anywhere in the
+/// filter counts.
+fn flag_source_combat_pairing(p: &mut RwProfile, target: &TargetFilter) {
+    if crate::game::filter::filter_contains_filter_prop(target, &|prop| {
+        matches!(
+            prop,
+            FilterProp::CombatRelation {
+                subject: CombatRelationSubject::Source,
+                ..
+            }
+        )
+    }) {
+        p.reads_member_bound = true;
+        p.reads_source_combat_pairing = true;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4050,7 +4072,7 @@ fn board_membership_read(filter: &TargetFilter) -> RwProfile {
     // CR 603.10a (PR-6.75 c5): a read whose filter names a per-member-bound set /
     // attachment / chosen referent is member-distinct ⇒ refuses batch-T1.
     p.reads_member_bound |= member_bound_target_filter(filter);
-    p.reads_source_combat_pairing |= filter.names_source_combat_partners();
+    flag_source_combat_pairing(&mut p, filter);
     p
 }
 
@@ -4748,7 +4770,7 @@ fn damage_writes(target: &TargetFilter) -> RwProfile {
     flag_legacy_write_target(&mut p, target);
     // CR 509.1g + CR 603.3b: damage to the source's own combat partners
     // ("each creature it blocked this combat") is per member.
-    p.reads_source_combat_pairing |= target.names_source_combat_partners();
+    flag_source_combat_pairing(&mut p, target);
     p
 }
 
@@ -4838,7 +4860,7 @@ fn rw_effect(
             // CR 509.1g + CR 603.3b: damage to the source's own combat partners
             // (Cathedral Membrane's "each creature it blocked this combat") is
             // per member.
-            p.reads_source_combat_pairing |= target.names_source_combat_partners();
+            flag_source_combat_pairing(&mut p, target);
             if player_filter.is_some() {
                 p.merge(life_writes());
             }
