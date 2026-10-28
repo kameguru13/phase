@@ -2,20 +2,19 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 
 use crate::database::synthesis::KeywordTriggerInstaller;
-#[cfg(test)]
-use crate::types::ability::TapStateChange;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AdditionalCostOrigin,
-    AttachmentReferent, BounceSelection, CardTypeSetSource, CastManaSpentMetric, ChosenAttribute,
+    AttachmentReferent, CardTypeSetSource, CastManaSpentMetric, ChosenAttribute,
     CommanderOwnership, ControllerRef, CopyRetargetPermission, DamageAmountScope,
     DamageAmountThreshold, DelayedAbilityOrigin, DelayedTriggerCondition, DurationEvent, Effect,
-    EffectScope, FilterProp, ModalChoice, NameStickerSet, ObjectScope, OriginConstraint,
-    PlayerFilter, PlayerScope, PreventionAmount, QuantityExpr, QuantityRef, RenownSubject,
-    ResolvedAbility, SacrificeCost, StaticCondition, TargetFilter, TargetRef, TributeOutcome,
-    TriggerCondition, TriggerConditionAnchor, TriggerConstraint, TriggerDefinition,
-    TriggerDefinitionOccurrenceRef, TriggerDefinitionRef, TriggerEntry, TriggerGrantProducerKey,
-    TypeFilter, TypedFilter,
+    FilterProp, ModalChoice, NameStickerSet, ObjectScope, OriginConstraint, PlayerFilter,
+    PlayerScope, QuantityExpr, QuantityRef, RenownSubject, ResolvedAbility, SacrificeCost,
+    StaticCondition, TargetFilter, TargetRef, TributeOutcome, TriggerCondition,
+    TriggerConditionAnchor, TriggerConstraint, TriggerDefinition, TriggerDefinitionOccurrenceRef,
+    TriggerDefinitionRef, TriggerEntry, TriggerGrantProducerKey, TypeFilter, TypedFilter,
 };
+#[cfg(test)]
+use crate::types::ability::{EffectScope, TapStateChange};
 use crate::types::card_type::CoreType;
 use crate::types::events::{GameEvent, ManaTapState};
 use crate::types::game_state::{
@@ -2270,10 +2269,36 @@ fn off_zone_keyword_trigger_candidates(
         .collect()
 }
 
+/// An off-zone recipient's trigger list with its keyword companions replaced
+/// by `companions`: every other entry in its current order, then `companions`.
+/// The one description of the rebuilt list, used both to decide whether the
+/// reconcile changes it and to build it.
+fn with_keyword_companions<'a>(
+    current: &'a crate::types::definitions::Definitions<TriggerEntry>,
+    companions: &'a [TriggerEntry],
+) -> impl Iterator<Item = &'a TriggerEntry> + 'a {
+    current
+        .iter_all()
+        .filter(|entry| {
+            !matches!(
+                entry.occurrence,
+                TriggerDefinitionOccurrenceRef::KeywordCompanion { .. }
+            )
+        })
+        .chain(companions)
+}
+
 /// Reconciles every nonbattlefield keyword companion before trigger matching.
+/// CR 613.1f: a keyword granted by a layer-6 effect to a card outside the
+/// battlefield brings the keyword's triggered abilities that function in that
+/// card's zone — a granted Suspend's in exile (CR 702.62a), a granted
+/// Recover's in a graveyard (CR 702.59a).
+///
 /// Candidate construction and grant allocation both complete against staged
 /// clones before any object is committed, so an allocation/duplicate failure
-/// cannot leave a partial off-zone generation visible to collection.
+/// cannot leave a partial off-zone generation visible to collection. An object
+/// whose grant state and rebuilt trigger list already equal what it holds is
+/// not written, so it stays shared with earlier copies of the state.
 fn reconcile_off_zone_keyword_triggers(state: &mut GameState) {
     let object_ids = [Zone::Graveyard, Zone::Exile, Zone::Stack, Zone::Command]
         .into_iter()
@@ -2292,21 +2317,22 @@ fn reconcile_off_zone_keyword_triggers(state: &mut GameState) {
                 };
                 let candidates = off_zone_keyword_trigger_candidates(state, obj);
                 let mut occurrence_state = obj.trigger_occurrence_state.clone();
-                let entries = occurrence_state
+                let companions = occurrence_state
                     .reconcile_trigger_entries_matching(candidates, is_keyword_companion_producer)
                     .expect("off-zone keyword producers must be distinct and allocator capacity checked");
-                let mut trigger_definitions = obj
-                    .trigger_definitions
-                    .iter_all()
-                    .filter(|entry| {
-                        !matches!(
-                            entry.occurrence,
-                            TriggerDefinitionOccurrenceRef::KeywordCompanion { .. }
-                        )
-                    })
-                    .cloned()
-                    .collect::<Vec<TriggerEntry>>();
-                trigger_definitions.extend(entries);
+                // A write that would store what the object already holds is
+                // skipped: an equal copy stored through `get_mut` would only
+                // unshare the object from every earlier copy of the state.
+                if occurrence_state == obj.trigger_occurrence_state
+                    && with_keyword_companions(&obj.trigger_definitions, &companions)
+                        .eq(obj.trigger_definitions.iter_all())
+                {
+                    continue;
+                }
+                let trigger_definitions =
+                    with_keyword_companions(&obj.trigger_definitions, &companions)
+                        .cloned()
+                        .collect::<Vec<TriggerEntry>>();
                 staged.push((object_id, occurrence_state, trigger_definitions));
             }
             staged
@@ -9809,7 +9835,7 @@ fn reveal_causing_card(ability: &ResolvedAbility) -> Option<ObjectId> {
     let reveal_caused = ability
         .condition
         .as_ref()
-        .is_some_and(super::effects::condition_has_reveal_until_matched_guard);
+        .is_some_and(crate::types::ability::condition_has_reveal_until_matched_guard);
     if !reveal_caused {
         return None;
     }
@@ -14811,9 +14837,15 @@ fn collect_matching_delayed_triggers(
     // CR 702.50a: Epic effects are a persistent rest-of-game generator (never
     // stored as a `DelayedTrigger`, so cleanup never purges them). At the
     // beginning of each controller's upkeep, synthesize a fresh `EpicCopy`
-    // trigger from each stored effect and fire it through the same path.
-    for effect in &state.epic_effects {
-        let synth = super::effects::epic::epic_upkeep_trigger(effect);
+    // trigger from each stored effect and fire it through the same path. Each
+    // trigger names the first entry whose snapshot resolves identically to its
+    // own, so equal snapshots share one handle and their triggers compare,
+    // order and serialize as one.
+    for (index, effect) in state.epic_effects.iter().enumerate() {
+        let synth = super::effects::epic::epic_upkeep_trigger(
+            state.canonical_epic_effect_id(index),
+            effect,
+        );
         if let Some((event_index, trigger_event)) = delayed_trigger_event_with_index(
             &synth.condition,
             events,
@@ -18368,210 +18400,6 @@ pub(super) fn build_triggered_ability(
     }
     resolved
 }
-
-/// Extract the TargetFilter from an effect, if it has targeting requirements.
-/// Returns None for effects with no targeting (Draw, GainLife, etc.) or
-/// effects targeting self/controller (which don't need player selection).
-///
-/// CR 115.1: Only objects on the battlefield, stack, graveyard, exile, and
-/// command zone can be targeted. Selections from private zones (hand, library)
-/// are resolution-time choices, not targeting. ChangeZone effects with a
-/// hand or library origin are therefore excluded — the resolution path
-/// handles them via WaitingFor::EffectZoneChoice.
-///
-/// Note: TriggeringSpellController, TriggeringSpellOwner, TriggeringPlayer,
-/// and TriggeringSource auto-resolve from event context at resolution time
-/// (via `state.current_trigger_event`), so they do not require player selection.
-/// CR 115.1 + CR 702.26a: True when a `PhaseOut`/`PhaseIn` filter denotes a
-/// population to expand at resolution rather than a single declared target.
-fn phase_out_or_in_filter_is_mass(filter: &TargetFilter) -> bool {
-    match filter {
-        TargetFilter::Controller | TargetFilter::Player | TargetFilter::ScopedPlayer => true,
-        TargetFilter::Typed(tf) => {
-            tf.type_filters == [TypeFilter::Permanent]
-                && tf.controller.is_some()
-                && tf.properties.is_empty()
-        }
-        _ => false,
-    }
-}
-
-pub(crate) fn extract_target_filter_from_effect(effect: &Effect) -> Option<&TargetFilter> {
-    // CR 701.21a: Sacrifice does not target — the controller chooses permanents
-    // at resolution time via EffectZoneChoice. Returning a filter here would
-    // cause collect_target_slots to create target selection slots, routing
-    // resolution through the targeted path which lacks controller scoping.
-    if matches!(effect, Effect::Sacrifice { .. }) {
-        return None;
-    }
-    // CR 701.3d + CR 115.1: `UnattachAll` is a non-targeted mass effect. Its
-    // `target` is a resolution-time host-scope filter that `resolve_unattach_all`
-    // mass-scans (never a chosen target), and its `attachment` is a context-ref
-    // anaphor ("unattach it") resolved from the snapshot. Surfacing the host
-    // filter here would create a spurious required target slot (Stolen Uniform's
-    // "unattach it" would demand the controller pick among the creatures they
-    // control), stalling the delayed trigger unresolved. Mirrors the Sacrifice
-    // carve-out above; matches the `None` its mass siblings (DestroyAll/BounceAll)
-    // return from `Effect::target_filter`.
-    if matches!(effect, Effect::UnattachAll { .. }) {
-        return None;
-    }
-    // CR 115.1 + Whitemane Lion ruling: A `Bounce` whose Oracle text omitted
-    // the word "target" ("return a creature you control to its owner's hand")
-    // is NOT a targeted effect — the controller chooses an eligible permanent
-    // at resolution time via `EffectZoneChoice`. Returning a filter here would
-    // route resolution through the targeted path, which (a) creates spurious
-    // target selection slots at stack-push time and (b) leaves the resolver's
-    // targets vector empty, causing the effect to silently no-op. Mirrors the
-    // Sacrifice carve-out above.
-    if matches!(
-        effect,
-        Effect::Bounce {
-            selection: BounceSelection::AtResolution,
-            ..
-        }
-    ) {
-        return None;
-    }
-    // CR 702.95a + CR 115.10a + CR 608.2d: Soulbond pair choices are not
-    // targets. PairWith computes its legal partner while resolving.
-    if matches!(effect, Effect::PairWith { .. }) {
-        return None;
-    }
-    // CR 115.1 + CR 303.4f + CR 303.4g: An Aura's enchanted permanent is a
-    // CHOICE, not a target — Old-Growth Troll / Bronzehide Lion / Harold and
-    // Bob's return-as-Aura sub-effect contains no "target" word in Oracle
-    // text. The pick happens at resolution time via
-    // `WaitingFor::ReturnAsAuraTarget` (built without hexproof / protection
-    // filtering per CR 702.16b's targeting scope).
-    if matches!(effect, Effect::ReturnAsAura { .. }) {
-        return None;
-    }
-    // CR 115.1: ChangeZone from private zones (hand/library) uses resolution-time
-    // selection, not stack-push-time targeting.
-    if let Effect::ChangeZone { origin, target, .. } = effect {
-        if matches!(origin, Some(Zone::Hand) | Some(Zone::Library)) {
-            return None;
-        }
-        // Also check InZone property when origin is None but the filter specifies a private zone
-        if origin.is_none() {
-            if let Some(zone) = target.extract_in_zone() {
-                if matches!(zone, Zone::Hand | Zone::Library) {
-                    return None;
-                }
-            }
-        }
-    }
-    // CR 115.1 + CR 400.2: PutAtLibraryPosition from a private zone (hand/library)
-    // is a resolution-time selection, not a casting-time target. Brainstorm's
-    // "put two cards from your hand on top of your library" does not use the word
-    // "target" — the player chooses cards during resolution via EffectZoneChoice.
-    if let Effect::PutAtLibraryPosition { target, .. } = effect {
-        if let Some(zone) = target.extract_in_zone() {
-            if matches!(zone, Zone::Hand | Zone::Library) {
-                return None;
-            }
-        }
-    }
-    // CR 601.2c: "You may cast a spell ... from your hand without paying its mana
-    // cost" (Baral's Expertise, Bring Back-style sub-effects) names no "target" —
-    // CR 601.2c puts target announcement BEFORE costs, and these clauses skip it
-    // entirely. The spell is chosen at resolution from the granting player's hand
-    // (or library, for Future Sight-style cast-from-library permissions), so a
-    // stack-time target slot would surface a phantom 4th pick alongside the real
-    // bounce/etc. targets.
-    //
-    // CR 115.1: Exile-link variants (`ExiledBySource`, `ParentTarget`, anaphoric
-    // "that card" / "the exiled card") stay resolved context references via the
-    // final `is_context_ref` guard rather than stack-time target slots. Those bind
-    // a single object selected earlier in the same effect chain and are not the
-    // "free pick from hand" pattern this carve-out covers. The is-private-zone
-    // test mirrors `Effect::ChangeZone` and `Effect::PutAtLibraryPosition` above.
-    if let Effect::CastFromZone { target, .. } = effect {
-        if let Some(zone) = target.extract_in_zone() {
-            if matches!(zone, Zone::Hand | Zone::Library) {
-                return None;
-            }
-        }
-        // CR 115.1 + CR 608.2c: "Draw three cards and reveal them. You may
-        // cast one of them without paying its mana cost" (Mad Wizard's Lair)
-        // names no "target" — the pick is chosen at resolution from the cards
-        // the same resolution revealed (`EffectZoneChoice` over
-        // `LastRevealed`). At stack-push time nothing is revealed yet, so
-        // surfacing a slot builds a required pick with zero legal candidates
-        // and the whole trigger is dropped for lack of a legal target before
-        // it can resolve. Deliberately NOT folded into `is_context_ref`:
-        // that predicate also drives the optional-frame stash injector
-        // (`ability_with_event_context_targets`), which would singular-bind
-        // the first revealed card and collapse the choose-one-of-many into a
-        // forced pick.
-        if matches!(target, TargetFilter::LastRevealed) {
-            return None;
-        }
-    }
-    // CR 115.1 / CR 115.1d: Only effects that use the word "target" require stack-time target
-    // selection. `TargetFilter::Any` is a sentinel value meaning "broadcast to all
-    // matching permanents at resolution time" — it is never a declared target on any
-    // effect. The one exception is `DealDamage`, which uses `TargetFilter::Any` to
-    // represent the "any target" wording in damage-dealing spells and abilities (e.g.
-    // "deals 3 damage to any target"), where the player does choose a single target
-    // from the combined pool of creatures, planeswalkers, and players.
-    //
-    // For all other effects, `TargetFilter::Any` arises in two ways: (a) as a mass
-    // broadcast where the Oracle text contains no "target" keyword (e.g. "creatures
-    // get -N/-M until end of turn"), or (b) as an unthreaded subject sentinel produced
-    // by a sub-parser before the calling parser threads the real subject (SelfRef,
-    // ParentTarget, etc.). In both cases no player-chosen target is required.
-    // Generating a slot for `Any` causes a spurious WaitingFor::TriggerTargetSelection
-    // entry that players and the AI cannot resolve, producing a hard freeze (issue #824
-    // class).
-    // CR 120.1 + CR 115.1: `EachSourceDealsDamage` with a `Shared(Any)` recipient
-    // ("each Dwarf you control deals 1 damage to any target", Princess Snowfall)
-    // is the same "any target" player-chosen slot as `DealDamage` — surface it so
-    // the cast/trigger-time target slot is built.
-    // CR 115.1a/c/d + CR 115.4 + CR 615.7: `PreventDamage` with a declared `Single`
-    // recipient, `TargetFilter::Any`, and no `damage_source_filter` ("prevent the
-    // next 2 damage that would be dealt to any target this turn", Aven Redeemer,
-    // Healing Salve) is a player-chosen target slot over creatures, planeswalkers,
-    // and players. When `damage_source_filter` is present (Awe Strike, Maze of Ith),
-    // the target slot is carried by the source filter and `Any` is an untargeted
-    // broadcast recipient that must not mint a slot. When `amount` is `All`
-    // (Fog, Sewers of Estark), it is an untargeted mass prevention effect that must
-    // not mint a slot.
-    if effect.target_filter() == Some(&TargetFilter::Any)
-        && !matches!(
-            effect,
-            Effect::DealDamage { .. }
-                | Effect::EachSourceDealsDamage { .. }
-                | Effect::PreventDamage {
-                    recipient_scope: EffectScope::Single,
-                    damage_source_filter: None,
-                    amount: PreventionAmount::Next(_),
-                    ..
-                }
-                | Effect::PreventDamage {
-                    recipient_scope: EffectScope::Single,
-                    damage_source_filter: None,
-                    amount_dynamic: Some(_),
-                    ..
-                }
-        )
-    {
-        return None;
-    }
-    // CR 115.1 + CR 702.26a: Mass phase-out / phase-in ("all permanents you
-    // control phase out" — Teferi's Protection; "you phase out") expands its
-    // population filter at resolution. Only "target [type] phase(s) out/in"
-    // requires a stack-time target slot.
-    if matches!(effect, Effect::PhaseOut { .. } | Effect::PhaseIn { .. })
-        && effect
-            .target_filter()
-            .is_some_and(phase_out_or_in_filter_is_mass)
-    {
-        return None;
-    }
-    effect.target_filter().filter(|t| !t.is_context_ref())
-}
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -18582,18 +18410,19 @@ pub mod tests {
     use crate::game::filter::{matches_target_filter, FilterContext};
     use crate::game::zones::{create_object, move_to_zone};
     use crate::types::ability::{
-        AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AdditionalCost,
-        AggregateFunction, AttackersDeclaredCountSubject, CardSelectionMode, ChoiceType,
-        ChosenAttribute, ChosenSubtypeKind, CommanderOwnership, Comparator, ContinuousModification,
-        ControllerRef, DamageChannel, DamageKindFilter, DelayedTriggerCondition,
-        DelayedTriggerKind, DelayedTriggerLifetime, DiscardSelfScope, Duration,
-        EachDamageRecipient, Effect, FilterProp, GuessSubject, KickerVariant, ModalChoice,
-        MultiTargetSpec, NumberQuality, Parity, PlayerFilter, PlayerScope, PreventionAmount,
-        PreventionScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
-        ReplacementDefinition, ReplacementMode, ResolvedAbility, SearchSelectionConstraint,
-        SharedQuality, SharedQualityRelation, SpentColor, StaticCondition, StaticDefinition,
-        TargetFilter, TargetRef, TargetSelectionMode, TriggerCondition, TriggerConstraint,
-        TriggerDefinition, TriggerGrantInstanceRef, TypeFilter, TypedFilter,
+        extract_target_filter_from_effect, AbilityCondition, AbilityCost, AbilityDefinition,
+        AbilityKind, AdditionalCost, AggregateFunction, AttackersDeclaredCountSubject,
+        BounceSelection, CardSelectionMode, ChoiceType, ChosenAttribute, ChosenSubtypeKind,
+        CommanderOwnership, Comparator, ContinuousModification, ControllerRef, DamageChannel,
+        DamageKindFilter, DelayedTriggerCondition, DelayedTriggerKind, DelayedTriggerLifetime,
+        DiscardSelfScope, Duration, EachDamageRecipient, Effect, FilterProp, GuessSubject,
+        KickerVariant, ModalChoice, MultiTargetSpec, NumberQuality, Parity, PlayerFilter,
+        PlayerScope, PreventionAmount, PreventionScope, PtStat, PtValue, PtValueScope,
+        QuantityExpr, QuantityRef, ReplacementDefinition, ReplacementMode, ResolvedAbility,
+        SearchSelectionConstraint, SharedQuality, SharedQualityRelation, SpentColor,
+        StaticCondition, StaticDefinition, TargetFilter, TargetRef, TargetSelectionMode,
+        TriggerCondition, TriggerConstraint, TriggerDefinition, TriggerGrantInstanceRef,
+        TypeFilter, TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card::LayoutKind;
@@ -32130,6 +31959,7 @@ pub mod tests {
                                 owner: TargetFilter::Controller,
                                 attach_to: None,
                                 enters_attacking: false,
+                                attack_destination: crate::types::ability::TokenAttackDestination::ControllerChooses,
                                 supertypes: vec![],
                                 static_abilities: vec![],
                                 enter_with_counters: vec![],
@@ -35914,6 +35744,7 @@ pub mod tests {
                     .properties(vec![FilterProp::Token, FilterProp::EnteredThisTurn]),
             )),
             enters_attacking: false,
+            attack_destination: crate::types::ability::TokenAttackDestination::ControllerChooses,
             tapped: false,
             count: QuantityExpr::Fixed { value: 1 },
             extra_keywords: vec![],
@@ -45921,12 +45752,12 @@ pub mod tests {
 
     /// A battlefield permanent whose statics grant Recover to `recover` and
     /// Suspend to `suspend`. No transient and no granted static is involved, so
-    /// the off-zone keyword gather is structural.
+    /// the off-zone keyword gather is structural. Returns the granter's id.
     fn grant_off_zone_trigger_keywords(
         state: &mut GameState,
         recover: Option<ObjectId>,
         suspend: Option<ObjectId>,
-    ) {
+    ) -> ObjectId {
         let source = make_creature(state, PlayerId(0), "Keyword Granter", 1, 1);
         let grants = [
             recover.map(|id| (id, Keyword::Recover(ManaCost::generic(1)))),
@@ -45952,6 +45783,7 @@ pub mod tests {
                         .modifications(vec![ContinuousModification::AddKeyword { keyword }]),
                 );
         }
+        source
     }
 
     /// Creates player 0's "Off-Zone Card {index}" in `zone` with card id `8300 + index`.
@@ -46076,6 +45908,275 @@ pub mod tests {
             })
             .collect();
         assert_eq!(reconciled, expected);
+    }
+
+    /// Whether `id` holds at least one keyword-companion trigger entry.
+    fn holds_keyword_companion(state: &GameState, id: ObjectId) -> bool {
+        state.objects[&id]
+            .trigger_definitions
+            .iter_all()
+            .any(|entry| {
+                matches!(
+                    entry.occurrence,
+                    TriggerDefinitionOccurrenceRef::KeywordCompanion { .. }
+                )
+            })
+    }
+
+    /// BASE-shaped unguarded `reconcile_off_zone_keyword_triggers`: every
+    /// visited off-zone object is written.
+    fn reference_reconcile_off_zone_keyword_triggers(state: &mut GameState) {
+        let object_ids = [Zone::Graveyard, Zone::Exile, Zone::Stack, Zone::Command]
+            .into_iter()
+            .flat_map(|zone| crate::game::targeting::zone_object_ids(state, zone))
+            .collect::<Vec<_>>();
+        let mut staged = Vec::new();
+        for object_id in object_ids {
+            let Some(obj) = state.objects.get(&object_id) else {
+                continue;
+            };
+            let candidates = off_zone_keyword_trigger_candidates(state, obj);
+            let mut occurrence_state = obj.trigger_occurrence_state.clone();
+            let entries = occurrence_state
+                .reconcile_trigger_entries_matching(candidates, is_keyword_companion_producer)
+                .expect("reference reconciliation must allocate");
+            let mut trigger_definitions = obj
+                .trigger_definitions
+                .iter_all()
+                .filter(|entry| {
+                    !matches!(
+                        entry.occurrence,
+                        TriggerDefinitionOccurrenceRef::KeywordCompanion { .. }
+                    )
+                })
+                .cloned()
+                .collect::<Vec<TriggerEntry>>();
+            trigger_definitions.extend(entries);
+            staged.push((object_id, occurrence_state, trigger_definitions));
+        }
+        for (object_id, occurrence_state, trigger_definitions) in staged {
+            let obj = state.objects.get_mut(&object_id).unwrap();
+            obj.trigger_occurrence_state = occurrence_state;
+            obj.trigger_definitions = trigger_definitions.into();
+        }
+    }
+
+    /// Sharing witness: once every off-zone card's keyword companions are
+    /// current, a further reconcile writes no object. Fails on revert of the
+    /// write guard in `reconcile_off_zone_keyword_triggers` or of the lazy
+    /// grant allocation.
+    #[test]
+    fn current_off_zone_keyword_reconcile_keeps_store_shared() {
+        use crate::types::object_map::sweep_test_support::assert_sweep_keeps_store_shared;
+
+        let mut state = setup();
+        let plain = off_zone_test_card(&mut state, 0, Zone::Graveyard);
+        let recovering = off_zone_test_card(&mut state, 1, Zone::Graveyard);
+        let suspended = off_zone_test_card(&mut state, 2, Zone::Exile);
+        grant_off_zone_trigger_keywords(&mut state, Some(recovering), Some(suspended));
+        reconcile_off_zone_keyword_triggers(&mut state);
+        assert!(
+            holds_keyword_companion(&state, recovering)
+                && holds_keyword_companion(&state, suspended),
+            "reach-guard: the granted Recover and Suspend companions are installed"
+        );
+        assert!(!holds_keyword_companion(&state, plain));
+        assert_sweep_keeps_store_shared(state, reconcile_off_zone_keyword_triggers);
+    }
+
+    /// Targeted test: after a new grant reaches one off-zone card, the
+    /// reconcile writes that card alone. Fails on revert of the write guard in
+    /// `reconcile_off_zone_keyword_triggers` or of the lazy grant allocation.
+    #[test]
+    fn off_zone_keyword_reconcile_copies_only_the_card_whose_companions_changed() {
+        use crate::types::object_map::sweep_test_support::run_sweep_targeting;
+
+        let mut state = setup();
+        let plain = off_zone_test_card(&mut state, 0, Zone::Graveyard);
+        let suspended = off_zone_test_card(&mut state, 1, Zone::Exile);
+        grant_off_zone_trigger_keywords(&mut state, None, Some(suspended));
+        reconcile_off_zone_keyword_triggers(&mut state);
+        grant_off_zone_trigger_keywords(&mut state, Some(plain), None);
+        let (before, after) =
+            run_sweep_targeting(state, plain, reconcile_off_zone_keyword_triggers);
+        assert!(!holds_keyword_companion(&before, plain));
+        assert!(holds_keyword_companion(&after, plain));
+        assert!(holds_keyword_companion(&after, suspended));
+    }
+
+    /// Reference equality, with one object per conjunct of the write guard:
+    /// a card whose granted keyword changed while its producer stayed (the
+    /// rebuilt list differs, the grant state is equal), a card whose grant
+    /// state reorders while its list stays equal, and two current cards.
+    /// Passes at BASE by construction; fails if either conjunct of the write
+    /// guard in `reconcile_off_zone_keyword_triggers` is dropped.
+    #[test]
+    fn off_zone_keyword_reconcile_matches_unguarded_sweep() {
+        use crate::types::ability::{occurrence_for_grant, TriggerProducerOrigin};
+        use crate::types::object_map::sweep_test_support::assert_sweep_matches_reference;
+
+        let mut state = setup();
+        let plain = off_zone_test_card(&mut state, 0, Zone::Graveyard);
+        let retuned = off_zone_test_card(&mut state, 1, Zone::Graveyard);
+        let reordered = off_zone_test_card(&mut state, 2, Zone::Exile);
+        let current = off_zone_test_card(&mut state, 3, Zone::Exile);
+        let recover_granter = grant_off_zone_trigger_keywords(&mut state, Some(retuned), None);
+        grant_off_zone_trigger_keywords(&mut state, None, Some(reordered));
+        grant_off_zone_trigger_keywords(&mut state, None, Some(current));
+        reconcile_off_zone_keyword_triggers(&mut state);
+        assert!(
+            holds_keyword_companion(&state, current) && !holds_keyword_companion(&state, plain),
+            "reach-guard: the current card holds its companions and the plain card has none"
+        );
+
+        // The same static now grants Recover {2}: same producer, new payload.
+        state
+            .objects
+            .get_mut(&recover_granter)
+            .unwrap()
+            .static_definitions[0]
+            .modifications = vec![ContinuousModification::AddKeyword {
+            keyword: Keyword::Recover(ManaCost::generic(2)),
+        }];
+        // An out-of-class grant listed after the companions in the grant
+        // state but before them in the trigger list.
+        {
+            let obj = state.objects.get_mut(&reordered).unwrap();
+            let granted = TriggerGrantProducerKey::Granted {
+                origin: TriggerProducerOrigin::Transient {
+                    continuous_effect_id: 900,
+                    modification_index: 0,
+                },
+                output_index: 0,
+            };
+            let instance = obj
+                .trigger_occurrence_state
+                .grant_instance_for(granted.clone())
+                .unwrap();
+            let mut entries = vec![TriggerEntry::new(
+                occurrence_for_grant(&granted, instance),
+                TriggerDefinition::new(TriggerMode::Attacks),
+            )];
+            entries.extend(obj.trigger_definitions.iter_all().cloned());
+            obj.trigger_definitions = entries.into();
+        }
+
+        let (actual, _) = assert_sweep_matches_reference(
+            &state,
+            &[retuned, reordered],
+            reconcile_off_zone_keyword_triggers,
+            reference_reconcile_off_zone_keyword_triggers,
+        );
+        let recover_companions = actual.objects[&retuned]
+            .trigger_definitions
+            .iter_all()
+            .filter(|entry| {
+                matches!(
+                    entry.occurrence,
+                    TriggerDefinitionOccurrenceRef::KeywordCompanion { .. }
+                )
+            })
+            .map(|entry| entry.definition.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recover_companions,
+            KeywordTriggerInstaller::triggers_for(&Keyword::Recover(ManaCost::generic(2))),
+            "the retuned card carries the Recover {{2}} companion"
+        );
+    }
+
+    /// A permanent transient grant of `keyword` to `recipient` from `source`.
+    fn transient_keyword_grant(
+        id: u64,
+        source: ObjectId,
+        recipient: ObjectId,
+        keyword: Keyword,
+    ) -> TransientContinuousEffect {
+        TransientContinuousEffect {
+            id,
+            source_id: source,
+            controller: PlayerId(0),
+            timestamp: id,
+            duration: Duration::Permanent,
+            affected: TargetFilter::SpecificObject { id: recipient },
+            affected_recipient: None,
+            modifications: vec![ContinuousModification::AddKeyword { keyword }],
+            condition: None,
+            duration_subject: None,
+            end_permission: None,
+            granting_object: None,
+            duration_event_source: None,
+            source_name: "Keyword Granter".to_string(),
+        }
+    }
+
+    /// Production entry: once trigger collection has installed every granted
+    /// off-zone companion, a further collection writes no object, while a card
+    /// newly granted a keyword is still written through the same entry. Fails
+    /// on revert of the write guard in `reconcile_off_zone_keyword_triggers` or
+    /// of the lazy grant allocation. The grants are transient: a static added
+    /// to a battlefield granter after the first layer flush (which sets only
+    /// the live statics) is not part of the off-zone keyword gather.
+    #[test]
+    fn trigger_collection_keeps_current_off_zone_companion_holders_shared() {
+        let mut state = setup();
+        let source = make_creature(&mut state, PlayerId(0), "Keyword Granter", 1, 1);
+        let plain = off_zone_test_card(&mut state, 0, Zone::Graveyard);
+        let recovering = off_zone_test_card(&mut state, 1, Zone::Graveyard);
+        let suspended = off_zone_test_card(&mut state, 2, Zone::Exile);
+        state
+            .transient_continuous_effects
+            .push_back(transient_keyword_grant(
+                100,
+                source,
+                recovering,
+                Keyword::Recover(ManaCost::generic(1)),
+            ));
+        state
+            .transient_continuous_effects
+            .push_back(transient_keyword_grant(
+                101,
+                source,
+                suspended,
+                Keyword::Suspend {
+                    count: 0,
+                    cost: ManaCost::generic(1),
+                },
+            ));
+        process_triggers(&mut state, &[]);
+        assert!(
+            holds_keyword_companion(&state, recovering)
+                && holds_keyword_companion(&state, suspended),
+            "reach-guard: trigger collection installed the granted companions"
+        );
+        let settled = state.clone();
+        process_triggers(&mut state, &[]);
+        assert!(
+            state.objects.ptr_eq(&settled.objects),
+            "a collection that finds every companion current must write no object"
+        );
+
+        state
+            .transient_continuous_effects
+            .push_back(transient_keyword_grant(
+                102,
+                source,
+                plain,
+                Keyword::Recover(ManaCost::generic(1)),
+            ));
+        let granted = state.clone();
+        process_triggers(&mut state, &[]);
+        assert!(
+            !state.objects.shares_object_with(&granted.objects, plain)
+                && holds_keyword_companion(&state, plain),
+            "a newly granted companion is written through the same entry"
+        );
+        assert!(state
+            .objects
+            .shares_object_with(&granted.objects, suspended));
+        assert!(state
+            .objects
+            .shares_object_with(&granted.objects, recovering));
     }
 
     #[test]
