@@ -52,11 +52,13 @@ impl EffectTimingPolicy {
         }
 
         // CR 611.2a + CR 514.2: a combat-window payload is priced only when the candidate itself
-        // resolves it, so a permanent spell is not timed by what its abilities do later.
-        for effect in own_resolution_effects(ctx) {
-            if effect_is_combat_trick_payload(effect) {
-                score += combat_trick_score(ctx);
-            }
+        // resolves it, so a permanent spell is not timed by what its abilities do later. The
+        // trick is priced once per candidate, however many payload effects its chain carries.
+        if own_resolution_effects(ctx)
+            .into_iter()
+            .any(effect_is_combat_trick_payload)
+        {
+            score += combat_trick_score(ctx);
         }
 
         score
@@ -2648,7 +2650,18 @@ mod tests {
         name: &str,
         oracle_text: &str,
     ) -> ObjectId {
-        let abilities = parsed(oracle_text, name, "Instant");
+        oracle_spell(state, controller, name, oracle_text, CoreType::Instant)
+    }
+
+    /// An instant or sorcery in `controller`'s hand, built from its verbatim Oracle text.
+    fn oracle_spell(
+        state: &mut GameState,
+        controller: PlayerId,
+        name: &str,
+        oracle_text: &str,
+        core_type: CoreType,
+    ) -> ObjectId {
+        let abilities = parsed(oracle_text, name, &core_type.to_string());
         let id = create_object(
             state,
             CardId(state.next_object_id),
@@ -2657,7 +2670,7 @@ mod tests {
             Zone::Hand,
         );
         let obj = state.objects.get_mut(&id).unwrap();
-        obj.card_types.core_types.push(CoreType::Instant);
+        obj.card_types.core_types.push(core_type);
         obj.abilities = std::sync::Arc::new(abilities);
         id
     }
@@ -2987,5 +3000,83 @@ mod tests {
                 d(card)
             );
         }
+    }
+
+    const BARGE_IN: &str = "Target attacking creature gets +2/+2 until end of turn. Each attacking non-Human creature gains trample until end of turn.";
+    const ARM_THE_CATHARS: &str = "Until end of turn, target creature gets +3/+3, up to one other target creature gets +2/+2, and up to one other target creature gets +1/+1. Those creatures gain vigilance until end of turn.";
+
+    /// The combat-trick payload effects in the spell ability chain of a card parsed from
+    /// `oracle_text`.
+    fn trick_payloads(oracle_text: &str, name: &str, core_type: CoreType) -> Vec<Effect> {
+        parsed(oracle_text, name, &core_type.to_string())
+            .iter()
+            .filter(|a| a.kind == AbilityKind::Spell)
+            .flat_map(crate::cast_facts::collect_definition_effects)
+            .filter(|effect| effect_is_combat_trick_payload(effect))
+            .cloned()
+            .collect()
+    }
+
+    /// CR 611.2a + CR 514.2: one spell is one combat trick, however many until-end-of-turn
+    /// payloads its resolution carries. Barge In's `Pump` plus trample grant, and Arm the
+    /// Cathars' three `Pump`s plus vigilance grant, price as Giant Growth's single `Pump` does:
+    /// the trick penalty out of combat, the combat bonus in DeclareAttackers. Arm the Cathars is a
+    /// sorcery, so only its own precombat main phase is a window it can be cast in.
+    #[test]
+    fn effect_timing_prices_a_multi_payload_trick_once() {
+        let barge_in = trick_payloads(BARGE_IN, "Barge In", CoreType::Instant);
+        assert!(
+            barge_in.len() >= 2
+                && barge_in.iter().any(|e| matches!(e, Effect::Pump { .. }))
+                && barge_in
+                    .iter()
+                    .any(|e| matches!(e, Effect::GenericEffect { .. })),
+            "premise: Barge In carries a Pump and a GenericEffect trick payload: {barge_in:?}"
+        );
+        let arm = trick_payloads(ARM_THE_CATHARS, "Arm the Cathars", CoreType::Sorcery);
+        assert!(
+            arm.iter()
+                .filter(|e| matches!(e, Effect::Pump { .. }))
+                .count()
+                >= 2,
+            "premise: Arm the Cathars carries several Pump trick payloads: {arm:?}"
+        );
+
+        for (phase, combat) in [(Phase::End, false), (Phase::DeclareAttackers, true)] {
+            let mut state = d1_board(phase, P0);
+            if combat {
+                state.combat = Some(CombatState::default());
+            }
+            let bi = oracle_instant(&mut state, P0, "Barge In", BARGE_IN);
+            let gg = oracle_instant(&mut state, P0, "Giant Growth", GIANT_GROWTH);
+            let d = |id| timing_delta(&state, &cast_candidate(&state, id));
+            let (d_bi, d_gg) = (d(bi), d(gg));
+            if combat {
+                assert!(d_gg > 0.0, "{phase:?}: the combat bonus fires, got {d_gg}");
+            } else {
+                assert!(d_gg < 0.0, "{phase:?}: the trick penalty fires, got {d_gg}");
+            }
+            assert!(
+                (d_bi - d_gg).abs() < 1e-9,
+                "{phase:?}: Barge In {d_bi} must price as Giant Growth {d_gg}"
+            );
+        }
+
+        let mut state = d1_board(Phase::PreCombatMain, P0);
+        let arm = oracle_spell(
+            &mut state,
+            P0,
+            "Arm the Cathars",
+            ARM_THE_CATHARS,
+            CoreType::Sorcery,
+        );
+        let gg = oracle_instant(&mut state, P0, "Giant Growth", GIANT_GROWTH);
+        let d = |id| timing_delta(&state, &cast_candidate(&state, id));
+        let (d_arm, d_gg) = (d(arm), d(gg));
+        assert!(d_gg < 0.0, "reach: the trick penalty fires, got {d_gg}");
+        assert!(
+            (d_arm - d_gg).abs() < 1e-9,
+            "Arm the Cathars {d_arm} must price as Giant Growth {d_gg}"
+        );
     }
 }
