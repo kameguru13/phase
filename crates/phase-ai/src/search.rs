@@ -19665,17 +19665,15 @@ one on the bottom of your library.";
         }
 
         fn verdict(&self, ctx: &PolicyContext<'_>) -> PolicyVerdict {
-            match &ctx.candidate.action {
-                GameAction::ActivateAbility { source_id, .. }
-                    if ctx.search_depth == SearchDepth::Root && *source_id == self.source =>
-                {
-                    PolicyVerdict::preference(
+            if let GameAction::ActivateAbility { source_id, .. } = &ctx.candidate.action {
+                if ctx.search_depth == SearchDepth::Root && *source_id == self.source {
+                    return PolicyVerdict::preference(
                         -ROOT_TIMING_STUB_DELTA,
                         PolicyReason::new("root_timing_stub"),
-                    )
+                    );
                 }
-                _ => PolicyVerdict::neutral(PolicyReason::new("root_timing_stub")),
             }
+            PolicyVerdict::neutral(PolicyReason::new("root_timing_stub"))
         }
     }
 
