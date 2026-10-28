@@ -1812,7 +1812,7 @@ fn flag_member_bound_write_target(p: &mut RwProfile, target: &TargetFilter) {
 /// `filter_contains_filter_prop` walker, so a relation nested anywhere in the
 /// filter counts.
 fn flag_source_combat_pairing(p: &mut RwProfile, target: &TargetFilter) {
-    if crate::game::filter::filter_contains_filter_prop(target, &|prop| {
+    if crate::types::ability::filter_contains_filter_prop(target, &|prop| {
         matches!(
             prop,
             FilterProp::CombatRelation {
