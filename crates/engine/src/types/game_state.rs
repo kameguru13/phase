@@ -1675,6 +1675,63 @@ pub struct ZoneChangeRecord {
     /// `#[serde(default)]` ⇒ pre-existing saved states deserialize to `false`.
     #[serde(default)]
     pub was_prepared: bool,
+    /// CR 800.4a + CR 603.6c: whether the object moved to `to_zone` or left the
+    /// game with its owner. `Moved` unless the player-leaves-game procedure
+    /// stamps it. Omitted on the wire when `Moved`.
+    #[serde(default, skip_serializing_if = "ZoneDeparture::is_moved")]
+    pub departure: ZoneDeparture,
+}
+
+/// CR 800.4a + CR 603.6c: how an object left the zone a [`ZoneChangeRecord`]
+/// names. When a player leaves the game, every object they own leaves the game;
+/// the engine keeps such an object in exile, but it was not exiled, so only a
+/// leaves-the-battlefield ability sees it go.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ZoneDeparture {
+    /// The object moved from `from_zone` to `to_zone`.
+    #[default]
+    Moved,
+    /// CR 800.4a + CR 603.6c: the object left the game because its owner left
+    /// the game. A phased-in permanent leaving this way triggers
+    /// leaves-the-battlefield abilities; nothing that names where an object
+    /// went (exile included) sees it.
+    LeftGame,
+    /// CR 702.26k: a phased-out permanent left the game because its owner left
+    /// the game. This doesn't cause zone-change abilities to trigger.
+    LeftGamePhasedOut,
+}
+
+impl ZoneDeparture {
+    pub fn is_moved(&self) -> bool {
+        *self == ZoneDeparture::Moved
+    }
+
+    /// CR 800.4a: the object left the game instead of moving to `to_zone`.
+    pub fn left_game(&self) -> bool {
+        !self.is_moved()
+    }
+
+    /// CR 800.4a + CR 603.6c + CR 702.26k: whether an ability watching for an
+    /// object to leave the battlefield sees this departure from the battlefield.
+    /// `names_destination` is whether the ability also requires the object to go
+    /// to a particular zone. An object that left the game went to no zone, so only
+    /// an ability naming no destination sees it, and only when it was a phased-in
+    /// permanent.
+    pub fn observed_leaving_battlefield(&self, names_destination: bool) -> bool {
+        match self {
+            ZoneDeparture::Moved => true,
+            ZoneDeparture::LeftGame => !names_destination,
+            ZoneDeparture::LeftGamePhasedOut => false,
+        }
+    }
+}
+
+/// CR 800.4a: the departure the player-leaves-game procedure stamps on the
+/// zone-change record of one object's move (`GameState::leaving_game_departure`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeavingGameDeparture {
+    pub object_id: ObjectId,
+    pub departure: ZoneDeparture,
 }
 
 /// Deserialization shape of [`ZoneChangeRecord`]; a record saved without `arrival` loads with arrival equal to departure.
@@ -1730,6 +1787,8 @@ struct ZoneChangeRecordWire {
     is_suspected: bool,
     #[serde(default)]
     was_prepared: bool,
+    #[serde(default)]
+    departure: ZoneDeparture,
 }
 
 impl From<ZoneChangeRecordWire> for ZoneChangeRecord {
@@ -1767,6 +1826,7 @@ impl From<ZoneChangeRecordWire> for ZoneChangeRecord {
             recorded_turn_number,
             is_suspected,
             was_prepared,
+            departure,
         } = wire;
         Self {
             object_id,
@@ -1801,6 +1861,7 @@ impl From<ZoneChangeRecordWire> for ZoneChangeRecord {
             recorded_turn_number,
             is_suspected,
             was_prepared,
+            departure,
         }
     }
 }
@@ -2150,6 +2211,7 @@ impl ZoneChangeRecord {
             recorded_turn_number: 0,
             is_suspected: false,
             was_prepared: false,
+            departure: ZoneDeparture::Moved,
         }
     }
 }
@@ -5343,6 +5405,12 @@ pub struct PendingPlayerScopeSacrificeChoice {
     /// continuation can run.
     #[serde(default)]
     pub completion: PendingPlayerScopeSacrificeCompletion,
+    /// CR 608.2c: the stack entry whose resolution opened this collection or
+    /// parked this batch. A carrier is consumed only by an answer of that same
+    /// resolution; `None` (older saves, or no resolving entry) binds on the
+    /// instruction source and carrier shape alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolving_entry: Option<ObjectId>,
 }
 
 /// CR 101.4 + CR 118.12a + CR 111.2: An APNAP poll for a player-scoped
@@ -8541,6 +8609,17 @@ pub enum DeferredLifeCostResume {
         remaining_life_payments: Vec<u32>,
         resume_at_resolution_depth: usize,
     },
+    /// CR 702.37e + CR 116.2b + CR 118.11 + CR 614.6 + CR 616.1: Resume turning a
+    /// face-down permanent face up after a life payment's replacement post-effect drains.
+    TurnFaceUp {
+        player: PlayerId,
+        #[serde(alias = "object_id")]
+        source: ObjectIncarnationRef,
+        cost_source: crate::types::ability::TurnUpCostSource,
+        resume_at_resolution_depth: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remaining_cost: Option<Box<AbilityCost>>,
+    },
 }
 
 impl DeferredLifeCostResume {
@@ -8550,7 +8629,7 @@ impl DeferredLifeCostResume {
     /// be classified.
     pub fn withholds_priority(&self) -> bool {
         match self {
-            DeferredLifeCostResume::Cast { .. } => true,
+            DeferredLifeCostResume::Cast { .. } | DeferredLifeCostResume::TurnFaceUp { .. } => true,
             // A resolution-time "pay any amount of life" choice (CR 608.2).
             DeferredLifeCostResume::PayAmount { .. } => false,
             // A mana payment's Phyrexian life; its outer root names the owner.
@@ -8569,6 +8648,10 @@ impl DeferredLifeCostResume {
                 ..
             }
             | DeferredLifeCostResume::ManaRoot {
+                resume_at_resolution_depth,
+                ..
+            }
+            | DeferredLifeCostResume::TurnFaceUp {
                 resume_at_resolution_depth,
                 ..
             } => *resume_at_resolution_depth,
@@ -8987,6 +9070,38 @@ pub enum PendingCostMoveResume {
     /// a replacement pause, which is exactly the shape that guard says to box
     /// rather than widen the budget for.
     RandomDiscardUnlessPayment(Box<RandomDiscardUnlessPaymentResume>),
+    /// CR 702.37e + CR 116.2b + CR 118.11 + CR 614.6 + CR 616.1: A turn-face-up
+    /// special action cost move (ReturnToHand, Discard, Sacrifice) paused by a
+    /// replacement choice. Resumption continues at `paused_at_index + 1`.
+    TurnFaceUpCostMove {
+        player: PlayerId,
+        #[serde(alias = "object_id")]
+        source: ObjectIncarnationRef,
+        cost_source: crate::types::ability::TurnUpCostSource,
+        move_kind: TurnFaceUpMoveKind,
+        chosen: Vec<ObjectId>,
+        paused_at_index: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remaining_cost: Option<Box<AbilityCost>>,
+        /// CR 603.2c + CR 603.10a: Cost events emitted in earlier actions of
+        /// this one logical move, withheld from trigger collection so the
+        /// group is stamped and its triggers collected once at completion.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        deferred_cost_events: Vec<GameEvent>,
+        /// CR 603.10a: `zone_changes_this_turn` indices of the battlefield
+        /// departures already performed by this payment, so the whole selection
+        /// is stamped as one simultaneous departure across replacement pauses.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        departure_record_indices: Vec<usize>,
+    },
+}
+
+/// CR 702.37e: The kind of cost move being performed to turn a permanent face up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TurnFaceUpMoveKind {
+    ReturnToHand,
+    Discard,
+    Sacrifice,
 }
 
 /// CR 616.1 + CR 608.2c: where a parked counter-cost root's own replacement
@@ -9046,7 +9161,8 @@ impl PendingCostMoveResume {
             | Self::ActivationMillPayment { .. }
             | Self::LoyaltyActivation { .. }
             | Self::CounterAdditionUnlessPayment { .. }
-            | Self::RandomDiscardUnlessPayment(_) => None,
+            | Self::RandomDiscardUnlessPayment(_)
+            | Self::TurnFaceUpCostMove { .. } => None,
         }
     }
 
@@ -9062,7 +9178,8 @@ impl PendingCostMoveResume {
             | PendingCostMoveResume::ManaAbilityPayment { .. }
             | PendingCostMoveResume::ActivationMillPayment { .. }
             | PendingCostMoveResume::CounterCostRemovalPayment { .. }
-            | PendingCostMoveResume::LoyaltyActivation { .. } => true,
+            | PendingCostMoveResume::LoyaltyActivation { .. }
+            | PendingCostMoveResume::TurnFaceUpCostMove { .. } => true,
             // CR 116.2h: foretelling is a special action; its {2} is paid before
             // its exile move, which can then pause on a replacement.
             PendingCostMoveResume::Foretell { .. } => true,
@@ -9118,7 +9235,8 @@ impl PendingCostMoveResume {
             | PendingCostMoveResume::ActivationMillPayment { .. }
             | PendingCostMoveResume::LoyaltyActivation { .. }
             | PendingCostMoveResume::CounterAdditionUnlessPayment { .. }
-            | PendingCostMoveResume::RandomDiscardUnlessPayment(_) => None,
+            | PendingCostMoveResume::RandomDiscardUnlessPayment(_)
+            | PendingCostMoveResume::TurnFaceUpCostMove { .. } => None,
         }
     }
 }
@@ -9640,7 +9758,8 @@ impl GameState {
                 match self.pending_deferred_life_cost_resume.as_ref()? {
                     DeferredLifeCostResume::Cast { pending, .. } => pending.as_deref(),
                     DeferredLifeCostResume::PayAmount { .. }
-                    | DeferredLifeCostResume::ManaRoot { .. } => None,
+                    | DeferredLifeCostResume::ManaRoot { .. }
+                    | DeferredLifeCostResume::TurnFaceUp { .. } => None,
                 }
             }
             PendingCastOwner::CostMove => match self.pending_cost_move_resume.as_ref()? {
@@ -9664,7 +9783,8 @@ impl GameState {
                 | PendingCostMoveResume::ManaAbilityPayment { .. }
                 | PendingCostMoveResume::LoyaltyActivation { .. }
                 | PendingCostMoveResume::CounterAdditionUnlessPayment { .. }
-                | PendingCostMoveResume::RandomDiscardUnlessPayment(..) => None,
+                | PendingCostMoveResume::RandomDiscardUnlessPayment(..)
+                | PendingCostMoveResume::TurnFaceUpCostMove { .. } => None,
             },
             PendingCastOwner::DiscardForCost => match self.pending_discard_for_cost.as_deref()? {
                 PendingDiscardForCostResume::Chosen { pending, .. }
@@ -9685,7 +9805,8 @@ impl GameState {
                 match self.pending_deferred_life_cost_resume.as_mut()? {
                     DeferredLifeCostResume::Cast { pending, .. } => pending.as_deref_mut(),
                     DeferredLifeCostResume::PayAmount { .. }
-                    | DeferredLifeCostResume::ManaRoot { .. } => None,
+                    | DeferredLifeCostResume::ManaRoot { .. }
+                    | DeferredLifeCostResume::TurnFaceUp { .. } => None,
                 }
             }
             PendingCastOwner::CostMove => match self.pending_cost_move_resume.as_mut()? {
@@ -9709,7 +9830,8 @@ impl GameState {
                 | PendingCostMoveResume::ManaAbilityPayment { .. }
                 | PendingCostMoveResume::LoyaltyActivation { .. }
                 | PendingCostMoveResume::CounterAdditionUnlessPayment { .. }
-                | PendingCostMoveResume::RandomDiscardUnlessPayment(..) => None,
+                | PendingCostMoveResume::RandomDiscardUnlessPayment(..)
+                | PendingCostMoveResume::TurnFaceUpCostMove { .. } => None,
             },
             PendingCastOwner::DiscardForCost => {
                 match self.pending_discard_for_cost.as_deref_mut()? {
@@ -9900,7 +10022,8 @@ pub enum ManaAbilityResume {
     /// completes.
     TurnFaceUp {
         player: PlayerId,
-        object_id: ObjectId,
+        #[serde(alias = "object_id")]
+        source: ObjectIncarnationRef,
         cost: ManaCost,
         /// The announced value for a cost that contained X. `None` means the
         /// cost had no X; `Some(0)` remains a real CR 107.3d announcement and
@@ -10015,6 +10138,10 @@ fn visit_cost_move_resume_events(
             ..
         }
         | PendingCostMoveResume::SacrificeForCost {
+            deferred_cost_events,
+            ..
+        }
+        | PendingCostMoveResume::TurnFaceUpCostMove {
             deferred_cost_events,
             ..
         } => deferred_cost_events.iter_mut().for_each(&mut *f),
@@ -11815,6 +11942,15 @@ pub enum CostResume {
     /// CR 118.12: Resume a resolution-time `Effect::PayCost` after the payer
     /// selects objects for an interactive cost such as tapping creatures.
     Resolution,
+    /// CR 702.37e + CR 116.2b + CR 118.1 + CR 118.3: Resumption context after paying a non-mana cost
+    /// (e.g. ReturnToHand, Discard, PayLife, Reveal, Sacrifice) to turn a face-down permanent face up.
+    TurnFaceUp {
+        #[serde(alias = "object_id")]
+        source: ObjectIncarnationRef,
+        cost_source: crate::types::ability::TurnUpCostSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remaining_cost: Option<Box<AbilityCost>>,
+    },
 }
 
 /// CR 601.2h + CR 702.48c: Identifies which spell-cost component a
@@ -19436,7 +19572,9 @@ impl WaitingFor {
                     spell: pending_cast,
                     ..
                 } => Some(pending_cast),
-                CostResume::ManaAbility { .. } | CostResume::Resolution => None,
+                CostResume::ManaAbility { .. }
+                | CostResume::Resolution
+                | CostResume::TurnFaceUp { .. } => None,
             },
             WaitingFor::CollectEvidenceChoice { resume, .. } => match resume.as_ref() {
                 CollectEvidenceResume::Casting { pending_cast, .. } => Some(pending_cast),
@@ -19472,7 +19610,9 @@ impl WaitingFor {
                     spell: pending_cast,
                     ..
                 } => Some(pending_cast),
-                CostResume::ManaAbility { .. } | CostResume::Resolution => None,
+                CostResume::ManaAbility { .. }
+                | CostResume::Resolution
+                | CostResume::TurnFaceUp { .. } => None,
             },
             WaitingFor::CollectEvidenceChoice { resume, .. } => match resume.as_mut() {
                 CollectEvidenceResume::Casting { pending_cast, .. } => Some(pending_cast),
@@ -19521,7 +19661,10 @@ impl WaitingFor {
         (self.has_pending_cast() && !matches!(self, WaitingFor::ManaSourceSelection { .. }))
             || matches!(
                 self,
-                WaitingFor::EquipTarget { .. }
+                WaitingFor::PayCost {
+                    resume: CostResume::TurnFaceUp { .. },
+                    ..
+                } | WaitingFor::EquipTarget { .. }
                     | WaitingFor::CrewVehicle { .. }
                     | WaitingFor::StationTarget { .. }
                     | WaitingFor::SaddleMount { .. }
@@ -19723,7 +19866,8 @@ impl WaitingFor {
                 CostResume::ManaAbility { mana_ability } => Some(mana_ability),
                 CostResume::Spell { .. }
                 | CostResume::SpellCost { .. }
-                | CostResume::Resolution => None,
+                | CostResume::Resolution
+                | CostResume::TurnFaceUp { .. } => None,
             },
             WaitingFor::CollectEvidenceChoice { resume, .. } => match resume.as_ref() {
                 CollectEvidenceResume::ManaAbility {
@@ -24228,6 +24372,16 @@ declare_game_state! {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merged_card_component_route: Option<MergedCardComponentRoute>,
 
+    /// CR 800.4a + CR 603.6c: how the object the player-leaves-game procedure is
+    /// about to move leaves its zone. Set by `elimination` immediately before
+    /// that object's move and consumed by `zones::move_to_zone` when it builds
+    /// the zone-change record, so the record (and the journaled command that
+    /// carries it) says `LeftGame` before it is recorded. Purely synchronous
+    /// (set, consumed, cleared in the same move), so it never survives a
+    /// pause; the serde guard is belt-and-suspenders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leaving_game_departure: Option<LeavingGameDeparture>,
+
     /// CR 705.2: Result of the most recent coin flip in the current resolution,
     /// carrying the flipper so `AbilityCondition::CoinFlipOutcome` is
     /// controller-relative. Written by the flip authority and read when a
@@ -25921,7 +26075,8 @@ fn visit_cost_move_resume_chains<'a>(
             visit_mana_cost_cursor_chains(cursor, f)
         }
         PendingCostMoveResume::ReplacementMayCost { .. }
-        | PendingCostMoveResume::Foretell { .. } => Ok(()),
+        | PendingCostMoveResume::Foretell { .. }
+        | PendingCostMoveResume::TurnFaceUpCostMove { .. } => Ok(()),
     }
 }
 
@@ -25936,7 +26091,9 @@ fn visit_deferred_life_cost_resume_chains<'a>(
         DeferredLifeCostResume::ManaRoot { resume, .. } => {
             visit_mana_ability_resume_chains(resume, f)
         }
-        DeferredLifeCostResume::PayAmount { .. } => Ok(()),
+        DeferredLifeCostResume::PayAmount { .. } | DeferredLifeCostResume::TurnFaceUp { .. } => {
+            Ok(())
+        }
     }
 }
 
@@ -25952,7 +26109,7 @@ fn visit_cost_resume_chains<'a>(
             visit_pending_mana_ability_chains(mana_ability, f)
         }
         // The resolving chain itself owns this payment's rider.
-        CostResume::Resolution => Ok(()),
+        CostResume::Resolution | CostResume::TurnFaceUp { .. } => Ok(()),
     }
 }
 
@@ -32090,6 +32247,7 @@ impl GameState {
             resolving_player_scope_tail: None,
             resolving_created_token_seats: None,
             merged_card_component_route: None,
+            leaving_game_departure: None,
             resolution_coin_flip: None,
             repeat_process_requested: None,
             pending_player_scope_sacrifice_choice: None,
@@ -34151,7 +34309,9 @@ impl GameState {
                 DeferredLifeCostResume::ManaRoot { resume, .. } => {
                     visit_mana_ability_resume_events(resume, f);
                 }
-                DeferredLifeCostResume::Cast { .. } | DeferredLifeCostResume::PayAmount { .. } => {}
+                DeferredLifeCostResume::Cast { .. }
+                | DeferredLifeCostResume::PayAmount { .. }
+                | DeferredLifeCostResume::TurnFaceUp { .. } => {}
             }
         }
     }
@@ -35184,6 +35344,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         resolving_player_scope_tail: _,
         resolving_created_token_seats: _,
         merged_card_component_route: _,
+        leaving_game_departure: _,
         resolution_coin_flip: _,
         repeat_process_requested: _,
         may_trigger_auto_choices: _,
@@ -40673,6 +40834,7 @@ mod tests {
                 deferred_events: vec![event.clone()],
                 ..PendingPlayerScopeSacrificeCompletion::default()
             },
+            resolving_entry: None,
         });
         let StackEntryKind::TriggeredAbility { trigger_event, .. } = &mut state
             .stack
@@ -48921,6 +49083,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn allows_cancel_cast_covers_turn_face_up_pay_cost() {
+        let turn_face_up = WaitingFor::PayCost {
+            player: PlayerId(0),
+            kind: PayCostKind::ReturnToHand,
+            choices: vec![ObjectId(2)],
+            count: 2,
+            min_count: 2,
+            resume: CostResume::TurnFaceUp {
+                source: ObjectIncarnationRef::of(ObjectId(1), 1),
+                cost_source: crate::types::ability::TurnUpCostSource::Morph,
+                remaining_cost: None,
+            },
+        };
+        assert!(turn_face_up.allows_cancel_cast());
+        assert!(!turn_face_up.has_pending_cast());
+
+        let resolution = WaitingFor::PayCost {
+            player: PlayerId(0),
+            kind: PayCostKind::ReturnToHand,
+            choices: vec![ObjectId(2)],
+            count: 1,
+            min_count: 1,
+            resume: CostResume::Resolution,
+        };
+        assert!(!resolution.allows_cancel_cast());
+    }
+
     /// The broadening flips exactly the four keyword states: Priority,
     /// ManaSourceSelection, and the modal shapes (which own their own
     /// CancelCast pushes) still report false.
@@ -49412,6 +49602,54 @@ mod tests {
             reserialized["remaining_batches"],
             serde_json::json!([[1, [2, 3]]]),
             "a legacy mass-order queue must retain its migration authority across a save"
+        );
+    }
+
+    /// CR 608.2c: a player-scope sacrifice carrier saved before it recorded the
+    /// resolution that wrote it decodes with no entry provenance, so it binds on
+    /// its instruction source and carrier shape alone; a carrier with no
+    /// provenance writes none.
+    #[test]
+    fn pending_player_scope_sacrifice_choice_decodes_without_entry_provenance() {
+        let pending = PendingPlayerScopeSacrificeChoice {
+            ability: Box::new(ResolvedAbility::new(
+                Effect::Sacrifice {
+                    target: TargetFilter::Any,
+                    count: QuantityExpr::Fixed { value: 1 },
+                    min_count: 1,
+                },
+                Vec::new(),
+                ObjectId(10),
+                PlayerId(0),
+            )),
+            remaining_players: vec![PlayerId(1)],
+            selections: vec![(PlayerId(0), vec![ObjectId(11)])],
+            completion: PendingPlayerScopeSacrificeCompletion::default(),
+            resolving_entry: Some(ObjectId(12)),
+        };
+        let mut wire = serde_json::to_value(&pending).unwrap();
+        assert_eq!(wire["resolving_entry"], serde_json::json!(12));
+        wire.as_object_mut()
+            .expect("the carrier serializes as an object")
+            .remove("resolving_entry");
+
+        let decoded: PendingPlayerScopeSacrificeChoice = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            decoded.resolving_entry, None,
+            "an older save without entry provenance binds on the instruction source alone"
+        );
+        assert_eq!(
+            decoded,
+            PendingPlayerScopeSacrificeChoice {
+                resolving_entry: None,
+                ..pending
+            }
+        );
+
+        let reserialized = serde_json::to_value(&decoded).unwrap();
+        assert!(
+            reserialized.get("resolving_entry").is_none(),
+            "a carrier with no entry provenance writes no `resolving_entry` key"
         );
     }
 
@@ -54022,6 +54260,7 @@ mod restored_exact_attack_authority_tests {
                             remaining_players: vec![],
                             selections: vec![],
                             completion: Default::default(),
+                            resolving_entry: None,
                         });
                     state.waiting_for.clone()
                 }
