@@ -2920,8 +2920,10 @@ fn member_bound_filter_prop(p: &FilterProp) -> bool {
         // that member's own pairings (live combat, or its departure row's
         // `block_pairs` once it has left) or its own block-history records, so
         // two co-triggering sources touch different creatures and are not one
-        // shared function. Two Abu Ja'fars dying together must prompt. A
-        // parent-target subject is a declared target, closed by the target gate.
+        // shared function. Two such triggers from one event must prompt (the
+        // same-event discriminator); two Abu Ja'fars dying together prompt through
+        // the batch `reads_source_combat_pairing` row. A parent-target subject is
+        // a declared target, closed by the target gate.
         FilterProp::CombatRelation {
             relation: _,
             subject: CombatRelationSubject::Source,
