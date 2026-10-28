@@ -643,8 +643,10 @@ pub(crate) struct RwProfile {
     /// blocking or blocked by it"). A departed source answers from its own
     /// departure row, so co-departing members touch different creatures, and
     /// what each one sets off (a leaves trigger, CR 603.6c) lands between them:
-    /// the order is observable. A subset of `reads_member_bound`, kept apart so
-    /// the batch depth can prompt on it alone. `drop_writes` keeps it (a read).
+    /// the order is observable. Set wherever such a filter is profiled as a
+    /// write target or membership read, so the batch depth can prompt on it
+    /// alone; the same-event depth answers through `reads_member_bound`.
+    /// `drop_writes` keeps it (a read).
     reads_source_combat_pairing: bool,
     /// CR 613.4b-c: the scopes at which the profile reads live power/toughness
     /// after layer 7c. A `BasePower` read shares the ObjectPt axis for ordinary

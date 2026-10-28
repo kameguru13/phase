@@ -15,7 +15,7 @@ use engine::types::ability::TargetRef;
 use engine::types::actions::GameAction;
 use engine::types::game_state::{CastPaymentMode, GameState, StackEntryKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
-use engine::types::mana::{ManaType, ManaUnit};
+use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
@@ -1036,6 +1036,10 @@ fn two_cathedral_membranes_dying_together(stinger_first: bool) -> Zone {
     scenario.at_phase(Phase::PreCombatMain);
     let driver = scenario
         .add_creature_from_oracle(P0, "Driver of the Dead", 3, 2, DRIVER_OF_THE_DEAD)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Black],
+            generic: 3,
+        })
         .id();
     let stinger = scenario
         .add_creature_from_oracle(P0, "Deathtouch Stinger", 1, 1, "Deathtouch")
