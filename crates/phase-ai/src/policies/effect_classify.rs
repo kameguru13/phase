@@ -18,6 +18,7 @@ use engine::types::zones::Zone;
 
 use super::context::PolicyContext;
 use super::self_protection_classify::effect_has_defensive_payload;
+use crate::cast_facts::{collect_definition_effects, CastFacts};
 
 /// Player-impact magnitude above which target selection has a directional
 /// preference rather than falling back to the spell's broader polarity.
@@ -2093,6 +2094,20 @@ pub(crate) fn effect_is_combat_trick_payload(effect: &Effect) -> bool {
         }
         _ => false,
     }
+}
+
+/// The effects a cast spell itself resolves: its spell abilities (CR 113.3a + CR 608.2), read
+/// through `CastFacts::primary_effects`' `AbilityKind::Spell` filter. A permanent spell's
+/// activated and triggered abilities (CR 113.3b + CR 113.3c) resolve only once activated or
+/// triggered, after the permanent has entered (CR 608.3a + CR 603.6a), so a combat-window
+/// payload among them is not the cast's.
+pub(crate) fn spell_resolution_effects<'a>(facts: &CastFacts<'a>) -> Vec<&'a Effect> {
+    facts
+        .primary_effects
+        .iter()
+        .copied()
+        .flat_map(collect_definition_effects)
+        .collect()
 }
 
 #[cfg(test)]

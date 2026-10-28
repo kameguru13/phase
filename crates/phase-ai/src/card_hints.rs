@@ -8,7 +8,7 @@ use engine::types::player::PlayerId;
 
 use crate::cast_facts::{cast_facts_for_action, CastFacts};
 use crate::eval::opponent_battlefield_creature_threat_value;
-use crate::policies::effect_classify::effect_is_combat_trick_payload;
+use crate::policies::effect_classify::{effect_is_combat_trick_payload, spell_resolution_effects};
 use crate::policies::hand_disruption::disruption_window_score;
 #[cfg(test)]
 use engine::types::game_state::CastPaymentMode;
@@ -53,9 +53,11 @@ pub(crate) fn should_play_now_with_facts(
             let has_damage = immediate_effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::DealDamage { .. }));
-            let has_pump = immediate_effects
-                .iter()
-                .any(|effect| effect_is_combat_trick_payload(effect));
+            // CR 611.2a + CR 514.2: only the spell's own resolution times it as a combat trick;
+            // an enters-trigger pump on a permanent cast precombat lasts through that combat.
+            let has_pump = spell_resolution_effects(facts)
+                .into_iter()
+                .any(effect_is_combat_trick_payload);
             let has_counter = immediate_effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::Counter { .. }));
@@ -176,6 +178,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::cast_facts::collect_definition_effects;
     use engine::game::zones::create_object;
     use engine::types::ability::{
         AbilityDefinition, AbilityKind, Effect, PtValue, TargetFilter, TriggerDefinition,
@@ -832,5 +835,88 @@ mod tests {
         let ds = under_murder("Dwarven Song", DWARVEN_SONG);
         assert_eq!(under_murder("Heroic Intervention", HEROIC_INTERVENTION), ds);
         assert_eq!(under_murder("Adamant Will", ADAMANT_WILL), ds);
+    }
+
+    const BLADE_TRIBE_BERSERKERS: &str = "Metalcraft — When this creature enters, if you control three or more artifacts, this creature gets +3/+3 and gains haste until end of turn.";
+    const CENTAUR_HEALER: &str = "When this creature enters, you gain 3 life.";
+
+    /// CR 608.3a + CR 603.6a + CR 611.2a: an enters trigger's pump on a permanent cast in the
+    /// precombat main phase lasts through that turn's combat, so the cast is not timed as a
+    /// combat trick. Blade-Tribe Berserkers' until-end-of-turn "+3/+3 and gains haste" enters
+    /// trigger takes the creature hint, the one Centaur Healer's lifegain enters trigger earns on
+    /// the same 3/3 body, and never falls below a vanilla 3/3's.
+    #[test]
+    fn should_play_now_does_not_time_an_enters_pump_creature_like_a_pump() {
+        let etb = |name, oracle_text| {
+            let triggers = engine::parser::oracle::parse_oracle_text(
+                oracle_text,
+                name,
+                &[],
+                &["Creature".to_string()],
+                &[],
+            )
+            .triggers;
+            assert_eq!(triggers.len(), 1, "premise: {name} has one enters trigger");
+            triggers.into_iter().next().unwrap()
+        };
+        let berserkers_etb = etb("Blade-Tribe Berserkers", BLADE_TRIBE_BERSERKERS);
+        assert!(
+            berserkers_etb
+                .execute
+                .as_deref()
+                .is_some_and(|execute| collect_definition_effects(execute)
+                    .into_iter()
+                    .any(effect_is_combat_trick_payload)),
+            "premise: Blade-Tribe Berserkers' enters trigger carries a combat-trick payload: \
+             {berserkers_etb:?}"
+        );
+
+        // The same 3/3 creature body for every row, with or without an enters trigger.
+        let hint = |trigger: Option<TriggerDefinition>| {
+            let mut state = make_state();
+            let card_id = add_spell_to_hand(
+                &mut state,
+                PlayerId(0),
+                "Body",
+                CoreType::Creature,
+                Vec::new(),
+            );
+            let object_id = state
+                .objects
+                .values()
+                .find(|object| object.card_id == card_id)
+                .map(|object| object.id)
+                .unwrap();
+            let obj = state.objects.get_mut(&object_id).unwrap();
+            obj.power = Some(3);
+            obj.toughness = Some(3);
+            if let Some(trigger) = trigger {
+                obj.trigger_definitions.push(trigger);
+            }
+            let action = GameAction::CastSpell {
+                object_id,
+                card_id,
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::Auto,
+            };
+            let facts = cast_facts_for_action(&state, &action, PlayerId(0)).unwrap();
+            let immediate_etb = !facts.immediate_etb_triggers.is_empty();
+            (should_play_now(&state, &action, PlayerId(0)), immediate_etb)
+        };
+        let (berserkers, berserkers_reach) = hint(Some(berserkers_etb));
+        let (healer, healer_reach) = hint(Some(etb("Centaur Healer", CENTAUR_HEALER)));
+        let (vanilla, _) = hint(None);
+        assert!(
+            berserkers_reach && healer_reach,
+            "reach: both enters triggers are read as the cast's immediate enters triggers"
+        );
+        assert_eq!(
+            berserkers, healer,
+            "Blade-Tribe Berserkers must take Centaur Healer's creature hint"
+        );
+        assert!(
+            berserkers >= vanilla,
+            "Blade-Tribe Berserkers {berserkers} must not fall below a vanilla 3/3's {vanilla}"
+        );
     }
 }

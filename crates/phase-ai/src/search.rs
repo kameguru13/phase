@@ -4143,7 +4143,7 @@ fn run_iterative_deepening(
                 // Action failed simulation — same penalty as origin/main so the
                 // AI prefers any valid alternative.
                 RootLine::Unsearched {
-                    score: r.score - 1000.0,
+                    score: r.tactical_total() - 1000.0,
                 }
             };
             rung_lines.push(RootRungScore {
@@ -15599,6 +15599,36 @@ mod tests {
         assert_eq!(out, vec![(cast.action, f64::NEG_INFINITY)]);
     }
 
+    /// A held activation whose successor simulation fails keeps its deferral under the
+    /// failed-simulation penalty: its unsearched score is `tactical_total() - 1000.0`, so the
+    /// patience hold still orders it among the other failed candidates.
+    #[test]
+    fn unsimulated_held_root_candidate_keeps_its_deferral() {
+        let state = searchable_state();
+        let mut config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(7);
+        config.search.planner_mode = PlannerMode::BeamOnly; // rung 0 only
+        let missing_source = ObjectId(u64::MAX);
+        assert!(
+            !state.objects.contains_key(&missing_source),
+            "premise: the activation's source does not exist, so its simulation fails"
+        );
+        let held = CandidateAction {
+            action: activate(missing_source, 0),
+            metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Ability),
+        };
+        let (score, deferral) = (0.5, -1.5);
+
+        let mut services =
+            PlannerServices::new_default(PlayerId(0), &config, PolicyRegistry::shared());
+        let ranked = vec![RankedCandidate::new(held.clone(), score).with_deferral(Some(deferral))];
+        let out = run_iterative_deepening(&state, ranked, 0.1, &config, &mut services);
+        assert!(
+            services.memo_witness.successor_simulations > 0,
+            "reach: the held candidate requests its successor simulation"
+        );
+        assert_eq!(out, vec![(held.action, score + deferral - 1000.0)]);
+    }
+
     // V6: the rung witness records completion + node usage for every executed rung.
     #[test]
     fn rung_stats_record_completion_and_node_usage() {
@@ -20764,9 +20794,11 @@ one on the bottom of your library.";
     /// D1 at the root (the mtg-bot Coordinated Assault regression): in the AI's own Draw step
     /// EffectTiming prices Coordinated Assault's until-end-of-turn `GenericEffect` pump as a
     /// combat trick (CR 611.2a + CR 514.2), and the searched root carries that verdict at the
-    /// own-Draw weight 0.35.
+    /// own-Draw weight 0.35. Giant Growth is no reference here: tactical_gate::assess_pre_cast
+    /// rejects a fixed-P/T Pump spell in this window before scoring, and that gate does not read
+    /// GenericEffect pumps.
     #[test]
-    fn own_draw_root_prices_a_generic_effect_pump_like_a_pump() {
+    fn own_draw_root_carries_the_trick_verdict_on_a_generic_effect_pump_at_0_35() {
         use crate::policies::registry::NUDGE_MAX;
 
         let mut scenario = GameScenario::new();

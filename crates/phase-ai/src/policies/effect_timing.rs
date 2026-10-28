@@ -20,7 +20,8 @@ use crate::features::DeckFeatures;
 use super::activation::turn_only;
 use super::context::{collect_ability_effects, PolicyContext};
 use super::effect_classify::{
-    effect_is_combat_trick_payload, extract_target_filter, targets_creatures_only,
+    effect_is_combat_trick_payload, extract_target_filter, spell_resolution_effects,
+    targets_creatures_only,
 };
 use super::registry::{
     DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy, STRONG_MAX,
@@ -46,12 +47,32 @@ impl EffectTimingPolicy {
                 Effect::Destroy { .. } => removal_score(ctx),
                 Effect::DealDamage { .. } => burn_score(ctx),
                 Effect::Counter { .. } => counterspell_score(ctx),
-                effect if effect_is_combat_trick_payload(effect) => combat_trick_score(ctx),
                 _ => 0.0,
             };
         }
 
+        // CR 611.2a + CR 514.2: a combat-window payload is priced only when the candidate itself
+        // resolves it, so a permanent spell is not timed by what its abilities do later.
+        for effect in own_resolution_effects(ctx) {
+            if effect_is_combat_trick_payload(effect) {
+                score += combat_trick_score(ctx);
+            }
+        }
+
         score
+    }
+}
+
+/// The effects the candidate itself resolves. A cast spell resolves its spell abilities
+/// ([`spell_resolution_effects`]); every other candidate's [`PolicyContext::effects`] is
+/// already the one ability it activates, chooses modes for, or targets with.
+fn own_resolution_effects<'a>(ctx: &PolicyContext<'a>) -> Vec<&'a Effect> {
+    match &ctx.candidate.action {
+        GameAction::CastSpell { .. } => ctx
+            .cast_facts()
+            .map(|facts| spell_resolution_effects(&facts))
+            .unwrap_or_default(),
+        _ => ctx.effects(),
     }
 }
 
@@ -2880,6 +2901,90 @@ mod tests {
             assert!(
                 (activate(mor) - activate(ww)).abs() < 1e-9,
                 "{label}: Mother of Runes' activation must price as Wellwisher's"
+            );
+        }
+    }
+
+    const AKKI_DRILLMASTER: &str = "{T}: Target creature gains haste until end of turn.";
+    const SHIVAN_DRAGON: &str = "Flying\n{R}: This creature gets +1/+0 until end of turn.";
+
+    /// A creature card in P0's hand with `mana_cost` and `abilities`.
+    fn creature_in_hand(
+        state: &mut GameState,
+        name: &str,
+        mana_cost: ManaCost,
+        abilities: Vec<AbilityDefinition>,
+    ) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(state.next_object_id),
+            P0,
+            name.to_string(),
+            Zone::Hand,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.mana_cost = mana_cost;
+        obj.abilities = std::sync::Arc::new(abilities);
+        id
+    }
+
+    /// CR 113.3b + CR 608.3a + CR 611.2a: a permanent spell's activated pump resolves only once
+    /// it is activated, after the permanent has entered, so it does not make the cast a combat
+    /// trick. Akki Drillmaster's "{T}: Target creature gains haste until end of turn." (an
+    /// until-end-of-turn `GenericEffect`) and Shivan Dragon's "{R}: This creature gets +1/+0
+    /// until end of turn." (a `Pump`) price their precombat-main cast as a vanilla creature of
+    /// the same cost does, on a board where Coordinated Assault takes the trick penalty.
+    #[test]
+    fn effect_timing_does_not_price_a_permanent_spells_activated_pump_as_a_combat_trick() {
+        use engine::types::mana::ManaCostShard::Red;
+
+        let cost = |shards: Vec<_>, generic| ManaCost::Cost { shards, generic };
+        for (name, oracle_text, keywords, mana_cost) in [
+            (
+                "Akki Drillmaster",
+                AKKI_DRILLMASTER,
+                &[][..],
+                cost(vec![Red], 2),
+            ),
+            (
+                "Shivan Dragon",
+                SHIVAN_DRAGON,
+                &["Flying"][..],
+                cost(vec![Red, Red], 4),
+            ),
+        ] {
+            let keywords: Vec<String> = keywords.iter().map(|k| k.to_string()).collect();
+            let abilities = engine::parser::oracle::parse_oracle_text(
+                oracle_text,
+                name,
+                &keywords,
+                &["Creature".to_string()],
+                &[],
+            )
+            .abilities;
+            assert!(
+                abilities.iter().all(|a| a.kind != AbilityKind::Spell)
+                    && abilities.iter().any(|a| a.kind == AbilityKind::Activated
+                        && effect_is_combat_trick_payload(&a.effect)),
+                "premise: {name} carries a combat-trick payload in an activated ability and has \
+                 no spell ability: {abilities:?}"
+            );
+
+            let mut state = d1_board(Phase::PreCombatMain, P0);
+            let card = creature_in_hand(&mut state, name, mana_cost.clone(), abilities);
+            let vanilla = creature_in_hand(&mut state, "Vanilla", mana_cost, Vec::new());
+            let ca = oracle_instant(&mut state, P0, "Coordinated Assault", COORDINATED_ASSAULT);
+            let d = |id| timing_delta(&state, &cast_candidate(&state, id));
+            let d_vanilla = d(vanilla);
+            assert!(
+                d(ca) < d_vanilla - 1.5,
+                "{name}: reach: the trick penalty fires on this board"
+            );
+            assert!(
+                (d(card) - d_vanilla).abs() < 1e-9,
+                "{name}: the cast {} must price as a vanilla creature's {d_vanilla}",
+                d(card)
             );
         }
     }
