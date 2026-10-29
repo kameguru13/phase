@@ -32,6 +32,8 @@ runs:
       #   - engine sources, plus crates/engine/data/** and build.rs, which the
       #     engine lib compiles in (include_str! / OUT_DIR embed)
       #   - crates/engine/Cargo.toml and Cargo.lock (dep bumps such as nom)
+      #   - data/bracket_lists.json, which oracle-gen reads from its data dir and
+      #     stamps into each card's bracket signals
       # Tracked inputs use `git ls-files -s`: the index blob SHAs of the
       # checked-out tree, a content hash with no file reads. Reading the index
       # rather than the work tree also keeps the key fixed when oracle-gen's
@@ -49,6 +51,7 @@ runs:
           crates/engine/build.rs
           crates/engine/Cargo.toml
           Cargo.lock
+          data/bracket_lists.json
         )
         # Validate each path independently, so a rename that drops one input
         # from the key fails loudly instead of silently freezing the key on it.
