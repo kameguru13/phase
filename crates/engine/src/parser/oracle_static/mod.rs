@@ -59,7 +59,7 @@ mod prelude {
         noncreature_subtype_set, CoreType, SubtypeSet, Supertype,
     };
     pub(super) use crate::types::counter::{parse_counter_type, CounterMatch};
-    pub(super) use crate::types::events::ActivatedAbilityKind;
+    pub(super) use crate::types::event_kinds::ActivatedAbilityKind;
     pub(super) use crate::types::keywords::{Keyword, KeywordKind};
     pub(super) use crate::types::mana::{ManaColor, ManaCost, ManaType, SpecialAction};
     pub(super) use crate::types::phase::Phase;
@@ -165,8 +165,9 @@ pub(crate) use grammar::parse_pt_mod;
 pub(crate) use grammar::promote_nested_ability_quotes;
 pub(crate) use grammar::typed_filter_for_subtype;
 pub(crate) use keyword_grant::{
-    classify_quoted_inner, parse_chosen_qualifier_subject, parse_continuous_modifications,
-    parse_graveyard_granted_keyword_kind, parse_quoted_ability_modifications, split_keyword_list,
+    classify_quoted_inner, find_refused_loyalty_grant_sentence, parse_chosen_qualifier_subject,
+    parse_continuous_modifications, parse_graveyard_granted_keyword_kind,
+    parse_quoted_ability_modifications, split_keyword_list,
     try_parse_graveyard_keyword_grant_clause, try_parse_graveyard_keyword_grant_static,
 };
 pub(crate) use mana_transform::{
@@ -215,7 +216,7 @@ pub(crate) fn parse_flashback_trailing_self_spell_cost_reduction(
     let mut def = static_helpers::try_parse_cost_modification(
         &text,
         &lower,
-        Some(crate::types::game_state::CastingVariant::Flashback),
+        Some(crate::types::game_state_kinds::CastingVariant::Flashback),
     )?;
     shared::populate_active_zones_from_condition(&mut def);
     Some(def)
