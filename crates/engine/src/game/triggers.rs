@@ -4884,6 +4884,15 @@ pub(crate) fn collect_logical_zone_trigger_settlement(
                     !matched.batched,
                     "settlement's collector path reserves batched triggers for carrier latches"
                 );
+                // CR 603.2 + CR 113.2c: discovery checked every candidate before
+                // any was recorded, so halves of one printed ability that share a
+                // limit key can both match this occurrence. Re-check each against
+                // the ledger as earlier candidates spend it, the same admission
+                // authority `TriggerCollectionSession::record_match` uses.
+                if !matched_trigger_constraint_allows_admission(state, &matched, &occurrence.event)
+                {
+                    continue;
+                }
                 record_trigger_fired_with_ref(
                     state,
                     matched.constraint.as_ref(),
@@ -49524,6 +49533,84 @@ pub mod tests {
         assert_eq!(
             settled[0].trigger_events, subject_events,
             "the settlement context retains the exact other occurrence"
+        );
+    }
+
+    /// CR 603.2 + CR 113.2c: settlement admits split halves of one printed
+    /// "triggers only once each turn" ability through the same ledger re-check as
+    /// ordinary collection. Both halves match the one replayed occurrence, so the
+    /// leading half's admission spends the shared key and the later half is
+    /// rejected instead of recording the key a second time.
+    #[test]
+    fn logical_zone_settlement_admits_one_split_half_per_shared_trigger_limit() {
+        let mut state = setup();
+        let observer = make_creature(&mut state, PlayerId(0), "Split dies observer", 0, 1);
+        let half = |offset| {
+            let mut trigger = TriggerDefinition::new(TriggerMode::ChangesZone)
+                .origin(Zone::Battlefield)
+                .destination(Zone::Graveyard)
+                .trigger_zones(vec![Zone::Battlefield, Zone::Graveyard])
+                .valid_card(TargetFilter::Typed(
+                    TypedFilter::default().with_type(TypeFilter::Creature),
+                ))
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Database,
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                        player: TargetFilter::Controller,
+                    },
+                ));
+            trigger.constraint = Some(TriggerConstraint::OncePerTurn {
+                spent_by: TriggerLimitSpend::Triggering,
+            });
+            trigger.limit_leader_offset = std::num::NonZeroUsize::new(offset);
+            trigger
+        };
+        let object = state.objects.get_mut(&observer).expect("observer exists");
+        std::sync::Arc::make_mut(&mut object.base_trigger_definitions).extend([half(0), half(1)]);
+        object.materialize_base_trigger_definitions();
+        let object = &state.objects[&observer];
+        let leader_ref = object.trigger_definition_ref(
+            object
+                .trigger_definitions
+                .iter_all()
+                .next()
+                .expect("the leading half is installed"),
+        );
+
+        let subject = make_creature(&mut state, PlayerId(0), "Settlement subject", 2, 2);
+        let mut group = allocate_logical_zone_change_group(&mut state, &[observer, subject]);
+        let mut subject_events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, subject, Zone::Graveyard, &mut subject_events);
+        group
+            .append_delivery_events(&subject_events)
+            .expect("retain the subject's occurrence");
+        let mut observer_events = Vec::new();
+        crate::game::zones::move_to_zone(
+            &mut state,
+            observer,
+            Zone::Graveyard,
+            &mut observer_events,
+        );
+        group
+            .append_delivery_events(&observer_events)
+            .expect("retain the observer's own occurrence");
+        latch_logical_zone_change_group_immediately_after(&mut state, &mut group);
+
+        let settled = collect_logical_zone_trigger_settlement(&mut state, &group)
+            .expect("complete departure contexts settle");
+        assert_eq!(
+            settled
+                .iter()
+                .filter(|context| context.pending.source_id == observer)
+                .count(),
+            1,
+            "one printed ability triggers once across its split halves"
+        );
+        assert_eq!(
+            state.triggers_fired_this_turn,
+            HashSet::from([leader_ref]),
+            "the admitted half spends the leading half's key exactly once"
         );
     }
 

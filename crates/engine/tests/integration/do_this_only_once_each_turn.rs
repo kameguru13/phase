@@ -1001,9 +1001,8 @@ fn corruption_of_towashi_declined_draw_leaves_its_other_half_free() {
     );
 }
 
-/// CR 113.2c + CR 603.2h: the shared limit runs both ways — drawing off the
-/// "enters transformed" half spends the "transforms" half too, so the ability
-/// draws once for the entry and not again for a later transform.
+/// CR 113.2c + CR 603.2h: the ability draws once across a transformed entry and a
+/// later transform.
 #[test]
 fn corruption_of_towashi_draw_on_an_enters_transformed_spends_its_transform_half() {
     let CorruptionBoard {

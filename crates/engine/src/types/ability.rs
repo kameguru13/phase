@@ -38137,7 +38137,10 @@ impl TriggerDefinitionRef {
     ///
     /// Known gap: a half whose occurrence has no ordered slot (a retained or granted
     /// copy, see [`TriggerDefinitionOccurrenceRef::preceding_slot`]) keys on itself,
-    /// so each such half spends its own limit.
+    /// so each such half spends its own limit. A `CopiedValue` step assumes the
+    /// halves stay adjacent in the copiable list; if only a later half is retained
+    /// or the leader is deduped, the step names a key that matches no live entry and
+    /// the half falls back to spending its own limit.
     pub fn limit_ledger_ref(&self, def: &TriggerDefinition) -> Cow<'_, TriggerDefinitionRef> {
         match def
             .limit_leader_offset

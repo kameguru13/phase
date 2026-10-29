@@ -1599,15 +1599,17 @@ fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameSt
     filtered.pending_trigger_firing = None;
     filtered.stack_trigger_firings.clear();
     filtered.resolving_trigger_firing = None;
-    // CR 400.2 + CR 401.2: trigger-limit ledgers are rules-execution authority keyed
-    // by stable ObjectIds (position handles once hidden), and their occurrences can
-    // name a printed card. No viewer consumer reads them.
+    // CR 400.2 + CR 401.2: trigger-limit ledgers and the batched zone-change replay
+    // guard are rules-execution authority keyed by stable ObjectIds (position handles
+    // once hidden), and their occurrences can name a printed card. No viewer consumer
+    // reads them.
     filtered.triggers_fired_this_turn.clear();
     filtered.trigger_fire_counts_this_turn.clear();
     filtered.triggers_fired_this_turn_per_opponent.clear();
     filtered.trigger_indicated_actions_this_turn.clear();
     filtered.triggers_fired_this_game.clear();
     filtered.triggered_abilities_added_mana_this_turn.clear();
+    filtered.batched_zone_change_trigger_fired.clear();
     for trigger in &mut filtered.delayed_triggers {
         trigger.provenance = crate::types::identifiers::DelayedInstallIdentity::LegacyDelayed;
     }
@@ -5140,7 +5142,10 @@ mod tests {
             state.triggers_fired_this_game.insert(key.clone());
             state
                 .triggered_abilities_added_mana_this_turn
-                .insert((key, PlayerId(0)));
+                .insert((key.clone(), PlayerId(0)));
+            state
+                .batched_zone_change_trigger_fired
+                .insert((key, state.turn_number, 0));
         }
         assert_eq!(state.objects[&hidden].zone, Zone::Library, "precondition");
         let authoritative = state.clone();
@@ -5155,6 +5160,7 @@ mod tests {
             assert!(filtered.trigger_indicated_actions_this_turn.is_empty());
             assert!(filtered.triggers_fired_this_game.is_empty());
             assert!(filtered.triggered_abilities_added_mana_this_turn.is_empty());
+            assert!(filtered.batched_zone_change_trigger_fired.is_empty());
         }
         assert_eq!(state.triggers_fired_this_turn.len(), 2);
         assert_eq!(state.trigger_fire_counts_this_turn.len(), 2);
@@ -5162,6 +5168,7 @@ mod tests {
         assert_eq!(state.trigger_indicated_actions_this_turn.len(), 2);
         assert_eq!(state.triggers_fired_this_game.len(), 2);
         assert_eq!(state.triggered_abilities_added_mana_this_turn.len(), 2);
+        assert_eq!(state.batched_zone_change_trigger_fired.len(), 2);
         assert!(
             state == authoritative,
             "filtering leaves the authoritative state unchanged"
