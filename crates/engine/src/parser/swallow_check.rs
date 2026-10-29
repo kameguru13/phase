@@ -33,18 +33,20 @@ use super::oracle_nom::error::OracleError;
 use super::oracle_nom::primitives::{scan_contains, scan_preceded, split_sentence_units};
 use super::oracle_target::{
     parse_block_pairing_clause, parse_source_blocked_history_clause, BlockPairingForm,
+    CombatRelationSubjectWord,
 };
 use super::oracle_trigger::parse_distributed_x_cost_condition;
 use super::swallow_evidence::UnitEvidence;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, ActivationRestriction, CastingPermission,
-    ChooseFromZoneConstraint, CoinFlipRun, CombatHistoryScope, CombatRelation, Comparator,
-    ContinuousModification, CopyRetargetPermission, DamageModification, DelayedTriggerCondition,
-    Duration, Effect, FilterProp, ManaProduction, ModalSelectionConstraint, OpponentMayScope,
-    ParsedCondition, PerPlayerScope, PlayerFilter, QuantityExpr, QuantityRef, ReplacementCondition,
-    ReplacementDefinition, ReplacementMode, RestrictionExpiry, SpellStackToGraveyardReplacement,
-    StaticCondition, StaticDefinition, TargetFilter, TriggerCondition, TriggerConstraint,
-    TriggerDefinition, UnlessPayScaling, ZoneOwner,
+    ChooseFromZoneConstraint, CoinFlipRun, CombatHistoryScope, CombatRelation,
+    CombatRelationSubject, Comparator, ContinuousModification, CopyRetargetPermission,
+    DamageModification, DelayedTriggerCondition, Duration, Effect, FilterProp, ManaProduction,
+    ModalSelectionConstraint, OpponentMayScope, ParsedCondition, PerPlayerScope, PlayerFilter,
+    QuantityExpr, QuantityRef, ReplacementCondition, ReplacementDefinition, ReplacementMode,
+    RestrictionExpiry, SpellStackToGraveyardReplacement, StaticCondition, StaticDefinition,
+    TargetFilter, TriggerCondition, TriggerConstraint, TriggerDefinition, UnlessPayScaling,
+    ZoneOwner,
 };
 use crate::types::ability_visit::{
     visit_ability_def, visit_replacement, visit_static, visit_trigger,
@@ -6326,35 +6328,39 @@ fn detect_combat_history_relation(
 /// and the effect silently widened to every creature of the type. Verb phrases
 /// ("becomes blocked by ~", "being blocked by") are consumed whole and skipped:
 /// they are trigger events and conditions, not postnominal restrictions.
+///
+/// Each clause needs its own filter: clauses are matched to filters by form and
+/// subject, and a line with more clauses of one kind than filters of that kind
+/// is reported, so a represented "blocking or blocked by this creature" can't
+/// vouch for an unbound "blocking or blocked by it" on the same line.
 fn detect_combat_pairing_relation(
     cleaned: &str,
     original: &str,
     evidence: &UnitEvidence,
     diagnostics: &mut Vec<OracleDiagnostic>,
 ) {
-    let represented = |form: BlockPairingForm| {
-        evidence.any::<FilterProp>(|prop| {
-            matches!(
-                (form, prop),
-                (
-                    BlockPairingForm::BlockingOrBlockedBy,
-                    FilterProp::CombatRelation {
-                        relation: CombatRelation::BlockingOrBlockedBy,
-                        ..
-                    },
-                ) | (
-                    BlockPairingForm::BlockedBy,
-                    FilterProp::CombatRelation {
-                        relation: CombatRelation::BlockedBySubject { scope: None },
-                        ..
-                    },
-                )
+    let represented = |form: BlockPairingForm, subject: CombatRelationSubject| {
+        evidence.count::<FilterProp>(|prop| match (form, prop) {
+            (
+                BlockPairingForm::BlockingOrBlockedBy,
+                FilterProp::CombatRelation {
+                    relation: CombatRelation::BlockingOrBlockedBy,
+                    subject: found,
+                },
             )
+            | (
+                BlockPairingForm::BlockedBy,
+                FilterProp::CombatRelation {
+                    relation: CombatRelation::BlockedBySubject { scope: None },
+                    subject: found,
+                },
+            ) => *found == subject,
+            _ => false,
         })
     };
+    let mut clauses: Vec<(BlockPairingForm, CombatRelationSubject)> = Vec::new();
     let mut remaining = cleaned;
-    let mut swallowed = false;
-    while let Some((_, form, rest)) = scan_preceded(remaining, |input| {
+    while let Some((_, clause, rest)) = scan_preceded(remaining, |input| {
         alt((
             value(
                 None,
@@ -6363,19 +6369,40 @@ fn detect_combat_pairing_relation(
                     tag("blocked by "),
                 ),
             ),
-            map(parse_block_pairing_clause, |(form, _)| Some(form)),
+            map(parse_block_pairing_clause, |(form, word)| {
+                Some((form, pairing_subject_of(word)))
+            }),
         ))
         .parse(input)
     }) {
-        swallowed |= form.is_some_and(|form| !represented(form));
+        clauses.extend(clause);
         remaining = rest;
     }
+    let swallowed = clauses.iter().any(|&(form, subject)| {
+        let wanted = clauses
+            .iter()
+            .filter(|&&clause| clause == (form, subject))
+            .count();
+        represented(form, subject) < wanted
+    });
     if swallowed {
         diagnostics.push(OracleDiagnostic::swallowed_clause(
             OracleSemanticFeature::CombatPairingRelation.detector_label(),
             truncate(original, 140),
             None,
         ));
+    }
+}
+
+/// The `CombatRelationSubject` a pairing clause's subject denotes when it is
+/// represented: the source for "it" / "~" / "this creature", the parent
+/// target for "target creature".
+fn pairing_subject_of(word: CombatRelationSubjectWord) -> CombatRelationSubject {
+    match word {
+        CombatRelationSubjectWord::Pronoun | CombatRelationSubjectWord::SelfName => {
+            CombatRelationSubject::Source
+        }
+        CombatRelationSubjectWord::TargetCreature => CombatRelationSubject::ParentTarget,
     }
 }
 
@@ -15365,6 +15392,43 @@ this spell's mana cost.\nDestroy target attacking creature without flying.",
                 parsed.parse_warnings
             );
         }
+    }
+
+    /// Each pairing clause needs its own filter, matched by form and subject: a
+    /// represented "blocking or blocked by this creature" does not vouch for an
+    /// unbound "blocking or blocked by it" on the same line, and a parent-target
+    /// filter does not represent a source clause.
+    #[test]
+    fn combat_pairing_relation_detector_matches_each_clause_to_its_own_filter() {
+        use crate::types::ability::{CombatRelation, CombatRelationSubject};
+        let pairing = |subject| {
+            serde_json::to_string(&FilterProp::CombatRelation {
+                relation: CombatRelation::BlockingOrBlockedBy,
+                subject,
+            })
+            .expect("a FilterProp serializes")
+        };
+        let source = pairing(CombatRelationSubject::Source);
+        let target = pairing(CombatRelationSubject::ParentTarget);
+        let text = "destroy all creatures blocking or blocked by this creature and all creatures blocking or blocked by it.";
+        let reports = |props: &[&str]| {
+            let evidence = UnitEvidence::from_json_for_test(&format!("[{}]", props.join(",")));
+            let mut diagnostics = Vec::new();
+            super::detect_combat_pairing_relation(text, text, &evidence, &mut diagnostics);
+            !diagnostics.is_empty()
+        };
+        assert!(
+            reports(&[&source]),
+            "two source clauses, one filter: the second clause is unrepresented"
+        );
+        assert!(
+            !reports(&[&source, &source]),
+            "one filter per clause: nothing is swallowed"
+        );
+        assert!(
+            reports(&[&source, &target]),
+            "a parent-target filter does not represent a source clause"
+        );
     }
 }
 
