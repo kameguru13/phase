@@ -1,6 +1,7 @@
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::ops::{BitOrAssign, ControlFlow};
 use std::sync::Arc;
 
@@ -26777,7 +26778,63 @@ impl TargetFilter {
                 filters.iter().find_map(TargetFilter::controller_scope)
             }
             TargetFilter::Not { filter } => filter.controller_scope(),
-            _ => None,
+            // Nested filters these helpers deliberately do not traverse: no card
+            // nests a scoped-player or parent-target controller inside them.
+            TargetFilter::StackAbility { .. }
+            | TargetFilter::TrackedSetFiltered { .. }
+            | TargetFilter::ChosenDamageSource { .. } => None,
+            TargetFilter::None
+            | TargetFilter::Any
+            | TargetFilter::Player
+            | TargetFilter::Controller
+            | TargetFilter::SourceController
+            | TargetFilter::ControllerAndControlledPermanents { .. }
+            | TargetFilter::Opponent
+            | TargetFilter::SelfRef
+            | TargetFilter::GrantingObject { .. }
+            | TargetFilter::SourceOrPaired
+            | TargetFilter::StackSpell
+            | TargetFilter::SpecificObject { .. }
+            | TargetFilter::SpecificPlayer { .. }
+            | TargetFilter::PlayerWhoChoseLabel { .. }
+            | TargetFilter::PlayerMatching { .. }
+            | TargetFilter::Neighbor { .. }
+            | TargetFilter::ScopedPlayer
+            | TargetFilter::AttachedTo
+            | TargetFilter::LastCreated
+            | TargetFilter::LastRevealed
+            | TargetFilter::LastZoneChanged
+            | TargetFilter::CostPaidObject
+            | TargetFilter::AmassedArmy
+            | TargetFilter::ChosenCard
+            | TargetFilter::TrackedSet { .. }
+            | TargetFilter::ExiledBySource
+            | TargetFilter::ExiledCardByIndex { .. }
+            | TargetFilter::TriggeringSpellController
+            | TargetFilter::TriggeringSpellOwner
+            | TargetFilter::TriggeringPlayer
+            | TargetFilter::TriggeringSource
+            | TargetFilter::AttackedPlayerOrPlaneswalker
+            | TargetFilter::EventTarget
+            | TargetFilter::TriggeringSourceController
+            | TargetFilter::EventTargetController
+            | TargetFilter::ParentTarget
+            | TargetFilter::ParentTargetSlot { .. }
+            | TargetFilter::DeclaredPlayer { .. }
+            | TargetFilter::ParentTargetController
+            | TargetFilter::ParentTargetOwner
+            | TargetFilter::SourceChosenPlayer
+            | TargetFilter::OriginalController
+            | TargetFilter::OriginalSource
+            | TargetFilter::PostReplacementSourceController
+            | TargetFilter::PostReplacementDamageSource
+            | TargetFilter::PostReplacementDamageTarget
+            | TargetFilter::PostReplacementDamageTargetOwner
+            | TargetFilter::DefendingPlayer
+            | TargetFilter::HasChosenName
+            | TargetFilter::Named { .. }
+            | TargetFilter::Owner
+            | TargetFilter::AllPlayers => None,
         }
     }
 
@@ -26800,7 +26857,63 @@ impl TargetFilter {
                 .iter()
                 .any(TargetFilter::uses_scoped_player_controller),
             TargetFilter::Not { filter } => filter.uses_scoped_player_controller(),
-            _ => false,
+            // Nested filters these helpers deliberately do not traverse: no card
+            // nests a scoped-player or parent-target controller inside them.
+            TargetFilter::StackAbility { .. }
+            | TargetFilter::TrackedSetFiltered { .. }
+            | TargetFilter::ChosenDamageSource { .. } => false,
+            TargetFilter::None
+            | TargetFilter::Any
+            | TargetFilter::Player
+            | TargetFilter::Controller
+            | TargetFilter::SourceController
+            | TargetFilter::ControllerAndControlledPermanents { .. }
+            | TargetFilter::Opponent
+            | TargetFilter::SelfRef
+            | TargetFilter::GrantingObject { .. }
+            | TargetFilter::SourceOrPaired
+            | TargetFilter::StackSpell
+            | TargetFilter::SpecificObject { .. }
+            | TargetFilter::SpecificPlayer { .. }
+            | TargetFilter::PlayerWhoChoseLabel { .. }
+            | TargetFilter::PlayerMatching { .. }
+            | TargetFilter::Neighbor { .. }
+            | TargetFilter::ScopedPlayer
+            | TargetFilter::AttachedTo
+            | TargetFilter::LastCreated
+            | TargetFilter::LastRevealed
+            | TargetFilter::LastZoneChanged
+            | TargetFilter::CostPaidObject
+            | TargetFilter::AmassedArmy
+            | TargetFilter::ChosenCard
+            | TargetFilter::TrackedSet { .. }
+            | TargetFilter::ExiledBySource
+            | TargetFilter::ExiledCardByIndex { .. }
+            | TargetFilter::TriggeringSpellController
+            | TargetFilter::TriggeringSpellOwner
+            | TargetFilter::TriggeringPlayer
+            | TargetFilter::TriggeringSource
+            | TargetFilter::AttackedPlayerOrPlaneswalker
+            | TargetFilter::EventTarget
+            | TargetFilter::TriggeringSourceController
+            | TargetFilter::EventTargetController
+            | TargetFilter::ParentTarget
+            | TargetFilter::ParentTargetSlot { .. }
+            | TargetFilter::DeclaredPlayer { .. }
+            | TargetFilter::ParentTargetController
+            | TargetFilter::ParentTargetOwner
+            | TargetFilter::SourceChosenPlayer
+            | TargetFilter::OriginalController
+            | TargetFilter::OriginalSource
+            | TargetFilter::PostReplacementSourceController
+            | TargetFilter::PostReplacementDamageSource
+            | TargetFilter::PostReplacementDamageTarget
+            | TargetFilter::PostReplacementDamageTargetOwner
+            | TargetFilter::DefendingPlayer
+            | TargetFilter::HasChosenName
+            | TargetFilter::Named { .. }
+            | TargetFilter::Owner
+            | TargetFilter::AllPlayers => false,
         }
     }
 
@@ -37654,6 +37767,13 @@ pub struct TriggerDefinition {
     pub description: Option<String>,
     #[serde(default)]
     pub constraint: Option<TriggerConstraint>,
+    /// CR 113.2c + CR 603.2 + CR 603.2h: a later half of one printed triggered
+    /// ability that a compound split lowered to several definitions; distance back
+    /// to the leading half, whose identity keys every per-definition limit ledger
+    /// (see [`TriggerDefinitionRef::limit_ledger_ref`]). `None` for an unsplit
+    /// ability and for the leading half.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_leader_offset: Option<NonZeroUsize>,
     #[serde(default)]
     pub condition: Option<TriggerCondition>,
     /// CR 508.1g: Pre-payment eligibility of the linked optional attack cost.
@@ -37955,6 +38075,48 @@ impl TriggerDefinitionOccurrenceRef {
             Self::Unmaterialized => None,
         }
     }
+
+    /// CR 113.2c: the slot `n` places before this one in the same ordered trigger
+    /// set, where the earlier halves of one printed ability that a compound split
+    /// lowered to several definitions live. `None` when this occurrence has no
+    /// ordered slot to step back through, or the step underflows.
+    pub fn preceding_slot(&self, n: NonZeroUsize) -> Option<Self> {
+        match self {
+            Self::Printed {
+                base_set,
+                printed_index,
+            } => Some(Self::Printed {
+                base_set: *base_set,
+                printed_index: printed_index.checked_sub(n.get())?,
+            }),
+            // The copied slot and its printed origin both index the copied
+            // printed list, so the halves stay adjacent in each.
+            Self::CopiedValue {
+                copy_effect,
+                copied_slot,
+                printed_origin,
+            } => Some(Self::CopiedValue {
+                copy_effect: *copy_effect,
+                copied_slot: copied_slot.checked_sub(n.get())?,
+                printed_origin: match printed_origin {
+                    Some(origin) => Some(TriggerPrintedOrigin {
+                        printed_ref: origin.printed_ref.clone(),
+                        printed_occurrence: origin.printed_occurrence.checked_sub(n.get())?,
+                    }),
+                    None => None,
+                },
+            }),
+            // Each retained half is its own producer (its `source_printed_index`
+            // is part of the producer key), so it holds its own grant instance;
+            // stepping back the index alone would name no live entry.
+            Self::CopyRetained { .. } => None,
+            // Grant instances carry no ordered printed slot.
+            Self::KeywordCompanion { .. }
+            | Self::Granted { .. }
+            | Self::ExpandedGrant { .. }
+            | Self::Unmaterialized => None,
+        }
+    }
 }
 
 /// Exact identity of a trigger definition that functions on one object
@@ -37963,6 +38125,31 @@ impl TriggerDefinitionOccurrenceRef {
 pub struct TriggerDefinitionRef {
     pub source: ObjectIncarnationRef,
     pub occurrence: TriggerDefinitionOccurrenceRef,
+}
+
+impl TriggerDefinitionRef {
+    /// CR 113.2c + CR 603.2 + CR 603.2h: the key under which `def`'s per-definition
+    /// limit ledgers (once each turn, once, the first N times each turn, and the
+    /// indicated action) are read and written. Every lowered half of one printed
+    /// ability keys on its leading half, so the ability spends one limit across all
+    /// its trigger events. Ability identity is unchanged: only the ledgers use this
+    /// key.
+    ///
+    /// Known gap: a half whose occurrence has no ordered slot (a retained or granted
+    /// copy, see [`TriggerDefinitionOccurrenceRef::preceding_slot`]) keys on itself,
+    /// so each such half spends its own limit.
+    pub fn limit_ledger_ref(&self, def: &TriggerDefinition) -> Cow<'_, TriggerDefinitionRef> {
+        match def
+            .limit_leader_offset
+            .and_then(|offset| self.occurrence.preceding_slot(offset))
+        {
+            Some(occurrence) => Cow::Owned(TriggerDefinitionRef {
+                source: self.source,
+                occurrence,
+            }),
+            None => Cow::Borrowed(self),
+        }
+    }
 }
 
 /// Identity-bearing runtime trigger entry.
@@ -38381,6 +38568,7 @@ impl TriggerDefinition {
             spell_cast_origin: OriginConstraint::Any,
             description: None,
             constraint: None,
+            limit_leader_offset: None,
             condition: None,
             attack_cost_condition: None,
             counter_filter: None,
@@ -47860,6 +48048,7 @@ mod tests {
             spell_cast_origin: OriginConstraint::Any,
             description: Some("When ~ dies, draw a card.".to_string()),
             constraint: None,
+            limit_leader_offset: std::num::NonZeroUsize::new(1),
             condition: None,
             attack_cost_condition: None,
             counter_filter: None,
@@ -47884,6 +48073,109 @@ mod tests {
         let json = serde_json::to_string(&trigger).unwrap();
         let deserialized: TriggerDefinition = serde_json::from_str(&json).unwrap();
         assert_eq!(trigger, deserialized);
+    }
+
+    /// CR 113.2c + CR 603.2h: a later split half keys its limit ledgers on the slot
+    /// its offset steps back to; an occurrence with no ordered printed slot, an
+    /// unmarked definition, or an underflowing step keys on itself.
+    #[test]
+    fn limit_ledger_ref_steps_back_to_the_leading_half() {
+        let source = ObjectIncarnationRef::of(ObjectId(7), 3);
+        let base_set = TriggerBaseSetInstanceRef::INITIAL;
+        let at = |occurrence| TriggerDefinitionRef { source, occurrence };
+        let printed = |printed_index| TriggerDefinitionOccurrenceRef::Printed {
+            base_set,
+            printed_index,
+        };
+        let copy_effect = CopyEffectInstanceRef {
+            continuous_effect_id: 4,
+            modification_index: 0,
+        };
+        let copied = |slot: usize| TriggerDefinitionOccurrenceRef::CopiedValue {
+            copy_effect,
+            copied_slot: slot,
+            printed_origin: Some(TriggerPrintedOrigin {
+                printed_ref: PrintedCardRef {
+                    oracle_id: "oracle".to_string(),
+                    face_name: "Face".to_string(),
+                },
+                printed_occurrence: slot,
+            }),
+        };
+        let mut later_half = TriggerDefinition::new(TriggerMode::LifeGained);
+        later_half.limit_leader_offset = NonZeroUsize::new(1);
+        let unmarked = TriggerDefinition::new(TriggerMode::LifeGained);
+
+        assert_eq!(
+            at(printed(2)).limit_ledger_ref(&later_half).into_owned(),
+            at(printed(1))
+        );
+        assert_eq!(
+            at(copied(2)).limit_ledger_ref(&later_half).into_owned(),
+            at(copied(1)),
+            "the copied slot and its printed origin both step back"
+        );
+        assert!(matches!(
+            at(printed(2)).limit_ledger_ref(&unmarked),
+            Cow::Borrowed(_)
+        ));
+        let underflow = at(printed(0));
+        assert_eq!(*underflow.limit_ledger_ref(&later_half), underflow);
+        for unordered in [
+            TriggerDefinitionOccurrenceRef::CopyRetained {
+                grant_instance: TriggerGrantInstanceRef(9),
+                source_base_set: base_set,
+                source_printed_index: 2,
+            },
+            TriggerDefinitionOccurrenceRef::Granted {
+                grant_instance: TriggerGrantInstanceRef(9),
+            },
+        ] {
+            let key = at(unordered);
+            assert_eq!(
+                *key.limit_ledger_ref(&later_half),
+                key,
+                "a slotless occurrence keys on itself"
+            );
+        }
+    }
+
+    /// The controller-relation helpers recurse through `And` / `Or` / `Not` only; the
+    /// filters nested in `StackAbility`, `TrackedSetFiltered` and `ChosenDamageSource`
+    /// are deliberately not traversed.
+    #[test]
+    fn controller_relation_helpers_recurse_through_boolean_operands_only() {
+        let typed =
+            |controller| TargetFilter::Typed(TypedFilter::creature().controller(controller));
+        let negated = TargetFilter::Not {
+            filter: Box::new(TargetFilter::Or {
+                filters: vec![typed(ControllerRef::ParentTargetController)],
+            }),
+        };
+        assert_eq!(
+            negated.controller_scope(),
+            Some(ControllerRef::ParentTargetController)
+        );
+        let scoped = TargetFilter::And {
+            filters: vec![TargetFilter::Any, typed(ControllerRef::ScopedPlayer)],
+        };
+        assert!(scoped.uses_scoped_player_controller());
+
+        assert_eq!(
+            TargetFilter::StackAbility {
+                controller: Some(ControllerRef::Opponent),
+                tag: None,
+                kind: None,
+            }
+            .controller_scope(),
+            None
+        );
+        assert!(!TargetFilter::TrackedSetFiltered {
+            id: crate::types::identifiers::TrackedSetId(1),
+            filter: Box::new(typed(ControllerRef::ScopedPlayer)),
+            caused_by: None,
+        }
+        .uses_scoped_player_controller());
     }
 
     #[test]

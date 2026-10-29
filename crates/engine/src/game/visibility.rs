@@ -1599,6 +1599,15 @@ fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameSt
     filtered.pending_trigger_firing = None;
     filtered.stack_trigger_firings.clear();
     filtered.resolving_trigger_firing = None;
+    // CR 400.2 + CR 401.2: trigger-limit ledgers are rules-execution authority keyed
+    // by stable ObjectIds (position handles once hidden), and their occurrences can
+    // name a printed card. No viewer consumer reads them.
+    filtered.triggers_fired_this_turn.clear();
+    filtered.trigger_fire_counts_this_turn.clear();
+    filtered.triggers_fired_this_turn_per_opponent.clear();
+    filtered.trigger_indicated_actions_this_turn.clear();
+    filtered.triggers_fired_this_game.clear();
+    filtered.triggered_abilities_added_mana_this_turn.clear();
     for trigger in &mut filtered.delayed_triggers {
         trigger.provenance = crate::types::identifiers::DelayedInstallIdentity::LegacyDelayed;
     }
@@ -5084,6 +5093,79 @@ mod tests {
                 "viewer {viewer:?} must not receive the observation table"
             );
         }
+    }
+
+    /// CR 400.2 + CR 401.2: the trigger-limit ledgers are keyed by stable ObjectIds — a
+    /// hidden library card's position handle among them — so every viewer projection
+    /// clears the whole family, for a hidden and a public source alike, and the
+    /// authoritative state keeps them.
+    #[test]
+    fn viewer_projections_clear_the_trigger_limit_ledgers() {
+        use crate::types::ability::{
+            TriggerBaseSetInstanceRef, TriggerDefinitionOccurrenceRef, TriggerDefinitionRef,
+        };
+        let mut state = GameState::new_two_player(42);
+        let hidden = create_object(
+            &mut state,
+            CardId(7),
+            PlayerId(1),
+            "Library Sentinel".to_string(),
+            Zone::Battlefield,
+        );
+        let mut events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, hidden, Zone::Library, &mut events);
+        let public = create_object(
+            &mut state,
+            CardId(8),
+            PlayerId(0),
+            "Public Watcher".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [hidden, public] {
+            let key = TriggerDefinitionRef {
+                source: ObjectIncarnationRef::of(id, state.objects[&id].incarnation),
+                occurrence: TriggerDefinitionOccurrenceRef::Printed {
+                    base_set: TriggerBaseSetInstanceRef::INITIAL,
+                    printed_index: 0,
+                },
+            };
+            state.triggers_fired_this_turn.insert(key.clone());
+            state.trigger_fire_counts_this_turn.insert(key.clone(), 1);
+            state
+                .triggers_fired_this_turn_per_opponent
+                .insert((key.clone(), PlayerId(1)));
+            state
+                .trigger_indicated_actions_this_turn
+                .insert((key.clone(), PlayerId(0)));
+            state.triggers_fired_this_game.insert(key.clone());
+            state
+                .triggered_abilities_added_mana_this_turn
+                .insert((key, PlayerId(0)));
+        }
+        assert_eq!(state.objects[&hidden].zone, Zone::Library, "precondition");
+        let authoritative = state.clone();
+
+        for filtered in [
+            filter_state_for_viewer(&state, PlayerId(0)),
+            filter_state_for_unseated_viewer(&state),
+        ] {
+            assert!(filtered.triggers_fired_this_turn.is_empty());
+            assert!(filtered.trigger_fire_counts_this_turn.is_empty());
+            assert!(filtered.triggers_fired_this_turn_per_opponent.is_empty());
+            assert!(filtered.trigger_indicated_actions_this_turn.is_empty());
+            assert!(filtered.triggers_fired_this_game.is_empty());
+            assert!(filtered.triggered_abilities_added_mana_this_turn.is_empty());
+        }
+        assert_eq!(state.triggers_fired_this_turn.len(), 2);
+        assert_eq!(state.trigger_fire_counts_this_turn.len(), 2);
+        assert_eq!(state.triggers_fired_this_turn_per_opponent.len(), 2);
+        assert_eq!(state.trigger_indicated_actions_this_turn.len(), 2);
+        assert_eq!(state.triggers_fired_this_game.len(), 2);
+        assert_eq!(state.triggered_abilities_added_mana_this_turn.len(), 2);
+        assert!(
+            state == authoritative,
+            "filtering leaves the authoritative state unchanged"
+        );
     }
 
     /// CR 400.2 + CR 400.7: a permanent that returns to its owner's hand leaves id-keyed LKI

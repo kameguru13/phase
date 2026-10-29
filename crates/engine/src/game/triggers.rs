@@ -363,6 +363,10 @@ fn ward_cost_to_ability_cost(ward_cost: &WardCost) -> AbilityCost {
 struct MatchedTrigger {
     trig_idx: usize,
     definition_ref: Option<TriggerDefinitionRef>,
+    /// CR 113.2c + CR 603.2h: the key of this definition's per-definition limit
+    /// ledgers (`TriggerDefinitionRef::limit_ledger_ref`) — the leading half's
+    /// identity for a later half of a split printed ability, else `definition_ref`.
+    ledger_ref: Option<TriggerDefinitionRef>,
     pending: PendingTrigger,
     trigger_events: Vec<GameEvent>,
     batched: bool,
@@ -602,6 +606,8 @@ enum TriggerCollectionOperation {
     RecordTriggerFired {
         constraint: Option<TriggerConstraint>,
         source_context: Box<Option<TriggerSourceContext>>,
+        /// The limit-ledger key (`MatchedTrigger::ledger_ref`), not the ability's
+        /// own identity; the field name is kept for wire stability.
         definition_ref: Option<TriggerDefinitionRef>,
         event: GameEvent,
     },
@@ -698,7 +704,7 @@ impl TriggerCollectionSession {
             TriggerCollectionOperation::RecordTriggerFired {
                 constraint: matched.constraint.clone(),
                 source_context: Box::new(matched.pending.ability.trigger_source.clone()),
-                definition_ref: matched.definition_ref.clone(),
+                definition_ref: matched.ledger_ref.clone(),
                 event: event.clone(),
             },
         );
@@ -3467,6 +3473,11 @@ fn collect_matching_triggers_inner(
                 pending.push(MatchedTrigger {
                     trig_idx,
                     definition_ref: definition_ref.clone(),
+                    // CR 113.2c + CR 603.2h: every lowered half of one printed
+                    // ability spends one limit.
+                    ledger_ref: definition_ref
+                        .as_ref()
+                        .map(|key| key.limit_ledger_ref(trig_def).into_owned()),
                     pending: PendingTrigger {
                         source_id: obj_id,
                         controller,
@@ -4877,7 +4888,7 @@ pub(crate) fn collect_logical_zone_trigger_settlement(
                     state,
                     matched.constraint.as_ref(),
                     matched.pending.ability.trigger_source.as_ref(),
-                    matched.definition_ref.as_ref(),
+                    matched.ledger_ref.as_ref(),
                     &occurrence.event,
                 );
                 pending.push(PendingTriggerContext::batched(
@@ -5011,6 +5022,14 @@ fn collect_latched_batched_zone_triggers(
         let matched = MatchedTrigger {
             trig_idx,
             definition_ref: Some(latched.definition_ref.clone()),
+            // CR 113.2c + CR 603.2h: every lowered half of one printed ability
+            // spends one limit.
+            ledger_ref: Some(
+                latched
+                    .definition_ref
+                    .limit_ledger_ref(&latched.definition)
+                    .into_owned(),
+            ),
             pending: PendingTrigger {
                 source_id: source_context.identity.reference.object_id,
                 controller: source_context.lki.controller,
@@ -5049,7 +5068,7 @@ fn collect_latched_batched_zone_triggers(
             state,
             matched.constraint.as_ref(),
             matched.pending.ability.trigger_source.as_ref(),
-            matched.definition_ref.as_ref(),
+            matched.ledger_ref.as_ref(),
             first_event,
         );
         record_matched_batched_zone_change_replay(state, &matched);
@@ -15783,6 +15802,10 @@ fn check_trigger_constraint_with_ref(
         Some(c) => c,
         None => return true, // No constraint — always fires
     };
+    // CR 113.2c + CR 603.2h: every lowered half of one printed ability spends one
+    // limit, so the ledger arms below read the leading half's key.
+    let ledger_ref = definition_ref.map(|key| key.limit_ledger_ref(trig_def));
+    let ledger_ref = ledger_ref.as_deref();
 
     match constraint {
         // A legacy synthetic off-zone trigger has no ledger identity until the
@@ -15791,16 +15814,16 @@ fn check_trigger_constraint_with_ref(
         // must still be evaluated for every trigger source.
         TriggerConstraint::OncePerTurn { spent_by } => match spent_by {
             TriggerLimitSpend::Triggering => {
-                definition_ref.is_none_or(|key| !state.triggers_fired_this_turn.contains(key))
+                ledger_ref.is_none_or(|key| !state.triggers_fired_this_turn.contains(key))
             }
             // CR 603.2h: triggers only if its source's controller has not taken the
             // indicated action this turn.
             TriggerLimitSpend::IndicatedAction => {
-                definition_ref.is_none_or(|key| !indicated_action_taken_by(state, key, controller))
+                ledger_ref.is_none_or(|key| !indicated_action_taken_by(state, key, controller))
             }
         },
         TriggerConstraint::OncePerGame => {
-            definition_ref.is_none_or(|key| !state.triggers_fired_this_game.contains(key))
+            ledger_ref.is_none_or(|key| !state.triggers_fired_this_game.contains(key))
         }
         TriggerConstraint::OnlyDuringYourTurn => state.active_player == controller,
         // CR 102.3 / CR 805.4a: team-aware — under shared team turns a turn
@@ -15821,7 +15844,7 @@ fn check_trigger_constraint_with_ref(
             if opponent_id == controller || state.active_player != opponent_id {
                 return false;
             }
-            let Some(key) = definition_ref else {
+            let Some(key) = ledger_ref else {
                 return true;
             };
             let per_opponent_key = (key.clone(), opponent_id);
@@ -15919,7 +15942,7 @@ fn check_trigger_constraint_with_ref(
             source_context.is_some_and(|source| source.source_read(state).level() == *level)
         }
         // CR 603.4: "This ability triggers only the first N times each turn."
-        TriggerConstraint::MaxTimesPerTurn { max } => definition_ref.is_none_or(|key| {
+        TriggerConstraint::MaxTimesPerTurn { max } => ledger_ref.is_none_or(|key| {
             state
                 .trigger_fire_counts_this_turn
                 .get(key)
@@ -15948,11 +15971,11 @@ fn matched_trigger_constraint_allows_admission(
         Some(TriggerConstraint::OncePerTurn {
             spent_by: TriggerLimitSpend::Triggering,
         }) => matched
-            .definition_ref
+            .ledger_ref
             .as_ref()
             .is_none_or(|key| !state.triggers_fired_this_turn.contains(key)),
         Some(TriggerConstraint::OncePerGame) => matched
-            .definition_ref
+            .ledger_ref
             .as_ref()
             .is_none_or(|key| !state.triggers_fired_this_game.contains(key)),
         Some(TriggerConstraint::OncePerOpponentPerTurn) => {
@@ -15961,14 +15984,14 @@ fn matched_trigger_constraint_allows_admission(
             };
             *player_id != matched.pending.controller
                 && state.active_player == *player_id
-                && matched.definition_ref.as_ref().is_none_or(|key| {
+                && matched.ledger_ref.as_ref().is_none_or(|key| {
                     !state
                         .triggers_fired_this_turn_per_opponent
                         .contains(&(key.clone(), *player_id))
                 })
         }
         Some(TriggerConstraint::MaxTimesPerTurn { max }) => {
-            matched.definition_ref.as_ref().is_none_or(|key| {
+            matched.ledger_ref.as_ref().is_none_or(|key| {
                 state
                     .trigger_fire_counts_this_turn
                     .get(key)
@@ -18101,24 +18124,29 @@ fn indicated_action_taken_by(
         .contains(&(key.clone(), player))
 }
 
-/// CR 603.2h: the definition key whose "Do this only once each turn" limit governs this
-/// resolving instruction, or `None` for any other ability.
-pub(crate) fn indicated_action_limit(ability: &ResolvedAbility) -> Option<&TriggerDefinitionRef> {
+/// CR 603.2h: the ledger key whose "Do this only once each turn" limit governs this
+/// resolving instruction, or `None` for any other ability. CR 113.2c: a later half of a
+/// split printed ability answers with its leading half's key
+/// (`TriggerDefinitionRef::limit_ledger_ref`), so all halves share one limit.
+pub(crate) fn indicated_action_limit(
+    ability: &ResolvedAbility,
+) -> Option<Cow<'_, TriggerDefinitionRef>> {
     let key = ability.trigger_definition_ref.as_ref()?;
+    let definition = ability.triggered_definition()?;
     matches!(
-        ability.triggered_definition()?.constraint,
+        definition.constraint,
         Some(TriggerConstraint::OncePerTurn {
             spent_by: TriggerLimitSpend::IndicatedAction
         })
     )
-    .then_some(key)
+    .then(|| key.limit_ledger_ref(definition))
 }
 
 /// CR 603.2h + CR 608.2d: has this instance's controller already taken the indicated
 /// action this turn? Then its instruction is no longer an option for this instance.
 pub(crate) fn indicated_action_already_taken(state: &GameState, ability: &ResolvedAbility) -> bool {
     indicated_action_limit(ability)
-        .is_some_and(|key| indicated_action_taken_by(state, key, ability.controller))
+        .is_some_and(|key| indicated_action_taken_by(state, &key, ability.controller))
 }
 
 /// CR 603.2h: the controller chose to take the indicated action — spend the limit
@@ -18128,12 +18156,12 @@ pub(crate) fn record_indicated_action_taken(state: &mut GameState, ability: &Res
     let Some(key) = indicated_action_limit(ability) else {
         return;
     };
-    if indicated_action_taken_by(state, key, ability.controller) {
+    if indicated_action_taken_by(state, &key, ability.controller) {
         return;
     }
     crate::game::ledger::record_trigger_fired(
         state,
-        key.clone(),
+        key.into_owned(),
         crate::types::resolved_commands::ResolvedTriggerLedgerEdit::IndicatedActionTaken {
             player: ability.controller,
         },
@@ -29316,6 +29344,8 @@ pub mod tests {
         ability.set_trigger_source_recursive(source_context);
         let matched = MatchedTrigger {
             trig_idx: 0,
+            // An unsplit definition is its own limit-ledger key.
+            ledger_ref: Some(definition_ref.clone()),
             definition_ref: Some(definition_ref),
             pending: PendingTrigger {
                 source_id: source,
@@ -29451,6 +29481,8 @@ pub mod tests {
         ability.set_trigger_source_recursive(source_context);
         let matched = MatchedTrigger {
             trig_idx: 0,
+            // An unsplit definition is its own limit-ledger key.
+            ledger_ref: Some(definition_ref.clone()),
             definition_ref: Some(definition_ref),
             pending: PendingTrigger {
                 source_id: source,
@@ -33010,6 +33042,169 @@ pub mod tests {
             )])
         );
         assert!(state.trigger_indicated_actions_this_turn.is_empty());
+    }
+
+    /// A source whose printed slots 0 and 1 are the two halves of one split printed
+    /// ability (slot 1 marked with offset 1) and whose slot 2 is a separate ability
+    /// with the same limit. Returns the definitions and their live refs.
+    fn install_split_limited_source(
+        state: &mut GameState,
+        spent_by: TriggerLimitSpend,
+    ) -> (ObjectId, Vec<TriggerDefinition>, Vec<TriggerDefinitionRef>) {
+        let source = make_creature(state, PlayerId(0), "Split limit source", 1, 1);
+        let limited = |offset| {
+            let mut def = TriggerDefinition::new(TriggerMode::Drawn);
+            def.constraint = Some(TriggerConstraint::OncePerTurn { spent_by });
+            def.limit_leader_offset = std::num::NonZeroUsize::new(offset);
+            def
+        };
+        let defs = vec![limited(0), limited(1), limited(0)];
+        let object = state.objects.get_mut(&source).expect("source exists");
+        std::sync::Arc::make_mut(&mut object.base_trigger_definitions).extend(defs.clone());
+        object.materialize_base_trigger_definitions();
+        let object = &state.objects[&source];
+        let refs = object
+            .trigger_definitions
+            .iter_all()
+            .map(|entry| object.trigger_definition_ref(entry))
+            .collect();
+        (source, defs, refs)
+    }
+
+    /// CR 113.2c + CR 603.2h: the halves of one printed ability spend one
+    /// indicated-action limit. Accepting the later half's instruction spends the
+    /// leading half's key, which then blocks both halves for that controller only;
+    /// a separate ability of the same source is unaffected.
+    #[test]
+    fn split_halves_share_one_indicated_action_limit() {
+        let mut state = setup();
+        let (source, defs, refs) =
+            install_split_limited_source(&mut state, TriggerLimitSpend::IndicatedAction);
+        assert_ne!(refs[0], refs[1], "the halves stay distinct abilities");
+        let event = GameEvent::CardDrawn {
+            player_id: PlayerId(0),
+            object_id: ObjectId(99),
+            nth_in_turn: 1,
+            nth_in_step: 1,
+        };
+        let fires = |state: &GameState, slot: usize, player: PlayerId| {
+            check_trigger_constraint_with_ref(
+                state,
+                &defs[slot],
+                Some(&refs[slot]),
+                None,
+                player,
+                Some(&event),
+            )
+        };
+        assert!(fires(&state, 0, PlayerId(0)) && fires(&state, 1, PlayerId(0)));
+
+        let source_context = trigger_source_context_for_latch(&state, &state.objects[&source]);
+        let mut later_half = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            Vec::new(),
+            source,
+            PlayerId(0),
+        );
+        later_half.set_trigger_source_recursive(source_context);
+        later_half.trigger_definition_ref = Some(refs[1].clone());
+        record_indicated_action_taken(&mut state, &later_half);
+        assert_eq!(
+            *state.trigger_indicated_actions_this_turn,
+            HashSet::from([(refs[0].clone(), PlayerId(0))]),
+            "the later half spends the leading half's key"
+        );
+        assert!(indicated_action_already_taken(&state, &later_half));
+
+        assert!(!fires(&state, 0, PlayerId(0)), "the leading half is spent");
+        assert!(!fires(&state, 1, PlayerId(0)), "the later half is spent");
+        assert!(
+            fires(&state, 1, PlayerId(1)),
+            "a controller who has not taken the action is not limited"
+        );
+        assert!(
+            fires(&state, 2, PlayerId(0)),
+            "another ability of the same source is not limited"
+        );
+    }
+
+    /// CR 113.2c + CR 603.2: the halves of one printed ability spend one
+    /// "triggers only once each turn" limit. Once the leading half's candidate is
+    /// admitted, the later half's candidate is rejected at admission and its fire-time
+    /// check fails; a separate ability of the same source is unaffected.
+    #[test]
+    fn split_halves_share_one_trigger_limit_at_admission() {
+        let mut state = setup();
+        let (source, defs, refs) =
+            install_split_limited_source(&mut state, TriggerLimitSpend::Triggering);
+        let event = GameEvent::CardDrawn {
+            player_id: PlayerId(0),
+            object_id: ObjectId(99),
+            nth_in_turn: 1,
+            nth_in_step: 1,
+        };
+        let matched = |slot: usize| MatchedTrigger {
+            trig_idx: slot,
+            definition_ref: Some(refs[slot].clone()),
+            ledger_ref: Some(refs[slot].limit_ledger_ref(&defs[slot]).into_owned()),
+            pending: PendingTrigger {
+                source_id: source,
+                controller: PlayerId(0),
+                condition: None,
+                ability: Box::new(ResolvedAbility::new(
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                    Vec::new(),
+                    source,
+                    PlayerId(0),
+                )),
+                timestamp: 0,
+                target_constraints: Vec::new(),
+                distribute: None,
+                trigger_event: Some(event.clone()),
+                modal: None,
+                mode_abilities: Vec::new(),
+                description: None,
+                may_trigger_origin: None,
+                subject_match_count: None,
+                die_result: None,
+                provenance: None,
+            },
+            trigger_events: vec![event.clone()],
+            batched: false,
+            constraint: defs[slot].constraint.clone(),
+        };
+        let mut session = TriggerCollectionSession::new(TriggerCollectionOverlay::default());
+
+        assert!(
+            session.record_match(&mut state, &matched(0), &event),
+            "reach: the leading half's candidate is admitted"
+        );
+        assert_eq!(
+            state.triggers_fired_this_turn,
+            HashSet::from([refs[0].clone()])
+        );
+        assert!(
+            !session.record_match(&mut state, &matched(1), &event),
+            "the later half shares the spent limit"
+        );
+        assert!(!check_trigger_constraint_with_ref(
+            &state,
+            &defs[1],
+            Some(&refs[1]),
+            None,
+            PlayerId(0),
+            Some(&event),
+        ));
+        assert!(
+            session.record_match(&mut state, &matched(2), &event),
+            "another ability of the same source keeps its own limit"
+        );
     }
 
     #[test]

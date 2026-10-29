@@ -3980,6 +3980,9 @@ fn scan_trigger_definition(t: &TriggerDefinition, mode: ScanMode) -> Axes {
         mana_ability_produced: _,
         clash_result: _,
         granting_object: _,
+        // A split half's slot offset to the leading half: a ledger-key mapping
+        // (CR 113.2c + CR 603.2h), not a matcher; it reaches no filter or quantity.
+        limit_leader_offset: _,
     } = t;
 
     let mut acc = Axes::NONE;

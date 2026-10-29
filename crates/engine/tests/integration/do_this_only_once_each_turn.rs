@@ -15,9 +15,11 @@
 
 use std::collections::HashSet;
 
+use engine::game::game_object::BackFaceData;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::ability::TriggerDefinitionRef;
+use engine::types::ability::{AbilityKind, TriggerDefinitionRef};
 use engine::types::actions::{CastChoice, GameAction};
+use engine::types::card_type::{CardType, CoreType};
 use engine::types::counter::CounterType;
 use engine::types::game_state::{
     AutoMayChoice, CastOfferKind, CastPaymentMode, MayTriggerAutoChoiceScope, StackEntryKind,
@@ -749,5 +751,352 @@ fn graha_unaffordable_life_payment_is_not_offered_and_does_not_spend_the_limit()
     assert!(
         graha_refs(&runner, graha).is_empty(),
         "G'raha took its action this turn, so it no longer triggers"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T9 / T10 — the halves of one split printed ability share one limit
+// ---------------------------------------------------------------------------
+
+const CORRUPTION_OF_TOWASHI: &str = "When this enchantment enters, incubate 4. (Create an Incubator token with four +1/+1 counters on it and \"{2}: Transform this token.\" It transforms into a 0/0 Phyrexian artifact creature.)\nWhenever a permanent you control transforms or a permanent you control enters transformed, you may draw a card. Do this only once each turn.";
+
+const MACH_1: &str = "Flying\nWhen MACH-1 enters and whenever you gain life, surveil 1. This ability triggers only once each turn. (To surveil 1, look at the top card of your library. You may put it into your graveyard.)";
+
+/// Thraben Gargoyle's printed front face: a production self-transform activation
+/// (event "a permanent you control transforms").
+const THRABEN_GARGOYLE: &str = "Defender\n{6}: Transform this creature.";
+
+/// The activation paragraph of Jill, Shiva's Dominant: a production return of a
+/// double-faced card to the battlefield transformed (CR 712.14a — event "a permanent
+/// you control enters transformed"). Her ETB paragraph is not under test.
+const JILL_RETURN_TRANSFORMED: &str = "{3}{U}{U}, {T}: Exile Jill, then return it to the battlefield transformed under its owner's control. Activate only as a sorcery.";
+
+fn creature_back_face(name: &str, power: i32, toughness: i32) -> BackFaceData {
+    BackFaceData {
+        name: name.to_string(),
+        power: Some(power),
+        toughness: Some(toughness),
+        card_types: CardType {
+            supertypes: vec![],
+            core_types: vec![CoreType::Creature],
+            subtypes: vec![],
+        },
+        ..Default::default()
+    }
+}
+
+/// Corruption of Towashi (no ETB) beside two P0 double-faced creatures: Thraben
+/// Gargoyle transforms (Corruption's "transforms" half) and Jill returns
+/// transformed (its "enters transformed" half).
+///
+/// The engine also reports a transformed entry as a transform (`zone_pipeline`
+/// applies CR 712.14a through `transform_permanent`, which emits
+/// `GameEvent::Transformed`), so Jill's entry can put both halves on the stack. The
+/// assertions below hold either way: they name the half each event must reach and
+/// count draws, never the number of stacked instances.
+struct CorruptionBoard {
+    runner: GameRunner,
+    corruption: ObjectId,
+    gargoyle: ObjectId,
+    jill: ObjectId,
+    /// The "transforms" half's identity, which keys the shared limit.
+    transforms_half: TriggerDefinitionRef,
+    /// The "enters transformed" half's identity.
+    enters_transformed_half: TriggerDefinitionRef,
+}
+
+fn corruption_board() -> CorruptionBoard {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let corruption = scenario
+        .add_enchantment_from_oracle(P0, "Corruption of Towashi", CORRUPTION_OF_TOWASHI)
+        .id();
+    let gargoyle = scenario
+        .add_creature_from_oracle(P0, "Thraben Gargoyle", 2, 2, THRABEN_GARGOYLE)
+        .id();
+    let jill = scenario
+        .add_creature_from_oracle(P0, "Jill, Shiva's Dominant", 2, 2, JILL_RETURN_TRANSFORMED)
+        .id();
+    scenario.with_library_top(P0, &["Card A", "Card B", "Card C"]);
+    let mut runner = scenario.build();
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&gargoyle)
+        .unwrap()
+        .back_face = Some(creature_back_face("Stonewing Antagonizer", 4, 2));
+    runner.state_mut().objects.get_mut(&jill).unwrap().back_face =
+        Some(creature_back_face("Returned Back Face", 4, 5));
+
+    // CR 113.2c: the split halves stay distinct abilities, and both key their limit
+    // ledger on the first half.
+    let object = &runner.state().objects[&corruption];
+    let entries = object.trigger_definitions.as_slice();
+    assert_eq!(
+        entries.len(),
+        3,
+        "reach: Corruption's ETB plus two split halves"
+    );
+    let first = object.trigger_definition_ref(&entries[1]);
+    let second = object.trigger_definition_ref(&entries[2]);
+    assert_ne!(first, second, "the halves keep their own identities");
+    assert_eq!(*first.limit_ledger_ref(&entries[1].definition), first);
+    assert_eq!(*second.limit_ledger_ref(&entries[2].definition), first);
+    let (first, second) = (first.clone(), second.clone());
+
+    CorruptionBoard {
+        runner,
+        corruption,
+        gargoyle,
+        jill,
+        transforms_half: first,
+        enters_transformed_half: second,
+    }
+}
+
+fn activate_only_ability(runner: &mut GameRunner, source: ObjectId, mana: &[ManaType]) {
+    for &kind in mana {
+        runner
+            .state_mut()
+            .add_mana_to_pool(P0, ManaUnit::new(kind, ObjectId(0), false, vec![]));
+    }
+    let ability_index = runner.state().objects[&source]
+        .abilities
+        .iter()
+        .position(|ability| ability.kind == AbilityKind::Activated)
+        .expect("the source has its printed activated ability");
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: source,
+            ability_index,
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("activate the printed ability");
+}
+
+/// Event A — "a permanent you control transforms": Thraben Gargoyle's activation.
+fn transform_gargoyle(runner: &mut GameRunner, gargoyle: ObjectId) {
+    activate_only_ability(runner, gargoyle, &[ManaType::Colorless; 6]);
+}
+
+/// Event B — "a permanent you control enters transformed": Jill's activation.
+fn return_jill_transformed(runner: &mut GameRunner, jill: ObjectId) {
+    let mut mana = vec![ManaType::Colorless; 3];
+    mana.extend([ManaType::Blue; 2]);
+    activate_only_ability(runner, jill, &mana);
+}
+
+/// Resolve the stack, answering every "you may" prompt with `accept` and every
+/// surveil with "keep on top". Returns the definition refs of the `source`
+/// triggers that reached the stack.
+fn resolve_all(
+    runner: &mut GameRunner,
+    source: ObjectId,
+    accept: bool,
+) -> Vec<Option<TriggerDefinitionRef>> {
+    let mut seen = HashSet::new();
+    let mut refs = Vec::new();
+    for _ in 0..60 {
+        for entry in &runner.state().stack {
+            if let StackEntryKind::TriggeredAbility {
+                source_id, ability, ..
+            } = &entry.kind
+            {
+                if *source_id == source && seen.insert(entry.id) {
+                    refs.push(ability.trigger_definition_ref.clone());
+                }
+            }
+        }
+        let action = match runner.state().waiting_for.clone() {
+            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => return refs,
+            WaitingFor::Priority { .. } => GameAction::PassPriority,
+            WaitingFor::OptionalEffectChoice { player, .. } => {
+                assert_eq!(player, P0, "the controller answers the instruction");
+                GameAction::DecideOptionalEffect { accept }
+            }
+            WaitingFor::SurveilChoice { .. } => GameAction::SelectCards { cards: vec![] },
+            other => panic!("unexpected prompt while resolving: {other:?}"),
+        };
+        runner.act(action).expect("resolve the stack");
+    }
+    panic!("the stack never settled");
+}
+
+fn hand_size(runner: &GameRunner) -> usize {
+    runner.state().players[P0.0 as usize].hand.len()
+}
+
+/// CR 113.2c + CR 603.2h: drawing off the "transforms" half takes the indicated
+/// action of the one printed ability, so a later "enters transformed" the same turn
+/// does not trigger it.
+#[test]
+fn corruption_of_towashi_draw_on_a_transform_spends_its_enters_transformed_half() {
+    let CorruptionBoard {
+        mut runner,
+        corruption,
+        gargoyle,
+        jill,
+        transforms_half,
+        ..
+    } = corruption_board();
+    let hand_before = hand_size(&runner);
+
+    transform_gargoyle(&mut runner, gargoyle);
+    let fired = resolve_all(&mut runner, corruption, true);
+    assert_eq!(
+        fired,
+        vec![Some(transforms_half)],
+        "reach: the transform triggers the transforms half"
+    );
+    assert!(runner.state().objects[&gargoyle].transformed);
+    assert_eq!(hand_size(&runner), hand_before + 1, "the draw was taken");
+
+    return_jill_transformed(&mut runner, jill);
+    let fired = resolve_all(&mut runner, corruption, true);
+    assert!(
+        runner.state().objects[&jill].transformed
+            && runner.state().objects[&jill].zone == Zone::Battlefield,
+        "reach: Jill entered transformed"
+    );
+    assert!(
+        fired.is_empty(),
+        "the enters-transformed half shares the spent limit: {fired:?}"
+    );
+    assert_eq!(hand_size(&runner), hand_before + 1);
+}
+
+/// CR 603.2h: declining the draw on a transform takes no action, so the
+/// enters-transformed half still triggers, and accepting it draws once.
+#[test]
+fn corruption_of_towashi_declined_draw_leaves_its_other_half_free() {
+    let CorruptionBoard {
+        mut runner,
+        corruption,
+        gargoyle,
+        jill,
+        transforms_half,
+        enters_transformed_half,
+    } = corruption_board();
+    let hand_before = hand_size(&runner);
+
+    transform_gargoyle(&mut runner, gargoyle);
+    let fired = resolve_all(&mut runner, corruption, false);
+    assert_eq!(
+        fired,
+        vec![Some(transforms_half)],
+        "reach: the transform triggers the transforms half"
+    );
+    assert_eq!(hand_size(&runner), hand_before, "the draw was declined");
+
+    return_jill_transformed(&mut runner, jill);
+    let fired = resolve_all(&mut runner, corruption, true);
+    assert!(
+        fired.contains(&Some(enters_transformed_half)),
+        "the untaken limit leaves the enters-transformed half free: {fired:?}"
+    );
+    assert_eq!(
+        hand_size(&runner),
+        hand_before + 1,
+        "the ability draws once"
+    );
+}
+
+/// CR 113.2c + CR 603.2h: the shared limit runs both ways — drawing off the
+/// "enters transformed" half spends the "transforms" half too, so the ability
+/// draws once for the entry and not again for a later transform.
+#[test]
+fn corruption_of_towashi_draw_on_an_enters_transformed_spends_its_transform_half() {
+    let CorruptionBoard {
+        mut runner,
+        corruption,
+        gargoyle,
+        jill,
+        enters_transformed_half,
+        ..
+    } = corruption_board();
+    let hand_before = hand_size(&runner);
+
+    return_jill_transformed(&mut runner, jill);
+    let fired = resolve_all(&mut runner, corruption, true);
+    assert!(
+        fired.contains(&Some(enters_transformed_half)),
+        "reach: the transformed entry triggers the enters-transformed half: {fired:?}"
+    );
+    assert_eq!(
+        hand_size(&runner),
+        hand_before + 1,
+        "the ability draws once for the entry"
+    );
+
+    transform_gargoyle(&mut runner, gargoyle);
+    let fired = resolve_all(&mut runner, corruption, true);
+    assert!(
+        runner.state().objects[&gargoyle].transformed,
+        "reach: the Gargoyle transformed"
+    );
+    assert!(
+        fired.is_empty(),
+        "the transforms half shares the spent limit: {fired:?}"
+    );
+    assert_eq!(hand_size(&runner), hand_before + 1);
+}
+
+fn gain_one_life(scenario: &mut GameScenario, name: &str) -> ObjectId {
+    scenario
+        .add_spell_to_hand_from_oracle(P0, name, true, "You gain 1 life.")
+        .with_mana_cost(free())
+        .id()
+}
+
+/// CR 603.2: MACH-1's life-gain half triggers once each turn (reach guard for the
+/// shared-limit test below).
+#[test]
+fn mach_1_life_gain_half_triggers_only_once_each_turn() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let mach = scenario
+        .add_creature_from_oracle(P0, "MACH-1, Swooping Scoundrel", 1, 3, MACH_1)
+        .id();
+    let first = gain_one_life(&mut scenario, "Test Gain One");
+    let second = gain_one_life(&mut scenario, "Test Gain Two");
+    scenario.with_library_top(P0, &["Card A", "Card B"]);
+    let mut runner = scenario.build();
+
+    cast(&mut runner, first);
+    let fired = resolve_all(&mut runner, mach, true);
+    assert_eq!(fired.len(), 1, "gaining life triggers MACH-1");
+
+    cast(&mut runner, second);
+    let fired = resolve_all(&mut runner, mach, true);
+    assert!(fired.is_empty(), "{fired:?}");
+}
+
+/// CR 113.2c + CR 603.2: "When MACH-1 enters and whenever you gain life, surveil 1.
+/// This ability triggers only once each turn." is one ability, so its entering
+/// spends the limit for the life-gain half the same turn.
+#[test]
+fn mach_1_entering_spends_its_life_gain_half() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let mach = scenario
+        .add_creature_to_hand_from_oracle(P0, "MACH-1, Swooping Scoundrel", 1, 3, MACH_1)
+        .with_mana_cost(free())
+        .id();
+    let gain = gain_one_life(&mut scenario, "Test Gain");
+    scenario.with_library_top(P0, &["Card A", "Card B"]);
+    let mut runner = scenario.build();
+    let life_before = runner.life(P0);
+
+    cast(&mut runner, mach);
+    let fired = resolve_all(&mut runner, mach, true);
+    assert_eq!(fired.len(), 1, "reach: MACH-1's entering triggers it");
+    assert_eq!(runner.state().objects[&mach].zone, Zone::Battlefield);
+
+    cast(&mut runner, gain);
+    let fired = resolve_all(&mut runner, mach, true);
+    assert_eq!(runner.life(P0), life_before + 1, "reach: P0 gained life");
+    assert!(
+        fired.is_empty(),
+        "the life-gain half shares the spent limit: {fired:?}"
     );
 }

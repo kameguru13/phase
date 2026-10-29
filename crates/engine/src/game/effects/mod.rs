@@ -9697,6 +9697,8 @@ fn trigger_matchers_read_filter_population(
         clash_result: _,
         room_door: _,
         granting_object: _,
+        // A limit-ledger key mapping between split halves; names no population.
+        limit_leader_offset: _,
         attack_cost_condition,
     } = trigger;
     [valid_card, valid_target, valid_subject_player, valid_source]

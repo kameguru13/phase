@@ -41101,6 +41101,152 @@ fn cast_or_activate_split_never_ships_two_counted_halves() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Shared limit across the halves of one split printed ability (CR 113.2c +
+// CR 603.2 + CR 603.2h). Oracle text verbatim from MTGJSON.
+// ---------------------------------------------------------------------------
+
+const CORRUPTION_OF_TOWASHI: &str = "When this enchantment enters, incubate 4. (Create an Incubator token with four +1/+1 counters on it and \"{2}: Transform this token.\" It transforms into a 0/0 Phyrexian artifact creature.)\nWhenever a permanent you control transforms or a permanent you control enters transformed, you may draw a card. Do this only once each turn.";
+const MACH_1: &str = "Flying\nWhen MACH-1 enters and whenever you gain life, surveil 1. This ability triggers only once each turn. (To surveil 1, look at the top card of your library. You may put it into your graveyard.)";
+const TWO_STREAMS_FACILITY: &str = "Whenever you planeswalk to Two Streams Facility and at the beginning of the first upkeep of the game, each player chooses green anchor or red waterfall.\nEach player who last chose green anchor may play an additional land during each of their turns.\nCreatures controlled by players who last chose red waterfall get +2/+0 and have haste.\nWhenever chaos ensues, each player who last chose green anchor chooses red waterfall, and vice versa.";
+
+fn split_limit_triggers(text: &str, name: &str, card_type: &str) -> Vec<TriggerDefinition> {
+    parse_oracle_text(text, name, &[], &[card_type.to_string()], &[]).triggers
+}
+
+fn leader_offsets(triggers: &[TriggerDefinition]) -> Vec<Option<usize>> {
+    triggers
+        .iter()
+        .map(|def| def.limit_leader_offset.map(NonZeroUsize::get))
+        .collect()
+}
+
+/// Corruption of Towashi: the cross-subject split ("transforms or ... enters
+/// transformed") lowers to two definitions; the second keys its CR 603.2h limit on
+/// the first. The ETB line is a separate paragraph (CR 113.2c), so it shares nothing.
+#[test]
+fn corruption_of_towashi_split_halves_share_one_indicated_action_limit() {
+    let triggers = split_limit_triggers(
+        CORRUPTION_OF_TOWASHI,
+        "Corruption of Towashi",
+        "Enchantment",
+    );
+    assert_eq!(triggers.len(), 3, "{triggers:#?}");
+    assert_eq!(triggers[1].mode, TriggerMode::Transformed);
+    assert_eq!(triggers[2].mode, TriggerMode::ChangesZone);
+    for half in &triggers[1..] {
+        assert_eq!(
+            half.constraint,
+            Some(TriggerConstraint::OncePerTurn {
+                spent_by: TriggerLimitSpend::IndicatedAction
+            })
+        );
+    }
+    assert_eq!(leader_offsets(&triggers), vec![None, None, Some(1)]);
+}
+
+/// MACH-1: the "when ... enters and whenever ..." split (Pattern 1) shares its
+/// "This ability triggers only once each turn" limit (CR 603.2).
+#[test]
+fn mach_1_and_when_split_halves_share_one_trigger_limit() {
+    let triggers = split_limit_triggers(MACH_1, "MACH-1, Swooping Scoundrel", "Creature");
+    assert_eq!(triggers.len(), 2, "{triggers:#?}");
+    assert_eq!(triggers[0].mode, TriggerMode::ChangesZone);
+    assert_eq!(triggers[1].mode, TriggerMode::LifeGained);
+    for half in &triggers {
+        assert_eq!(
+            half.constraint,
+            Some(TriggerConstraint::OncePerTurn {
+                spent_by: TriggerLimitSpend::Triggering
+            })
+        );
+    }
+    assert_eq!(leader_offsets(&triggers), vec![None, Some(1)]);
+}
+
+/// Every split branch marks its later halves when the line carries a per-definition
+/// limit: the "and whenever" split, the 2-way shared-subject "or" split, and the
+/// N-way serial list (each later half counts back to the first). Without a limit
+/// sentence no half is marked.
+#[test]
+fn split_branches_mark_later_halves_only_when_the_line_has_a_shared_limit() {
+    let cases: [(&str, usize); 3] = [
+        (
+            "Whenever this creature attacks and whenever this creature becomes tapped, you may draw a card.",
+            2,
+        ),
+        (
+            "Whenever this creature attacks or becomes tapped, you may draw a card.",
+            2,
+        ),
+        (
+            "Whenever this creature attacks, blocks, or becomes the target of a spell, you may draw a card.",
+            3,
+        ),
+    ];
+    for (body, halves) in cases {
+        let limited = split_limit_triggers(
+            &format!("{body} Do this only once each turn."),
+            "Synthetic Split",
+            "Creature",
+        );
+        assert_eq!(limited.len(), halves, "{body}: {limited:#?}");
+        assert!(
+            limited.iter().all(|def| def.constraint
+                == Some(TriggerConstraint::OncePerTurn {
+                    spent_by: TriggerLimitSpend::IndicatedAction
+                })),
+            "{body}: {limited:#?}"
+        );
+        let expected: Vec<_> = (0..halves).map(|i| (i > 0).then_some(i)).collect();
+        assert_eq!(leader_offsets(&limited), expected, "{body}");
+
+        let unlimited = split_limit_triggers(body, "Synthetic Split", "Creature");
+        assert_eq!(
+            unlimited.len(),
+            halves,
+            "reach: {body} splits: {unlimited:#?}"
+        );
+        assert_eq!(leader_offsets(&unlimited), vec![None; halves], "{body}");
+    }
+}
+
+/// Two Streams Facility: its first-upkeep half carries a once-per-game limit of its
+/// own event, not a limit sentence of the line, so the halves share nothing.
+#[test]
+fn two_streams_facility_event_level_limit_is_not_shared() {
+    let triggers = split_limit_triggers(TWO_STREAMS_FACILITY, "Two Streams Facility", "Plane");
+    let upkeep = triggers
+        .iter()
+        .position(|def| def.mode == TriggerMode::Phase)
+        .unwrap_or_else(|| panic!("reach: the first-upkeep half parses: {triggers:#?}"));
+    assert_eq!(
+        triggers[upkeep].constraint,
+        Some(TriggerConstraint::OncePerGame),
+        "reach: the first-upkeep half is once per game"
+    );
+    assert!(upkeep > 0, "reach: the planeswalk half precedes it");
+    assert_eq!(
+        leader_offsets(&triggers),
+        vec![None; triggers.len()],
+        "{triggers:#?}"
+    );
+}
+
+/// The cast-or-activate split is unchanged: Glava's activation half stays a strict
+/// failure and its spell half carries no leader offset.
+#[test]
+fn cast_or_activate_split_keeps_its_strict_activation_half_unmarked() {
+    let triggers = cast_or_activate_triggers(GLAVA, "Glava, Five-Advents Mage", "Creature");
+    assert_eq!(triggers.len(), 2, "{triggers:#?}");
+    assert!(
+        matches!(triggers[1].mode, TriggerMode::Unknown(_)),
+        "{:?}",
+        triggers[1].mode
+    );
+    assert_eq!(leader_offsets(&triggers), vec![None, None]);
+}
+
 // CR 603.4 + CR 722.3a: Woodwork Prodigy (FRA) front face, verbatim Oracle —
 // "At the beginning of your upkeep, if this creature isn't prepared, it
 // becomes prepared. (While it's prepared, you may cast a copy of its spell.

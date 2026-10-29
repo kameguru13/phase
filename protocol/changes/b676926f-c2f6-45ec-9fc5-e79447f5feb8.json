@@ -3,5 +3,5 @@
     "full",
     "wire"
   ],
-  "reason": "TriggerConstraint::OncePerTurn gains serde-defaulted spent_by (TriggerLimitSpend: Triggering | IndicatedAction) carried in trigger definitions inside GameState; GameState gains trigger_indicated_actions_this_turn; the resolved rules journal gains ResolvedTriggerLedgerEdit::IndicatedActionTaken. Older full-game and P2P peers cannot decode the new ledger tag and would silently treat a CR 603.2h limit as a trigger limit; first contact must refuse the skew."
+  "reason": "TriggerConstraint::OncePerTurn gains serde-defaulted spent_by (TriggerLimitSpend: Triggering | IndicatedAction) carried in trigger definitions inside GameState; GameState gains trigger_indicated_actions_this_turn; the resolved rules journal gains ResolvedTriggerLedgerEdit::IndicatedActionTaken; and TriggerDefinition gains serde-defaulted limit_leader_offset. Older full-game and P2P peers cannot decode the new ledger tag and would silently treat a CR 603.2h limit as a trigger limit; first contact must refuse the skew."
 }

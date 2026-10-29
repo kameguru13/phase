@@ -1450,6 +1450,8 @@ pub fn trigger_definition_is_cast_stable_for_pre_cast(definition: &TriggerDefini
         clash_result: _,
         room_door: _,
         granting_object: _,
+        // Only re-keys a constraint's ledger, and `constraint` must be absent here.
+        limit_leader_offset: _,
     } = definition
     else {
         return false;

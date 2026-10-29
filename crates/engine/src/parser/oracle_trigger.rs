@@ -97,6 +97,7 @@ use crate::types::triggers::{
     AbilityLifecyclePoint, AttackTargetFilter, ControlChangeSide, PlaneswalkRole, TriggerMode,
 };
 use crate::types::zones::Zone;
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 
 /// Returns true if `filter` references the trigger source itself — directly
@@ -872,6 +873,7 @@ pub(crate) fn parse_trigger_lines_at_index_ir(
                 ctx,
             ));
         }
+        share_split_limit(&mut results);
         return results;
     }
 
@@ -925,17 +927,15 @@ pub(crate) fn parse_trigger_lines_at_index_ir(
                 ir
             })
             .collect();
-        // Shared-constraint marker. A constraint with a per-definition ledger
-        // (`constraint_counts_per_definition`) must span both halves of the one
-        // printed ability: CR 603.2h for "Do this only once each turn" (Glava,
-        // Five-Advents Mage), whose indicated-action fact is keyed per
-        // `TriggerDefinitionRef`, so two lowered halves would each take the
-        // action once; for "This ability triggers only once each turn" (Bill
-        // Potts) the firing counter is keyed the same way, so two lowered
-        // halves would each fire once. Until a single-definition disjunctive trigger lets one
-        // counter span both events, the activation half is a strict failure
-        // and the spell half keeps the constraint, so exactly one counted
-        // definition is live.
+        // A constraint with a per-definition ledger
+        // (`constraint_counts_per_definition`) spans both halves of the one
+        // printed ability (CR 113.2c + CR 603.2h): "Do this only once each turn"
+        // (Glava, Five-Advents Mage) and "This ability triggers only once each
+        // turn" (Bill Potts). The shared-limit marker (`share_split_limit`) would
+        // key both halves' ledgers on the spell half, but the activation half's
+        // runtime is not yet covered by tests, so it stays a strict failure: the
+        // spell half keeps the constraint and is the one live counted definition.
+        // Lifting this is gated on activation-half runtime tests.
         if results.iter().any(|ir| {
             lowered_trigger_constraint(&ir.modifiers, ir.partial_def.constraint.clone())
                 .as_ref()
@@ -967,6 +967,7 @@ pub(crate) fn parse_trigger_lines_at_index_ir(
                 ctx,
             ));
         }
+        share_split_limit(&mut results);
         return results;
     }
 
@@ -4351,13 +4352,38 @@ fn lowered_trigger_constraint(
         })
 }
 
+/// CR 113.2c + CR 603.2 + CR 603.2h: the halves of one printed triggered ability that a
+/// compound split lowered to several definitions spend one per-definition limit. When
+/// the line's own limit sentence (`modifiers.constraint`, parsed from the full line)
+/// keeps a per-definition ledger, each later half records its distance back to the
+/// leading half, whose identity keys the ledgers at runtime. The halves occupy adjacent
+/// printed slots (`base_trigger_index.offset(i)`). A "for the first time each turn"
+/// event qualifier (`first_time_limit`) limits only the half whose event it qualifies,
+/// so it is not shared.
+fn share_split_limit(results: &mut [TriggerIr]) {
+    let shares_limit = results.iter().any(|ir| {
+        ir.modifiers
+            .constraint
+            .as_ref()
+            .is_some_and(constraint_counts_per_definition)
+    });
+    if !shares_limit {
+        return;
+    }
+    for (i, ir) in results.iter_mut().enumerate() {
+        ir.partial_def.limit_leader_offset = NonZeroUsize::new(i);
+    }
+}
+
 /// Whether `constraint` keeps a per-trigger-definition ledger. The four
 /// ledger arms are keyed by `TriggerDefinitionRef` in
 /// `triggers.rs::check_trigger_constraint_with_ref` (firings, or for CR 603.2h
 /// the controller's indicated action), so a printed line that a compound split
-/// lowers to two definitions would spend each half separately (CR 603.2h: "Do
-/// this only once each turn" limits the one printed ability, not each of its
-/// events). The remaining arms are predicates on the event or the game state,
+/// lowers to two definitions must spend one limit across its halves (CR 603.2h:
+/// "Do this only once each turn" limits the one printed ability, not each of its
+/// events): `share_split_limit` marks the later halves with
+/// `TriggerDefinition::limit_leader_offset`, and the ledgers key on the leading
+/// half. The remaining arms are predicates on the event or the game state,
 /// which every half evaluates identically. Exhaustive, so a new
 /// `TriggerConstraint` variant is forced into this decision.
 fn constraint_counts_per_definition(constraint: &TriggerConstraint) -> bool {
