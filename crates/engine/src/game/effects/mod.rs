@@ -16061,8 +16061,9 @@ fn optional_effect_is_infeasible(state: &GameState, ability: &ResolvedAbility) -
         }
         // CR 118.12 + CR 118.3 + CR 608.2d: an optional discard the player can't
         // pay in full is an impossible option. Hydrate event-context targets
-        // first, exactly as resolution does, so a "that player discards" binding
-        // is read rather than the controller fallback.
+        // first, exactly as resolution does (`resolve_chain_body` hydrates before
+        // `resolve_effect`), so the count and the specific-card check read the
+        // same targets the resolver will.
         Effect::Discard { .. } => {
             let effective = hydrate_event_context_targets(state, ability);
             discard::optional_discard_is_infeasible(state, effective.as_ref())
