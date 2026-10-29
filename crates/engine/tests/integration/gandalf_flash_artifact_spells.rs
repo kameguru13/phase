@@ -16,9 +16,13 @@ use crate::support::shared_card_db as load_db;
 /// Gandalf on P0's battlefield in P0's upkeep (no sorcery-speed timing), `card` in hand, and
 /// enough colorless and green mana floating to pay it.
 fn upkeep_with_gandalf(card: &str) -> (GameRunner, ObjectId) {
+    with_gandalf_at(Phase::Upkeep, card)
+}
+
+fn with_gandalf_at(phase: Phase, card: &str) -> (GameRunner, ObjectId) {
     let db = load_db().expect("the committed integration card fixture loads");
     let mut scenario = GameScenario::new();
-    scenario.at_phase(Phase::Upkeep);
+    scenario.at_phase(phase);
     scenario.add_real_card(P0, "Gandalf the White", Zone::Battlefield, db);
     let spell = scenario.add_real_card(P0, card, Zone::Hand, db);
     let mut mana = vec![ManaUnit::new(ManaType::Colorless, ObjectId(9_900), false, vec![]); 3];
@@ -64,6 +68,14 @@ fn a_nonlegendary_artifact_has_flash_under_gandalf() {
 
 #[test]
 fn a_nonlegendary_nonartifact_creature_still_needs_sorcery_timing() {
+    // Reach guard: the same board in P0's main phase casts the Bears, so the upkeep refusal
+    // below is the timing rule and not an unrelated casting failure.
+    let (mut runner, spell) = with_gandalf_at(Phase::PreCombatMain, "Grizzly Bears");
+    assert!(
+        cast(&mut runner, spell),
+        "Grizzly Bears can be cast at sorcery speed from this board"
+    );
+
     let (mut runner, spell) = upkeep_with_gandalf("Grizzly Bears");
     assert!(
         !cast(&mut runner, spell),

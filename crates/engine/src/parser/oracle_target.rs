@@ -5245,7 +5245,11 @@ pub(super) fn distribute_shared_properties(
 fn leading_leg_type_filters(filter: &TargetFilter) -> &[TypeFilter] {
     match filter {
         TargetFilter::Typed(typed) => &typed.type_filters,
-        TargetFilter::Or { filters } => filters.first().map_or(&[], leading_leg_type_filters),
+        // A leg carrying a non-property suffix ("... with the chosen name") lowers to an
+        // `And` whose first member is the typed head.
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            filters.first().map_or(&[], leading_leg_type_filters)
+        }
         _ => &[],
     }
 }
