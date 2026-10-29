@@ -5746,6 +5746,22 @@ fn resolve_optional_effect_decision_step(
         AutoMayChoice::Accept => {
             // CR 603.2h: choosing to take the indicated action spends the limit — before the
             // action runs, so an event the action itself causes cannot re-trigger the ability.
+            // "Its source's controller" takes the action: the lowering guard admits only
+            // instructions the shared routing classification proves are addressed to the
+            // controller. Re-check that classification against this instance's actual
+            // targets — the one input the parser can only approximate.
+            debug_assert!(
+                crate::game::triggers::indicated_action_limit(&ability).is_none()
+                    || crate::types::ability::optional_addressee_is_always_controller(
+                        &ability.effect,
+                        ability.optional_player.as_ref(),
+                        ability
+                            .targets
+                            .iter()
+                            .any(|target| matches!(target, TargetRef::Player(_))),
+                    ),
+                "CR 603.2h: an indicated action must be answered by the ability's controller"
+            );
             crate::game::triggers::record_indicated_action_taken(state, &ability);
             ability.context.optional_effect_performed = true;
             state

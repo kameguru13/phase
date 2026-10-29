@@ -18128,14 +18128,6 @@ pub(crate) fn record_indicated_action_taken(state: &mut GameState, ability: &Res
     let Some(key) = indicated_action_limit(ability) else {
         return;
     };
-    // CR 603.2h: "its source's controller" takes the action. The lowering guard admits only
-    // instructions the shared routing classification proves are addressed to the
-    // controller, so the accepting player is the controller.
-    debug_assert_eq!(
-        crate::game::effects::optional_prompt_player(state, ability),
-        Some(ability.controller),
-        "CR 603.2h: an indicated action must be answered by the ability's controller"
-    );
     if indicated_action_taken_by(state, key, ability.controller) {
         return;
     }
