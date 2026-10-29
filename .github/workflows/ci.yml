@@ -353,7 +353,11 @@ jobs:
   card-data-gate:
     name: Card data (generate, validate, coverage)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 30m overran on slow runners. A passing cardgen-cache miss takes 13–18.5m
+    # with the `tool` engine build at ~7m, but some runners take ~21m for that
+    # same build, which puts the whole job at ~31–32m. The ceiling only bills
+    # the failure case.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
