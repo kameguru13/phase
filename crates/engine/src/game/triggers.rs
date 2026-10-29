@@ -49614,6 +49614,115 @@ pub mod tests {
         );
     }
 
+    /// Settles two dying subjects against a battlefield observer carrying two
+    /// batched halves with a "triggers only once each turn" limit. With
+    /// `shared_limit` the second half steps back to the first as its limit
+    /// leader (one printed ability, CR 113.2c); without it each half is its own
+    /// ledger key. Returns the observer's settled contexts and the leading
+    /// half's ref.
+    fn settle_latched_batched_halves(
+        shared_limit: bool,
+    ) -> (
+        GameState,
+        Vec<PendingTriggerContext>,
+        ObjectId,
+        TriggerDefinitionRef,
+    ) {
+        let mut state = setup();
+        let observer = make_creature(&mut state, PlayerId(0), "Batched split observer", 0, 1);
+        let half = |offset| {
+            let mut trigger = TriggerDefinition::new(TriggerMode::ChangesZone)
+                .origin(Zone::Battlefield)
+                .destination(Zone::Graveyard)
+                .trigger_zones(vec![Zone::Battlefield, Zone::Graveyard])
+                .valid_card(TargetFilter::Typed(
+                    TypedFilter::default().with_type(TypeFilter::Creature),
+                ))
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Database,
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                        player: TargetFilter::Controller,
+                    },
+                ));
+            trigger.batched = true;
+            trigger.constraint = Some(TriggerConstraint::OncePerTurn {
+                spent_by: TriggerLimitSpend::Triggering,
+            });
+            trigger.limit_leader_offset = if shared_limit {
+                std::num::NonZeroUsize::new(offset)
+            } else {
+                None
+            };
+            trigger
+        };
+        let object = state.objects.get_mut(&observer).expect("observer exists");
+        std::sync::Arc::make_mut(&mut object.base_trigger_definitions).extend([half(0), half(1)]);
+        object.materialize_base_trigger_definitions();
+        let object = &state.objects[&observer];
+        let leader_ref = object.trigger_definition_ref(
+            object
+                .trigger_definitions
+                .iter_all()
+                .next()
+                .expect("the leading half is installed"),
+        );
+
+        let first_subject = make_creature(&mut state, PlayerId(0), "First batched subject", 2, 2);
+        let second_subject = make_creature(&mut state, PlayerId(0), "Second batched subject", 2, 2);
+        let mut group = allocate_logical_zone_change_group(&mut state, &[]);
+        for subject in [first_subject, second_subject] {
+            let mut events = Vec::new();
+            crate::game::zones::move_to_zone(&mut state, subject, Zone::Graveyard, &mut events);
+            group
+                .append_delivery_events(&events)
+                .expect("retain the subject's occurrence");
+        }
+        latch_logical_zone_change_group_immediately_after(&mut state, &mut group);
+
+        let settled: Vec<_> = collect_logical_zone_trigger_settlement(&mut state, &group)
+            .expect("batched latches settle")
+            .into_iter()
+            .filter(|context| context.pending.source_id == observer)
+            .collect();
+        (state, settled, observer, leader_ref)
+    }
+
+    /// CR 603.2 + CR 113.2c: the latched batched settlement path admits one
+    /// split half per shared "triggers only once each turn" limit. Each latched
+    /// definition is checked against the ledger and recorded before the next
+    /// definition is checked, so the later half reads the key the leading half
+    /// spent.
+    #[test]
+    fn latched_batched_settlement_admits_one_split_half_per_shared_trigger_limit() {
+        let (state, settled, _, leader_ref) = settle_latched_batched_halves(true);
+        assert_eq!(
+            settled.len(),
+            1,
+            "one printed ability triggers once across its batched split halves"
+        );
+        assert_eq!(
+            settled[0].trigger_events.len(),
+            2,
+            "reach: the admitted context is the latched batched one carrying both occurrences"
+        );
+        assert_eq!(
+            state.triggers_fired_this_turn,
+            HashSet::from([leader_ref]),
+            "the admitted half spends the leading half's key exactly once"
+        );
+
+        // Sibling: distinct limit keys admit both halves, so both reach the
+        // latched loop and the shared-key rejection above is not vacuous.
+        let (state, settled, _, _) = settle_latched_batched_halves(false);
+        assert_eq!(
+            settled.len(),
+            2,
+            "two independent limits admit both batched halves"
+        );
+        assert_eq!(state.triggers_fired_this_turn.len(), 2);
+    }
+
     #[test]
     fn logical_zone_settlement_batches_all_retained_occurrences_once() {
         let mut state = setup();

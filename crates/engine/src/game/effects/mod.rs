@@ -16059,6 +16059,14 @@ fn optional_effect_is_infeasible(state: &GameState, ability: &ResolvedAbility) -
             let effective = hydrate_event_context_targets(state, ability);
             counters::move_counters_optional_is_infeasible(state, effective.as_ref())
         }
+        // CR 118.12 + CR 118.3 + CR 608.2d: an optional discard the player can't
+        // pay in full is an impossible option. Hydrate event-context targets
+        // first, exactly as resolution does, so a "that player discards" binding
+        // is read rather than the controller fallback.
+        Effect::Discard { .. } => {
+            let effective = hydrate_event_context_targets(state, ability);
+            discard::optional_discard_is_infeasible(state, effective.as_ref())
+        }
         // CR 608.2d + CR 122.1: an optional exact counter-removal selection
         // cannot be accepted unless every required permanent is selectable.
         Effect::ChooseObjectsIntoTrackedSet { .. } => {
@@ -22220,6 +22228,10 @@ fn resolve_chain_body(
                 ..
             }
             | Effect::PutAtLibraryPosition { .. }
+            // CR 118.12 + CR 118.3: a short discard pool is a declined option.
+            // The resolver would discard the cards it has (`count = min(num,
+            // eligible)`) and run the "If you do" rider on a cost never paid in full.
+            | Effect::Discard { .. }
     );
     if optional_is_infeasible && auto_decline_infeasible_optional {
         return resolve_optional_effect_decision_step(
@@ -55582,10 +55594,41 @@ mod tests {
         );
     }
 
-    /// CR 603.12 + CR 701.9a: If no card was discarded, a "when you do"
-    /// reflexive trigger must not ask for its required target.
+    /// An optional "you may discard" of `count` cards by `target` from source
+    /// `ObjectId(100)` controlled by P0.
+    fn optional_discard(count: QuantityExpr, target: TargetFilter) -> ResolvedAbility {
+        let mut discard = ResolvedAbility::new(
+            Effect::Discard {
+                count,
+                target,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
+                unless_filter: None,
+                filter: None,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        discard.optional = true;
+        discard
+    }
+
+    fn add_hand_card(state: &mut GameState, owner: PlayerId, card: u64) -> ObjectId {
+        create_object(
+            state,
+            CardId(card),
+            owner,
+            format!("Hand Card {card}"),
+            Zone::Hand,
+        )
+    }
+
+    /// CR 118.12 + CR 118.3 + CR 608.2d + CR 603.12: with an empty hand, "you may
+    /// discard a card. When you do, …" (the Ill-Timed Explosion class) is an
+    /// impossible option: it is not offered, and no reflexive trigger is created.
+    /// The probe (`upfront_optional_gate`) and production agree.
     #[test]
-    fn optional_empty_hand_discard_does_not_create_reflexive_target_choice() {
+    fn optional_empty_hand_discard_is_not_offered_and_creates_no_reflexive_target_choice() {
         let mut state = GameState::new_two_player(42);
         let attacker = create_object(
             &mut state,
@@ -55614,39 +55657,181 @@ mod tests {
             PlayerId(0),
         )
         .condition(AbilityCondition::WhenYouDo);
-        let mut discard = ResolvedAbility::new(
-            Effect::Discard {
-                count: QuantityExpr::Fixed { value: 1 },
+        let discard = optional_discard(QuantityExpr::Fixed { value: 1 }, TargetFilter::Controller)
+            .sub_ability(reflexive);
+
+        // Positive control: one card in hand makes the same discard offerable.
+        let mut payable = state.clone();
+        add_hand_card(&mut payable, PlayerId(0), 11);
+        assert!(
+            upfront_optional_gate(&payable, &discard, OptionalFeasibility::Probe).is_some(),
+            "reach: a payable discard opens the optional gate"
+        );
+        assert!(
+            upfront_optional_gate(&state, &discard, OptionalFeasibility::Probe).is_none(),
+            "the probe agrees an empty-hand discard is not offered"
+        );
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &discard, &mut events, 0).unwrap();
+        assert!(
+            !matches!(
+                state.waiting_for,
+                WaitingFor::OptionalEffectChoice { .. } | WaitingFor::TriggerTargetSelection { .. }
+            ),
+            "an empty-hand discard is neither offered nor followed by a reflexive target prompt, got {:?}",
+            state.waiting_for
+        );
+        assert!(state.objects[&attacker].counters.is_empty());
+    }
+
+    /// CR 118.3: "you may discard two cards. If you do, draw three cards." with one
+    /// card in hand can't be paid in full, so it is not offered: the card stays in
+    /// hand and the "If you do" draw does not happen. Two cards make it offerable.
+    #[test]
+    fn optional_discard_short_pool_is_not_offered_and_gates_its_rider() {
+        let build = |hand_cards: u64| {
+            let mut state = GameState::new_two_player(42);
+            let hand: Vec<_> = (0..hand_cards)
+                .map(|n| add_hand_card(&mut state, PlayerId(0), 10 + n))
+                .collect();
+            for n in 0..3 {
+                create_object(
+                    &mut state,
+                    CardId(20 + n),
+                    PlayerId(0),
+                    format!("Library {n}"),
+                    Zone::Library,
+                );
+            }
+            (state, hand)
+        };
+        let draw_three = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 3 },
                 target: TargetFilter::Controller,
-                selection: crate::types::ability::CardSelectionMode::Chosen,
-                unless_filter: None,
-                filter: None,
             },
             vec![],
             ObjectId(100),
             PlayerId(0),
         )
-        .sub_ability(reflexive);
-        discard.optional = true;
+        .condition(AbilityCondition::effect_performed());
+        let ability = optional_discard(QuantityExpr::Fixed { value: 2 }, TargetFilter::Controller)
+            .sub_ability(draw_three);
 
+        let (mut state, hand) = build(1);
         let mut events = Vec::new();
-        resolve_ability_chain(&mut state, &discard, &mut events, 0).unwrap();
-        assert!(matches!(
-            state.waiting_for,
-            WaitingFor::OptionalEffectChoice { .. }
-        ));
-        let waiting = crate::game::engine_payment_choices::handle_optional_effect_choice(
-            &mut state,
-            true,
-            &mut events,
-        )
-        .unwrap();
-
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
         assert!(
-            !matches!(waiting, WaitingFor::TriggerTargetSelection { .. }),
-            "an empty-hand discard must not create a reflexive target prompt"
+            !matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. }),
+            "one card can't pay a two-card discard, got {:?}",
+            state.waiting_for
         );
-        assert!(state.objects[&attacker].counters.is_empty());
+        assert_eq!(
+            state.objects[&hand[0]].zone,
+            Zone::Hand,
+            "nothing discarded"
+        );
+        assert_eq!(state.players[0].hand.len(), 1, "the rider did not draw");
+        assert_eq!(state.players[0].library.len(), 3);
+
+        let (mut state, _) = build(2);
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        assert!(
+            matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. }),
+            "two cards pay the discard, got {:?}",
+            state.waiting_for
+        );
+    }
+
+    /// CR 608.2d: "up to N" admits zero and "discard your hand" is always payable
+    /// (Balin, Loremaster ruling: you may discard your hand even with zero cards),
+    /// so both stay offered with an empty hand; a per-player fan-out
+    /// (`player_scope`) decides per player downstream and is never decided here.
+    #[test]
+    fn optional_discard_never_impossible_shapes_stay_offered() {
+        let discard_hand = optional_discard(
+            QuantityExpr::Ref {
+                qty: QuantityRef::HandSize {
+                    player: PlayerScope::Controller,
+                },
+            },
+            TargetFilter::Controller,
+        );
+        let up_to_two = optional_discard(
+            QuantityExpr::UpTo {
+                max: Box::new(QuantityExpr::Fixed { value: 2 }),
+            },
+            TargetFilter::Controller,
+        );
+        for (shape, ability) in [
+            ("discard your hand", discard_hand),
+            ("up to two", up_to_two),
+        ] {
+            let mut state = GameState::new_two_player(42);
+            assert!(state.players[0].hand.is_empty());
+            assert!(!discard::optional_discard_is_infeasible(&state, &ability));
+            let mut events = Vec::new();
+            resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+            assert!(
+                matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. }),
+                "{shape}: an empty hand still offers it, got {:?}",
+                state.waiting_for
+            );
+        }
+
+        let state = GameState::new_two_player(42);
+        let mut fan_out =
+            optional_discard(QuantityExpr::Fixed { value: 1 }, TargetFilter::ScopedPlayer);
+        assert!(
+            discard::optional_discard_is_infeasible(&state, &fan_out),
+            "reach: unscoped, the same discard from an empty hand is decided infeasible"
+        );
+        fan_out.player_scope = Some(PlayerFilter::Opponent);
+        assert!(
+            !discard::optional_discard_is_infeasible(&state, &fan_out),
+            "a player_scope fan-out is never decided by the root predicate"
+        );
+    }
+
+    /// CR 603.2 + CR 608.2d: "that player may discard a card" reads the trigger
+    /// event's player, not the controller's hand, before deciding feasibility.
+    #[test]
+    fn optional_discard_feasibility_reads_the_event_context_player() {
+        let ability = optional_discard(
+            QuantityExpr::Fixed { value: 1 },
+            TargetFilter::TriggeringPlayer,
+        );
+        let build = |p1_hand: bool| {
+            let mut state = GameState::new_two_player(42);
+            if p1_hand {
+                add_hand_card(&mut state, PlayerId(1), 11);
+            }
+            state.current_trigger_event = Some(GameEvent::LifeChanged {
+                player_id: PlayerId(1),
+                amount: -1,
+                new_total: crate::types::events::LifeTotalReading::default(),
+            });
+            assert!(state.players[0].hand.is_empty());
+            state
+        };
+
+        let mut state = build(true);
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        assert!(
+            matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. }),
+            "the triggering player's card pays the discard, got {:?}",
+            state.waiting_for
+        );
+
+        let mut state = build(false);
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        assert!(
+            !matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. }),
+            "the triggering player has no card to discard, got {:?}",
+            state.waiting_for
+        );
     }
 
     /// Abandon Attachments #81: interactive discard (player has 2+ cards) → IfYouDo draw 2.

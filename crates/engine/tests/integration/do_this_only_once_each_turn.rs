@@ -1060,14 +1060,140 @@ fn mach_1_life_gain_half_triggers_only_once_each_turn() {
     let second = gain_one_life(&mut scenario, "Test Gain Two");
     scenario.with_library_top(P0, &["Card A", "Card B"]);
     let mut runner = scenario.build();
+    let life_before = runner.life(P0);
 
     cast(&mut runner, first);
     let fired = resolve_all(&mut runner, mach, true);
+    assert_eq!(
+        runner.life(P0),
+        life_before + 1,
+        "reach: the first spell gained life"
+    );
     assert_eq!(fired.len(), 1, "gaining life triggers MACH-1");
 
     cast(&mut runner, second);
     let fired = resolve_all(&mut runner, mach, true);
+    assert_eq!(
+        runner.life(P0),
+        life_before + 2,
+        "reach: the second spell gained life, so the trigger event happened"
+    );
     assert!(fired.is_empty(), "{fired:?}");
+}
+
+// ---------------------------------------------------------------------------
+// An impossible optional discard is not offered and spends no limit
+// ---------------------------------------------------------------------------
+
+const IRREVERENT_GREMLIN: &str = "Menace (This creature can't be blocked except by two or more creatures.)\nWhenever another creature you control with power 2 or less enters, you may discard a card. If you do, draw a card. Do this only once each turn.";
+
+/// A free token maker: each activation is "another creature you control with
+/// power 2 or less enters" for Irreverent Gremlin.
+const SOLDIER_MAKER: &str = "{0}: Create a 1/1 white Soldier creature token.";
+
+/// A free draw, to give P0 a card to discard.
+const FREE_DRAW: &str = "{0}: Draw a card.";
+
+/// Activate `source`'s only ability for free and pass priority until it has
+/// resolved, stopping with any triggers it caused on the stack.
+fn activate_and_resolve(runner: &mut GameRunner, source: ObjectId) {
+    activate_only_ability(runner, source, &[]);
+    for _ in 0..12 {
+        let on_stack = runner
+            .state()
+            .stack
+            .iter()
+            .any(|entry| entry.source_id == source);
+        match runner.state().waiting_for {
+            WaitingFor::Priority { .. } if on_stack => {
+                runner.act(GameAction::PassPriority).expect("pass priority");
+            }
+            _ => return,
+        }
+    }
+    panic!("the activated ability never resolved");
+}
+
+fn graveyard_size(runner: &GameRunner) -> usize {
+    runner.state().players[P0.0 as usize].graveyard.len()
+}
+
+/// CR 118.12 + CR 118.3 + CR 608.2d + CR 603.2h: with an empty hand, Irreverent
+/// Gremlin's "you may discard a card" can't be paid, so it is not offered and the
+/// controller takes no indicated action; the next entry the same turn triggers it
+/// again, and once a card is discarded the limit is spent.
+#[test]
+fn irreverent_gremlin_empty_hand_discard_is_not_offered_and_does_not_spend_the_limit() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let gremlin = scenario
+        .add_creature_from_oracle(P0, "Irreverent Gremlin", 2, 2, IRREVERENT_GREMLIN)
+        .id();
+    let soldier_maker = scenario
+        .add_artifact_from_oracle(P0, "Soldier Maker", SOLDIER_MAKER)
+        .id();
+    let card_drawer = scenario
+        .add_artifact_from_oracle(P0, "Card Drawer", FREE_DRAW)
+        .id();
+    scenario.with_library_top(P0, &["Card A", "Card B", "Card C"]);
+    let mut runner = scenario.build();
+    assert_eq!(hand_size(&runner), 0);
+    let graveyard_before = graveyard_size(&runner);
+
+    // Leg 1: empty hand — the trigger resolves without a prompt.
+    activate_and_resolve(&mut runner, soldier_maker);
+    let refs = stacked_trigger_refs(&runner, gremlin);
+    let [Some(gremlin_ref)] = refs.as_slice() else {
+        panic!("reach: the Soldier's entry triggers Gremlin once, got {refs:?}");
+    };
+    let gremlin_ref = gremlin_ref.clone();
+    runner.advance_until_stack_empty();
+    assert_settled_priority(&runner, "an empty-hand discard is never offered");
+    assert!(
+        indicated_actions(&runner).is_empty(),
+        "an impossible discard takes no indicated action"
+    );
+    assert_eq!(hand_size(&runner), 0, "no card drawn");
+    assert_eq!(
+        graveyard_size(&runner),
+        graveyard_before,
+        "no card discarded"
+    );
+
+    // Leg 2: one card in hand — the next entry triggers again and is offered.
+    activate_and_resolve(&mut runner, card_drawer);
+    assert_eq!(hand_size(&runner), 1, "reach: P0 drew a card to discard");
+    activate_and_resolve(&mut runner, soldier_maker);
+    assert_eq!(
+        stacked_trigger_refs(&runner, gremlin).len(),
+        1,
+        "the untaken limit leaves Gremlin free to trigger"
+    );
+    runner.advance_until_stack_empty();
+    assert_optional_prompt(&runner, P0, "a payable discard is offered");
+    decide(&mut runner, true);
+    runner.advance_until_stack_empty();
+    assert_settled_priority(&runner, "after discarding and drawing");
+    assert_eq!(
+        indicated_actions(&runner),
+        HashSet::from([(gremlin_ref, P0)]),
+        "discarding takes the indicated action"
+    );
+    assert_eq!(hand_size(&runner), 1, "discarded one card, drew one card");
+    assert_eq!(graveyard_size(&runner), graveyard_before + 1);
+
+    // Leg 3: the limit is spent — the next entry does not trigger Gremlin.
+    let battlefield_before = runner.state().battlefield.len();
+    activate_and_resolve(&mut runner, soldier_maker);
+    assert_eq!(
+        runner.state().battlefield.len(),
+        battlefield_before + 1,
+        "reach: another Soldier entered"
+    );
+    assert!(
+        stacked_trigger_refs(&runner, gremlin).is_empty(),
+        "Gremlin's controller took its action this turn, so it no longer triggers"
+    );
 }
 
 /// CR 113.2c + CR 603.2: "When MACH-1 enters and whenever you gain life, surveil 1.
