@@ -2,6 +2,9 @@
 //! spells as though they had flash.", verified against MTGJSON) lets its controller cast ANY
 //! artifact spell at instant speed, legendary or not. Each leg of the list repeats "spells", so
 //! "legendary" qualifies only the left leg.
+//!
+//! Gandalf is built from its Oracle text, so the permission under test comes from the parser
+//! at test time rather than from the precomputed card fixture.
 
 use engine::game::scenario::{GameRunner, GameScenario, P0};
 use engine::game::scenario_db::GameScenarioDbExt;
@@ -13,6 +16,12 @@ use engine::types::zones::Zone;
 
 use crate::support::shared_card_db as load_db;
 
+/// Gandalf the White's Oracle text (Scryfall), 4/5 Legendary Creature — Avatar Wizard.
+const GANDALF_THE_WHITE: &str = "Flash\n\
+You may cast legendary spells and artifact spells as though they had flash.\n\
+If a legendary permanent or an artifact entering or leaving the battlefield causes a triggered \
+ability of a permanent you control to trigger, that ability triggers an additional time.";
+
 /// Gandalf on P0's battlefield in P0's upkeep (no sorcery-speed timing), `card` in hand, and
 /// enough colorless and green mana floating to pay it.
 fn upkeep_with_gandalf(card: &str) -> (GameRunner, ObjectId) {
@@ -23,7 +32,10 @@ fn with_gandalf_at(phase: Phase, card: &str) -> (GameRunner, ObjectId) {
     let db = load_db().expect("the committed integration card fixture loads");
     let mut scenario = GameScenario::new();
     scenario.at_phase(phase);
-    scenario.add_real_card(P0, "Gandalf the White", Zone::Battlefield, db);
+    scenario
+        .add_creature_from_oracle(P0, "Gandalf the White", 4, 5, GANDALF_THE_WHITE)
+        .as_legendary()
+        .with_subtypes(vec!["Avatar", "Wizard"]);
     let spell = scenario.add_real_card(P0, card, Zone::Hand, db);
     let mut mana = vec![ManaUnit::new(ManaType::Colorless, ObjectId(9_900), false, vec![]); 3];
     mana.extend(vec![
