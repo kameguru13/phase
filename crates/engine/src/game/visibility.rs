@@ -261,6 +261,9 @@ fn redact_paid_cast_cleanup_authority(waiting_for: &mut WaitingFor) {
 fn redact_resolution_cleanup_authority(cleanup: &mut crate::types::ability::ResolutionCastCleanup) {
     cleanup.offer_id = None;
     cleanup.delayed_trigger_receipts.clear();
+    // CR 603.2h limit authority is rules-execution state like the trigger-limit ledgers
+    // this module already clears; no viewer consumer reads it.
+    cleanup.indicated_action = None;
 }
 
 fn redact_casting_permission_cleanup_authority(
@@ -14551,6 +14554,7 @@ mod tests {
                     ),
                     exiled_misses: Vec::new(),
                     delayed_trigger_receipts: Vec::new(),
+                    indicated_action: None,
                     reject_action: ResolutionMvRejectAction::BottomWithMisses,
                     success_action: Default::default(),
                 }),
@@ -14901,6 +14905,7 @@ mod tests {
                 reject_action: ResolutionMvRejectAction::RemainExiled,
                 success_action: ResolutionCastSuccessAction::BottomMisses,
                 delayed_trigger_receipts: receipts,
+                indicated_action: None,
             }),
             duration: None,
             source_id: None,
@@ -15141,6 +15146,117 @@ mod tests {
         assert!(
             shared > 0,
             "redacting one object must not copy every other object"
+        );
+    }
+
+    /// CR 603.2h: a resolution cast's carried "Do this only once each turn" limit is
+    /// rules-execution authority. Both carriers — the paid `GraveyardPaidCast` offer and
+    /// the elected `ExileWithAltCost` permission — reach every viewer with it cleared,
+    /// beside the existing `offer_id` redaction, while the authoritative state keeps it.
+    #[test]
+    fn resolution_cast_indicated_action_is_redacted_from_viewer_copies() {
+        use crate::types::ability::{
+            CastingPermission, IndicatedActionLimit, ResolutionCastCleanup,
+            TriggerBaseSetInstanceRef, TriggerDefinitionOccurrenceRef, TriggerDefinitionRef,
+        };
+        use crate::types::identifiers::{ObjectIncarnationRef, ResolutionCastOfferId};
+
+        let owner = PlayerId(0);
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(9_101),
+            owner,
+            "Limited source".into(),
+            Zone::Battlefield,
+        );
+        let hit_card = create_object(
+            &mut state,
+            CardId(9_102),
+            owner,
+            "Offered card".into(),
+            Zone::Graveyard,
+        );
+        let limit = IndicatedActionLimit {
+            ledger_ref: TriggerDefinitionRef {
+                source: ObjectIncarnationRef::of(source, 0),
+                occurrence: TriggerDefinitionOccurrenceRef::Printed {
+                    base_set: TriggerBaseSetInstanceRef::INITIAL,
+                    printed_index: 0,
+                },
+            },
+            controller: owner,
+        };
+        let offer_id = ResolutionCastOfferId(91);
+        let mut permission =
+            exile_with_alt_cost_permission(source, owner, Some(offer_id), Vec::new());
+        let CastingPermission::ExileWithAltCost {
+            resolution_cleanup: Some(permission_cleanup),
+            ..
+        } = &mut permission
+        else {
+            unreachable!("the helper builds an ExileWithAltCost with a cleanup");
+        };
+        permission_cleanup.indicated_action = Some(Box::new(limit.clone()));
+        let offer_cleanup: ResolutionCastCleanup = permission_cleanup.clone();
+        state
+            .objects
+            .get_mut(&hit_card)
+            .unwrap()
+            .casting_permissions = vec![permission];
+        state.waiting_for = WaitingFor::CastOffer {
+            player: owner,
+            kind: CastOfferKind::GraveyardPaidCast {
+                hit_card,
+                mana_spend_permission: None,
+                graveyard_replacement: None,
+                enters_with_modifications: Default::default(),
+                cast_transformed: false,
+                additional_cost: None,
+                cleanup: offer_cleanup,
+            },
+        };
+        let before = serde_json::to_value(&state).unwrap();
+
+        for viewer in [owner, PlayerId(1)] {
+            let view = filter_state_for_viewer(&state, viewer);
+            let WaitingFor::CastOffer {
+                kind: CastOfferKind::GraveyardPaidCast { cleanup, .. },
+                ..
+            } = &view.waiting_for
+            else {
+                panic!("{viewer:?}: the viewer keeps the public paid-cast prompt");
+            };
+            assert_eq!(
+                cleanup.offer_id, None,
+                "reach: the offer cleanup was redacted"
+            );
+            assert_eq!(cleanup.indicated_action, None, "{viewer:?}: offer carrier");
+            let permission_cleanup = sole_cleanup(&view.objects[&hit_card].casting_permissions);
+            assert_eq!(permission_cleanup.offer_id, None);
+            assert_eq!(
+                permission_cleanup.indicated_action, None,
+                "{viewer:?}: permission carrier"
+            );
+        }
+
+        assert!(
+            serde_json::to_value(&state).unwrap() == before,
+            "redacting viewer copies must not alter the authoritative state"
+        );
+        let WaitingFor::CastOffer {
+            kind: CastOfferKind::GraveyardPaidCast { cleanup, .. },
+            ..
+        } = &state.waiting_for
+        else {
+            unreachable!("the authoritative prompt is unchanged");
+        };
+        assert_eq!(cleanup.indicated_action.as_deref(), Some(&limit));
+        assert_eq!(
+            sole_cleanup(&state.objects[&hit_card].casting_permissions)
+                .indicated_action
+                .as_deref(),
+            Some(&limit)
         );
     }
 

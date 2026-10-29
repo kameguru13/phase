@@ -24117,8 +24117,8 @@ declare_game_state! {
     pub triggers_fired_this_turn_per_opponent: HashSet<(TriggerDefinitionRef, PlayerId)>,
     /// CR 603.2h: (trigger definition, player) pairs — that player, controlling that
     /// ability, has taken its "Do this only once each turn" indicated action this turn.
-    /// Sole writer: `triggers::record_indicated_action_taken` (acceptance of the ability's
-    /// optional instruction). Read at fire time and at resolution (incl. the
+    /// Sole writer: `triggers::record_indicated_action`, on acceptance of a non-cast
+    /// instruction or when a CR 603.2h resolution cast becomes cast. Read at fire time and at resolution (incl. the
     /// `upfront_optional_gate` authority). Cleared at turn start. Boxed: populated only
     /// once a CR 603.2h ability's action is taken, so it keeps `GameState`'s inline size
     /// inside the `game_state_size` stack budget.
@@ -38281,6 +38281,7 @@ mod tests {
                     success_action:
                         crate::types::ability::ResolutionCastSuccessAction::BottomMisses,
                     delayed_trigger_receipts: vec![receipt.clone()],
+                    indicated_action: None,
                 },
             },
         };
@@ -38456,6 +38457,7 @@ mod tests {
             reject_action: ResolutionMvRejectAction::RemainExiled,
             success_action: ResolutionCastSuccessAction::BottomMisses,
             delayed_trigger_receipts: Vec::new(),
+            indicated_action: None,
         };
 
         // GraveyardPaidCast — an empty rider is skipped and a carried rider

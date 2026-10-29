@@ -8066,8 +8066,8 @@ fn project_out_resources(state: &GameState) -> GameState {
     // `triggers_fired_this_turn` ONLY for `OncePerTurn { spent_by: Triggering }` at
     // admission, and `trigger_fire_counts_this_turn` ONLY for `MaxTimesPerTurn`.
     // `trigger_indicated_actions_this_turn` is written ONLY by
-    // `record_indicated_action_taken` when the controller accepts a CR 603.2h ability's
-    // optional instruction. An UNRESTRICTED (repeatable) trigger, or a CR 603.2h trigger
+    // `triggers::record_indicated_action`, on acceptance of a non-cast instruction or
+    // when a CR 603.2h resolution cast becomes cast. An UNRESTRICTED (repeatable) trigger, or a CR 603.2h trigger
     // that is always declined, inserts into NONE of them, so a legitimate
     // unrestricted-trigger loop never touches them and PRESERVING them cannot break
     // legit-loop equality. For a GATED trigger the key/count is present/grows, so two

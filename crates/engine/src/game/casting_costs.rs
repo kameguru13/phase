@@ -13434,6 +13434,16 @@ fn finalize_cast_with_phyrexian_choices_inner(
             player,
             casting_permission_index,
         );
+    // CR 603.2h + CR 601.2i: capture the elected resolution cast's "Do this only once
+    // each turn" limit BEFORE the stack move, whose zone-exit cleanup drops the
+    // `ExileWithAltCost` permission carrying it. Spent below, once the spell is cast.
+    let resolution_cast_indicated_action =
+        super::casting::selected_resolution_cast_indicated_action(
+            state,
+            object_id,
+            player,
+            casting_permission_index,
+        );
     // CR 601.2a + CR 601.2i: The spell was announced onto the stack earlier,
     // but the object's `zone` field stayed at its origin through cost payment
     // so continuous effects that granted castability ("cards in your graveyard
@@ -13681,6 +13691,16 @@ fn finalize_cast_with_phyrexian_choices_inner(
             .pending
             .chain
             .set_first_optional_effect_performed_gate(true);
+    }
+
+    // CR 603.2h + CR 601.2i: the spell is now cast — the controller has taken a
+    // "you may cast … Do this only once each turn" indicated action. Recorded before
+    // this action's triggers are collected, so the SpellCast it causes cannot re-trigger.
+    // An event raised while paying for this cast (before CR 601.2i) is checked against a
+    // ledger this commit has already written by collection time; no card in the class can
+    // raise its own trigger event while paying.
+    if let Some(limit) = resolution_cast_indicated_action.as_deref() {
+        crate::game::triggers::record_indicated_action(state, limit);
     }
 
     // CR 601.2a + CR 601.2b + CR 110.4: Record permission usage when the spell
@@ -25438,6 +25458,7 @@ mod tests {
                         reject_action: ResolutionMvRejectAction::BottomWithMisses,
                         success_action: ResolutionCastSuccessAction::BottomMisses,
                         delayed_trigger_receipts: Vec::new(),
+                        indicated_action: None,
                     }),
                     duration: None,
 
@@ -25566,6 +25587,7 @@ mod tests {
                             remaining_hits: vec![next_hit],
                         },
                         delayed_trigger_receipts: Vec::new(),
+                        indicated_action: None,
                     }),
                     duration: None,
 
@@ -25649,6 +25671,7 @@ mod tests {
                             remaining_hits: vec![],
                         },
                         delayed_trigger_receipts: Vec::new(),
+                        indicated_action: None,
                     }),
                     duration: None,
 
@@ -25939,6 +25962,7 @@ mod tests {
                         reject_action: ResolutionMvRejectAction::BottomWithMisses,
                         success_action: ResolutionCastSuccessAction::BottomMisses,
                         delayed_trigger_receipts: Vec::new(),
+                        indicated_action: None,
                     }),
                     duration: None,
 
@@ -26011,6 +26035,7 @@ mod tests {
                         reject_action: ResolutionMvRejectAction::BottomWithMisses,
                         success_action: ResolutionCastSuccessAction::BottomMisses,
                         delayed_trigger_receipts: Vec::new(),
+                        indicated_action: None,
                     }),
                     duration: None,
 
@@ -26167,6 +26192,7 @@ mod tests {
                     reject_action: ResolutionMvRejectAction::BottomWithMisses,
                     success_action: ResolutionCastSuccessAction::BottomMisses,
                     delayed_trigger_receipts: Vec::new(),
+                    indicated_action: None,
                 },
                 &mut events,
             )

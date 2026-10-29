@@ -69,8 +69,11 @@ use super::oracle_util::{
     strip_reminder_text, TextPair, GRANTING_SELF_PLACEHOLDER, SELF_REF_PARSE_ONLY_PHRASES,
 };
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
-use crate::types::ability::optional_addressee_is_always_controller;
 use crate::types::ability::ManaProduction;
+use crate::types::ability::{
+    indicated_action_commit, optional_addressee_is_always_controller, CardPlayMode,
+    CastFromZoneDriver, IndicatedActionCommit,
+};
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag,
     AdditionalCostOrigin, AdditionalCostPaymentSource, AggregateFunction, AttachmentKind,
@@ -4578,7 +4581,9 @@ fn chain_creates_reflexive_ability(def: &AbilityDefinition) -> bool {
 /// - any instruction whose prompt the shared routing classification
 ///   ([`optional_addressee_is_always_controller`]) cannot prove is addressed to the
 ///   controller ("they may", another player's payment, subject-anchored and scoped
-///   instructions, a copy offered to a targeted player).
+///   instructions, a copy offered to a targeted player);
+/// - a cast indicated action that is not a single-card cast made during this resolution
+///   (CR 601.2i + CR 608.2g): only that shape reaches the commit that spends the limit.
 fn has_single_indicated_action_instruction(def: &AbilityDefinition) -> bool {
     fn spine<'a>(def: &'a AbilityDefinition, nodes: &mut Vec<&'a AbilityDefinition>) {
         nodes.push(def);
@@ -4603,6 +4608,26 @@ fn has_single_indicated_action_instruction(def: &AbilityDefinition) -> bool {
                 Some(TargetFilter::TriggeringSource)
             ))
     };
+    // CR 608.2g + CR 601.2i: only a single-card cast made during this resolution reaches
+    // the commit that spends the limit; a lingering grant, a window, a play, a borrowed
+    // alternative cost or any other cast instruction has no observable commit → strict
+    // failure.
+    let commit_is_observable =
+        |node: &AbilityDefinition| match indicated_action_commit(&node.effect) {
+            IndicatedActionCommit::OnAccept => true,
+            IndicatedActionCommit::OnSpellCast => {
+                matches!(
+                    &*node.effect,
+                    Effect::CastFromZone {
+                        mode: CardPlayMode::Cast,
+                        driver: CastFromZoneDriver::DuringResolution,
+                        duration: None,
+                        alt_ability_cost: None,
+                        ..
+                    }
+                ) && node.multi_target.is_none()
+            }
+        };
     def.modal.is_none()
         && nodes.iter().all(|node| node.player_scope.is_none())
         && matches!(optional.as_slice(), [only]
@@ -4612,7 +4637,15 @@ fn has_single_indicated_action_instruction(def: &AbilityDefinition) -> bool {
                 &only.effect,
                 only.optional_player.as_ref(),
                 targets_may_include_player(only),
-            ))
+            )
+            && commit_is_observable(only)
+            // The carrier builders stamp the limit from any `CastFromZone` node of the
+            // chain, and no other cast instruction has a commit at all: the indicated
+            // action must be the chain's only cast instruction.
+            && nodes.iter().all(|node| {
+                indicated_action_commit(&node.effect) == IndicatedActionCommit::OnAccept
+                    || std::ptr::eq(*node, *only)
+            }))
 }
 
 /// Strip constraint sentences from effect text so they don't produce spurious sub-abilities.

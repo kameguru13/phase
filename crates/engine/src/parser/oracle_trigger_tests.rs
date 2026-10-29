@@ -41894,3 +41894,141 @@ fn untyped_event_window_declines_the_head() {
     assert_eq!(plain.mode, TriggerMode::ChangesZone);
     assert_eq!(plain.condition, None);
 }
+
+// ---------------------------------------------------------------------------
+// CR 603.2h cast indicated actions: the lowering guard admits only a single-card
+// cast made during this resolution (CR 601.2i + CR 608.2g), the one shape whose
+// commit spends the limit. Oracle text verbatim from MTGJSON.
+// ---------------------------------------------------------------------------
+
+const EMET_SELCH_OF_THE_THIRD_SEAT: &str = "Spells you cast from your graveyard cost {2} less to cast.\nWhenever one or more opponents lose life, you may cast target instant or sorcery card from your graveyard. If that spell would be put into your graveyard, exile it instead. Do this only once each turn.";
+const PLANETARIUM_OF_WAN_SHI_TONG: &str = "{1}, {T}: Scry 2.\nWhenever you scry or surveil, look at the top card of your library. You may cast that card without paying its mana cost. Do this only once each turn. (Look at the card after you scry or surveil.)";
+
+/// The chain's optional instruction (the indicated action's node).
+fn optional_node(def: &TriggerDefinition) -> &AbilityDefinition {
+    let mut node = def.execute.as_deref();
+    while let Some(current) = node {
+        if current.optional {
+            return current;
+        }
+        node = current.sub_ability.as_deref();
+    }
+    panic!("the chain has an optional instruction: {def:#?}");
+}
+
+/// P-G1: Emet-Selch and Planetarium make a single-card cast during the resolution,
+/// so the guard admits their CR 603.2h limit.
+#[test]
+fn single_card_during_resolution_cast_lowers_to_an_indicated_action_limit() {
+    for (text, name, card_type) in [
+        (
+            EMET_SELCH_OF_THE_THIRD_SEAT,
+            "Emet-Selch of the Third Seat",
+            "Creature",
+        ),
+        (
+            PLANETARIUM_OF_WAN_SHI_TONG,
+            "Planetarium of Wan Shi Tong",
+            "Artifact",
+        ),
+    ] {
+        let triggers = split_limit_triggers(text, name, card_type);
+        let [trigger] = triggers.as_slice() else {
+            panic!("{name}: one trigger, got {triggers:#?}");
+        };
+        assert!(
+            !matches!(trigger.mode, TriggerMode::Unknown(_)),
+            "{name}: {:?}",
+            trigger.mode
+        );
+        assert_eq!(
+            trigger.constraint,
+            Some(TriggerConstraint::OncePerTurn {
+                spent_by: TriggerLimitSpend::IndicatedAction
+            }),
+            "{name}"
+        );
+        assert!(
+            matches!(
+                &*optional_node(trigger).effect,
+                Effect::CastFromZone {
+                    driver: crate::types::ability::CastFromZoneDriver::DuringResolution,
+                    duration: None,
+                    ..
+                }
+            ),
+            "{name}: the indicated action is a during-resolution cast"
+        );
+    }
+}
+
+/// P-G2: a lingering "you may cast … this turn" grant has no CR 601.2i commit the
+/// limit can ride, so the CR 603.2h line strict-fails.
+#[test]
+fn lingering_cast_from_zone_indicated_action_strict_fails() {
+    const NAME: &str = "Synthetic Lingering Caster";
+    let limited = parse_trigger_line(
+        "Whenever you gain life, you may cast target instant card from your graveyard this turn. Do this only once each turn.",
+        NAME,
+    );
+    assert!(
+        matches!(limited.mode, TriggerMode::Unknown(_)),
+        "{:?}",
+        limited.mode
+    );
+    // Reach guard: without the limit sentence the same body is a supported optional
+    // lingering `CastFromZone`, so the Unknown above comes from the cast guard.
+    let plain = parse_trigger_line(
+        "Whenever you gain life, you may cast target instant card from your graveyard this turn.",
+        NAME,
+    );
+    assert_eq!(plain.mode, TriggerMode::LifeGained);
+    let execute = plain.execute.as_deref().expect("cast body");
+    assert!(execute.optional);
+    assert!(
+        matches!(
+            &*execute.effect,
+            Effect::CastFromZone {
+                duration: Some(_),
+                ..
+            }
+        ),
+        "{:?}",
+        execute.effect
+    );
+}
+
+/// P-G3: a cast instruction other than `CastFromZone` (Skyclave Shade's lingering
+/// graveyard grant plus a limit sentence) has no commit either, so it strict-fails
+/// instead of spending on acceptance.
+#[test]
+fn granted_casting_permission_indicated_action_strict_fails() {
+    const NAME: &str = "Synthetic Skyclave Grant";
+    let limited = parse_trigger_line(
+        "Whenever a land you control enters, if this card is in your graveyard and it's your turn, you may cast it from your graveyard this turn. Do this only once each turn.",
+        NAME,
+    );
+    assert!(
+        matches!(limited.mode, TriggerMode::Unknown(_)),
+        "{:?}",
+        limited.mode
+    );
+    // Reach guard: without the limit sentence the body is an optional
+    // `GrantCastingPermission` root.
+    let plain = parse_trigger_line(
+        "Whenever a land you control enters, if this card is in your graveyard and it's your turn, you may cast it from your graveyard this turn.",
+        NAME,
+    );
+    assert!(
+        !matches!(plain.mode, TriggerMode::Unknown(_)),
+        "{:?}",
+        plain.mode
+    );
+    let execute = plain.execute.as_deref().expect("grant body");
+    assert!(execute.optional);
+    assert!(
+        matches!(&*execute.effect, Effect::GrantCastingPermission { .. }),
+        "{:?}",
+        execute.effect
+    );
+}

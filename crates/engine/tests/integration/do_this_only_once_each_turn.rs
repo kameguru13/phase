@@ -17,7 +17,7 @@ use std::collections::HashSet;
 
 use engine::game::game_object::BackFaceData;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::ability::{AbilityKind, TriggerDefinitionRef};
+use engine::types::ability::{AbilityKind, TargetRef, TriggerDefinitionRef};
 use engine::types::actions::{CastChoice, GameAction};
 use engine::types::card_type::{CardType, CoreType};
 use engine::types::counter::CounterType;
@@ -27,10 +27,12 @@ use engine::types::game_state::{
 };
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
-use engine::types::mana::{ManaColor, ManaCost, ManaType, ManaUnit};
+use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
+
+use super::cast_this_way_gate_8721::{accept_offer_and_pay, decline_offer, offered_card};
 
 const PANTLAZA: &str = "Whenever Pantlaza or another Dinosaur you control enters, you may discover X, where X is that creature's toughness. Do this only once each turn. (Exile cards from the top of your library until you exile a nonland card with that mana value or less. Cast it without paying its mana cost or put it into your hand. Put the rest on the bottom in a random order.)";
 
@@ -1223,5 +1225,475 @@ fn mach_1_entering_spends_its_life_gain_half() {
     assert!(
         fired.is_empty(),
         "the life-gain half shares the spent limit: {fired:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CR 603.2h + CR 601.2i + CR 733.1: a "you may cast …" indicated action is taken
+// when the spell becomes cast. Offering the cast is not casting: a declined offer,
+// a rejected election or a cancelled cast is reversed and spends nothing.
+// ---------------------------------------------------------------------------
+
+const EMET_SELCH: &str = "Spells you cast from your graveyard cost {2} less to cast.\nWhenever one or more opponents lose life, you may cast target instant or sorcery card from your graveyard. If that spell would be put into your graveyard, exile it instead. Do this only once each turn.";
+
+const LIFE_DRAIN_ENGINE: &str = "{0}: Each opponent loses 1 life.";
+
+const PLANETARIUM_ORACLE: &str = "{1}, {T}: Scry 2.\nWhenever you scry or surveil, look at the top card of your library. You may cast that card without paying its mana cost. Do this only once each turn. (Look at the card after you scry or surveil.)";
+
+const SHOCK: &str = "Shock deals 2 damage to any target.";
+
+/// Emet-Selch of the Third Seat (both Oracle lines) with a free "each opponent
+/// loses 1 life" activation, one `{R}` "Draw a card." instant in P0's graveyard per
+/// name, Mountains to pay for each cast and a seeded library. CR 118.7a: the {2}
+/// generic reduction leaves {R} to pay.
+struct EmetBoard {
+    runner: GameRunner,
+    emet: ObjectId,
+    drain: ObjectId,
+    instants: Vec<ObjectId>,
+}
+
+fn emet_board(instant_names: &[&str]) -> EmetBoard {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let emet = scenario
+        .add_creature_from_oracle(P0, "Emet-Selch of the Third Seat", 2, 2, EMET_SELCH)
+        .id();
+    let drain = scenario
+        .add_artifact_from_oracle(P0, "Life Drain Engine", LIFE_DRAIN_ENGINE)
+        .id();
+    let instants = instant_names
+        .iter()
+        .map(|name| {
+            scenario
+                .add_spell_to_graveyard(P0, name, true)
+                .from_oracle_text("Draw a card.")
+                .with_mana_cost(ManaCost::Cost {
+                    shards: vec![ManaCostShard::Red],
+                    generic: 0,
+                })
+                .id()
+        })
+        .collect();
+    for _ in 0..3 {
+        scenario.add_basic_land(P0, ManaColor::Red);
+    }
+    scenario.with_library_top(P0, &["Card A", "Card B", "Card C", "Card D"]);
+    EmetBoard {
+        runner: scenario.build(),
+        emet,
+        drain,
+        instants,
+    }
+}
+
+/// Activate the drain and resolve it; the opponent's life loss triggers Emet-Selch.
+/// Answers the trigger's target choice with `target` when one is raised (CR 603.3d)
+/// and returns with the trigger on the stack.
+fn drain_targeting(
+    runner: &mut GameRunner,
+    board_drain: ObjectId,
+    emet: ObjectId,
+    target: ObjectId,
+) {
+    let p1_life = runner.life(P1);
+    let stacked_before = stacked_trigger_refs(runner, emet).len();
+    activate_and_resolve(runner, board_drain);
+    assert_eq!(
+        runner.life(P1),
+        p1_life - 1,
+        "reach: the opponent lost life"
+    );
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::TriggerTargetSelection { .. }
+    ) {
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(target)),
+            })
+            .expect("target the graveyard instant");
+    }
+    assert_eq!(
+        stacked_trigger_refs(runner, emet).len(),
+        stacked_before + 1,
+        "reach: the life loss triggers Emet-Selch"
+    );
+}
+
+/// The Emet-Selch trigger's ledger key, read off a stacked instance.
+fn stacked_emet_ref(runner: &GameRunner, emet: ObjectId) -> TriggerDefinitionRef {
+    match stacked_trigger_refs(runner, emet).first() {
+        Some(Some(key)) => key.clone(),
+        other => panic!("an Emet-Selch trigger with a definition ref is stacked: {other:?}"),
+    }
+}
+
+/// E1 (maintainer's case): accepting "you may cast" opens the cast offer; declining
+/// the offer casts nothing, so no indicated action is taken and the next life loss
+/// triggers Emet-Selch again.
+#[test]
+fn emet_selch_declined_cast_offer_does_not_spend_the_limit() {
+    let EmetBoard {
+        mut runner,
+        emet,
+        drain,
+        instants,
+    } = emet_board(&["Test Draw"]);
+    let test_draw = instants[0];
+
+    drain_targeting(&mut runner, drain, emet, test_draw);
+    runner.advance_until_stack_empty();
+    assert_optional_prompt(&runner, P0, "reach: Emet-Selch offers its may");
+    decide(&mut runner, true);
+    assert_eq!(
+        offered_card(&runner),
+        Some(test_draw),
+        "reach: accepting opens the cast offer for the targeted card"
+    );
+    decline_offer(&mut runner);
+    assert_settled_priority(&runner, "after declining the cast offer");
+    assert!(
+        indicated_actions(&runner).is_empty(),
+        "CR 733.1: an offered cast that is not cast takes no indicated action"
+    );
+    assert_eq!(runner.state().objects[&test_draw].zone, Zone::Graveyard);
+
+    drain_targeting(&mut runner, drain, emet, test_draw);
+    runner.advance_until_stack_empty();
+    assert_optional_prompt(
+        &runner,
+        P0,
+        "the untaken limit leaves Emet-Selch free to trigger",
+    );
+}
+
+/// E2 + E3: a cast started and then cancelled at payment spends nothing (the limit
+/// rides the cast, not the offer); a cast that completes spends it at CR 601.2i,
+/// and the ability stops triggering for the turn.
+#[test]
+fn emet_selch_cancelled_cast_spends_nothing_and_a_completed_cast_spends_the_limit() {
+    let EmetBoard {
+        mut runner,
+        emet,
+        drain,
+        instants,
+    } = emet_board(&["Test Draw"]);
+    let test_draw = instants[0];
+
+    // E2: accept, elect the cast, then cancel at mana payment.
+    drain_targeting(&mut runner, drain, emet, test_draw);
+    let emet_ref = stacked_emet_ref(&runner, emet);
+    runner.advance_until_stack_empty();
+    assert_optional_prompt(&runner, P0, "reach: Emet-Selch offers its may");
+    decide(&mut runner, true);
+    assert_eq!(offered_card(&runner), Some(test_draw));
+    runner
+        .act(GameAction::GraveyardPaidCastChoice {
+            choice: CastChoice::Cast,
+        })
+        .expect("elect the offered cast");
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::ManaPayment { .. }),
+        "reach: the elected cast pauses at mana payment, got {:?}",
+        runner.state().waiting_for
+    );
+    assert!(
+        indicated_actions(&runner).is_empty(),
+        "an elected cast still paying has not become cast (CR 601.2i)"
+    );
+    runner
+        .act(GameAction::CancelCast)
+        .expect("cancel the cast at payment");
+    runner.advance_until_stack_empty();
+    assert_settled_priority(&runner, "after cancelling the cast");
+    assert!(
+        indicated_actions(&runner).is_empty(),
+        "CR 733.1: a cancelled cast is reversed and takes no indicated action"
+    );
+    assert_eq!(runner.state().objects[&test_draw].zone, Zone::Graveyard);
+
+    // E3: the next life loss triggers again; this time the cast completes.
+    drain_targeting(&mut runner, drain, emet, test_draw);
+    runner.advance_until_stack_empty();
+    assert_optional_prompt(&runner, P0, "the cancelled cast left the limit untaken");
+    decide(&mut runner, true);
+    assert_eq!(offered_card(&runner), Some(test_draw));
+    accept_offer_and_pay(&mut runner);
+    assert_eq!(
+        runner.state().objects[&test_draw].zone,
+        Zone::Stack,
+        "reach: the offered card was cast"
+    );
+    assert_eq!(
+        indicated_actions(&runner),
+        HashSet::from([(emet_ref, P0)]),
+        "CR 601.2i: the spell became cast, so the controller took the indicated action"
+    );
+
+    // The drain is an instant-speed activation: the next life loss comes while the
+    // cast spell is still on the stack, and Emet-Selch no longer triggers.
+    let p1_life = runner.life(P1);
+    activate_and_resolve(&mut runner, drain);
+    assert_eq!(
+        runner.life(P1),
+        p1_life - 1,
+        "reach: the opponent lost life again"
+    );
+    assert!(
+        stacked_trigger_refs(&runner, emet).is_empty(),
+        "the action was taken this turn, so Emet-Selch no longer triggers"
+    );
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "no Emet-Selch trigger is waiting for a target either, got {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(
+        runner
+            .state()
+            .stack
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        vec![test_draw],
+        "only the cast spell remains on the stack"
+    );
+}
+
+/// Two Emet-Selch instances on the stack, each targeting its own instant (so the
+/// lower one's target stays legal, CR 608.2b): instance 1 targets `instants[0]`,
+/// instance 2 — on top — targets `instants[1]`.
+fn emet_stacked_twice() -> EmetBoard {
+    let mut board = emet_board(&["Test Draw A", "Test Draw B"]);
+    let (lower, upper) = (board.instants[0], board.instants[1]);
+    drain_targeting(&mut board.runner, board.drain, board.emet, lower);
+    drain_targeting(&mut board.runner, board.drain, board.emet, upper);
+    assert_eq!(
+        stacked_trigger_refs(&board.runner, board.emet).len(),
+        2,
+        "reach: two Emet-Selch instances are stacked"
+    );
+    board
+}
+
+/// E4a (stacked instances): the top instance accepts and declines the offer, which
+/// takes no action, so the lower instance still offers its may.
+#[test]
+fn emet_selch_top_instance_declining_the_offer_leaves_the_lower_instance_free() {
+    let EmetBoard {
+        mut runner,
+        emet: _,
+        drain: _,
+        instants,
+    } = emet_stacked_twice();
+    runner.advance_until_stack_empty();
+    assert_optional_prompt(&runner, P0, "reach: the top instance offers its may");
+    decide(&mut runner, true);
+    assert_eq!(
+        offered_card(&runner),
+        Some(instants[1]),
+        "reach: the top instance offers its own target"
+    );
+    decline_offer(&mut runner);
+    assert_optional_prompt(
+        &runner,
+        P0,
+        "the top instance took no action, so the lower instance still offers its may",
+    );
+    assert!(indicated_actions(&runner).is_empty());
+}
+
+/// E4b (stacked instances): the top instance casts its card, which becomes cast
+/// while that instance resolves (CR 608.2g) — so when the lower instance resolves
+/// the action has been taken and it does nothing.
+#[test]
+fn emet_selch_top_instance_casting_leaves_the_lower_instance_with_nothing_to_do() {
+    let EmetBoard {
+        mut runner,
+        emet,
+        drain: _,
+        instants,
+    } = emet_stacked_twice();
+    let emet_ref = stacked_emet_ref(&runner, emet);
+    runner.advance_until_stack_empty();
+    assert_optional_prompt(&runner, P0, "reach: the top instance offers its may");
+    decide(&mut runner, true);
+    assert_eq!(offered_card(&runner), Some(instants[1]));
+    accept_offer_and_pay(&mut runner);
+    assert_eq!(
+        runner.state().stack.last().map(|entry| entry.id),
+        Some(instants[1]),
+        "reach: the top instance's card is cast above the lower instance"
+    );
+    runner.advance_until_stack_empty();
+    assert_settled_priority(
+        &runner,
+        "the lower instance resolves with no prompt once the action was taken",
+    );
+    assert_eq!(
+        runner.state().objects[&instants[0]].zone,
+        Zone::Graveyard,
+        "the lower instance cast nothing"
+    );
+    assert_eq!(indicated_actions(&runner), HashSet::from([(emet_ref, P0)]));
+}
+
+/// Planetarium of Wan Shi Tong (full Oracle text) with `looked` on top of P0's
+/// library and two "Scry 1." enablers in hand.
+struct PlanetariumBoard {
+    runner: GameRunner,
+    planetarium: ObjectId,
+    looked: ObjectId,
+    enablers: [ObjectId; 2],
+}
+
+fn planetarium_board(looked_name: &str, looked_oracle: &str) -> PlanetariumBoard {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let planetarium = scenario
+        .add_artifact_from_oracle(P0, "Planetarium of Wan Shi Tong", PLANETARIUM_ORACLE)
+        .id();
+    scenario.with_library_top(P0, &["Card A", "Card B", "Card C"]);
+    let looked = scenario
+        .add_spell_to_library_top(P0, looked_name, true)
+        .from_oracle_text(looked_oracle)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Red],
+            generic: 0,
+        })
+        .id();
+    let enablers = [
+        scenario
+            .add_spell_to_hand_from_oracle(P0, "Scry Enabler One", false, "Scry 1.")
+            .with_mana_cost(free())
+            .id(),
+        scenario
+            .add_spell_to_hand_from_oracle(P0, "Scry Enabler Two", false, "Scry 1.")
+            .with_mana_cost(free())
+            .id(),
+    ];
+    PlanetariumBoard {
+        runner: scenario.build(),
+        planetarium,
+        looked,
+        enablers,
+    }
+}
+
+/// Cast a "Scry 1." enabler and keep the scried card on top. Returns with any
+/// Planetarium trigger resolved up to its prompt.
+fn scry_keeping_top(runner: &mut GameRunner, enabler: ObjectId) {
+    cast(runner, enabler);
+    runner.advance_until_stack_empty();
+    let WaitingFor::ScryChoice { cards, .. } = runner.state().waiting_for.clone() else {
+        panic!(
+            "reach: the enabler scries, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    runner
+        .act(GameAction::SelectCards { cards })
+        .expect("keep the scried card on top");
+    runner.advance_until_stack_empty();
+}
+
+/// P1: Planetarium's free cast spends the limit when the looked-at spell becomes
+/// cast, and the ability stops triggering for the turn.
+#[test]
+fn planetarium_free_cast_spends_the_limit_when_the_spell_becomes_cast() {
+    let PlanetariumBoard {
+        mut runner,
+        planetarium,
+        looked,
+        enablers,
+    } = planetarium_board("Looked Draw", "Draw a card.");
+
+    cast(&mut runner, enablers[0]);
+    runner.advance_until_stack_empty();
+    let WaitingFor::ScryChoice { cards, .. } = runner.state().waiting_for.clone() else {
+        panic!(
+            "reach: the enabler scries, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    runner
+        .act(GameAction::SelectCards { cards })
+        .expect("keep the scried card on top");
+    let planetarium_ref = match stacked_trigger_refs(&runner, planetarium).as_slice() {
+        [Some(key)] => key.clone(),
+        other => panic!("reach: the scry triggers Planetarium once, got {other:?}"),
+    };
+    runner.advance_until_stack_empty();
+    assert_optional_prompt(&runner, P0, "reach: Planetarium offers its may");
+    decide(&mut runner, true);
+    assert_eq!(
+        runner.state().objects[&looked].zone,
+        Zone::Stack,
+        "reach: the looked-at card is cast during the resolution"
+    );
+    assert_eq!(
+        indicated_actions(&runner),
+        HashSet::from([(planetarium_ref, P0)]),
+        "CR 601.2i: the free cast became cast, so the indicated action was taken"
+    );
+    runner.advance_until_stack_empty();
+    assert_settled_priority(&runner, "after the free spell resolved");
+
+    scry_keeping_top(&mut runner, enablers[1]);
+    assert!(
+        stacked_trigger_refs(&runner, planetarium).is_empty(),
+        "the action was taken this turn, so Planetarium no longer triggers"
+    );
+    assert_settled_priority(&runner, "no further Planetarium prompt this turn");
+}
+
+/// P2: a free cast cancelled at its target choice is reversed (CR 733.1): the
+/// looked-at card returns to the library, no action is taken, and the next scry
+/// triggers Planetarium again.
+#[test]
+fn planetarium_cancelled_free_cast_does_not_spend_the_limit() {
+    let PlanetariumBoard {
+        mut runner,
+        planetarium: _,
+        looked,
+        enablers,
+    } = planetarium_board("Shock", SHOCK);
+
+    scry_keeping_top(&mut runner, enablers[0]);
+    assert_optional_prompt(&runner, P0, "reach: Planetarium offers its may");
+    decide(&mut runner, true);
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::TargetSelection { .. }
+        ),
+        "reach: the free Shock pauses at its target choice, got {:?}",
+        runner.state().waiting_for
+    );
+    assert!(
+        indicated_actions(&runner).is_empty(),
+        "a cast still choosing targets has not become cast (CR 601.2i)"
+    );
+    runner
+        .act(GameAction::CancelCast)
+        .expect("cancel the free cast at its target choice");
+    runner.advance_until_stack_empty();
+    assert_settled_priority(&runner, "after cancelling the free cast");
+    assert!(
+        indicated_actions(&runner).is_empty(),
+        "CR 733.1: a cancelled cast is reversed and takes no indicated action"
+    );
+    assert_eq!(
+        runner.state().objects[&looked].zone,
+        Zone::Library,
+        "the cancelled card returns to the library"
+    );
+
+    scry_keeping_top(&mut runner, enablers[1]);
+    assert_optional_prompt(
+        &runner,
+        P0,
+        "the untaken limit leaves Planetarium free to trigger again",
     );
 }

@@ -7,9 +7,9 @@ use crate::types::ability::{
     AttachmentReferent, CardTypeSetSource, CastManaSpentMetric, ChosenAttribute,
     CommanderOwnership, ControllerRef, CopyRetargetPermission, DamageAmountScope,
     DamageAmountThreshold, DelayedAbilityOrigin, DelayedTriggerCondition, DurationEvent, Effect,
-    FilterProp, ModalChoice, NameStickerSet, ObjectScope, OriginConstraint, PlayerFilter,
-    PlayerScope, QuantityExpr, QuantityRef, RenownSubject, ResolvedAbility, SacrificeCost,
-    StaticCondition, TargetFilter, TargetRef, TributeOutcome, TriggerCondition,
+    FilterProp, IndicatedActionLimit, ModalChoice, NameStickerSet, ObjectScope, OriginConstraint,
+    PlayerFilter, PlayerScope, QuantityExpr, QuantityRef, RenownSubject, ResolvedAbility,
+    SacrificeCost, StaticCondition, TargetFilter, TargetRef, TributeOutcome, TriggerCondition,
     TriggerConditionAnchor, TriggerConstraint, TriggerDefinition, TriggerDefinitionOccurrenceRef,
     TriggerDefinitionRef, TriggerEntry, TriggerGrantProducerKey, TriggerLimitSpend, TypeFilter,
     TypedFilter,
@@ -18158,24 +18158,43 @@ pub(crate) fn indicated_action_already_taken(state: &GameState, ability: &Resolv
         .is_some_and(|key| indicated_action_taken_by(state, &key, ability.controller))
 }
 
-/// CR 603.2h: the controller chose to take the indicated action — spend the limit
+/// CR 603.2h + CR 603.3a: the "Do this only once each turn" limit this resolving
+/// instruction spends, snapshotted by value — its ledger key and the triggered
+/// ability's controller — or `None` for any other ability.
+pub(crate) fn indicated_action_for(ability: &ResolvedAbility) -> Option<IndicatedActionLimit> {
+    indicated_action_limit(ability).map(|key| IndicatedActionLimit {
+        ledger_ref: key.into_owned(),
+        controller: ability.controller,
+    })
+}
+
+/// CR 603.2h: the controller has taken the indicated action — spend `limit`
 /// (idempotent). The sole writer of `GameState::trigger_indicated_actions_this_turn`.
-/// `ability.controller` is the triggered ability's controller (CR 603.3a).
-pub(crate) fn record_indicated_action_taken(state: &mut GameState, ability: &ResolvedAbility) {
-    let Some(key) = indicated_action_limit(ability) else {
-        return;
-    };
-    if indicated_action_taken_by(state, &key, ability.controller) {
+/// Reached on acceptance of a non-cast instruction ([`record_indicated_action_taken`])
+/// and, for a cast instruction, when the resolution cast becomes cast (CR 601.2i).
+pub(crate) fn record_indicated_action(state: &mut GameState, limit: &IndicatedActionLimit) {
+    if indicated_action_taken_by(state, &limit.ledger_ref, limit.controller) {
         return;
     }
     crate::game::ledger::record_trigger_fired(
         state,
-        key.into_owned(),
+        limit.ledger_ref.clone(),
         crate::types::resolved_commands::ResolvedTriggerLedgerEdit::IndicatedActionTaken {
-            player: ability.controller,
+            player: limit.controller,
         },
     )
     .expect("indicated-action fact must have a valid ledger prefix");
+}
+
+/// CR 603.2h: the controller chose to take an indicated action that is taken by
+/// choosing it (`IndicatedActionCommit::OnAccept`) — the Accept arm's entry. Spends
+/// this instruction's limit through [`record_indicated_action`]; a no-op for any
+/// ability without one. `ability.controller` is the triggered ability's controller
+/// (CR 603.3a).
+pub(crate) fn record_indicated_action_taken(state: &mut GameState, ability: &ResolvedAbility) {
+    if let Some(limit) = indicated_action_for(ability) {
+        record_indicated_action(state, &limit);
+    }
 }
 
 /// Record that a constrained trigger has fired.
@@ -18211,8 +18230,9 @@ fn record_trigger_fired_with_ref(
         TriggerConstraint::OncePerTurn {
             spent_by: TriggerLimitSpend::IndicatedAction,
         } => {
-            // CR 603.2h: triggering spends nothing; the controller's acceptance of
-            // the instruction does (`record_indicated_action_taken`).
+            // CR 603.2h: triggering spends nothing; taking the indicated action does
+            // (`record_indicated_action`): on acceptance of a non-cast instruction, or
+            // when a CR 603.2h resolution cast becomes cast (CR 601.2i).
         }
         TriggerConstraint::OncePerGame => {
             crate::game::ledger::record_trigger_fired(

@@ -5910,6 +5910,13 @@ pub struct ResolutionCastCleanup {
     /// Legacy saves have no trustworthy receipt and decode to an empty list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub delayed_trigger_receipts: Vec<ResolutionCastDelayedTriggerReceipt>,
+    /// CR 603.2h + CR 601.2i: the "Do this only once each turn" limit this resolution
+    /// cast spends when its spell becomes cast. `None` for every cast that is not a
+    /// CR 603.2h indicated action (Discover's indicated action is the discover itself,
+    /// spent on acceptance). Boxed: rides `WaitingFor::CastOffer` and
+    /// `CastingPermission::ExileWithAltCost` inside the `GameState` stack budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indicated_action: Option<Box<IndicatedActionLimit>>,
 }
 
 /// CR 608.2g + CR 609.4b: how a cast-during-resolution pays.
@@ -6085,6 +6092,7 @@ mod resolution_cast_face_policy_serde_tests {
                 member_pool: vec![ObjectId(702)],
             },
             delayed_trigger_receipts: Vec::new(),
+            indicated_action: None,
         };
         let round_tripped_policy: ResolutionCastFacePolicy =
             serde_json::from_value(serde_json::to_value(&policy).unwrap()).unwrap();
@@ -6328,6 +6336,7 @@ mod resolution_cast_face_policy_serde_tests {
             reject_action: ResolutionMvRejectAction::RemainExiled,
             success_action: ResolutionCastSuccessAction::BottomMisses,
             delayed_trigger_receipts: Vec::new(),
+            indicated_action: None,
         })
         .unwrap();
         cleanup
@@ -6335,6 +6344,50 @@ mod resolution_cast_face_policy_serde_tests {
             .expect("struct serializes as object")
             .remove("face_policy");
         assert!(serde_json::from_value::<ResolutionCastCleanup>(cleanup).is_err());
+    }
+
+    /// CR 603.2h + CR 601.2i: the carried indicated-action limit is serde-defaulted.
+    /// A cleanup serialized before the field existed decodes to `None` and
+    /// re-serializes byte-identically (the key is omitted when `None`); a carried
+    /// limit round-trips exactly.
+    #[test]
+    fn resolution_cast_cleanup_indicated_action_back_compat_and_round_trip() {
+        let untimed = ResolutionCastCleanup {
+            source_id: ObjectId(701),
+            offer_id: None,
+            face_policy: policy(),
+            exiled_misses: Vec::new(),
+            reject_action: ResolutionMvRejectAction::RemainExiled,
+            success_action: ResolutionCastSuccessAction::BottomMisses,
+            delayed_trigger_receipts: Vec::new(),
+            indicated_action: None,
+        };
+        let legacy = serde_json::to_value(&untimed).unwrap();
+        assert!(
+            legacy.get("indicated_action").is_none(),
+            "a cleanup with no limit omits the key, so legacy payloads are unchanged"
+        );
+        let decoded: ResolutionCastCleanup = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(decoded.indicated_action, None);
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), legacy);
+
+        let carried = ResolutionCastCleanup {
+            indicated_action: Some(Box::new(IndicatedActionLimit {
+                ledger_ref: TriggerDefinitionRef {
+                    source: ObjectIncarnationRef::of(ObjectId(701), 3),
+                    occurrence: TriggerDefinitionOccurrenceRef::Printed {
+                        base_set: TriggerBaseSetInstanceRef::INITIAL,
+                        printed_index: 1,
+                    },
+                },
+                controller: PlayerId(1),
+            })),
+            ..untimed
+        };
+        let encoded = serde_json::to_value(&carried).unwrap();
+        assert!(encoded.get("indicated_action").is_some());
+        let round_tripped: ResolutionCastCleanup = serde_json::from_value(encoded).unwrap();
+        assert_eq!(round_tripped, carried);
     }
 }
 
@@ -15669,6 +15722,272 @@ pub(crate) fn optional_addressee_is_always_controller(
                 false
             }
         })
+}
+
+/// CR 603.2h + CR 601.2i + CR 733.1: when a "Do this only once each turn" indicated
+/// action counts as taken. A cast is taken when the spell becomes cast — a declined,
+/// rejected or cancelled cast is reversed and was never taken; any other instruction
+/// is taken when the controller chooses it (CR 118.12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndicatedActionCommit {
+    OnAccept,
+    OnSpellCast,
+}
+
+/// CR 603.2h: when the instruction `effect` counts as taken. Every instruction that
+/// casts, or lets the controller cast, a spell is `OnSpellCast`; the lowering guard
+/// admits only the single-card during-resolution `CastFromZone` among them, so every
+/// other cast shape strict-fails. Exhaustive over `Effect`, so a new variant forces a
+/// decision here.
+pub(crate) fn indicated_action_commit(effect: &Effect) -> IndicatedActionCommit {
+    match effect {
+        // CR 601.2a + CR 601.2i: cast or play a card from a zone, any driver.
+        Effect::CastFromZone { .. }
+        // CR 601.2i: a lingering "you may cast it … this turn" grant; the cast comes later.
+        | Effect::GrantCastingPermission { .. }
+        // CR 707.12: "you may cast the copy" — a cast copy becomes cast.
+        | Effect::CastCopyOfCard { .. }
+        // CR 608.2g: a free-cast window casts spells during the resolution.
+        | Effect::FreeCastFromZones { .. }
+        // CR 702.94a: "you may cast it by paying [cost]".
+        | Effect::MiracleCast { .. }
+        // CR 702.35a: cast it by paying its madness cost.
+        | Effect::MadnessCast { .. } => IndicatedActionCommit::OnSpellCast,
+        // CR 701.57a / CR 702.85a / CR 702.60a: the keyword action is the indicated
+        // action; the spell cast inside it is part of that action (Pantlaza ruling).
+        Effect::Discover { .. } | Effect::Cascade | Effect::Ripple { .. } => {
+            IndicatedActionCommit::OnAccept
+        }
+        // Heist (Arena keyword action, absent from the CR) and its continuation: the
+        // heist is the action; the exiled card's permission is part of it.
+        Effect::Heist { .. } | Effect::HeistExile => IndicatedActionCommit::OnAccept,
+        // CR 707.10: a copy of a spell isn't cast.
+        Effect::CopySpell { .. } | Effect::EpicCopy { .. } => IndicatedActionCommit::OnAccept,
+        Effect::StartYourEngines { .. }
+        | Effect::ChangeSpeed { .. }
+        | Effect::DealDamage { .. }
+        | Effect::ApplyPostReplacementDamage { .. }
+        | Effect::EachDealsDamageEqualToPower { .. }
+        | Effect::EachSourceDealsDamage { .. }
+        | Effect::Draw { .. }
+        | Effect::Pump { .. }
+        | Effect::PairWith { .. }
+        | Effect::Destroy { .. }
+        | Effect::Regenerate { .. }
+        | Effect::RemoveAllDamage { .. }
+        | Effect::Counter { .. }
+        | Effect::CounterAll { .. }
+        | Effect::Token { .. }
+        | Effect::GainLife { .. }
+        | Effect::LoseLife { .. }
+        | Effect::SetTapState { .. }
+        | Effect::RemoveCounter { .. }
+        | Effect::Sacrifice { .. }
+        | Effect::DiscardCard { .. }
+        | Effect::Mill { .. }
+        | Effect::Scry { .. }
+        | Effect::PumpAll { .. }
+        | Effect::DamageAll { .. }
+        | Effect::DamageEachPlayer { .. }
+        | Effect::DestroyAll { .. }
+        | Effect::ChangeZone { .. }
+        | Effect::ChangeZoneAll { .. }
+        | Effect::Dig { .. }
+        | Effect::GainControl { .. }
+        | Effect::GainControlAll { .. }
+        | Effect::ControlNextTurn { .. }
+        | Effect::Attach { .. }
+        | Effect::UnattachAll { .. }
+        | Effect::Surveil { .. }
+        | Effect::Fight { .. }
+        | Effect::Bounce { .. }
+        | Effect::BounceAll { .. }
+        | Effect::Explore
+        | Effect::ExploreAll { .. }
+        | Effect::Investigate
+        | Effect::Tribute { .. }
+        | Effect::TimeTravel
+        | Effect::BecomeMonarch { .. }
+        | Effect::NoOp
+        | Effect::Proliferate
+        | Effect::ProliferateTarget { .. }
+        | Effect::Populate
+        | Effect::Clash
+        | Effect::ExileTopCardContest { .. }
+        | Effect::Behold { .. }
+        | Effect::EndTheTurn
+        | Effect::EndCombatPhase
+        | Effect::Vote { .. }
+        | Effect::SeparateIntoPiles { .. }
+        | Effect::SwitchPT { .. }
+        | Effect::CopyTokenOf { .. }
+        | Effect::CreateTokenCopyFromPool { .. }
+        | Effect::Myriad
+        | Effect::Encore
+        | Effect::CombineHost { .. }
+        | Effect::ChooseAugmentAndCombineWithHost { .. }
+        | Effect::Meld { .. }
+        | Effect::ExileHaunting { .. }
+        | Effect::HideawayConceal { .. }
+        | Effect::CopyTokenBlockingAttacker { .. }
+        | Effect::BecomeCopy { .. }
+        | Effect::ChoosePermanent { .. }
+        | Effect::GainActivatedAbilitiesOfTarget { .. }
+        | Effect::ChooseCard { .. }
+        | Effect::PutCounter { .. }
+        | Effect::ChooseCounterKind { .. }
+        | Effect::PutChosenCounter { .. }
+        | Effect::PutCounterAll { .. }
+        | Effect::MultiplyCounter { .. }
+        | Effect::ChooseCounterAdjustment { .. }
+        | Effect::DoublePT { .. }
+        | Effect::DoublePTAll { .. }
+        | Effect::MoveCounters { .. }
+        | Effect::ReproduceEventCounters { .. }
+        | Effect::Animate { .. }
+        | Effect::ReturnAsAura { .. }
+        | Effect::RegisterBending { .. }
+        | Effect::GenericEffect { .. }
+        | Effect::Cleanup { .. }
+        | Effect::Mana { .. }
+        | Effect::Discard { .. }
+        | Effect::Shuffle { .. }
+        | Effect::Transform { .. }
+        | Effect::FlipPermanent { .. }
+        | Effect::SearchLibrary { .. }
+        | Effect::SearchOutsideGame { .. }
+        | Effect::OpenBoosterPack { .. }
+        | Effect::RevealHand { .. }
+        | Effect::RevealFromHand { .. }
+        | Effect::Reveal { .. }
+        | Effect::RevealChosenNumbers { .. }
+        | Effect::RevealTop { .. }
+        | Effect::ExileTop { .. }
+        | Effect::ExileFaceDownPile { .. }
+        | Effect::TargetOnly { .. }
+        | Effect::Choose { .. }
+        | Effect::OpponentGuess { .. }
+        | Effect::SwapChosenLabels { .. }
+        | Effect::ChooseDamageSource { .. }
+        | Effect::Suspect { .. }
+        | Effect::Unsuspect { .. }
+        | Effect::Connive { .. }
+        | Effect::PhaseOut { .. }
+        | Effect::PhaseIn { .. }
+        | Effect::ForceBlock { .. }
+        | Effect::ForceAttack { .. }
+        | Effect::SolveCase
+        | Effect::BecomePrepared { .. }
+        | Effect::BecomeUnprepared { .. }
+        | Effect::BecomeSaddled { .. }
+        | Effect::SetClassLevel { .. }
+        | Effect::CreateDelayedTrigger { .. }
+        | Effect::AddTargetReplacement { .. }
+        | Effect::AddRestriction { .. }
+        | Effect::ReduceNextSpellCost { .. }
+        | Effect::GrantNextSpellAbility { .. }
+        | Effect::AddPendingETBCounters { .. }
+        | Effect::AddPendingEntersModifications { .. }
+        | Effect::CreateEmblem { .. }
+        | Effect::CreateBoon { .. }
+        | Effect::NoteNumber { .. }
+        | Effect::PayCost { .. }
+        | Effect::ExileResolvingSpellInsteadOfGraveyard { .. }
+        | Effect::PreventDamage { .. }
+        | Effect::CreateDamageReplacement { .. }
+        | Effect::CreateDrawReplacement { .. }
+        | Effect::CreatePlaneswalkReplacement { .. }
+        | Effect::LoseTheGame { .. }
+        | Effect::WinTheGame { .. }
+        | Effect::RollDie { .. }
+        | Effect::FlipCoins { .. }
+        | Effect::RingTemptsYou
+        | Effect::VentureIntoDungeon
+        | Effect::VentureInto { .. }
+        | Effect::TakeTheInitiative
+        | Effect::ArrangePlanarDeckTop { .. }
+        | Effect::Planeswalk
+        | Effect::ChaosEnsues
+        | Effect::ReverseTurnOrder
+        | Effect::RedistributeLifeTotals
+        | Effect::OpenAttractions { .. }
+        | Effect::RollToVisitAttractions
+        | Effect::AssembleContraptions { .. }
+        | Effect::AssembleContraptionsFromRollDifference
+        | Effect::CrankContraptions { .. }
+        | Effect::ReassembleContraption { .. }
+        | Effect::AssembleContraptionOnSprocket { .. }
+        | Effect::ReassembleContraptionOnSprocket { .. }
+        | Effect::PutSticker { .. }
+        | Effect::ApplySticker { .. }
+        | Effect::ProcessRadCounters
+        | Effect::ChooseFromZone { .. }
+        | Effect::RememberCard { .. }
+        | Effect::NoteManaSpent
+        | Effect::ForEachCategory { .. }
+        | Effect::ChooseObjectsIntoTrackedSet { .. }
+        | Effect::ChooseAndSacrificeRest { .. }
+        | Effect::EachPlayerCopyChosen { .. }
+        | Effect::Exploit { .. }
+        | Effect::GainEnergy { .. }
+        | Effect::GivePlayerCounter { .. }
+        | Effect::LoseAllPlayerCounters { .. }
+        | Effect::ExileFromTopUntil { .. }
+        | Effect::RevealUntil { .. }
+        | Effect::PhysicalContest { .. }
+        | Effect::PutAtLibraryPosition { .. }
+        | Effect::ChooseDrawnThisTurnPayOrTopdeck { .. }
+        | Effect::PutOnTopOrBottom { .. }
+        | Effect::GiftDelivery { .. }
+        | Effect::Goad { .. }
+        | Effect::GoadAll { .. }
+        | Effect::Detain { .. }
+        | Effect::SetRoomDoorLock { .. }
+        | Effect::ExchangeControl { .. }
+        | Effect::ChangeTargets { .. }
+        | Effect::Manifest { .. }
+        | Effect::ManifestDread
+        | Effect::Cloak { .. }
+        | Effect::TurnFaceUp { .. }
+        | Effect::TurnFaceDown { .. }
+        | Effect::ExtraTurn { .. }
+        | Effect::GrantExtraLoyaltyActivations { .. }
+        | Effect::SkipNextTurn { .. }
+        | Effect::SkipNextStep { .. }
+        | Effect::AdditionalPhase { .. }
+        | Effect::ModifyAnnouncedX { .. }
+        | Effect::Double { .. }
+        | Effect::RuntimeHandled { .. }
+        | Effect::Incubate { .. }
+        | Effect::Amass { .. }
+        | Effect::EmpowerJace { .. }
+        | Effect::Monstrosity { .. }
+        | Effect::Specialize
+        | Effect::Renown { .. }
+        | Effect::Bolster { .. }
+        | Effect::Adapt { .. }
+        | Effect::Learn
+        | Effect::Forage
+        | Effect::CompletePlayerAction { .. }
+        | Effect::Harness
+        | Effect::CollectEvidence { .. }
+        | Effect::Endure { .. }
+        | Effect::BlightEffect { .. }
+        | Effect::Seek { .. }
+        | Effect::SetLifeTotal { .. }
+        | Effect::ExchangeLifeWithStat { .. }
+        | Effect::ExchangeLifeTotals { .. }
+        | Effect::SetDayNight { .. }
+        | Effect::GiveControl { .. }
+        | Effect::RemoveFromCombat { .. }
+        | Effect::BecomeBlocked { .. }
+        | Effect::Conjure { .. }
+        | Effect::ApplyPerpetual { .. }
+        | Effect::Intensify { .. }
+        | Effect::DraftFromSpellbook { .. }
+        | Effect::ChooseOneOf { .. }
+        | Effect::Unimplemented { .. } => IndicatedActionCommit::OnAccept,
+    }
 }
 
 /// CR 107.1c + CR 107.14: Detect a "pay any amount of X" shape — the parser
@@ -38153,6 +38472,15 @@ impl TriggerDefinitionRef {
             None => Cow::Borrowed(self),
         }
     }
+}
+
+/// CR 603.2h: one "Do this only once each turn" limit — the ability's ledger key
+/// (`TriggerDefinitionRef::limit_ledger_ref`) and the controller (CR 603.3a) whose
+/// taking of the indicated action spends it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct IndicatedActionLimit {
+    pub ledger_ref: TriggerDefinitionRef,
+    pub controller: PlayerId,
 }
 
 /// Identity-bearing runtime trigger entry.

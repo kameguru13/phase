@@ -179,3 +179,53 @@ fn lim_duls_paladin_empty_hand_runs_its_if_you_dont_branch() {
     runner.advance_until_stack_empty();
     assert_optional_prompt(&runner, P1, "a card in hand pays the discard");
 }
+
+const CHECKS_AND_BALANCES: &str = "Cast this spell only if there are three or more players in the game.\nWhenever a player casts a spell, each of that player's opponents may discard a card. If they do, counter that spell.";
+
+/// CR 118.12 + CR 118.3 + CR 608.2d, per seat: Checks and Balances fans "may discard
+/// a card" out to each opponent of the caster (CR 608.2c). The empty-handed opponent
+/// can't pay, so only the opponent holding a card is asked; when that opponent
+/// declines, nobody discarded and the spell is not countered.
+#[test]
+fn checks_and_balances_asks_only_the_opponent_who_can_discard() {
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let p2 = PlayerId(2);
+    scenario.add_enchantment_from_oracle(P0, "Checks and Balances", CHECKS_AND_BALANCES);
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Test Draw", false, "Draw a card.")
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let fodder = scenario.add_card_to_hand(p2, "Fodder");
+    scenario.with_library_top(P0, &["Card A", "Card B"]);
+    let mut runner = scenario.build();
+    assert_eq!(
+        hand_len(&runner, P1),
+        0,
+        "test precondition: P1 holds no card"
+    );
+    let library_before = library_len(&runner, P0);
+
+    cast(&mut runner, spell);
+    runner.advance_until_stack_empty();
+    assert_optional_prompt(
+        &runner,
+        p2,
+        "only the opponent who can pay the discard is asked",
+    );
+    runner
+        .act(GameAction::DecideOptionalEffect { accept: false })
+        .expect("P2 declines the discard");
+    runner.advance_until_stack_empty();
+    assert_settled_priority(&runner, "no other opponent is asked");
+    assert_eq!(
+        runner.state().objects[&fodder].zone,
+        Zone::Hand,
+        "P2 kept its card"
+    );
+    assert_eq!(
+        library_len(&runner, P0),
+        library_before - 1,
+        "the spell resolved and drew its card instead of being countered"
+    );
+}

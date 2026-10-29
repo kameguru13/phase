@@ -5744,11 +5744,9 @@ fn resolve_optional_effect_decision_step(
     ability.repeat_until = None;
     match choice {
         AutoMayChoice::Accept => {
-            // CR 603.2h: choosing to take the indicated action spends the limit — before the
-            // action runs, so an event the action itself causes cannot re-trigger the ability.
-            // "Its source's controller" takes the action: the lowering guard admits only
-            // instructions the shared routing classification proves are addressed to the
-            // controller. Re-check that classification against this instance's actual
+            // CR 603.2h: "its source's controller" takes the indicated action: the lowering
+            // guard admits only instructions the shared routing classification proves are
+            // addressed to the controller. Re-check that classification against this instance's actual
             // targets — the one input the parser can only approximate.
             debug_assert!(
                 crate::game::triggers::indicated_action_limit(&ability).is_none()
@@ -5762,7 +5760,26 @@ fn resolve_optional_effect_decision_step(
                     ),
                 "CR 603.2h: an indicated action must be answered by the ability's controller"
             );
-            crate::game::triggers::record_indicated_action_taken(state, &ability);
+            // CR 603.2h + CR 601.2i + CR 733.1: a cast instruction is taken when its spell
+            // becomes cast — the limit rides the resolution cast
+            // (`ResolutionCastCleanup::indicated_action`) and is spent at finalization; an
+            // offer declined, rejected or cancelled spends nothing. Every other instruction
+            // is taken by choosing it — before it runs, so an event it causes cannot
+            // re-trigger the ability.
+            match crate::types::ability::indicated_action_commit(&ability.effect) {
+                crate::types::ability::IndicatedActionCommit::OnAccept => {
+                    crate::game::triggers::record_indicated_action_taken(state, &ability);
+                }
+                crate::types::ability::IndicatedActionCommit::OnSpellCast => {
+                    // CR 603.2h: the lowering guard admits no cast instruction but
+                    // `CastFromZone` as an indicated action, so no other cast instruction
+                    // carries a limit here.
+                    debug_assert!(
+                        matches!(ability.effect, Effect::CastFromZone { .. })
+                            || crate::game::triggers::indicated_action_for(&ability).is_none()
+                    );
+                }
+            }
             ability.context.optional_effect_performed = true;
             state
                 .player_actions_this_way
