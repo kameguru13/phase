@@ -5751,6 +5751,9 @@ fn resolve_optional_effect_decision_step(
     ability.repeat_until = None;
     match choice {
         AutoMayChoice::Accept => {
+            // CR 603.2h: choosing to take the indicated action spends the limit — before the
+            // action runs, so an event the action itself causes cannot re-trigger the ability.
+            crate::game::triggers::record_indicated_action_taken(state, &ability);
             ability.context.optional_effect_performed = true;
             state
                 .player_actions_this_way
@@ -10043,7 +10046,7 @@ fn trigger_constraint_reads_filter_population(
             filter.as_ref().is_some_and(has_filter)
         }
         // Filter-free: nothing to read.
-        TriggerConstraint::OncePerTurn
+        TriggerConstraint::OncePerTurn { .. }
         | TriggerConstraint::OncePerGame
         | TriggerConstraint::OnlyDuringYourTurn
         | TriggerConstraint::NthDrawThisTurn { .. }
@@ -16006,6 +16009,16 @@ fn optionality_is_per_iteration(state: &GameState, ability: &ResolvedAbility) ->
 /// typed state: a missing chosen counter kind, no removable matching counter, or
 /// an exact `ParentTarget` hand-off that records no produced object. Suppressing
 /// the prompt lets the effect resolve as its defined no-op instead.
+/// CR 118.3 + CR 608.2d: the optional `PayCost` classes whose affordability
+/// `costs::can_pay` (resolution scope) decides before the "you may" is offered.
+/// `PayLife` excludes "pay any amount of life" (`is_pay_any_amount`): X is chosen at
+/// payment and 0 is always payable (CR 119.4b), so it is never impossible.
+fn optional_pay_cost_affordability_is_decidable(cost: &AbilityCost) -> bool {
+    matches!(cost, AbilityCost::TapCreatures { .. })
+        || matches!(cost, AbilityCost::PayLife { amount }
+            if !crate::types::ability::is_pay_any_amount(amount))
+}
+
 fn optional_effect_is_infeasible(state: &GameState, ability: &ResolvedAbility) -> bool {
     match &ability.effect {
         Effect::PutSticker { .. } => stickers::optional_is_infeasible(state, ability),
@@ -16051,11 +16064,11 @@ fn optional_effect_is_infeasible(state: &GameState, ability: &ResolvedAbility) -
             target: TargetFilter::SelfRef,
             ..
         } => transform_effect::optional_self_transform_is_impossible(state, ability),
-        Effect::PayCost {
-            cost: cost @ AbilityCost::TapCreatures { .. },
-            payer,
-            ..
-        } => {
+        // CR 118.3 + CR 119.4 + CR 608.2d: a player without the resources can't pay, so an
+        // unaffordable optional payment is an impossible option and is never offered.
+        Effect::PayCost { cost, payer, .. }
+            if optional_pay_cost_affordability_is_decidable(cost) =>
+        {
             let Some(payer) =
                 crate::game::targeting::resolve_effect_player_ref(state, ability, payer)
             else {
@@ -16291,7 +16304,7 @@ pub(crate) enum OptionalFeasibility {
 /// CR 603.5 + CR 608.2c + CR 608.2d + CR 603.12a — THE single authority for *"does this
 /// ability open ONE up-front optional gate, and to whom, under which key?"*
 ///
-/// `None` ⇒ no up-front gate opens at all. Four disjoint reasons, in the order they are
+/// `None` ⇒ no up-front gate opens at all. Five disjoint reasons, in the order they are
 /// evaluated:
 ///
 /// 1. not `optional`;
@@ -16301,7 +16314,9 @@ pub(crate) enum OptionalFeasibility {
 ///    see the coupling note there);
 /// 3. one of the three `repeat_for` shapes that re-fire optionality PER ITERATION
 ///    (CR 608.2c + CR 608.2d + CR 603.12a);
-/// 4. an infeasible optional (CR 608.2d: "a player can't choose an impossible option").
+/// 4. the instance's controller already took this ability's CR 603.2h "Do this only once
+///    each turn" indicated action this turn (`triggers::indicated_action_already_taken`);
+/// 5. an infeasible optional (CR 608.2d: "a player can't choose an impossible option").
 ///
 /// **THE FEASIBILITY PROBE IS THE LAST CONJUNCT, AND THAT ORDERING IS A GUARANTEE, NOT AN
 /// IMPLEMENTATION ACCIDENT.** `engine::entry_publishes_pin_slots` calls this once per announced
@@ -16370,6 +16385,12 @@ pub(crate) fn upfront_optional_gate(
     // CR 608.2c + CR 608.2d + CR 603.12a: the three shapes that SUPPRESS the single up-front
     // gate and fire optionality per iteration instead.
     if optionality_is_per_iteration(state, ability) {
+        return None;
+    }
+    // CR 603.2h + CR 608.2d: an instance whose controller already took this ability's
+    // indicated action this turn has no option to offer — no gate opens. Production
+    // declines it before reaching here (see `resolve_chain_body`).
+    if crate::game::triggers::indicated_action_already_taken(state, ability) {
         return None;
     }
     let infeasible = match feasibility {
@@ -22199,6 +22220,23 @@ fn resolve_chain_body(
         }
         None => ability,
     };
+
+    // CR 603.2h + CR 608.2d: once this ability's controller has taken its indicated action
+    // this turn, the instruction is no longer an option — an instance already on the stack
+    // resolves with no effect (Calix / Ondu Spiritdancer / Riveteers Ascendancy rulings).
+    // Production half of `upfront_optional_gate`'s indicated-action conjunct: the gate
+    // answers `None` for this instance, and `None` alone would fall through to the
+    // resolver and perform the action, so route through the one decline authority
+    // (CR 608.2c) BEFORE any stored "always accept" answer is read.
+    if ability.optional && crate::game::triggers::indicated_action_already_taken(state, ability) {
+        return resolve_optional_effect_decision_step(
+            state,
+            ability.clone(),
+            AutoMayChoice::Decline,
+            events,
+            depth + 1,
+        );
+    }
 
     // Per-iteration optionality must reach the rebound singleton ability before
     // feasibility is decided. In particular, the root's first member can have
@@ -28045,6 +28083,117 @@ mod tests {
         ChooseOneOfKind, CoinFlipRun, LibraryInstructionActor, LibraryPosition,
         ParentTargetMissingReason, SearchSelectionConstraint, SpentColor, UNION_DEPTH_BUDGET,
     };
+
+    /// CR 603.2h + CR 608.2d: the "would it prompt" authority agrees with production for
+    /// an instance whose controller already took the ability's indicated action — no gate
+    /// opens, so no stored "always accept" answer is read for it. The instance is a clone
+    /// of the stacked Pantlaza trigger, exactly what `apply_trigger_doubling` stacks for an
+    /// additional instance.
+    #[test]
+    fn upfront_optional_gate_withholds_an_instance_whose_indicated_action_was_taken() {
+        use crate::types::actions::{CastChoice, GameAction};
+        use crate::types::game_state::{CastOfferKind, CastPaymentMode, StackEntryKind};
+        const PANTLAZA: &str = "Whenever Pantlaza or another Dinosaur you control enters, you may discover X, where X is that creature's toughness. Do this only once each turn. (Exile cards from the top of your library until you exile a nonland card with that mana value or less. Cast it without paying its mana cost or put it into your hand. Put the rest on the bottom in a random order.)";
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
+        let pantlaza = scenario
+            .add_creature_from_oracle(P0, "Pantlaza, Sun-Favored", 4, 4, PANTLAZA)
+            .with_subtypes(vec!["Dinosaur"])
+            .id();
+        let dino = scenario
+            .add_creature_to_hand(P0, "Dino A", 2, 2)
+            .with_subtypes(vec!["Dinosaur"])
+            .with_mana_cost(crate::types::mana::ManaCost::generic(0))
+            .id();
+        scenario
+            .add_spell_to_library_top(P0, "Hit", false)
+            .with_mana_cost(crate::types::mana::ManaCost::generic(0));
+        let mut runner = scenario.build();
+        let card_id = runner.state().objects[&dino].card_id;
+        runner
+            .act(GameAction::CastSpell {
+                object_id: dino,
+                card_id,
+                targets: vec![],
+                payment_mode: CastPaymentMode::Auto,
+            })
+            .expect("cast Dino A");
+        let mut instance = None;
+        for _ in 0..6 {
+            instance = runner
+                .state()
+                .stack
+                .iter()
+                .find_map(|entry| match &entry.kind {
+                    StackEntryKind::TriggeredAbility {
+                        source_id, ability, ..
+                    } if *source_id == pantlaza => Some((**ability).clone()),
+                    _ => None,
+                });
+            if instance.is_some() {
+                break;
+            }
+            runner.act(GameAction::PassPriority).expect("pass priority");
+        }
+        let instance = instance.expect("Pantlaza's trigger reaches the stack");
+
+        // Positive control: before the action is taken the instance opens a keyed gate,
+        // and a stored answer for that key is read.
+        let gate = upfront_optional_gate(runner.state(), &instance, OptionalFeasibility::Probe)
+            .expect("an untaken instance opens its gate");
+        let key = gate
+            .key
+            .clone()
+            .expect("the may-trigger instance carries a key");
+        let mut remembered = runner.state().clone();
+        remembered.set_may_trigger_auto_choice(key.clone(), AutoMayChoice::Accept);
+        assert_eq!(
+            stored_may_answer(&remembered, &instance),
+            Some(AutoMayChoice::Accept)
+        );
+
+        runner.advance_until_stack_empty();
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::OptionalEffectChoice { .. }
+        ));
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: true })
+            .expect("accept the discover");
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::CastOffer {
+                kind: CastOfferKind::Discover { .. },
+                ..
+            }
+        ));
+        runner
+            .act(GameAction::DiscoverChoice {
+                choice: CastChoice::Decline,
+            })
+            .expect("decline the discover cast");
+        runner.advance_until_stack_empty();
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+        assert!(crate::game::triggers::indicated_action_already_taken(
+            runner.state(),
+            &instance
+        ));
+
+        assert!(
+            upfront_optional_gate(runner.state(), &instance, OptionalFeasibility::Probe).is_none(),
+            "an instance whose indicated action was taken opens no gate"
+        );
+        let mut remembered = runner.state().clone();
+        remembered.set_may_trigger_auto_choice(key, AutoMayChoice::Accept);
+        assert!(
+            stored_may_answer(&remembered, &instance).is_none(),
+            "no gate, so no stored answer is read for the spent instance"
+        );
+    }
 
     #[test]
     fn optional_decline_selector_preserves_none_borrowed_and_owned_branches() {

@@ -369,6 +369,7 @@ mod displacer_kitten_firesinger_loop;
 mod divine_gambit_metamorphose_prompt_8257;
 mod divine_visitation_token_substitution;
 mod djinn_most_common_color_static;
+mod do_this_only_once_each_turn;
 mod doom_s_time_platform_exile_with_time_counters;
 mod doomsday;
 mod doomsday_excruciator_copy;

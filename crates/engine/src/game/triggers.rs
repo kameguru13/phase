@@ -11,7 +11,8 @@ use crate::types::ability::{
     PlayerScope, QuantityExpr, QuantityRef, RenownSubject, ResolvedAbility, SacrificeCost,
     StaticCondition, TargetFilter, TargetRef, TributeOutcome, TriggerCondition,
     TriggerConditionAnchor, TriggerConstraint, TriggerDefinition, TriggerDefinitionOccurrenceRef,
-    TriggerDefinitionRef, TriggerEntry, TriggerGrantProducerKey, TypeFilter, TypedFilter,
+    TriggerDefinitionRef, TriggerEntry, TriggerGrantProducerKey, TriggerLimitSpend, TypeFilter,
+    TypedFilter,
 };
 #[cfg(test)]
 use crate::types::ability::{EffectScope, TapStateChange};
@@ -15686,7 +15687,7 @@ pub fn phase_trigger_scoped_to_turn_of(
             super::players::is_opponent(state, controller, active)
         }
         Some(
-            TriggerConstraint::OncePerTurn
+            TriggerConstraint::OncePerTurn { .. }
             | TriggerConstraint::OncePerGame
             | TriggerConstraint::NthSpellThisTurn { .. }
             | TriggerConstraint::NthDrawThisTurn { .. }
@@ -15788,9 +15789,16 @@ fn check_trigger_constraint_with_ref(
         // occurrence reconciler materializes it. That limits only the
         // identity-keyed "once" bookkeeping; all semantic constraints below
         // must still be evaluated for every trigger source.
-        TriggerConstraint::OncePerTurn => {
-            definition_ref.is_none_or(|key| !state.triggers_fired_this_turn.contains(key))
-        }
+        TriggerConstraint::OncePerTurn { spent_by } => match spent_by {
+            TriggerLimitSpend::Triggering => {
+                definition_ref.is_none_or(|key| !state.triggers_fired_this_turn.contains(key))
+            }
+            // CR 603.2h: triggers only if its source's controller has not taken the
+            // indicated action this turn.
+            TriggerLimitSpend::IndicatedAction => {
+                definition_ref.is_none_or(|key| !indicated_action_taken_by(state, key, controller))
+            }
+        },
         TriggerConstraint::OncePerGame => {
             definition_ref.is_none_or(|key| !state.triggers_fired_this_game.contains(key))
         }
@@ -15937,7 +15945,9 @@ fn matched_trigger_constraint_allows_admission(
     use crate::types::ability::TriggerConstraint;
 
     match matched.constraint.as_ref() {
-        Some(TriggerConstraint::OncePerTurn) => matched
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering,
+        }) => matched
             .definition_ref
             .as_ref()
             .is_none_or(|key| !state.triggers_fired_this_turn.contains(key)),
@@ -15967,7 +15977,12 @@ fn matched_trigger_constraint_allows_admission(
                     < *max
             })
         }
-        Some(
+        // CR 603.2h: admission records nothing, so an earlier sibling candidate
+        // cannot change its truth.
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::IndicatedAction,
+        })
+        | Some(
             TriggerConstraint::OnlyDuringYourTurn
             | TriggerConstraint::OnlyDuringOpponentsTurn
             | TriggerConstraint::OnlyDuringYourMainPhase
@@ -18073,6 +18088,59 @@ fn player_field(state: &GameState, controller: PlayerId, f: impl Fn(&Player) -> 
         .unwrap_or(false)
 }
 
+/// CR 603.2h: has `player`, controlling the ability `key`, taken its "Do this only
+/// once each turn" indicated action this turn? The single read predicate behind the
+/// fire-time check and the resolution gate.
+fn indicated_action_taken_by(
+    state: &GameState,
+    key: &TriggerDefinitionRef,
+    player: PlayerId,
+) -> bool {
+    state
+        .trigger_indicated_actions_this_turn
+        .contains(&(key.clone(), player))
+}
+
+/// CR 603.2h: the definition key whose "Do this only once each turn" limit governs this
+/// resolving instruction, or `None` for any other ability.
+pub(crate) fn indicated_action_limit(ability: &ResolvedAbility) -> Option<&TriggerDefinitionRef> {
+    let key = ability.trigger_definition_ref.as_ref()?;
+    matches!(
+        ability.triggered_definition()?.constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::IndicatedAction
+        })
+    )
+    .then_some(key)
+}
+
+/// CR 603.2h + CR 608.2d: has this instance's controller already taken the indicated
+/// action this turn? Then its instruction is no longer an option for this instance.
+pub(crate) fn indicated_action_already_taken(state: &GameState, ability: &ResolvedAbility) -> bool {
+    indicated_action_limit(ability)
+        .is_some_and(|key| indicated_action_taken_by(state, key, ability.controller))
+}
+
+/// CR 603.2h: the controller chose to take the indicated action — spend the limit
+/// (idempotent). The sole writer of `GameState::trigger_indicated_actions_this_turn`.
+/// `ability.controller` is the triggered ability's controller (CR 603.3a).
+pub(crate) fn record_indicated_action_taken(state: &mut GameState, ability: &ResolvedAbility) {
+    let Some(key) = indicated_action_limit(ability) else {
+        return;
+    };
+    if indicated_action_taken_by(state, key, ability.controller) {
+        return;
+    }
+    crate::game::ledger::record_trigger_fired(
+        state,
+        key.clone(),
+        crate::types::resolved_commands::ResolvedTriggerLedgerEdit::IndicatedActionTaken {
+            player: ability.controller,
+        },
+    )
+    .expect("indicated-action fact must have a valid ledger prefix");
+}
+
 /// Record that a constrained trigger has fired.
 fn record_trigger_fired_with_ref(
     state: &mut GameState,
@@ -18093,13 +18161,21 @@ fn record_trigger_fired_with_ref(
     };
 
     match constraint {
-        TriggerConstraint::OncePerTurn => {
+        TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering,
+        } => {
             crate::game::ledger::record_trigger_fired(
                 state,
                 key.clone(),
                 crate::types::resolved_commands::ResolvedTriggerLedgerEdit::OncePerTurn,
             )
             .expect("once-per-turn trigger must have a valid ledger prefix");
+        }
+        TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::IndicatedAction,
+        } => {
+            // CR 603.2h: triggering spends nothing; the controller's acceptance of
+            // the instruction does (`record_indicated_action_taken`).
         }
         TriggerConstraint::OncePerGame => {
             crate::game::ledger::record_trigger_fired(
@@ -29260,7 +29336,9 @@ pub mod tests {
             },
             trigger_events: vec![event.clone()],
             batched: true,
-            constraint: Some(TriggerConstraint::OncePerTurn),
+            constraint: Some(TriggerConstraint::OncePerTurn {
+                spent_by: TriggerLimitSpend::Triggering,
+            }),
         };
         let before = state.clone();
         let mut session = TriggerCollectionSession::transactional(
@@ -29480,7 +29558,9 @@ pub mod tests {
         let mut state = setup();
         let (_, event) = install_ledger_limited_combat_damage_trigger(
             &mut state,
-            TriggerConstraint::OncePerTurn,
+            TriggerConstraint::OncePerTurn {
+                spent_by: TriggerLimitSpend::Triggering,
+            },
         );
         let before = state.clone();
 
@@ -32837,6 +32917,99 @@ pub mod tests {
             controller,
             &controller_draw,
         ));
+    }
+
+    /// CR 603.2h: "its source's controller has not yet taken the indicated action" —
+    /// the fact is keyed by (definition, player), so a player who did not take it
+    /// still sees the ability trigger.
+    #[test]
+    fn indicated_action_limit_is_keyed_by_definition_and_controller() {
+        let mut state = setup();
+        let mut trig_def = make_trigger(TriggerMode::Drawn);
+        trig_def.constraint = Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::IndicatedAction,
+        });
+        let event = GameEvent::CardDrawn {
+            player_id: PlayerId(0),
+            object_id: ObjectId(99),
+            nth_in_turn: 1,
+            nth_in_step: 1,
+        };
+        assert!(
+            check_trigger_constraint(&state, &trig_def, ObjectId(1), 0, PlayerId(0), &event),
+            "untaken indicated action leaves the ability free to trigger"
+        );
+
+        let key = trigger_definition_ref_for_live_index(&state, ObjectId(1), 0);
+        crate::game::ledger::record_trigger_fired(
+            &mut state,
+            key,
+            crate::types::resolved_commands::ResolvedTriggerLedgerEdit::IndicatedActionTaken {
+                player: PlayerId(0),
+            },
+        )
+        .expect("indicated action records");
+
+        assert!(!check_trigger_constraint(
+            &state,
+            &trig_def,
+            ObjectId(1),
+            0,
+            PlayerId(0),
+            &event,
+        ));
+        assert!(
+            check_trigger_constraint(&state, &trig_def, ObjectId(1), 0, PlayerId(1), &event),
+            "a controller who has not taken the action this turn is not limited"
+        );
+        assert!(
+            check_trigger_constraint(&state, &trig_def, ObjectId(1), 1, PlayerId(0), &event),
+            "another ability of the same source is not limited"
+        );
+    }
+
+    /// CR 603.2 vs CR 603.2h: triggering spends "triggers only once each turn" but
+    /// records nothing for "Do this only once each turn".
+    #[test]
+    fn admission_records_triggering_limits_but_not_indicated_action_limits() {
+        let mut state = setup();
+        let event = GameEvent::CardDrawn {
+            player_id: PlayerId(0),
+            object_id: ObjectId(99),
+            nth_in_turn: 1,
+            nth_in_step: 1,
+        };
+
+        record_trigger_fired(
+            &mut state,
+            Some(&TriggerConstraint::OncePerTurn {
+                spent_by: TriggerLimitSpend::IndicatedAction,
+            }),
+            ObjectId(1),
+            0,
+            &event,
+        );
+        assert!(state.triggers_fired_this_turn.is_empty());
+        assert!(state.trigger_indicated_actions_this_turn.is_empty());
+
+        record_trigger_fired(
+            &mut state,
+            Some(&TriggerConstraint::OncePerTurn {
+                spent_by: TriggerLimitSpend::Triggering,
+            }),
+            ObjectId(1),
+            0,
+            &event,
+        );
+        assert_eq!(
+            state.triggers_fired_this_turn,
+            HashSet::from([trigger_definition_ref_for_live_index(
+                &state,
+                ObjectId(1),
+                0
+            )])
+        );
+        assert!(state.trigger_indicated_actions_this_turn.is_empty());
     }
 
     #[test]

@@ -37185,12 +37185,36 @@ fn is_default_nth_spell_comparator(comparator: &Comparator) -> bool {
     *comparator == Comparator::EQ
 }
 
+/// CR 603.2 + CR 603.2h: what uses up a once-each-turn trigger limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TriggerLimitSpend {
+    /// "This ability triggers only once each turn." — triggering spends the limit (CR 603.2).
+    #[default]
+    Triggering,
+    /// CR 603.2h: "Do this only once each turn." — the source's controller taking the
+    /// indicated action (accepting the ability's "you may" instruction) spends it.
+    IndicatedAction,
+}
+
+impl TriggerLimitSpend {
+    pub fn is_triggering(&self) -> bool {
+        matches!(self, Self::Triggering)
+    }
+}
+
 /// Rate-limiting constraint for triggered abilities.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum TriggerConstraint {
-    /// "This ability triggers only once each turn."
-    OncePerTurn,
+    /// A once-each-turn limit. `spent_by` names what uses it up:
+    /// - `Triggering`: "This ability triggers only once each turn." (CR 603.2)
+    /// - `IndicatedAction`: "Do this only once each turn." — the ability triggers only if
+    ///   its source's controller has not yet taken the indicated action that turn
+    ///   (CR 603.2h).
+    OncePerTurn {
+        #[serde(default, skip_serializing_if = "TriggerLimitSpend::is_triggering")]
+        spent_by: TriggerLimitSpend,
+    },
     /// "This ability triggers only once."
     OncePerGame,
     /// "This ability triggers only during your turn."
@@ -37224,6 +37248,7 @@ pub enum TriggerConstraint {
     AtClassLevel { level: u8 },
     /// CR 603.4: "This ability triggers only the first N times each turn." — generalizes
     /// OncePerTurn to arbitrary limits. OncePerTurn remains for backward compatibility.
+    /// Counts *firings*, like `OncePerTurn { spent_by: Triggering }`.
     MaxTimesPerTurn { max: u32 },
     /// CR 603.2: "for the first time during each of their turns" — fires once
     /// per opponent per turn. Used by Valgavoth, Harrower of Souls: "Whenever
@@ -42245,6 +42270,18 @@ impl PartialEq for ResolvedAbility {
 impl Eq for ResolvedAbility {}
 
 impl ResolvedAbility {
+    /// CR 113.7a + CR 603.3: the definition of the triggered ability this resolving node
+    /// belongs to, read from the trigger-time snapshot of its source — never live state.
+    pub fn triggered_definition(&self) -> Option<&TriggerDefinition> {
+        let occurrence = &self.trigger_definition_ref.as_ref()?.occurrence;
+        self.trigger_source
+            .as_ref()?
+            .trigger_entries
+            .iter()
+            .find(|entry| &entry.occurrence == occurrence)
+            .map(TriggerEntry::definition)
+    }
+
     /// CR 707.10 + CR 400.7: whether a copy of `self` resolves exactly as a copy
     /// of `other`. `PartialEq` compares `cost_paid_objects` by object id only (see
     /// its doc), but a copy uses the objects paid for its own original (CR 707.10)

@@ -83,8 +83,8 @@ use crate::types::ability::{
     PropertyAggregate, PtStat, PtValueScope, QuantityExpr, QuantityRef, RenownSubject,
     SacrificeAggregateStat, SacrificeCost, SacrificeRequirement, SharedQuality, SpentColor,
     StaticCondition, TapCreaturesRequirement, TapStateChange, TargetFilter, TriggerCondition,
-    TriggerConstraint, TriggerDefinition, TypeFilter, TypedFilter, UnlessPayModifier,
-    ZoneChangeClause,
+    TriggerConstraint, TriggerDefinition, TriggerLimitSpend, TypeFilter, TypedFilter,
+    UnlessPayModifier, ZoneChangeClause,
 };
 use crate::types::card_type::{is_land_subtype, CoreType};
 use crate::types::counter::CounterType;
@@ -924,13 +924,14 @@ pub(crate) fn parse_trigger_lines_at_index_ir(
                 ir
             })
             .collect();
-        // Shared-constraint marker. A constraint that counts firings per
-        // definition (`constraint_counts_per_definition`) must span both halves
-        // of the one printed ability: CR 603.2h for "Do this only once each
-        // turn" (Glava, Five-Advents Mage); for "This ability triggers only
-        // once each turn" (Bill Potts) the engine fact is that the counter is
-        // keyed per `TriggerDefinitionRef`, so two lowered halves would each
-        // fire once. Until a single-definition disjunctive trigger lets one
+        // Shared-constraint marker. A constraint with a per-definition ledger
+        // (`constraint_counts_per_definition`) must span both halves of the one
+        // printed ability: CR 603.2h for "Do this only once each turn" (Glava,
+        // Five-Advents Mage), whose indicated-action fact is keyed per
+        // `TriggerDefinitionRef`, so two lowered halves would each take the
+        // action once; for "This ability triggers only once each turn" (Bill
+        // Potts) the firing counter is keyed the same way, so two lowered
+        // halves would each fire once. Until a single-definition disjunctive trigger lets one
         // counter span both events, the activation half is a strict failure
         // and the spell half keeps the constraint, so exactly one counted
         // definition is live.
@@ -2718,6 +2719,22 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
     }
 
     def.constraint = lowered_trigger_constraint(modifiers, def.constraint.take());
+    // CR 603.2h + CR 608.2d: the engine observes the indicated action as the controller
+    // accepting the ability's single non-iterated "you may" instruction. Any other body
+    // names an action the engine cannot observe — strict failure, not a limit that never
+    // (or wrongly) spends.
+    if matches!(
+        def.constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::IndicatedAction
+        })
+    ) && !def
+        .execute
+        .as_deref()
+        .is_some_and(has_single_indicated_action_instruction)
+    {
+        return unknown_trigger_definition(&ir.source_text).1;
+    }
     constrain_triggering_spell_with_nth_filter(&mut def);
 
     // Preserve original oracle text for coverage/UI annotation.
@@ -4190,12 +4207,10 @@ pub(crate) fn parse_trigger_line_with_index(
 fn parse_trigger_constraint(lower: &str) -> Option<TriggerConstraint> {
     // Order is load-bearing: longer/more-specific matches must precede shorter ones
     // ("only once each turn" before "only once", etc.).
-    if scan_contains(lower, "this ability triggers only once each turn")
-        || scan_contains(lower, "triggers only once each turn")
-        // CR 603.2h: "Do this only once each turn" is functionally equivalent.
-        || scan_contains(lower, "do this only once each turn")
-    {
-        return Some(TriggerConstraint::OncePerTurn);
+    // CR 603.2 + CR 603.2h: "triggers only once each turn" is spent by triggering;
+    // "Do this only once each turn" is spent by the controller taking the indicated action.
+    if let Some((_, constraint, _)) = scan_preceded(lower, parse_once_each_turn_limit) {
+        return Some(constraint);
     }
     if scan_contains(lower, "this ability triggers only once") {
         return Some(TriggerConstraint::OncePerGame);
@@ -4223,6 +4238,24 @@ fn parse_trigger_constraint(lower: &str) -> Option<TriggerConstraint> {
         return Some(constraint);
     }
     None
+}
+
+/// CR 603.2 + CR 603.2h: the two once-each-turn limit sentences, distinguished by what
+/// spends the limit. The word-boundary scan also covers the "this ability triggers only
+/// once each turn" wording.
+fn parse_once_each_turn_limit(input: &str) -> OracleResult<'_, TriggerConstraint> {
+    alt((
+        value(
+            TriggerLimitSpend::IndicatedAction,
+            tag::<_, _, OracleError<'_>>("do this only once each turn"),
+        ),
+        value(
+            TriggerLimitSpend::Triggering,
+            tag("triggers only once each turn"),
+        ),
+    ))
+    .map(|spent_by| TriggerConstraint::OncePerTurn { spent_by })
+    .parse(input)
 }
 
 fn parse_nth_spell_this_turn_intervening_if(input: &str) -> OracleResult<'_, TriggerConstraint> {
@@ -4309,23 +4342,26 @@ fn lowered_trigger_constraint(
         .or_else(|| {
             // CR 603.2: Apply trigger-event frequency limits as a fallback.
             modifiers.first_time_limit.map(|limit| match limit {
-                FirstTimeLimit::EachTurn => TriggerConstraint::OncePerTurn,
+                FirstTimeLimit::EachTurn => TriggerConstraint::OncePerTurn {
+                    spent_by: TriggerLimitSpend::Triggering,
+                },
                 FirstTimeLimit::EachOpponentTurn => TriggerConstraint::OncePerOpponentPerTurn,
             })
         })
 }
 
-/// Whether `constraint` counts firings per trigger definition. The four
-/// counting arms are keyed by `TriggerDefinitionRef` in
-/// `triggers.rs::check_trigger_constraint_with_ref`, so a printed line that a
-/// compound split lowers to two definitions would count each half separately
-/// (CR 603.2h: "Do this only once each turn" limits the one printed ability, not
-/// each of its events). The remaining arms are predicates on the event or the
-/// game state, which every half evaluates identically. Exhaustive, so a new
+/// Whether `constraint` keeps a per-trigger-definition ledger. The four
+/// ledger arms are keyed by `TriggerDefinitionRef` in
+/// `triggers.rs::check_trigger_constraint_with_ref` (firings, or for CR 603.2h
+/// the controller's indicated action), so a printed line that a compound split
+/// lowers to two definitions would spend each half separately (CR 603.2h: "Do
+/// this only once each turn" limits the one printed ability, not each of its
+/// events). The remaining arms are predicates on the event or the game state,
+/// which every half evaluates identically. Exhaustive, so a new
 /// `TriggerConstraint` variant is forced into this decision.
 fn constraint_counts_per_definition(constraint: &TriggerConstraint) -> bool {
     match constraint {
-        TriggerConstraint::OncePerTurn
+        TriggerConstraint::OncePerTurn { .. }
         | TriggerConstraint::OncePerGame
         | TriggerConstraint::MaxTimesPerTurn { .. }
         | TriggerConstraint::OncePerOpponentPerTurn => true,
@@ -4501,6 +4537,26 @@ fn chain_creates_reflexive_ability(def: &AbilityDefinition) -> bool {
             .else_ability
             .as_deref()
             .is_some_and(chain_creates_reflexive_ability)
+}
+
+/// CR 603.2h: whether this chain names exactly one observable indicated action — a single
+/// non-iterated "you may" instruction (`optional`) across its `sub_ability` /
+/// `else_ability` spine. Its acceptance is the controller taking the indicated action.
+fn has_single_indicated_action_instruction(def: &AbilityDefinition) -> bool {
+    fn optional_nodes<'a>(def: &'a AbilityDefinition, found: &mut Vec<&'a AbilityDefinition>) {
+        if def.optional {
+            found.push(def);
+        }
+        for branch in [def.sub_ability.as_deref(), def.else_ability.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            optional_nodes(branch, found);
+        }
+    }
+    let mut found = Vec::new();
+    optional_nodes(def, &mut found);
+    matches!(found.as_slice(), [only] if only.repeat_for.is_none())
 }
 
 /// Strip constraint sentences from effect text so they don't produce spurious sub-abilities.
@@ -23845,7 +23901,7 @@ fn turn_window_condition(constraint: TriggerConstraint) -> Option<TriggerConditi
     let player = match constraint {
         TriggerConstraint::OnlyDuringYourTurn => PlayerFilter::Controller,
         TriggerConstraint::OnlyDuringOpponentsTurn => PlayerFilter::Opponent,
-        TriggerConstraint::OncePerTurn
+        TriggerConstraint::OncePerTurn { .. }
         | TriggerConstraint::OncePerGame
         | TriggerConstraint::NthSpellThisTurn { .. }
         | TriggerConstraint::NthDrawThisTurn { .. }

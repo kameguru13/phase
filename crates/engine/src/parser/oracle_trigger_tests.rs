@@ -3659,7 +3659,9 @@ fn trigger_card_leaves_your_graveyard_during_your_turn_once_each_turn() {
     // CR 603.2h: "triggers only once each turn" → OncePerTurn.
     assert_eq!(
         def.constraint,
-        Some(crate::types::ability::TriggerConstraint::OncePerTurn),
+        Some(crate::types::ability::TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        }),
     );
     assert!(def.execute.is_some());
 }
@@ -6861,6 +6863,37 @@ fn arabella_attack_trigger_binds_x_to_creature_count() {
 /// its execute must be a `Discover` whose limit binds to the *entering*
 /// creature's toughness - NOT a `Variable("X")` placeholder, which resolves
 /// to 0 at runtime and makes discover a silent no-op ("did not discover").
+/// CR 603.2h + CR 608.2d: "Do this only once each turn" after a mandatory instruction
+/// names an action the engine cannot observe as the controller's choice, so the
+/// trigger is a strict failure rather than a limit that never (or wrongly) spends.
+/// Reach guard: the same body under the "triggers only once each turn" wording parses
+/// to a live trigger.
+#[test]
+fn do_this_only_once_each_turn_after_a_mandatory_instruction_is_strict() {
+    let reach = parse_trigger_line(
+        "Whenever you gain life, draw a card. This ability triggers only once each turn.",
+        "Synthetic Once",
+    );
+    assert_eq!(reach.mode, TriggerMode::LifeGained);
+    assert_eq!(
+        reach.constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        })
+    );
+
+    let def = parse_trigger_line(
+        "Whenever you gain life, draw a card. Do this only once each turn.",
+        "Synthetic Do This",
+    );
+    assert!(
+        matches!(def.mode, TriggerMode::Unknown(_)),
+        "{:?}",
+        def.mode
+    );
+    assert!(def.execute.is_none());
+}
+
 #[test]
 fn trigger_pantlaza_etb_discover_x_is_entering_creature_toughness() {
     let def = parse_trigger_line(
@@ -6876,8 +6909,10 @@ fn trigger_pantlaza_etb_discover_x_is_entering_creature_toughness() {
     assert_eq!(def.destination, Some(Zone::Battlefield));
     assert_eq!(
         def.constraint,
-        Some(crate::types::ability::TriggerConstraint::OncePerTurn),
-        "\"Do this only once each turn\" must map to OncePerTurn",
+        Some(crate::types::ability::TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::IndicatedAction
+        }),
+        "\"Do this only once each turn\" must map to the CR 603.2h indicated-action limit",
     );
 
     let execute = def
@@ -7762,7 +7797,9 @@ fn trigger_once_each_turn_constraint() {
     assert_eq!(def.mode, TriggerMode::LifeGained);
     assert_eq!(
         def.constraint,
-        Some(crate::types::ability::TriggerConstraint::OncePerTurn)
+        Some(crate::types::ability::TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        })
     );
 }
 
@@ -10849,7 +10886,9 @@ fn trigger_you_put_counters_on_self() {
     assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
     assert_eq!(
         def.constraint,
-        Some(crate::types::ability::TriggerConstraint::OncePerTurn)
+        Some(crate::types::ability::TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        })
     );
     // Constraint sentence should NOT leak as a sub-ability
     if let Some(ref exec) = def.execute {
@@ -11298,7 +11337,9 @@ fn trigger_one_or_more_artifacts_leave_battlefield_during_your_turn() {
     );
     assert_eq!(
         def.constraint,
-        Some(TriggerConstraint::OncePerTurn),
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        }),
         "'only once each turn' must set OncePerTurn constraint"
     );
     assert!(
@@ -11329,7 +11370,9 @@ fn trigger_another_permanent_leaves_battlefield_during_your_turn() {
     );
     assert_eq!(
         def.constraint,
-        Some(TriggerConstraint::OncePerTurn),
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        }),
         "'only once each turn' must set OncePerTurn constraint"
     );
 }
@@ -14359,7 +14402,12 @@ fn trigger_you_gain_or_lose_life_during_your_turn_once_each_turn() {
             player: PlayerFilter::Controller,
         })
     );
-    assert_eq!(def.constraint, Some(TriggerConstraint::OncePerTurn));
+    assert_eq!(
+        def.constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        })
+    );
 }
 
 #[test]
@@ -15597,6 +15645,39 @@ fn nth_spell_constraint_serde_defaults_and_omits_exact_comparator() {
     );
 }
 
+/// CR 603.2 + CR 603.2h: the "triggers only once each turn" wire shape is unchanged
+/// (`spent_by` defaults to `Triggering` and is omitted), while the "Do this only once
+/// each turn" limit serializes its spend explicitly and round-trips.
+#[test]
+fn once_per_turn_constraint_serde_defaults_and_omits_triggering_spend() {
+    let old = r#"{"type":"OncePerTurn"}"#;
+    let decoded: TriggerConstraint = serde_json::from_str(old).expect("legacy export loads");
+    assert_eq!(
+        decoded,
+        TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        }
+    );
+    assert_eq!(
+        serde_json::to_string(&decoded).expect("triggering limit serializes"),
+        old,
+        "default spend must preserve the export shape"
+    );
+
+    let indicated = TriggerConstraint::OncePerTurn {
+        spent_by: TriggerLimitSpend::IndicatedAction,
+    };
+    let json = serde_json::to_string(&indicated).expect("indicated-action limit serializes");
+    assert_eq!(
+        json,
+        r#"{"type":"OncePerTurn","spent_by":"IndicatedAction"}"#
+    );
+    assert_eq!(
+        serde_json::from_str::<TriggerConstraint>(&json).expect("indicated action round-trips"),
+        indicated
+    );
+}
+
 #[test]
 fn trigger_nth_spell_with_filter_constrains_triggering_spell() {
     let def = parse_trigger_line(
@@ -16051,7 +16132,12 @@ fn trigger_you_investigate() {
     );
     assert_eq!(def.mode, TriggerMode::Investigated);
     assert_eq!(def.valid_target, Some(TargetFilter::Controller));
-    assert_eq!(def.constraint, Some(TriggerConstraint::OncePerTurn));
+    assert_eq!(
+        def.constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        })
+    );
 }
 
 #[test]
@@ -16079,7 +16165,9 @@ fn trigger_curator_discover_again_for_the_same_value() {
     assert_eq!(def.valid_target, Some(TargetFilter::Controller));
     assert_eq!(
         def.constraint,
-        Some(crate::types::ability::TriggerConstraint::OncePerTurn),
+        Some(crate::types::ability::TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        }),
     );
     let execute = def
         .execute
@@ -20056,7 +20144,12 @@ fn trigger_loki_becomes_target_of_ability_you_control() {
         })
     );
     // "This ability triggers only once each turn." → OncePerTurn (auto-wired).
-    assert_eq!(def.constraint, Some(TriggerConstraint::OncePerTurn));
+    assert_eq!(
+        def.constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        })
+    );
     // Effect body: untargeted single-card draw.
     let execute = def.execute.as_ref().expect("Loki has an execute body");
     match &*execute.effect {
@@ -23613,7 +23706,12 @@ fn ninjutsu_activation_trigger_with_once_per_turn() {
         );
     assert_eq!(triggers.len(), 1);
     assert_eq!(triggers[0].mode, TriggerMode::NinjutsuActivated);
-    assert_eq!(triggers[0].constraint, Some(TriggerConstraint::OncePerTurn));
+    assert_eq!(
+        triggers[0].constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        })
+    );
 }
 
 #[test]
@@ -31606,7 +31704,12 @@ fn burrowfiend_becomes_saddled_parses_with_once_per_turn() {
         "Stubborn Burrowfiend",
     );
     assert_eq!(def.mode, TriggerMode::BecomesSaddled);
-    assert_eq!(def.constraint, Some(TriggerConstraint::OncePerTurn));
+    assert_eq!(
+        def.constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        })
+    );
 }
 
 #[test]
@@ -31653,7 +31756,12 @@ fn first_time_each_turn_in_condition_sets_once_per_turn() {
         "Godo, Bandit Warlord",
     );
     assert_eq!(def.mode, TriggerMode::Attacks);
-    assert_eq!(def.constraint, Some(TriggerConstraint::OncePerTurn));
+    assert_eq!(
+        def.constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        })
+    );
 }
 
 #[test]
@@ -31694,7 +31802,12 @@ fn valiant_rescuer_regression() {
             "Valiant Rescuer",
         );
     assert_eq!(def.mode, TriggerMode::Cycled);
-    assert_eq!(def.constraint, Some(TriggerConstraint::OncePerTurn));
+    assert_eq!(
+        def.constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        })
+    );
     assert!(!def.secondary, "removed hack should not set secondary");
     match &def.valid_card {
         Some(TargetFilter::Typed(tf)) => {
@@ -31713,7 +31826,12 @@ fn aurelia_attacks_first_time_has_constraint() {
             "Aurelia, the Warleader",
         );
     assert_eq!(def.mode, TriggerMode::Attacks);
-    assert_eq!(def.constraint, Some(TriggerConstraint::OncePerTurn));
+    assert_eq!(
+        def.constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        })
+    );
 }
 
 #[test]
@@ -31770,7 +31888,12 @@ fn mighty_servant_becomes_crewed_parses_with_once_per_turn() {
         "Mighty Servant of Leuk-O",
     );
     assert_eq!(def.mode, TriggerMode::BecomesCrewed);
-    assert_eq!(def.constraint, Some(TriggerConstraint::OncePerTurn));
+    assert_eq!(
+        def.constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        })
+    );
 }
 
 #[test]
@@ -31787,8 +31910,18 @@ fn gourmand_talent_two_triggers_both_constrained() {
         "Whenever you gain life for the first time each turn, create a Food token.",
         "Gourmand's Talent",
     );
-    assert_eq!(first.constraint, Some(TriggerConstraint::OncePerTurn));
-    assert_eq!(second.constraint, Some(TriggerConstraint::OncePerTurn));
+    assert_eq!(
+        first.constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        })
+    );
+    assert_eq!(
+        second.constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        })
+    );
 }
 
 #[test]
@@ -31801,7 +31934,12 @@ fn stensia_generic_damage_trigger_constrained() {
             "Whenever a creature deals damage to one or more players for the first time each turn, put a +1/+1 counter on it.",
             "Stensia, Condemner's Keep",
         );
-    assert_eq!(def.constraint, Some(TriggerConstraint::OncePerTurn));
+    assert_eq!(
+        def.constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        })
+    );
 }
 
 // SOC Tier 2.6: "Whenever you create one or more creature tokens" —
@@ -40552,7 +40690,12 @@ fn bill_potts_activation_half_stays_strict_until_one_counter_spans_both_halves()
         })
     );
     assert_eq!(spell_half.valid_target, Some(TargetFilter::Controller));
-    assert_eq!(spell_half.constraint, Some(TriggerConstraint::OncePerTurn));
+    assert_eq!(
+        spell_half.constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        })
+    );
     assert_copies_triggering_source(spell_half, "Bill Potts spell half");
 
     assert!(
@@ -40580,7 +40723,12 @@ fn glava_spell_half_keeps_its_x_qualifier_and_activation_half_is_strict() {
             ],
         })
     );
-    assert_eq!(triggers[0].constraint, Some(TriggerConstraint::OncePerTurn));
+    assert_eq!(
+        triggers[0].constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::IndicatedAction
+        })
+    );
     assert!(triggers[0].optional);
     assert!(
         matches!(triggers[1].mode, TriggerMode::Unknown(_)),
@@ -40725,7 +40873,12 @@ fn cast_or_activate_split_never_ships_two_counted_halves() {
     );
     assert_eq!(lone.len(), 1);
     assert_eq!(lone[0].mode, TriggerMode::AbilityActivated);
-    assert_eq!(lone[0].constraint, Some(TriggerConstraint::OncePerTurn));
+    assert_eq!(
+        lone[0].constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        })
+    );
 
     let triggers = cast_or_activate_triggers(
         "Whenever you cast an instant spell or activate an ability, draw a card. This ability triggers only once each turn.",
@@ -40738,7 +40891,12 @@ fn cast_or_activate_split_never_ships_two_counted_halves() {
         triggers[0].valid_card,
         Some(TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant)))
     );
-    assert_eq!(triggers[0].constraint, Some(TriggerConstraint::OncePerTurn));
+    assert_eq!(
+        triggers[0].constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        })
+    );
     assert!(
         matches!(&triggers[1].mode, TriggerMode::Unknown(text)
             if text == "Whenever you activate an ability"),
@@ -41362,7 +41520,12 @@ fn event_window_composes_with_once_per_turn() {
         "Synthetic Window Once Per Turn",
     );
     assert_eq!(def.mode, TriggerMode::ChangesZone);
-    assert_eq!(def.constraint, Some(TriggerConstraint::OncePerTurn));
+    assert_eq!(
+        def.constraint,
+        Some(TriggerConstraint::OncePerTurn {
+            spent_by: TriggerLimitSpend::Triggering
+        })
+    );
     assert_eq!(def.condition, Some(event_time(combat_window())));
 }
 
