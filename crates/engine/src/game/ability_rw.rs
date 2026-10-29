@@ -1832,7 +1832,7 @@ fn flag_legacy_write_target(p: &mut RwProfile, target: &TargetFilter) {
     }
 }
 
-/// Set `reads_member_bound` when an effect WRITE target names a per-member-bound
+/// Record a per-member binding (`bind_per_member`) when an effect WRITE target names a per-member-bound
 /// referent (CR 603.10a, PR-6.75 c5) — the write path's counterpart to
 /// `member_bound_target_filter` read-position wiring. A `ChangeZone{TrackedSet}`
 /// return (Day of the Dragons) writes a per-source set ⇒ members diverge.
@@ -5249,7 +5249,7 @@ fn rw_effect(
         // channeled DEFERRED ETB metadata keyed to a future self-cast (mirrors
         // AddPendingETBCounters above, WriteScope::SelfSource): it reads no
         // event-live state (reads_event_live = false), no member-bound state
-        // (reads_member_bound = false), and writes no event object
+        // (`MemberBinding::Shared`), and writes no event object
         // (writes_event_object = EMPTY) — all inherited from self_write →
         // RwProfile::empty. CR 400.1: SetMembership is the membership state kind.
         // SOUNDNESS (CR 603.3b fail-open axis): AddSubtype/AddType carry NO
@@ -6825,7 +6825,7 @@ fn rw_quantity_ref(x: &QuantityRef) -> RwProfile {
         | QuantityRef::DistinctColorsAmong { source } => characteristic_source_read_bounded(source),
         // CR 603.10a (PR-6.75 c5): promoted out of the fail-closed group below to
         // its own arm so the next field addition is compiler-visible (a read-bearing
-        // field must force a re-audit). `reads_member_bound = true` is the HONEST
+        // field must force a re-audit). `bind_per_member()` is the HONEST
         // classification for BOTH sources, not conservative-by-reflex:
         //   - `ChainSet` is per-instance chain-published storage (same as the group
         //     below), so it is member-bound.
