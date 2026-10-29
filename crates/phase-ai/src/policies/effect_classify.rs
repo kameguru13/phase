@@ -2050,15 +2050,20 @@ pub(crate) fn effect_is_temporary_combat_modifier(effect: &Effect) -> bool {
             static_abilities,
             duration: Some(Duration::UntilEndOfTurn),
             ..
-        } => static_abilities
-            .iter()
-            .all(static_definition_is_temporary_combat_modifier),
+        } => {
+            // An empty grant modifies nothing, so it is no combat modifier.
+            !static_abilities.is_empty()
+                && static_abilities
+                    .iter()
+                    .all(static_definition_is_temporary_combat_modifier)
+        }
         _ => false,
     }
 }
 
 fn static_definition_is_temporary_combat_modifier(static_def: &StaticDefinition) -> bool {
     matches!(static_def.mode, StaticMode::Continuous)
+        && !static_def.modifications.is_empty()
         && static_def
             .modifications
             .iter()
@@ -2341,6 +2346,44 @@ mod suspect_scope_tests {
             extract_target_filter(&all_unsuspect).is_none(),
             "mass Unsuspect{{All}} (Absolving Lammasu) is a population effect, not target-filtered"
         );
+    }
+}
+
+#[cfg(test)]
+mod temporary_combat_modifier_tests {
+    use super::*;
+
+    fn until_end_of_turn(static_abilities: Vec<StaticDefinition>) -> Effect {
+        Effect::GenericEffect {
+            static_abilities,
+            target: Some(TargetFilter::ParentTarget),
+            duration: Some(Duration::UntilEndOfTurn),
+            end_cost: None,
+        }
+    }
+
+    fn pump(modifications: Vec<ContinuousModification>) -> StaticDefinition {
+        StaticDefinition::continuous()
+            .affected(TargetFilter::ParentTarget)
+            .modifications(modifications)
+    }
+
+    #[test]
+    fn empty_until_end_of_turn_grant_is_no_combat_modifier() {
+        let control = until_end_of_turn(vec![pump(vec![ContinuousModification::AddPower {
+            value: 1,
+        }])]);
+        assert!(
+            effect_is_temporary_combat_modifier(&control),
+            "reach-guard: a +1/+0 grant is a combat modifier"
+        );
+        assert!(!effect_is_temporary_combat_modifier(&until_end_of_turn(
+            vec![]
+        )));
+        assert!(!effect_is_temporary_combat_modifier(&until_end_of_turn(
+            vec![pump(vec![])]
+        )));
+        assert!(!effect_is_combat_trick_payload(&until_end_of_turn(vec![])));
     }
 }
 
