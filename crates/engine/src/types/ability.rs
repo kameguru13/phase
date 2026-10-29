@@ -15578,6 +15578,98 @@ pub(crate) fn quantity_expr_contains_scope(expr: &QuantityExpr, scope: ObjectSco
     }
 }
 
+/// CR 608.2d: one way an optional instruction's "you may" can be addressed to a player other
+/// than the ability's controller. The single routing classification: the resolver
+/// (`game::effects::optional_prompt_player`) resolves these in order, and the parser's
+/// CR 603.2h lowering guard (`optional_addressee_is_always_controller`) reads the same list,
+/// so the two cannot drift. An instruction with no route is addressed to its controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OptionalAddressRoute<'a> {
+    /// CR 118.12 + CR 608.2c: a resolution-time payment is offered to its payer.
+    Payer(&'a TargetFilter),
+    /// CR 608.2d: a parser-stamped subject ("they may") names who answers.
+    DeclaredSubject(&'a TargetFilter),
+    /// CR 608.2c: a subject-anchored instruction ("its controller may search …", "that
+    /// player may put …") is answered by the parent target's controller.
+    ParentTargetController,
+    /// CR 707.10c: "that player may copy this spell" is answered by a player among the
+    /// instruction's targets.
+    TargetedPlayer,
+    /// CR 503.1a + CR 608.2d: a per-player instruction ("that player may put a card from
+    /// their hand …") is answered by the scoped player when one is bound.
+    ScopedPlayer,
+}
+
+impl Effect {
+    /// CR 608.2d: the routes along which this optional instruction's "you may" can reach a
+    /// player other than the ability's controller, in the order they are tried.
+    pub(crate) fn optional_address_routes<'a>(
+        &'a self,
+        optional_player: Option<&'a TargetFilter>,
+    ) -> Vec<OptionalAddressRoute<'a>> {
+        let mut routes = Vec::new();
+        if let Effect::PayCost { payer, .. } = self {
+            routes.push(OptionalAddressRoute::Payer(payer));
+        }
+        if let Some(subject) = optional_player {
+            routes.push(OptionalAddressRoute::DeclaredSubject(subject));
+        }
+        let parent_target_controller = |filter: &TargetFilter| {
+            filter.controller_scope() == Some(ControllerRef::ParentTargetController)
+        };
+        match self {
+            Effect::Sacrifice { target, .. } | Effect::ChangeZone { target, .. }
+                if parent_target_controller(target) =>
+            {
+                routes.push(OptionalAddressRoute::ParentTargetController);
+            }
+            Effect::CopySpell { .. } => routes.push(OptionalAddressRoute::TargetedPlayer),
+            Effect::SearchLibrary {
+                target_player: Some(TargetFilter::ParentTargetController),
+                ..
+            } => routes.push(OptionalAddressRoute::ParentTargetController),
+            _ => {}
+        }
+        let scoped_change_zone = matches!(
+            self,
+            Effect::ChangeZone { target, .. } if target.uses_scoped_player_controller()
+        );
+        if scoped_change_zone
+            || self
+                .target_filter()
+                .is_some_and(TargetFilter::uses_scoped_player_controller)
+        {
+            routes.push(OptionalAddressRoute::ScopedPlayer);
+        }
+        routes
+    }
+}
+
+/// CR 603.2h + CR 608.2d: whether an optional instruction is always answered by the
+/// ability's controller, read from the shared routing classification
+/// ([`Effect::optional_address_routes`]). Fail-closed: a route counts only when it provably
+/// names the controller; every other route makes the answer `false`.
+/// `targets_may_include_player` answers the one route that depends on resolution-time
+/// targets (`TargetedPlayer`).
+pub(crate) fn optional_addressee_is_always_controller(
+    effect: &Effect,
+    optional_player: Option<&TargetFilter>,
+    targets_may_include_player: bool,
+) -> bool {
+    effect
+        .optional_address_routes(optional_player)
+        .into_iter()
+        .all(|route| match route {
+            OptionalAddressRoute::Payer(filter) | OptionalAddressRoute::DeclaredSubject(filter) => {
+                *filter == TargetFilter::Controller
+            }
+            OptionalAddressRoute::TargetedPlayer => !targets_may_include_player,
+            OptionalAddressRoute::ParentTargetController | OptionalAddressRoute::ScopedPlayer => {
+                false
+            }
+        })
+}
+
 /// CR 107.1c + CR 107.14: Detect a "pay any amount of X" shape — the parser
 /// emits `QuantityExpr::Ref { QuantityRef::Variable { name: "X" } }` for
 /// these prompts (Galvanic Discharge, etc.). A fixed or dynamic reference
@@ -26676,6 +26768,42 @@ pub enum VoteVisibility {
 }
 
 impl TargetFilter {
+    /// CR 109.4: the controller relation this filter names, reading the first `Typed`
+    /// operand through `And` / `Or` / `Not`.
+    pub(crate) fn controller_scope(&self) -> Option<ControllerRef> {
+        match self {
+            TargetFilter::Typed(tf) => tf.controller.clone(),
+            TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+                filters.iter().find_map(TargetFilter::controller_scope)
+            }
+            TargetFilter::Not { filter } => filter.controller_scope(),
+            _ => None,
+        }
+    }
+
+    /// CR 109.4 + CR 608.2d: whether this filter names objects the scoped player controls
+    /// or owns ("a card they control", "their graveyard").
+    pub(crate) fn uses_scoped_player_controller(&self) -> bool {
+        match self {
+            TargetFilter::Typed(tf) => {
+                tf.controller == Some(ControllerRef::ScopedPlayer)
+                    || tf.properties.iter().any(|prop| {
+                        matches!(
+                            prop,
+                            FilterProp::Owned {
+                                controller: ControllerRef::ScopedPlayer
+                            }
+                        )
+                    })
+            }
+            TargetFilter::Or { filters } | TargetFilter::And { filters } => filters
+                .iter()
+                .any(TargetFilter::uses_scoped_player_controller),
+            TargetFilter::Not { filter } => filter.uses_scoped_player_controller(),
+            _ => false,
+        }
+    }
+
     /// Either variant names exactly one player, so one that does not resolve names no one
     /// instead of falling back to another player (CR 608.2b).
     pub(crate) fn names_one_player(&self) -> bool {

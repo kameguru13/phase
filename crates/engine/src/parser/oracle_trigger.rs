@@ -69,6 +69,7 @@ use super::oracle_util::{
     strip_reminder_text, TextPair, GRANTING_SELF_PLACEHOLDER, SELF_REF_PARSE_ONLY_PHRASES,
 };
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
+use crate::types::ability::optional_addressee_is_always_controller;
 use crate::types::ability::ManaProduction;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag,
@@ -4542,37 +4543,50 @@ fn chain_creates_reflexive_ability(def: &AbilityDefinition) -> bool {
 /// CR 603.2h: whether this chain names exactly one observable indicated action — a single
 /// non-iterated "you may" instruction (`optional`) across its `sub_ability` /
 /// `else_ability` spine, answered by the source's controller at resolution. Its
-/// acceptance is the controller taking the indicated action. Rejected shapes, whose
-/// acceptance never reaches the resolution-time Accept authority or is another
-/// player's choice:
+/// acceptance is the controller taking the indicated action. Fail-closed rejections:
 /// - an optional modal root ("you may choose one"), whose acceptance is consumed while
 ///   the trigger is put on the stack (CR 603.3c + CR 700.2);
-/// - an instruction offered to other players (`optional_for`, CR 608.2d + CR 101.4) or
-///   addressed to another player ("they may", `optional_player`);
-/// - a payment whose payer is not the controller (CR 118.12).
+/// - a per-player fan-out anywhere on the spine (`player_scope`, CR 608.2c), which makes
+///   each scoped player the acting player;
+/// - an instruction offered to other players (`optional_for`, CR 608.2d + CR 101.4);
+/// - any instruction whose prompt the shared routing classification
+///   ([`optional_addressee_is_always_controller`]) cannot prove is addressed to the
+///   controller ("they may", another player's payment, subject-anchored and scoped
+///   instructions, a copy offered to a targeted player).
 fn has_single_indicated_action_instruction(def: &AbilityDefinition) -> bool {
-    fn optional_nodes<'a>(def: &'a AbilityDefinition, found: &mut Vec<&'a AbilityDefinition>) {
-        if def.optional {
-            found.push(def);
-        }
+    fn spine<'a>(def: &'a AbilityDefinition, nodes: &mut Vec<&'a AbilityDefinition>) {
+        nodes.push(def);
         for branch in [def.sub_ability.as_deref(), def.else_ability.as_deref()]
             .into_iter()
             .flatten()
         {
-            optional_nodes(branch, found);
+            spine(branch, nodes);
         }
     }
-    let mut found = Vec::new();
-    optional_nodes(def, &mut found);
+    let mut nodes = Vec::new();
+    spine(def, &mut nodes);
+    let optional: Vec<_> = nodes.iter().copied().filter(|node| node.optional).collect();
+    // CR 707.10: a player target reaches an instruction only through its own chosen
+    // target slot or by inheritance from an ancestor. The root's targets are its own; a
+    // root that copies the triggering spell (`TriggeringSource`) can name no player.
+    // Anything else is conservatively assumed to admit a player target.
+    let targets_may_include_player = |node: &AbilityDefinition| {
+        !(std::ptr::eq(node, def)
+            && matches!(
+                node.effect.target_filter(),
+                Some(TargetFilter::TriggeringSource)
+            ))
+    };
     def.modal.is_none()
-        && matches!(found.as_slice(), [only]
+        && nodes.iter().all(|node| node.player_scope.is_none())
+        && matches!(optional.as_slice(), [only]
         if only.repeat_for.is_none()
             && only.optional_for.is_none()
-            && only.optional_player.is_none()
-            && match &*only.effect {
-                Effect::PayCost { payer, .. } => *payer == TargetFilter::Controller,
-                _ => true,
-            })
+            && optional_addressee_is_always_controller(
+                &only.effect,
+                only.optional_player.as_ref(),
+                targets_may_include_player(only),
+            ))
 }
 
 /// Strip constraint sentences from effect text so they don't produce spurious sub-abilities.

@@ -413,14 +413,7 @@ pub(crate) fn resolved_battlefield_population_ids(
 }
 
 pub(crate) fn target_filter_controller_scope(filter: &TargetFilter) -> Option<ControllerRef> {
-    match filter {
-        TargetFilter::Typed(tf) => tf.controller.clone(),
-        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
-            filters.iter().find_map(target_filter_controller_scope)
-        }
-        TargetFilter::Not { filter } => target_filter_controller_scope(filter),
-        _ => None,
-    }
+    filter.controller_scope()
 }
 
 /// CR 608.2c + CR 102.2: whether `player` is a recipient of a `PlayerFilter`
@@ -16821,24 +16814,7 @@ fn filter_uses_relative_controller_you(filter: &TargetFilter) -> bool {
 /// player and candidate pool against the per-iteration scoped player, not the
 /// ability's controller.
 fn filter_uses_relative_controller_scoped(filter: &TargetFilter) -> bool {
-    match filter {
-        TargetFilter::Typed(tf) => {
-            tf.controller == Some(ControllerRef::ScopedPlayer)
-                || tf.properties.iter().any(|prop| {
-                    matches!(
-                        prop,
-                        FilterProp::Owned {
-                            controller: ControllerRef::ScopedPlayer
-                        }
-                    )
-                })
-        }
-        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
-            filters.iter().any(filter_uses_relative_controller_scoped)
-        }
-        TargetFilter::Not { filter } => filter_uses_relative_controller_scoped(filter),
-        _ => false,
-    }
+    filter.uses_scoped_player_controller()
 }
 
 /// CR 109.4 + CR 115.10a (issue #6505): True when this ability's effect — or any
@@ -17135,112 +17111,67 @@ pub(crate) fn optional_prompt_player(
     state: &GameState,
     ability: &ResolvedAbility,
 ) -> Option<PlayerId> {
-    if let Effect::PayCost { payer, .. } = &ability.effect {
-        if let Some(player) =
-            crate::game::targeting::resolve_effect_player_ref(state, ability, payer)
-        {
-            return Some(player);
-        }
-        // CR 608.2b: a payer that is an illegal or unannounced declared player is asked no one.
-        if payer.names_one_player() {
-            return None;
-        }
-    }
-    // CR 608.2d: a parser-stamped subject such as "they may" names the player
-    // who receives this choice. The reference resolves from the trigger event,
-    // preserving the event-time controller rather than inferring from effect shape.
-    if let Some(optional_player) = &ability.optional_player {
-        if let Some(player) =
-            crate::game::targeting::resolve_effect_player_ref(state, ability, optional_player)
-        {
-            return Some(player);
-        }
-        // CR 608.2b: an instruction addressed to an illegal or unannounced declared
-        // player is offered to no one.
-        if optional_player.names_one_player() {
-            return None;
-        }
-    }
-    if let Effect::Sacrifice { target, .. } = &ability.effect {
-        if target_filter_controller_scope(target) == Some(ControllerRef::ParentTargetController) {
-            if let Some(player) = crate::game::targeting::resolve_effect_player_ref(
-                state,
-                ability,
-                &TargetFilter::ParentTargetController,
-            ) {
-                return Some(player);
-            }
-        }
-    }
-    // CR 608.2d: "That player/opponent may put a permanent card from their
-    // hand onto the battlefield" is a subject-anchored ChangeZone choice.
-    // The candidate filter names the earlier target's controller, so route
-    // the optional prompt through the same LKI-aware player resolver before
-    // opening the subsequent EffectZoneChoice (Metamorphose, Divine Gambit).
-    if let Effect::ChangeZone { target, .. } = &ability.effect {
-        if target_filter_controller_scope(target) == Some(ControllerRef::ParentTargetController) {
-            if let Some(player) = crate::game::targeting::resolve_effect_player_ref(
-                state,
-                ability,
-                &TargetFilter::ParentTargetController,
-            ) {
-                return Some(player);
-            }
-        }
-    }
-
-    // CR 707.10 + CR 707.10c: "That player may copy this spell" (the Chain
-    // cycle — Chain of Acid / Plasma / Smog / Vapor). The optional copy
-    // sub-ability is offered to, and resolved by, the *targeted* player — not
-    // the original spell's caster. The targeted player arrives as a
-    // `TargetRef::Player` inherited from the parent effect's target list.
-    if matches!(ability.effect, Effect::CopySpell { .. }) {
-        if let Some(player) = ability.targets.iter().find_map(|t| match t {
-            TargetRef::Player(player) => Some(*player),
-            TargetRef::Object(_) => None,
-        }) {
-            return Some(player);
-        }
-    }
-
-    // CR 608.2c (issue #822): Subject-anchored SearchLibrary — "its controller
-    // may search their library" (Erode, Path to Exile) — prompts the parent
-    // target's controller. Route through the same LKI-aware central resolver
-    // the `Sacrifice` branch above uses instead of reading `obj.controller`
-    // directly: Destroy/Exile always moves the target off the battlefield
-    // before this optional gate is evaluated, and `reset_for_battlefield_exit`
-    // resets `base_controller` to the object's owner at that point, so a live
-    // lookup silently prompts the owner instead of the controller whenever a
-    // stolen/control-changed creature is the one destroyed or exiled.
-    if let Effect::SearchLibrary {
-        target_player: Some(TargetFilter::ParentTargetController),
-        ..
-    } = &ability.effect
+    use crate::types::ability::OptionalAddressRoute;
+    // CR 608.2d: the routes come from the one shared classification
+    // (`Effect::optional_address_routes`), which the CR 603.2h lowering guard also reads.
+    for route in ability
+        .effect
+        .optional_address_routes(ability.optional_player.as_ref())
     {
-        if let Some(player) = crate::game::targeting::resolve_effect_player_ref(
-            state,
-            ability,
-            &TargetFilter::ParentTargetController,
-        ) {
-            return Some(player);
-        }
-    }
-
-    // CR 503.1a + CR 608.2d (issue #1535): per-player upkeep optional effects
-    // ("that player may put a card from their hand ...") route the prompt to
-    // the scoped player, not the ability's controller (Braids, Conjurer Adept).
-    if let Some(scoped) = ability.scoped_player {
-        if let Effect::ChangeZone { target, .. } = &ability.effect {
-            if filter_uses_relative_controller_scoped(target) {
-                return Some(scoped);
+        match route {
+            // CR 118.12 + CR 608.2c: a payment is offered to its payer. CR 608.2d: a
+            // parser-stamped subject such as "they may" names the player who receives this
+            // choice; the reference resolves from the trigger event, preserving the
+            // event-time controller rather than inferring from effect shape.
+            OptionalAddressRoute::Payer(filter) | OptionalAddressRoute::DeclaredSubject(filter) => {
+                if let Some(player) =
+                    crate::game::targeting::resolve_effect_player_ref(state, ability, filter)
+                {
+                    return Some(player);
+                }
+                // CR 608.2b: an instruction addressed to an illegal or unannounced declared
+                // player is offered to no one.
+                if filter.names_one_player() {
+                    return None;
+                }
             }
-        }
-        if ability
-            .effect
-            .target_filter()
-            .is_some_and(filter_uses_relative_controller_scoped)
-        {
-            return Some(scoped);
+            // CR 608.2c (issue #822) + CR 608.2d: subject-anchored instructions —
+            // "its controller may search their library" (Erode, Path to Exile), "that
+            // player/opponent may put a permanent card from their hand onto the
+            // battlefield" (Metamorphose, Divine Gambit), a parent-target-controller
+            // sacrifice — prompt the parent target's controller through the LKI-aware
+            // central resolver: Destroy/Exile moves the target off the battlefield before
+            // this gate is evaluated and `reset_for_battlefield_exit` resets
+            // `base_controller` to the owner, so a live lookup would prompt the owner.
+            OptionalAddressRoute::ParentTargetController => {
+                if let Some(player) = crate::game::targeting::resolve_effect_player_ref(
+                    state,
+                    ability,
+                    &TargetFilter::ParentTargetController,
+                ) {
+                    return Some(player);
+                }
+            }
+            // CR 707.10 + CR 707.10c: "That player may copy this spell" (the Chain cycle —
+            // Chain of Acid / Plasma / Smog / Vapor). The optional copy is offered to, and
+            // resolved by, the *targeted* player, which arrives as a `TargetRef::Player`
+            // inherited from the parent effect's target list.
+            OptionalAddressRoute::TargetedPlayer => {
+                if let Some(player) = ability.targets.iter().find_map(|t| match t {
+                    TargetRef::Player(player) => Some(*player),
+                    TargetRef::Object(_) => None,
+                }) {
+                    return Some(player);
+                }
+            }
+            // CR 503.1a + CR 608.2d (issue #1535): per-player upkeep optional effects
+            // ("that player may put a card from their hand ...") route the prompt to the
+            // scoped player, not the ability's controller (Braids, Conjurer Adept).
+            OptionalAddressRoute::ScopedPlayer => {
+                if let Some(scoped) = ability.scoped_player {
+                    return Some(scoped);
+                }
+            }
         }
     }
 

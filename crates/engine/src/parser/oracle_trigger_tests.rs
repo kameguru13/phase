@@ -6979,6 +6979,117 @@ fn do_this_only_once_each_turn_on_another_players_payment_is_strict() {
     );
 }
 
+/// CR 603.2h + CR 608.2c: a per-player fan-out (`player_scope`) makes each scoped player
+/// the acting player, so "Do this only once each turn" on it is strict. Reach guard: the
+/// Hunted Wumpus body under "triggers only once each turn" is a live ETB trigger whose
+/// spine carries a `player_scope`.
+#[test]
+fn do_this_only_once_each_turn_on_a_player_scoped_fan_out_is_strict() {
+    let (reach, def) = once_each_turn_pair(
+        "When this creature enters, each other player may put a creature card from their hand onto the battlefield.",
+    );
+    assert_eq!(reach.mode, TriggerMode::ChangesZone);
+    let execute = reach.execute.as_deref().expect("reach: execute");
+    let mut spine = vec![execute];
+    while let Some(next) = spine.last().and_then(|node| node.sub_ability.as_deref()) {
+        spine.push(next);
+    }
+    assert!(
+        spine.iter().any(|node| node.player_scope.is_some()),
+        "{execute:#?}"
+    );
+    assert!(
+        matches!(def.mode, TriggerMode::Unknown(_)),
+        "{:?}",
+        def.mode
+    );
+}
+
+/// CR 603.2h + CR 608.2c: the `player_scope` rejection on its own — a per-player
+/// fan-out whose optional instruction has no addressee route of its own ("each player
+/// may draw a card"), so only the spine's `player_scope` names the acting players.
+/// Reach guard: under "triggers only once each turn" the spine carries a `player_scope`
+/// and the optional node has no addressee route.
+#[test]
+fn do_this_only_once_each_turn_on_an_each_player_may_fan_out_is_strict() {
+    let (reach, def) =
+        once_each_turn_pair("Whenever you cast a spell, each player may draw a card.");
+    assert_eq!(reach.mode, TriggerMode::SpellCast);
+    let execute = reach.execute.as_deref().expect("reach: execute");
+    let mut spine = vec![execute];
+    while let Some(next) = spine.last().and_then(|node| node.sub_ability.as_deref()) {
+        spine.push(next);
+    }
+    assert!(
+        spine.iter().any(|node| node.player_scope.is_some()),
+        "{execute:#?}"
+    );
+    let optional: Vec<_> = spine.iter().filter(|node| node.optional).collect();
+    assert!(
+        matches!(optional.as_slice(), [only]
+            if only.optional_for.is_none()
+                && only
+                    .effect
+                    .optional_address_routes(only.optional_player.as_ref())
+                    .is_empty()),
+        "{execute:#?}"
+    );
+    assert!(
+        matches!(def.mode, TriggerMode::Unknown(_)),
+        "{:?}",
+        def.mode
+    );
+}
+
+/// CR 603.2h + CR 503.1a: a per-player instruction scoped to the iterated player
+/// (Braids, Conjurer Adept: "that player may put … from their hand") is answered by the
+/// scoped player, so the shared routing classification rejects it. Reach guard: the same
+/// body under "triggers only once each turn" is a live upkeep trigger whose optional
+/// instruction carries the `ScopedPlayer` route.
+#[test]
+fn do_this_only_once_each_turn_on_a_scoped_players_instruction_is_strict() {
+    let (reach, def) = once_each_turn_pair(
+        "At the beginning of each player's upkeep, that player may put an artifact, creature, or land card from their hand onto the battlefield.",
+    );
+    assert_eq!(reach.mode, TriggerMode::Phase);
+    let execute = reach.execute.as_deref().expect("reach: execute");
+    assert!(execute.optional, "{execute:#?}");
+    assert!(
+        execute
+            .effect
+            .optional_address_routes(execute.optional_player.as_ref())
+            .contains(&crate::types::ability::OptionalAddressRoute::ScopedPlayer),
+        "{execute:#?}"
+    );
+    assert!(
+        matches!(def.mode, TriggerMode::Unknown(_)),
+        "{:?}",
+        def.mode
+    );
+}
+
+/// CR 603.2h + CR 608.2d + CR 101.4: an instruction offered to other players
+/// (`optional_for`) is not the source's controller taking the indicated action. Reach
+/// guard: the same body under "triggers only once each turn" sets `optional_for` (and no
+/// `player_scope`).
+#[test]
+fn do_this_only_once_each_turn_on_an_any_opponent_may_is_strict() {
+    let (reach, def) = once_each_turn_pair(
+        "Whenever you cast a spell, any opponent may sacrifice a creature of their choice.",
+    );
+    assert_eq!(reach.mode, TriggerMode::SpellCast);
+    let execute = reach.execute.as_deref().expect("reach: execute");
+    assert!(
+        execute.optional && execute.optional_for.is_some() && execute.player_scope.is_none(),
+        "{execute:#?}"
+    );
+    assert!(
+        matches!(def.mode, TriggerMode::Unknown(_)),
+        "{:?}",
+        def.mode
+    );
+}
+
 #[test]
 fn trigger_pantlaza_etb_discover_x_is_entering_creature_toughness() {
     let def = parse_trigger_line(
