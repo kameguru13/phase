@@ -6894,6 +6894,91 @@ fn do_this_only_once_each_turn_after_a_mandatory_instruction_is_strict() {
     assert!(def.execute.is_none());
 }
 
+/// Parse a single trigger line through the full Oracle pipeline under each
+/// once-each-turn wording, returning (triggers-only-once, do-this-only-once).
+fn once_each_turn_pair(body: &str) -> (TriggerDefinition, TriggerDefinition) {
+    let parse = |sentence: &str| {
+        let triggers = parse_oracle_text(
+            &format!("{body} {sentence}"),
+            "Synthetic Once",
+            &[],
+            &["Creature".to_string()],
+            &[],
+        )
+        .triggers;
+        assert_eq!(triggers.len(), 1, "{body}: {triggers:#?}");
+        triggers.into_iter().next().unwrap()
+    };
+    (
+        parse("This ability triggers only once each turn."),
+        parse("Do this only once each turn."),
+    )
+}
+
+/// CR 603.2h + CR 603.3c: an optional modal root ("you may choose one") is accepted
+/// while the trigger is put on the stack, never at the resolution-time Accept that
+/// takes the indicated action, so "Do this only once each turn" on it is strict.
+/// Reach guard: the same body under "triggers only once each turn" is a live,
+/// optional, modal SpellCast trigger.
+#[test]
+fn do_this_only_once_each_turn_on_an_optional_modal_root_is_strict() {
+    let (reach, def) = once_each_turn_pair(
+        "Whenever you cast a spell, you may choose one \u{2014} Draw a card; or You gain 2 life.",
+    );
+    assert_eq!(reach.mode, TriggerMode::SpellCast);
+    let execute = reach.execute.as_deref().expect("reach: modal execute");
+    assert!(execute.modal.is_some() && execute.optional, "{execute:#?}");
+    assert!(
+        matches!(def.mode, TriggerMode::Unknown(_)),
+        "{:?}",
+        def.mode
+    );
+}
+
+/// CR 603.2h + CR 608.2d: an instruction another player answers ("they may") is not
+/// the source's controller taking the indicated action, so the trigger is strict.
+/// Reach guard: the same body under "triggers only once each turn" parses its real
+/// mode with an `optional_player` subject.
+#[test]
+fn do_this_only_once_each_turn_on_another_players_may_is_strict() {
+    let (reach, def) =
+        once_each_turn_pair("Whenever a player commits a crime, they may draw a card.");
+    assert_eq!(reach.mode, TriggerMode::CommitCrime);
+    let execute = reach.execute.as_deref().expect("reach: execute");
+    assert!(
+        execute.optional && execute.optional_player.is_some(),
+        "{execute:#?}"
+    );
+    assert!(
+        matches!(def.mode, TriggerMode::Unknown(_)),
+        "{:?}",
+        def.mode
+    );
+}
+
+/// CR 603.2h + CR 118.12: a payment another player may make ("that player may pay")
+/// is not the source's controller taking the indicated action, so the trigger is
+/// strict. Reach guard: the same body under "triggers only once each turn" parses
+/// an optional `PayCost` whose payer is not the controller.
+#[test]
+fn do_this_only_once_each_turn_on_another_players_payment_is_strict() {
+    let (reach, def) = once_each_turn_pair(
+        "Whenever an opponent draws a card, that player may pay {2}. If the player doesn't, you create a Treasure token.",
+    );
+    assert_eq!(reach.mode, TriggerMode::Drawn);
+    let execute = reach.execute.as_deref().expect("reach: execute");
+    assert!(
+        execute.optional
+            && matches!(&*execute.effect, Effect::PayCost { payer, .. } if *payer != TargetFilter::Controller),
+        "{execute:#?}"
+    );
+    assert!(
+        matches!(def.mode, TriggerMode::Unknown(_)),
+        "{:?}",
+        def.mode
+    );
+}
+
 #[test]
 fn trigger_pantlaza_etb_discover_x_is_entering_creature_toughness() {
     let def = parse_trigger_line(

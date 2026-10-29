@@ -16003,12 +16003,6 @@ fn optionality_is_per_iteration(state: &GameState, ability: &ResolvedAbility) ->
         || is_repeated_optional_payment(ability)
 }
 
-/// CR 608.2d: "A player can't choose an impossible option." An optional effect
-/// whose only reachable outcome is a no-op must not be offered as a "you may"
-/// prompt at all. Each arm below proves infeasibility through its authoritative
-/// typed state: a missing chosen counter kind, no removable matching counter, or
-/// an exact `ParentTarget` hand-off that records no produced object. Suppressing
-/// the prompt lets the effect resolve as its defined no-op instead.
 /// CR 118.3 + CR 608.2d: the optional `PayCost` classes whose affordability
 /// `costs::can_pay` (resolution scope) decides before the "you may" is offered.
 /// `PayLife` excludes "pay any amount of life" (`is_pay_any_amount`): X is chosen at
@@ -16019,6 +16013,12 @@ fn optional_pay_cost_affordability_is_decidable(cost: &AbilityCost) -> bool {
             if !crate::types::ability::is_pay_any_amount(amount))
 }
 
+/// CR 608.2d: "A player can't choose an impossible option." An optional effect
+/// whose only reachable outcome is a no-op must not be offered as a "you may"
+/// prompt at all. Each arm below proves infeasibility through its authoritative
+/// typed state: a missing chosen counter kind, no removable matching counter, or
+/// an exact `ParentTarget` hand-off that records no produced object. Suppressing
+/// the prompt lets the effect resolve as its defined no-op instead.
 fn optional_effect_is_infeasible(state: &GameState, ability: &ResolvedAbility) -> bool {
     match &ability.effect {
         Effect::PutSticker { .. } => stickers::optional_is_infeasible(state, ability),

@@ -4541,7 +4541,15 @@ fn chain_creates_reflexive_ability(def: &AbilityDefinition) -> bool {
 
 /// CR 603.2h: whether this chain names exactly one observable indicated action — a single
 /// non-iterated "you may" instruction (`optional`) across its `sub_ability` /
-/// `else_ability` spine. Its acceptance is the controller taking the indicated action.
+/// `else_ability` spine, answered by the source's controller at resolution. Its
+/// acceptance is the controller taking the indicated action. Rejected shapes, whose
+/// acceptance never reaches the resolution-time Accept authority or is another
+/// player's choice:
+/// - an optional modal root ("you may choose one"), whose acceptance is consumed while
+///   the trigger is put on the stack (CR 603.3c + CR 700.2);
+/// - an instruction offered to other players (`optional_for`, CR 608.2d + CR 101.4) or
+///   addressed to another player ("they may", `optional_player`);
+/// - a payment whose payer is not the controller (CR 118.12).
 fn has_single_indicated_action_instruction(def: &AbilityDefinition) -> bool {
     fn optional_nodes<'a>(def: &'a AbilityDefinition, found: &mut Vec<&'a AbilityDefinition>) {
         if def.optional {
@@ -4556,7 +4564,15 @@ fn has_single_indicated_action_instruction(def: &AbilityDefinition) -> bool {
     }
     let mut found = Vec::new();
     optional_nodes(def, &mut found);
-    matches!(found.as_slice(), [only] if only.repeat_for.is_none())
+    def.modal.is_none()
+        && matches!(found.as_slice(), [only]
+        if only.repeat_for.is_none()
+            && only.optional_for.is_none()
+            && only.optional_player.is_none()
+            && match &*only.effect {
+                Effect::PayCost { payer, .. } => *payer == TargetFilter::Controller,
+                _ => true,
+            })
 }
 
 /// Strip constraint sentences from effect text so they don't produce spurious sub-abilities.
