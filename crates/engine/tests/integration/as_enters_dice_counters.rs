@@ -13,16 +13,17 @@
 //! emitted `DieRolled` results, never a hard-coded total.
 
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::ability::Effect;
+use engine::types::ability::{ChoiceType, Effect, TargetRef};
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
-use engine::types::game_state::{GameState, StackEntryKind, WaitingFor};
+use engine::types::game_state::{GameState, ParkedEntryState, StackEntryKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
+use engine::types::resolution::{FrameKind, ResolutionFrame};
 use engine::types::zones::Zone;
 
 const NEVERWINTER_HYDRA: &str = "As this creature enters, roll X d6. It enters with a number of +1/+1 counters on it equal to the total of those results.\nTrample\nWard {4} (Whenever this creature becomes the target of a spell or ability an opponent controls, counter it unless that player pays {4}.)";
@@ -56,6 +57,19 @@ const OPT: &str = "Scry 1. (Look at the top card of your library. You may put th
 const ANGELIC_SHIELD: &str = "Creatures you control get +0/+1.\nSacrifice this enchantment: Return target creature to its owner's hand.";
 const BOX_OF_FREE_RANGE_GOBLINS: &str =
     "Roll a six-sided die. Create a number of 1/1 red Goblin creature tokens equal to the result.";
+const EUREKA: &str = "Starting with you, each player may put a permanent card from their hand onto the battlefield. Repeat this process until no one puts a card onto the battlefield.";
+const FLASH: &str = "You may put a creature card from your hand onto the battlefield. If you do, sacrifice it unless you pay its mana cost reduced by {2}.";
+const CLONE: &str =
+    "You may have this creature enter as a copy of any creature on the battlefield.";
+const ADAPTIVE_AUTOMATON: &str = "As this creature enters, choose a creature type.\nThis creature is the chosen type in addition to its other types.\nOther creatures you control of the chosen type get +1/+1.";
+const FANATIC_OF_XENAGOS: &str = "Trample\nTribute 1 (As this creature enters, an opponent of your choice may put a +1/+1 counter on it.)\nWhen this creature enters, if tribute wasn't paid, it gets +1/+1 and gains haste until end of turn.";
+const ANOINTED_PEACEKEEPER: &str = "Vigilance\nAs this creature enters, look at an opponent's hand, then choose any card name.\nSpells your opponents cast with the chosen name cost {2} more to cast.\nActivated abilities of sources with the chosen name cost {2} more to activate unless they're mana abilities.";
+const TRISKELION: &str = "This creature enters with three +1/+1 counters on it.\nRemove a +1/+1 counter from this creature: It deals 1 damage to any target.";
+const CITY_OF_TRAITORS: &str = "When you play another land, sacrifice this land.\n{T}: Add {C}{C}.";
+const LOTUS_VALE: &str = "If this land would enter, sacrifice two untapped lands instead. If you do, put this land onto the battlefield. If you don't, put it into its owner's graveyard.\n{T}: Add three mana of any one color.";
+
+/// The scenario module exports only `P0` and `P1`.
+const P2: PlayerId = PlayerId(2);
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -68,6 +82,20 @@ fn board(seed: u64) -> GameScenario {
     let names: Vec<&str> = library.iter().map(String::as_str).collect();
     scenario.with_library_top(P0, &names);
     scenario.with_library_top(P1, &names);
+    scenario
+}
+
+/// Three seats, for a survivor's observer of a departing player's entry: P0
+/// owns the entrant and is the active player, P1 is the next seat, and P2 is the
+/// third player.
+fn board3(seed: u64) -> GameScenario {
+    let mut scenario = GameScenario::new_n_player(3, seed);
+    scenario.at_phase(Phase::PreCombatMain);
+    let library: Vec<String> = (0..12).map(|i| format!("Library Card {i}")).collect();
+    let names: Vec<&str> = library.iter().map(String::as_str).collect();
+    scenario.with_library_top(P0, &names);
+    scenario.with_library_top(P1, &names);
+    scenario.with_library_top(P2, &names);
     scenario
 }
 
@@ -379,12 +407,22 @@ fn has_unimplemented(state: &GameState, id: ObjectId) -> bool {
 }
 
 fn parked_entry_of(state: &GameState, id: ObjectId) -> bool {
-    state.deferred_entry_events.iter().any(|event| {
-        matches!(
-            event,
-            GameEvent::ZoneChanged { object_id, to: Zone::Battlefield, .. } if *object_id == id
-        )
-    })
+    parked_state_of(state, id).is_some()
+}
+
+/// The recorded state of `id`'s parked battlefield entry.
+fn parked_state_of(state: &GameState, id: ObjectId) -> Option<ParkedEntryState> {
+    state
+        .deferred_entry_events
+        .iter()
+        .find_map(|parked| match parked.event {
+            GameEvent::ZoneChanged {
+                object_id,
+                to: Zone::Battlefield,
+                ..
+            } if object_id == id => Some(parked.state),
+            _ => None,
+        })
 }
 
 fn queued_or_stacked_from(state: &GameState, source: ObjectId) -> usize {
@@ -1221,16 +1259,19 @@ fn breach_board(seed: u64) -> (GameRunner, ObjectId, ObjectId) {
 }
 
 /// Cast Through the Breach and accept the put, stopping at the next prompt.
-fn breach_until_roll(runner: &mut GameRunner, breach: ObjectId, imp: ObjectId) -> Vec<GameEvent> {
+/// Cast a "you may put" `spell` and put `entrant`, up to its entry's first prompt.
+fn put_until_roll(runner: &mut GameRunner, spell: ObjectId, entrant: ObjectId) -> Vec<GameEvent> {
     let mut events = Vec::new();
-    cast_and_pass(runner, breach, None, None, &mut events);
+    cast_and_pass(runner, spell, None, None, &mut events);
     for _ in 0..8 {
         let action = match &runner.state().waiting_for {
             WaitingFor::OptionalEffectChoice { .. } => {
                 GameAction::DecideOptionalEffect { accept: true }
             }
             WaitingFor::EffectZoneChoice { .. } | WaitingFor::ChooseFromZoneChoice { .. } => {
-                GameAction::SelectCards { cards: vec![imp] }
+                GameAction::SelectCards {
+                    cards: vec![entrant],
+                }
             }
             _ => break,
         };
@@ -1245,14 +1286,14 @@ fn an_unowned_put_onto_the_battlefield_is_collected_once() {
     for wants_draw in [true, false] {
         let seed = find_seed("a Breach Imp tie", |seed| {
             let (mut runner, imp, breach) = breach_board(seed);
-            breach_until_roll(&mut runner, breach, imp);
+            put_until_roll(&mut runner, breach, imp);
             tie_prompt_results(runner.state())
                 .is_some_and(|n| (survivors_total(&n) >= 3) == wants_draw)
         });
         let (mut runner, imp, breach) = breach_board(seed);
         let hand_before = hand(runner.state(), P0);
         let life_before = life(runner.state(), P0);
-        let mut events = breach_until_roll(&mut runner, breach, imp);
+        let mut events = put_until_roll(&mut runner, breach, imp);
         let naturals = tie_prompt_results(runner.state()).expect("DieKeepChoice reached");
         settle(&mut runner, &mut events, DEFAULT_ANSWERS);
         assert_eq!(zone(runner.state(), imp), Zone::Battlefield);
@@ -1307,6 +1348,966 @@ fn an_inline_entry_under_an_owner_is_observed_with_its_counters() {
             usize::from(wants_draw)
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// A parked entry records whether its entry happened
+// ---------------------------------------------------------------------------
+
+/// Eureka with Jumbo Imp as P0's only permanent card, a card for P1 to decline,
+/// and Soul Warden with the third player. Only the first pass of Eureka's process
+/// runs: its repeat stays unimplemented, and no row depends on it.
+fn eureka_imp_board(seed: u64) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    let mut scenario = board3(seed);
+    scenario.add_enchantment_from_oracle(P0, "Barbarian Class", BARBARIAN_CLASS_L1);
+    let warden = scenario
+        .add_creature_from_oracle(P2, "Soul Warden", 1, 1, SOUL_WARDEN)
+        .id();
+    let imp = free_creature(&mut scenario, "Jumbo Imp", 0, 0, JUMBO_IMP);
+    let eureka = free_spell(&mut scenario, "Eureka", false, EUREKA);
+    scenario.add_creature_to_hand(P1, "Vanilla Bear", 2, 2);
+    (scenario.build(), imp, eureka, warden)
+}
+
+fn eureka_imp_tie_seed() -> u64 {
+    find_seed("a Eureka Imp tie", |seed| {
+        let (mut runner, imp, eureka, _) = eureka_imp_board(seed);
+        put_until_roll(&mut runner, eureka, imp);
+        tie_prompt_results(runner.state()).is_some()
+    })
+}
+
+/// Answer the tie, leaving Imp's entry completed and P1's put open.
+fn answer_tie(runner: &mut GameRunner, events: &mut Vec<GameEvent>) -> Vec<u8> {
+    let WaitingFor::DieKeepChoice {
+        ignorable_indices,
+        ignore_count,
+        results,
+        ..
+    } = &runner.state().waiting_for
+    else {
+        panic!(
+            "expected DieKeepChoice, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    let naturals = results.clone();
+    let ignore_indices = ignorable_indices
+        .iter()
+        .take(*ignore_count)
+        .copied()
+        .collect();
+    act(
+        runner,
+        GameAction::SelectDieRolls { ignore_indices },
+        events,
+    );
+    naturals
+}
+
+const DECLINE_ANSWERS: Answers = Answers {
+    player_target: P1,
+    accept_optional: false,
+};
+
+/// V1. The maintainer's regression. CR 603.2 + CR 800.4a: Imp's entry finished
+/// before P1 was asked, so P0 leaving does not untrigger a third player's Soul
+/// Warden. Eureka's sequence is sequential (Hypergenesis's ruling on the same
+/// process), and its ruling holds the trigger until resolution ends.
+#[test]
+fn a_completed_entry_survives_its_owners_departure() {
+    let seed = eureka_imp_tie_seed();
+    for owner_leaves in [true, false] {
+        reset_triggers_seen();
+        let (mut runner, imp, eureka, warden) = eureka_imp_board(seed);
+        let before = life(runner.state(), P2);
+        let mut events = put_until_roll(&mut runner, eureka, imp);
+        let naturals = answer_tie(&mut runner, &mut events);
+
+        // Reach: the entry completed, is still parked, and nothing collected it.
+        assert_eq!(
+            parked_state_of(runner.state(), imp),
+            Some(ParkedEntryState::Completed)
+        );
+        assert!(
+            matches!(
+                runner.state().waiting_for,
+                WaitingFor::OptionalEffectChoice { player, .. } if player == P1
+            ),
+            "{:?}",
+            runner.state().waiting_for
+        );
+        assert_eq!(
+            plus_counters(runner.state(), imp),
+            survivors_total(&naturals)
+        );
+        assert_eq!(queued_or_stacked_from(runner.state(), warden), 0);
+
+        if owner_leaves {
+            act(
+                &mut runner,
+                GameAction::Concede { player_id: P0 },
+                &mut events,
+            );
+        }
+        settle(&mut runner, &mut events, DECLINE_ANSWERS);
+
+        assert_eq!(life(runner.state(), P2), before + 1, "Soul Warden once");
+        assert_eq!(take_triggers_seen_from(warden), 1);
+        assert_eq!(
+            zone(runner.state(), imp) == Zone::Battlefield,
+            !owner_leaves
+        );
+        assert_eq!(runner.state().players[0].is_eliminated, owner_leaves);
+    }
+}
+
+/// V5. CR 603.6d + CR 614.12a: the binding survives serialization, because a
+/// pause persists across actions.
+#[test]
+fn the_completion_binding_survives_a_round_trip() {
+    let (mut runner, imp, eureka, _) = eureka_imp_board(eureka_imp_tie_seed());
+    let mut events = put_until_roll(&mut runner, eureka, imp);
+    let wire = serde_json::to_value(runner.state()).expect("state serializes");
+    let restored: GameState = serde_json::from_value(wire).expect("state deserializes");
+    assert_eq!(
+        runner.state().deferred_entry_events,
+        restored.deferred_entry_events
+    );
+    assert_eq!(runner.state().resolution_stack, restored.resolution_stack);
+    assert!(
+        restored.resolution_stack.iter().any(|frame| matches!(
+            frame,
+            ResolutionFrame::PostReplacement(drains) if drains.resident().is_some_and(|drain| {
+                drain.parked_entrants.iter().any(|entrant| entrant.object_id == imp)
+            })
+        )),
+        "the restored dispatch names Imp"
+    );
+    *runner.state_mut() = restored;
+    answer_tie(&mut runner, &mut events);
+    assert_eq!(
+        parked_state_of(runner.state(), imp),
+        Some(ParkedEntryState::Completed)
+    );
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::OptionalEffectChoice { player, .. } if player == P1
+    ));
+}
+
+/// Answer a `ReplacementChoice` by accepting it, as `spark_double_as_enters` does.
+fn accept_replacement(runner: &mut GameRunner, events: &mut Vec<GameEvent>) {
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ),
+        "{:?}",
+        runner.state().waiting_for
+    );
+    act(runner, GameAction::ChooseReplacement { index: 0 }, events);
+}
+
+fn choose_copy_target(runner: &mut GameRunner, donor: ObjectId, events: &mut Vec<GameEvent>) {
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::CopyTargetChoice { .. }
+        ),
+        "{:?}",
+        runner.state().waiting_for
+    );
+    act(
+        runner,
+        GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(donor)),
+        },
+        events,
+    );
+}
+
+/// Answer a `NamedChoice` with its first option, and return that option.
+fn answer_named_choice(runner: &mut GameRunner, events: &mut Vec<GameEvent>) -> String {
+    let WaitingFor::NamedChoice { options, .. } = &runner.state().waiting_for else {
+        panic!("expected NamedChoice, got {:?}", runner.state().waiting_for);
+    };
+    let choice = options
+        .first()
+        .expect("a named choice offers options")
+        .clone();
+    act(
+        runner,
+        GameAction::ChooseOption {
+            choice: choice.clone(),
+        },
+        events,
+    );
+    choice
+}
+
+/// `ChoiceType::CardName` offers no options: the answer is any name in
+/// `all_card_names`.
+const SEEDED_CARD_NAME: &str = "Llanowar Elves";
+
+fn seed_card_names(runner: &mut GameRunner) {
+    runner.state_mut().all_card_names = vec![SEEDED_CARD_NAME.to_string()].into();
+}
+
+fn answer_card_name(runner: &mut GameRunner, events: &mut Vec<GameEvent>) {
+    assert!(is_card_name_choice(runner.state()));
+    act(
+        runner,
+        GameAction::ChooseOption {
+            choice: SEEDED_CARD_NAME.to_string(),
+        },
+        events,
+    );
+}
+
+fn is_card_name_choice(state: &GameState) -> bool {
+    matches!(
+        state.waiting_for,
+        WaitingFor::NamedChoice {
+            choice_type: ChoiceType::CardName,
+            ..
+        }
+    )
+}
+
+fn is_pending(state: &GameState, id: ObjectId) -> bool {
+    matches!(
+        parked_state_of(state, id),
+        Some(ParkedEntryState::Pending { .. })
+    )
+}
+
+fn concede(runner: &mut GameRunner, player_id: PlayerId, events: &mut Vec<GameEvent>) {
+    act(runner, GameAction::Concede { player_id }, events);
+}
+
+fn add_warden(scenario: &mut GameScenario) -> ObjectId {
+    scenario
+        .add_creature_from_oracle(P2, "Soul Warden", 1, 1, SOUL_WARDEN)
+        .id()
+}
+
+/// Anointed Peacekeeper as P0's free spell, with a card name to answer with.
+fn peacekeeper_board(seed: u64) -> (GameRunner, ObjectId) {
+    let mut scenario = board3(seed);
+    add_warden(&mut scenario);
+    let peacekeeper = free_keyword_creature(
+        &mut scenario,
+        "Anointed Peacekeeper",
+        (3, 3),
+        &["vigilance"],
+        ANOINTED_PEACEKEEPER,
+    );
+    let mut runner = scenario.build();
+    seed_card_names(&mut runner);
+    (runner, peacekeeper)
+}
+
+/// V20. A chooser's concession at an as-enters choice whose chain ended at that
+/// prompt: nothing is left above the drain, and the carrier abandonment retires
+/// it. Base panics at the abandonment's `.expect`.
+#[test]
+fn conceding_at_a_chain_ending_as_enters_choice_abandons_the_entry() {
+    let (mut runner, peacekeeper) = peacekeeper_board(7);
+    let before = life(runner.state(), P2);
+    let mut events = Vec::new();
+    cast_and_pass(&mut runner, peacekeeper, None, None, &mut events);
+    answer_named_choice(&mut runner, &mut events);
+    assert!(is_card_name_choice(runner.state()));
+    assert!(matches!(
+        runner.state().resolution_stack.last(),
+        Some(ResolutionFrame::PostReplacement(_))
+    ));
+    assert!(is_pending(runner.state(), peacekeeper));
+
+    concede(&mut runner, P0, &mut events);
+    settle(&mut runner, &mut events, DECLINE_ANSWERS);
+
+    assert_eq!(life(runner.state(), P2), before);
+    assert!(runner.state().resolution_stack.is_empty());
+    assert!(runner.state().deferred_entry_events.is_empty());
+    assert!(runner.state().players[0].is_eliminated);
+    assert_ne!(zone(runner.state(), peacekeeper), Zone::Battlefield);
+}
+
+/// V20's paired positive and bystander. Both choices made: the entry completed
+/// and Soul Warden triggers (CR 603.2).
+#[test]
+fn an_as_enters_choice_chain_completes_when_answered() {
+    for bystander_leaves in [false, true] {
+        let (mut runner, peacekeeper) = peacekeeper_board(7);
+        let before = life(runner.state(), P2);
+        let mut events = Vec::new();
+        cast_and_pass(&mut runner, peacekeeper, None, None, &mut events);
+        answer_named_choice(&mut runner, &mut events);
+        assert!(is_card_name_choice(runner.state()));
+        if bystander_leaves {
+            concede(&mut runner, P1, &mut events);
+            assert!(is_card_name_choice(runner.state()));
+        }
+        answer_card_name(&mut runner, &mut events);
+        settle(&mut runner, &mut events, DECLINE_ANSWERS);
+        assert_eq!(life(runner.state(), P2), before + 1);
+        assert_eq!(zone(runner.state(), peacekeeper), Zone::Battlefield);
+        assert_eq!(
+            runner.state().objects[&peacekeeper].chosen_card_name(),
+            Some(SEEDED_CARD_NAME)
+        );
+    }
+}
+
+/// V20's first prompt: `AC` is on top, so the abandonment clears it directly.
+#[test]
+fn conceding_at_the_first_choice_of_a_chain_abandons_the_entry() {
+    let (mut runner, peacekeeper) = peacekeeper_board(7);
+    let before = life(runner.state(), P2);
+    let mut events = Vec::new();
+    cast_and_pass(&mut runner, peacekeeper, None, None, &mut events);
+    assert!(is_pending(runner.state(), peacekeeper));
+    concede(&mut runner, P0, &mut events);
+    settle(&mut runner, &mut events, DECLINE_ANSWERS);
+    assert_eq!(life(runner.state(), P2), before);
+}
+
+/// Eureka with Jumbo Imp as P0's card and Anointed Peacekeeper as P1's only
+/// permanent card.
+fn eureka_peacekeeper_board(seed: u64) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    let mut scenario = board3(seed);
+    scenario.add_enchantment_from_oracle(P0, "Barbarian Class", BARBARIAN_CLASS_L1);
+    add_warden(&mut scenario);
+    let imp = free_creature(&mut scenario, "Jumbo Imp", 0, 0, JUMBO_IMP);
+    let eureka = free_spell(&mut scenario, "Eureka", false, EUREKA);
+    let peacekeeper = {
+        let mut builder = scenario.add_creature_to_hand(P1, "Anointed Peacekeeper", 3, 3);
+        builder.from_oracle_text_with_keywords(&["vigilance"], ANOINTED_PEACEKEEPER);
+        builder.with_mana_cost(ManaCost::generic(0));
+        builder.id()
+    };
+    let mut runner = scenario.build();
+    seed_card_names(&mut runner);
+    (runner, imp, eureka, peacekeeper)
+}
+
+fn eureka_peacekeeper_seed() -> u64 {
+    find_seed("a Eureka Imp tie", |seed| {
+        let (mut runner, imp, eureka, _) = eureka_peacekeeper_board(seed);
+        put_until_roll(&mut runner, eureka, imp);
+        tie_prompt_results(runner.state()).is_some()
+    })
+}
+
+/// Drive `eureka_peacekeeper_board` to P1's first choice, with Imp's entry
+/// completed and Peacekeeper's pending.
+fn eureka_to_peacekeeper_choice(
+    runner: &mut GameRunner,
+    imp: ObjectId,
+    eureka: ObjectId,
+) -> Vec<GameEvent> {
+    let mut events = put_until_roll(runner, eureka, imp);
+    answer_tie(runner, &mut events);
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::OptionalEffectChoice { player, .. } if player == P1
+    ));
+    act(
+        runner,
+        GameAction::DecideOptionalEffect { accept: true },
+        &mut events,
+    );
+    events
+}
+
+/// V23. CR 603.2 + CR 800.4a: a completed entry survives the carrier abandonment
+/// a later seat's concession raises. Imp's entry finished before P1 was asked,
+/// and P1 leaving removes only P1's objects.
+#[test]
+fn a_completed_entry_survives_a_later_seats_carrier_abandonment() {
+    let (mut runner, imp, eureka, peacekeeper) =
+        eureka_peacekeeper_board(eureka_peacekeeper_seed());
+    let before = life(runner.state(), P2);
+    let mut events = eureka_to_peacekeeper_choice(&mut runner, imp, eureka);
+    let counters = plus_counters(runner.state(), imp);
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::NamedChoice { player, .. } if player == P1
+    ));
+    assert_eq!(
+        parked_state_of(runner.state(), imp),
+        Some(ParkedEntryState::Completed)
+    );
+    assert!(is_pending(runner.state(), peacekeeper));
+
+    concede(&mut runner, P1, &mut events);
+    settle(&mut runner, &mut events, DECLINE_ANSWERS);
+
+    assert_eq!(life(runner.state(), P2), before + 1);
+    assert_eq!(zone(runner.state(), imp), Zone::Battlefield);
+    assert_eq!(plus_counters(runner.state(), imp), counters);
+    assert!(!runner.state().players[0].is_eliminated);
+    assert_ne!(zone(runner.state(), peacekeeper), Zone::Battlefield);
+    assert!(runner.state().deferred_entry_events.is_empty());
+    assert!(runner.state().resolution_stack.is_empty());
+}
+
+/// V23's paired positive: both entries complete, in the engine's merged order.
+#[test]
+fn both_seats_entries_complete_on_eureka() {
+    let (mut runner, imp, eureka, peacekeeper) =
+        eureka_peacekeeper_board(eureka_peacekeeper_seed());
+    let before = life(runner.state(), P2);
+    let mut events = eureka_to_peacekeeper_choice(&mut runner, imp, eureka);
+    answer_named_choice(&mut runner, &mut events);
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::OptionalEffectChoice { player, .. } if player == P2
+        ),
+        "{:?}",
+        runner.state().waiting_for
+    );
+    act(
+        &mut runner,
+        GameAction::DecideOptionalEffect { accept: false },
+        &mut events,
+    );
+    answer_card_name(&mut runner, &mut events);
+    settle(&mut runner, &mut events, DECLINE_ANSWERS);
+    assert_eq!(life(runner.state(), P2), before + 2);
+    assert_eq!(zone(runner.state(), peacekeeper), Zone::Battlefield);
+}
+
+/// A donor on P1's battlefield, Clone in P0's hand, Soul Warden with P2.
+fn clone_board3(
+    seed: u64,
+    donor_name: &str,
+    donor_oracle: &str,
+    donor_keywords: &[&str],
+) -> (GameScenario, ObjectId, ObjectId) {
+    let mut scenario = board3(seed);
+    add_warden(&mut scenario);
+    let donor = {
+        let mut builder = scenario.add_creature(P1, donor_name, 3, 3);
+        builder.from_oracle_text_with_keywords(donor_keywords, donor_oracle);
+        builder.id()
+    };
+    let clone = free_creature(&mut scenario, "Clone", 0, 0, CLONE);
+    (scenario, clone, donor)
+}
+
+/// Cast Clone, accept its optional entry and answer `CopyTargetChoice`.
+fn clone_until_copied(
+    runner: &mut GameRunner,
+    clone: ObjectId,
+    donor: ObjectId,
+    events: &mut Vec<GameEvent>,
+) {
+    cast_and_pass(runner, clone, None, None, events);
+    accept_replacement(runner, events);
+    choose_copy_target(runner, donor, events);
+}
+
+fn automaton_board(seed: u64) -> (GameScenario, ObjectId, ObjectId) {
+    clone_board3(seed, "Adaptive Automaton", ADAPTIVE_AUTOMATON, &[])
+}
+
+/// V17. CR 614.12a + CR 707.9: the copy answer records nothing. The copied
+/// choice is part of the entry, so conceding at it leaves the entry pending.
+#[test]
+fn conceding_at_a_copied_as_enters_choice_abandons_the_entry() {
+    let (scenario, clone, donor) = automaton_board(7);
+    let mut runner = scenario.build();
+    let before = life(runner.state(), P2);
+    let mut events = Vec::new();
+    clone_until_copied(&mut runner, clone, donor, &mut events);
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::NamedChoice { .. }
+    ));
+    assert!(is_pending(runner.state(), clone));
+    concede(&mut runner, P0, &mut events);
+    settle(&mut runner, &mut events, DECLINE_ANSWERS);
+    assert_eq!(life(runner.state(), P2), before);
+    assert!(runner.state().deferred_entry_events.is_empty());
+}
+
+/// V17's paired positive and bystander: the copied choice answered completes the
+/// entry, and Clone has the chosen type.
+#[test]
+fn a_copied_as_enters_choice_completes_the_entry_when_answered() {
+    for bystander_leaves in [false, true] {
+        let (scenario, clone, donor) = automaton_board(7);
+        let mut runner = scenario.build();
+        let before = life(runner.state(), P2);
+        let mut events = Vec::new();
+        clone_until_copied(&mut runner, clone, donor, &mut events);
+        if bystander_leaves {
+            concede(&mut runner, P1, &mut events);
+        }
+        let chosen = answer_named_choice(&mut runner, &mut events);
+        settle(&mut runner, &mut events, DECLINE_ANSWERS);
+        assert_eq!(life(runner.state(), P2), before + 1);
+        assert!(runner.state().objects[&clone]
+            .card_types
+            .subtypes
+            .contains(&chosen));
+    }
+}
+
+/// V17's counter-order sibling: a prompt after the copy, with no copied choice.
+#[test]
+fn conceding_at_a_copied_counter_order_prompt_abandons_the_entry() {
+    let (mut scenario, clone, donor) = clone_board3(7, "Triskelion", TRISKELION, &[]);
+    scenario.add_enchantment_from_oracle(P0, "Hardened Scales", HARDENED_SCALES);
+    scenario.add_enchantment_from_oracle(P0, "Branching Evolution", BRANCHING_EVOLUTION);
+    let mut runner = scenario.build();
+    let before = life(runner.state(), P2);
+    let mut events = Vec::new();
+    clone_until_copied(&mut runner, clone, donor, &mut events);
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ),
+        "{:?}",
+        runner.state().waiting_for
+    );
+    assert!(is_pending(runner.state(), clone));
+    concede(&mut runner, P0, &mut events);
+    settle(&mut runner, &mut events, DECLINE_ANSWERS);
+    assert_eq!(life(runner.state(), P2), before);
+}
+
+/// V17's Flash sibling: multi-eligible Flash rests the owner on its `ChangeZone`
+/// frame, and the carrier abandonment takes both. Base panics on that top.
+#[test]
+fn conceding_at_a_copied_choice_under_flashs_tail_does_not_panic() {
+    let mut scenario = board3(7);
+    add_warden(&mut scenario);
+    let donor = {
+        let mut builder = scenario.add_creature(P1, "Adaptive Automaton", 3, 3);
+        builder.from_oracle_text(ADAPTIVE_AUTOMATON);
+        builder.id()
+    };
+    let clone = free_creature(&mut scenario, "Clone", 0, 0, CLONE);
+    free_creature(&mut scenario, "Vanilla Bear", 2, 2, "");
+    let flash = free_spell(&mut scenario, "Flash", true, FLASH);
+    let mut runner = scenario.build();
+    let before = life(runner.state(), P2);
+    let mut events = put_until_roll(&mut runner, flash, clone);
+    accept_replacement(&mut runner, &mut events);
+    choose_copy_target(&mut runner, donor, &mut events);
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::NamedChoice { .. }
+    ));
+    let frames: Vec<_> = runner
+        .state()
+        .resolution_stack
+        .iter()
+        .map(ResolutionFrame::kind)
+        .collect();
+    assert_eq!(
+        frames,
+        vec![
+            FrameKind::AbilityContinuation,
+            FrameKind::ChangeZone,
+            FrameKind::PostReplacement
+        ]
+    );
+    concede(&mut runner, P0, &mut events);
+    settle(&mut runner, &mut events, DECLINE_ANSWERS);
+    assert_eq!(life(runner.state(), P2), before);
+    assert!(runner.state().players[0].is_eliminated);
+}
+
+fn fanatic_board(seed: u64) -> (GameScenario, ObjectId, ObjectId) {
+    clone_board3(
+        seed,
+        "Fanatic of Xenagos",
+        FANATIC_OF_XENAGOS,
+        &["trample", "tribute:1"],
+    )
+}
+
+/// Drive Clone copying Fanatic of Xenagos to the tribute decision.
+fn clone_to_tribute(runner: &mut GameRunner, clone: ObjectId, donor: ObjectId) -> Vec<GameEvent> {
+    let mut events = Vec::new();
+    clone_until_copied(runner, clone, donor, &mut events);
+    answer_named_choice(runner, &mut events);
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::TributeChoice { player, .. } if player == P1
+        ),
+        "{:?}",
+        runner.state().waiting_for
+    );
+    assert!(is_pending(runner.state(), clone));
+    let resident = runner
+        .state()
+        .active_post_replacement_drains()
+        .and_then(|drains| drains.resident())
+        .expect("the copied choice has an owner");
+    assert!(resident
+        .parked_entrants
+        .iter()
+        .any(|entrant| entrant.object_id == clone));
+    events
+}
+
+/// V18. CR 702.104a + CR 603.2: a copied choice whose tail prompts keeps an
+/// owner: the tribute decision is part of the entry, and the drain under the
+/// chain completes it, so the take collects it. An opponent paying gives the
+/// counter too.
+#[test]
+fn a_copied_choice_with_a_prompting_tail_completes_through_its_owner() {
+    for pay in [false, true] {
+        let (scenario, clone, donor) = fanatic_board(7);
+        let mut runner = scenario.build();
+        let before = life(runner.state(), P2);
+        let mut events = clone_to_tribute(&mut runner, clone, donor);
+        act(
+            &mut runner,
+            GameAction::DecideOptionalEffect { accept: pay },
+            &mut events,
+        );
+        settle(&mut runner, &mut events, DECLINE_ANSWERS);
+        assert_eq!(life(runner.state(), P2), before + 1, "pay = {pay}");
+        assert_eq!(plus_counters(runner.state(), clone), u32::from(pay));
+        assert!(runner.state().resolution_stack.is_empty());
+        assert!(runner.state().resolving_stack_entry.is_none());
+    }
+}
+
+/// V18's concession: the tribute decision was not made, and the authority
+/// refuses the gone entrant.
+#[test]
+fn conceding_at_a_copied_tribute_abandons_the_entry() {
+    let (scenario, clone, donor) = fanatic_board(7);
+    let mut runner = scenario.build();
+    let before = life(runner.state(), P2);
+    let mut events = clone_to_tribute(&mut runner, clone, donor);
+    concede(&mut runner, P0, &mut events);
+    // The prompt is P1's, so it stays open for P1.
+    act(
+        &mut runner,
+        GameAction::DecideOptionalEffect { accept: false },
+        &mut events,
+    );
+    settle(&mut runner, &mut events, DECLINE_ANSWERS);
+    assert_eq!(life(runner.state(), P2), before);
+}
+
+/// V19. CR 603.2 + CR 603.10: an entrant its own continuation moved is not
+/// refused. Flash's "sacrifice it unless you pay" is a later instruction of the
+/// put, so the entry triggered Soul Warden whatever the sacrifice does after.
+#[test]
+fn a_later_instruction_moving_the_entrant_does_not_undo_its_entry() {
+    fn flash_imp_board(seed: u64) -> (GameRunner, ObjectId, ObjectId) {
+        let mut scenario = board3(seed);
+        scenario.add_enchantment_from_oracle(P0, "Barbarian Class", BARBARIAN_CLASS_L1);
+        add_warden(&mut scenario);
+        let imp = scenario
+            .add_creature_to_hand_from_oracle(P0, "Jumbo Imp", 0, 0, JUMBO_IMP)
+            .with_mana_cost(ManaCost::Cost {
+                generic: 2,
+                shards: vec![ManaCostShard::Black],
+            })
+            .id();
+        scenario.with_mana_pool(P0, green(3));
+        let flash = free_spell(&mut scenario, "Flash", true, FLASH);
+        (scenario.build(), imp, flash)
+    }
+    let seed = find_seed("a Flash Imp tie", |seed| {
+        let (mut runner, imp, flash) = flash_imp_board(seed);
+        put_until_roll(&mut runner, flash, imp);
+        tie_prompt_results(runner.state()).is_some()
+    });
+    let (mut runner, imp, flash) = flash_imp_board(seed);
+    let before = life(runner.state(), P2);
+    let mut events = put_until_roll(&mut runner, flash, imp);
+    answer_tie(&mut runner, &mut events);
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { .. }),
+        "{:?}",
+        runner.state().waiting_for
+    );
+    assert!(is_pending(runner.state(), imp));
+    assert_eq!(plus_counters(runner.state(), imp), 0);
+    act(
+        &mut runner,
+        GameAction::PayUnlessCost { pay: false },
+        &mut events,
+    );
+    settle(&mut runner, &mut events, DECLINE_ANSWERS);
+    assert_eq!(life(runner.state(), P2), before + 1);
+    assert_eq!(zone(runner.state(), imp), Zone::Graveyard);
+}
+
+/// V19's Slime form: the printed Devour continuation, with Flash's tail merged
+/// ahead of its `PutCounter`.
+#[test]
+fn a_later_instruction_moving_a_devour_entrant_does_not_undo_its_entry() {
+    let mut scenario = board3(7);
+    add_warden(&mut scenario);
+    let victim = scenario.add_creature(P0, "Vanilla Bear", 2, 2).id();
+    let slime = {
+        let mut builder = scenario.add_creature_to_hand(P0, "Gluttonous Slime", 2, 2);
+        builder.from_oracle_text_with_keywords(&["flash", "devour:1"], GLUTTONOUS_SLIME);
+        builder.with_mana_cost(ManaCost::Cost {
+            generic: 2,
+            shards: vec![ManaCostShard::Green],
+        });
+        builder.id()
+    };
+    scenario.with_mana_pool(P0, green(3));
+    let flash = free_spell(&mut scenario, "Flash", true, FLASH);
+    let mut runner = scenario.build();
+    let before = life(runner.state(), P2);
+    let mut events = Vec::new();
+    cast_and_pass(&mut runner, flash, None, None, &mut events);
+    act(
+        &mut runner,
+        GameAction::DecideOptionalEffect { accept: true },
+        &mut events,
+    );
+    assert!(
+        effect_zone_choice(runner.state()),
+        "{:?}",
+        runner.state().waiting_for
+    );
+    act(
+        &mut runner,
+        GameAction::SelectCards {
+            cards: vec![victim],
+        },
+        &mut events,
+    );
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { .. }),
+        "{:?}",
+        runner.state().waiting_for
+    );
+    act(
+        &mut runner,
+        GameAction::PayUnlessCost { pay: false },
+        &mut events,
+    );
+    settle(&mut runner, &mut events, DECLINE_ANSWERS);
+    assert_eq!(life(runner.state(), P2), before + 1);
+    assert_eq!(zone(runner.state(), slime), Zone::Graveyard);
+}
+
+fn scales_board3(seed: u64) -> (GameRunner, ObjectId) {
+    let mut scenario = board3(seed);
+    add_warden(&mut scenario);
+    scenario.add_enchantment_from_oracle(P0, "Hardened Scales", HARDENED_SCALES);
+    scenario.add_enchantment_from_oracle(P0, "Branching Evolution", BRANCHING_EVOLUTION);
+    let hydra = x_creature(&mut scenario, "Neverwinter Hydra", NEVERWINTER_HYDRA, 1);
+    (scenario.build(), hydra)
+}
+
+/// V2. Decision 6, not a rule: the abandoned sibling of V1 on the teardown route.
+/// The answered and bystander forms are its pair.
+#[test]
+fn an_abandoned_continuation_produces_no_entry() {
+    let (mut runner, hydra) = scales_board3(7);
+    let before = life(runner.state(), P2);
+    let mut events = Vec::new();
+    cast_and_pass(&mut runner, hydra, Some(1), None, &mut events);
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::ReplacementChoice { .. }
+    ));
+    assert!(is_pending(runner.state(), hydra));
+    concede(&mut runner, P0, &mut events);
+    settle(&mut runner, &mut events, DECLINE_ANSWERS);
+    assert_eq!(life(runner.state(), P2), before);
+    assert!(runner.state().deferred_entry_events.is_empty());
+    assert!(runner.state().resolution_stack.is_empty());
+
+    for bystander_leaves in [false, true] {
+        let (mut runner, hydra) = scales_board3(7);
+        let before = life(runner.state(), P2);
+        let mut events = Vec::new();
+        cast_and_pass(&mut runner, hydra, Some(1), None, &mut events);
+        if bystander_leaves {
+            concede(&mut runner, P1, &mut events);
+        }
+        let index = replacement_index(runner.state(), "Hardened Scales");
+        act(
+            &mut runner,
+            GameAction::ChooseReplacement { index },
+            &mut events,
+        );
+        settle(&mut runner, &mut events, DECLINE_ANSWERS);
+        assert_eq!(
+            life(runner.state(), P2),
+            before + 1,
+            "bystander_leaves = {bystander_leaves}"
+        );
+    }
+}
+
+fn slime_board3() -> (GameRunner, ObjectId, ObjectId) {
+    let mut scenario = board3(7);
+    add_warden(&mut scenario);
+    let victim = scenario.add_creature(P0, "Vanilla Bear", 2, 2).id();
+    let slime = gluttonous_slime(&mut scenario);
+    (scenario.build(), slime, victim)
+}
+
+/// V3's pair: the answered Devour completes the entry. A concession at this
+/// prompt leaves its frames on the resolution stack, so no row pins it.
+#[test]
+fn an_answered_devour_completes_the_entry_for_a_third_player() {
+    let (mut runner, slime, victim) = slime_board3();
+    let before = life(runner.state(), P2);
+    let mut events = Vec::new();
+    cast_and_pass(&mut runner, slime, None, None, &mut events);
+    assert!(is_pending(runner.state(), slime));
+    act(
+        &mut runner,
+        GameAction::SelectCards {
+            cards: vec![victim],
+        },
+        &mut events,
+    );
+    settle(&mut runner, &mut events, DECLINE_ANSWERS);
+    assert_eq!(life(runner.state(), P2), before + 1);
+}
+
+/// V9. CR 305.1: a land play a replacement kept off the battlefield reaches the
+/// take completed, so "When you play another land" fires as it always has. Not
+/// determined by the cards; preserved from base and labelled in `engine_replacement`.
+#[test]
+fn a_replaced_land_play_stays_collectable() {
+    let mut scenario = board(7);
+    let city = scenario
+        .add_land_from_oracle(P0, "City of Traitors", CITY_OF_TRAITORS)
+        .id();
+    let vale = {
+        let mut builder = scenario.add_land_to_hand(P0, "Lotus Vale");
+        builder.from_oracle_text(LOTUS_VALE);
+        builder.id()
+    };
+    let mut runner = scenario.build();
+    let card_id = runner.state().objects[&vale].card_id;
+    let mut events = Vec::new();
+    act(
+        &mut runner,
+        GameAction::PlayLand {
+            object_id: vale,
+            card_id,
+        },
+        &mut events,
+    );
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ),
+        "{:?}",
+        runner.state().waiting_for
+    );
+    assert!(
+        runner.state().deferred_entry_events.iter().any(|parked| {
+            matches!(parked.event, GameEvent::LandPlayed { .. })
+                && matches!(parked.state, ParkedEntryState::Pending { .. })
+        }),
+        "reach guard: the play is parked pending"
+    );
+    let decline = replacement_decline_index(runner.state());
+    act(
+        &mut runner,
+        GameAction::ChooseReplacement { index: decline },
+        &mut events,
+    );
+    settle(&mut runner, &mut events, DEFAULT_ANSWERS);
+    assert_eq!(zone(runner.state(), vale), Zone::Graveyard);
+    assert_eq!(zone(runner.state(), city), Zone::Graveyard);
+}
+
+/// The last candidate of an optional replacement's choice is its decline.
+fn replacement_decline_index(state: &GameState) -> usize {
+    let WaitingFor::ReplacementChoice {
+        candidate_count, ..
+    } = &state.waiting_for
+    else {
+        panic!("expected ReplacementChoice, got {:?}", state.waiting_for);
+    };
+    candidate_count - 1
+}
+
+/// V10. A capture leaves another entrant's entry parked: Clone's copy prompt in
+/// P1's seat does not erase Imp's completed entry, so a third player's Soul Warden
+/// sees both. Declining P1's put is the pair.
+#[test]
+fn a_mid_entry_capture_keeps_another_entrants_entry() {
+    fn eureka_clone_board(seed: u64) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+        let mut scenario = board3(seed);
+        scenario.add_enchantment_from_oracle(P0, "Barbarian Class", BARBARIAN_CLASS_L1);
+        scenario.add_creature_from_oracle(P1, "Soul Warden", 1, 1, SOUL_WARDEN);
+        let donor = scenario.add_creature(P1, "Vanilla Bear", 2, 2).id();
+        let imp = free_creature(&mut scenario, "Jumbo Imp", 0, 0, JUMBO_IMP);
+        let eureka = free_spell(&mut scenario, "Eureka", false, EUREKA);
+        scenario
+            .add_creature_to_hand_from_oracle(P2, "Clone", 0, 0, CLONE)
+            .with_mana_cost(ManaCost::generic(0));
+        (scenario.build(), imp, eureka, donor)
+    }
+    /// Imp's entry completes and P1 declines, leaving P2's put open.
+    fn to_p2_put(runner: &mut GameRunner, imp: ObjectId, eureka: ObjectId) -> Vec<GameEvent> {
+        let mut events = put_until_roll(runner, eureka, imp);
+        answer_tie(runner, &mut events);
+        act(
+            runner,
+            GameAction::DecideOptionalEffect { accept: false },
+            &mut events,
+        );
+        assert!(
+            matches!(
+                runner.state().waiting_for,
+                WaitingFor::OptionalEffectChoice { player, .. } if player == P2
+            ),
+            "{:?}",
+            runner.state().waiting_for
+        );
+        events
+    }
+    let seed = find_seed("a Eureka Imp tie", |seed| {
+        let (mut runner, imp, eureka, _) = eureka_clone_board(seed);
+        put_until_roll(&mut runner, eureka, imp);
+        tie_prompt_results(runner.state()).is_some()
+    });
+
+    let (mut runner, imp, eureka, donor) = eureka_clone_board(seed);
+    let before = life(runner.state(), P1);
+    let mut events = to_p2_put(&mut runner, imp, eureka);
+    act(
+        &mut runner,
+        GameAction::DecideOptionalEffect { accept: true },
+        &mut events,
+    );
+    accept_replacement(&mut runner, &mut events);
+    assert_eq!(
+        parked_state_of(runner.state(), imp),
+        Some(ParkedEntryState::Completed)
+    );
+    choose_copy_target(&mut runner, donor, &mut events);
+    settle(&mut runner, &mut events, DECLINE_ANSWERS);
+    assert_eq!(life(runner.state(), P1), before + 2);
+
+    let (mut runner, imp, eureka, _) = eureka_clone_board(seed);
+    let before = life(runner.state(), P1);
+    let mut events = to_p2_put(&mut runner, imp, eureka);
+    settle(&mut runner, &mut events, DECLINE_ANSWERS);
+    assert_eq!(life(runner.state(), P1), before + 1);
 }
 
 // ---------------------------------------------------------------------------

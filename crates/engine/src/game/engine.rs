@@ -18496,11 +18496,14 @@ fn park_land_played_for_deferred_entry(
     object_id: ObjectId,
     origin_zone: Zone,
 ) {
-    state.deferred_entry_events.push(GameEvent::LandPlayed {
-        object_id,
-        player_id: player,
-        from_zone: origin_zone,
-    });
+    crate::game::engine_replacement::park_pending_entry(
+        state,
+        GameEvent::LandPlayed {
+            object_id,
+            player_id: player,
+            from_zone: origin_zone,
+        },
+    );
 }
 
 fn mark_land_played_from_zone(state: &mut GameState, object_id: ObjectId, zone: Zone) {

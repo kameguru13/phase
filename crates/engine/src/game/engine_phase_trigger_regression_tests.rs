@@ -4230,7 +4230,12 @@ fn copy_target_choice_fires_granted_etb_trigger_against_deferred_entry_event() {
                 )
             })
             .expect("move_to_zone must emit a ZoneChanged for the entry");
-        state.deferred_entry_events.push(entry_event);
+        state
+            .deferred_entry_events
+            .push(crate::types::game_state::ParkedEntry::pending(
+                entry_event,
+                None,
+            ));
     }
     state.waiting_for = WaitingFor::CopyTargetChoice {
         player: PlayerId(0),
@@ -4412,7 +4417,12 @@ fn copy_target_choice_surfaces_interactive_trigger_prompt_for_deferred_entry() {
                 )
             })
             .expect("move_to_zone must emit a ZoneChanged for the entry");
-        state.deferred_entry_events.push(entry_event);
+        state
+            .deferred_entry_events
+            .push(crate::types::game_state::ParkedEntry::pending(
+                entry_event,
+                None,
+            ));
     }
     state.waiting_for = WaitingFor::CopyTargetChoice {
         player: PlayerId(0),

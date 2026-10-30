@@ -61524,7 +61524,10 @@ mod entry_observation_settlement_tests {
                     record.co_departed.push(ObjectId(999));
                 }
             }
-            state.deferred_entry_events = vec![parked_event];
+            state.deferred_entry_events = vec![crate::types::game_state::ParkedEntry::pending(
+                parked_event,
+                None,
+            )];
             state.waiting_for = WaitingFor::CopyTargetChoice {
                 player: PlayerId(0),
                 source_id: parked,
@@ -61561,7 +61564,10 @@ mod entry_observation_settlement_tests {
         events.extend(more);
         assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
         assert!(state.pending_replacement.is_none());
-        state.deferred_entry_events = vec![events[0].clone()];
+        state.deferred_entry_events = vec![crate::types::game_state::ParkedEntry::pending(
+            events[0].clone(),
+            None,
+        )];
         settle_entries_before_instruction(&mut state, &events, &next, Some(&completed));
         let observed: Vec<ObjectId> = state
             .battlefield_entry_observations

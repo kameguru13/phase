@@ -9258,7 +9258,7 @@ fn paused_observer_trigger_events(state: &GameState, candidates: Vec<GameEvent>)
             !matches!(
                 ev,
                 GameEvent::PhaseChanged { .. } | GameEvent::SpellCopied { .. }
-            ) && !state.deferred_entry_events.contains(ev)
+            ) && !state.park_contains_event(ev)
         })
         .collect()
 }
@@ -44307,7 +44307,12 @@ pub mod tests {
         for settled in [false, true] {
             let (mut state, mut events) = observer_helper_fixture(settled);
             let parked = events[0].clone();
-            state.deferred_entry_events.push(parked.clone());
+            state
+                .deferred_entry_events
+                .push(crate::types::game_state::ParkedEntry::pending(
+                    parked.clone(),
+                    None,
+                ));
             if settled {
                 collect_and_drain_observer_triggers_if_settled(&mut state, &mut events, 0);
             } else {
@@ -44319,7 +44324,7 @@ pub mod tests {
             );
             assert_eq!(
                 state.deferred_entry_events,
-                vec![parked],
+                vec![crate::types::game_state::ParkedEntry::pending(parked, None)],
                 "settled={settled}: the owner's store is untouched"
             );
         }
@@ -54972,7 +54977,10 @@ mod entry_continuation_hold_tests {
         let (mut state, warden) = observer_board(SOUL_WARDEN);
         let parked = enter(&mut state, 900);
         let live = enter(&mut state, 901);
-        state.deferred_entry_events = vec![parked.clone()];
+        state.deferred_entry_events = vec![crate::types::game_state::ParkedEntry::pending(
+            parked.clone(),
+            None,
+        )];
         collect_triggers_into_deferred(&mut state, &[parked.clone(), live.clone()]);
         let collected = from_source(&state.deferred_triggers, warden);
         assert_eq!(collected.len(), 1, "exactly the unparked entry");
@@ -54989,7 +54997,10 @@ mod entry_continuation_hold_tests {
         let (mut state, warden) = observer_board(SOUL_WARDEN);
         let parked = enter(&mut state, 900);
         let live = enter(&mut state, 901);
-        state.deferred_entry_events = vec![parked.clone()];
+        state.deferred_entry_events = vec![crate::types::game_state::ParkedEntry::pending(
+            parked.clone(),
+            None,
+        )];
         let group = state.allocate_logical_zone_change_group(&[]);
         let segment =
             collect_logical_zone_trigger_segment(&mut state, &group, &[parked, live.clone()]);
@@ -55002,7 +55013,10 @@ mod entry_continuation_hold_tests {
         let (mut state, vampire) = observer_board(WELCOMING_VAMPIRE);
         let parked = enter(&mut state, 900);
         let live = enter(&mut state, 901);
-        state.deferred_entry_events = vec![parked.clone()];
+        state.deferred_entry_events = vec![crate::types::game_state::ParkedEntry::pending(
+            parked.clone(),
+            None,
+        )];
         collect_triggers_into_deferred(&mut state, &[parked, live.clone()]);
         let collected = from_source(&state.deferred_triggers, vampire);
         assert_eq!(collected.len(), 1);
@@ -55016,7 +55030,10 @@ mod entry_continuation_hold_tests {
         let (mut state, warden) = observer_board(SOUL_WARDEN);
         let parked = enter(&mut state, 900);
         let live = enter(&mut state, 901);
-        state.deferred_entry_events = vec![parked.clone()];
+        state.deferred_entry_events = vec![crate::types::game_state::ParkedEntry::pending(
+            parked.clone(),
+            None,
+        )];
         let mut group = state.allocate_logical_zone_change_group(&[]);
         append_and_collect_logical_zone_trigger_segment(
             &mut state,
@@ -55039,7 +55056,10 @@ mod entry_continuation_hold_tests {
     fn the_release_runs_ahead_of_the_drain_gate() {
         let (mut state, warden) = observer_board(SOUL_WARDEN);
         let parked = enter(&mut state, 900);
-        state.deferred_entry_events = vec![parked];
+        state.deferred_entry_events = vec![crate::types::game_state::ParkedEntry {
+            event: parked,
+            state: crate::types::game_state::ParkedEntryState::Completed,
+        }];
         assert!(state.deferred_triggers.is_empty());
         let mut events = Vec::new();
         let _ = drain_deferred_trigger_queue(&mut state, &mut events);
@@ -55065,6 +55085,10 @@ mod entry_continuation_hold_tests {
         // A live resolution frame: nothing is released, the park is kept.
         let (mut state, _) = observer_board(SOUL_WARDEN);
         let parked = enter(&mut state, 900);
+        let parked = crate::types::game_state::ParkedEntry {
+            event: parked,
+            state: crate::types::game_state::ParkedEntryState::Completed,
+        };
         state.deferred_entry_events = vec![parked.clone()];
         state.push_counter_additions(PendingCounterAdditionQueue {
             remaining: Vec::new(),

@@ -6054,9 +6054,11 @@ pub(super) fn handle_resolution_choice(
             // `deferred_entry_events` is also written by the as-enters
             // continuation bracket (`EntryContinuationParking`, CR 603.6d). A
             // park for any other `ChooseOneOf` continuation is collected by its
-            // logical owner's resume or by the settled-entry release, not here.
+            // logical owner's resume or by the settled-entry release, not here,
+            // and so is another entrant's park, which this replay leaves alone.
             if replays_enters_counter_capture {
-                let deferred = std::mem::take(&mut state.deferred_entry_events);
+                let deferred =
+                    crate::game::engine_replacement::take_parked_entries_of(state, source_id);
                 let source_still_on_bf = state
                     .objects
                     .get(&source_id)
@@ -8196,7 +8198,10 @@ pub(super) fn handle_resolution_choice(
                 .filter(|source| {
                     source.is_exact_object_and_resolution()
                         && source.prompt.identity.expected_zone == Zone::Battlefield
-                        && !state.deferred_entry_events.is_empty()
+                        && crate::game::engine_replacement::entry_park_holds_entrant(
+                            state,
+                            source.prompt.identity.reference.object_id,
+                        )
                 })
                 .map(|source| source.prompt.identity.reference.object_id)
             {
@@ -8216,10 +8221,11 @@ pub(super) fn handle_resolution_choice(
                 // trigger pause (OrderTriggers / DistributeAmong / target
                 // selection) raised by simultaneously-fired observers.
                 //
-                // Gated on `deferred_entry_events` being non-empty so a non-entry
+                // Gated on the park holding this permanent's entry so a non-entry
                 // persisted `NamedChoice` (Pithing Needle naming, Morophon type
-                // choice) takes the unchanged `else` path below — the no-op
-                // disambiguator that keeps the working path byte-for-byte intact.
+                // choice) takes the unchanged `else` path below, whatever another
+                // entrant has parked — the disambiguator that keeps the working
+                // path byte-for-byte intact.
                 // `last_named_choice` is left set across the helper's continuation
                 // drain (cleared after, mirroring the plain path) so any dependent
                 // continuation reads the answer.
