@@ -55,7 +55,7 @@
 //! priority (CR 504.2). The upkeep's own triggers resolve before its stack is next empty, so
 //! they only end its claim to being the low-information window (`PatientWindow::BeforeMain`).
 //!
-//! Three cases of the rule are not yet classified. A search and its shuffle stay held and lent,
+//! Four cases of the rule are not yet classified. A search and its shuffle stay held and lent,
 //! though nothing in the rule exempts them: with the order hidden (CR 401.2) and randomized
 //! (CR 701.24a) the draw takes a random card on either side of a fetch, and choosing the land
 //! after the draw is what the hold is for. It fails when the AI knows its top card, which a
@@ -67,7 +67,8 @@
 //! and likewise for the main-phase stand-down. And the draw step's draw itself triggers
 //! "whenever you draw a card" abilities (CR 603.2), whose intervening-if (CR 603.4) an upkeep
 //! activation may make true: Starving Revenant's descend 8 after an upkeep sacrifice. Only
-//! beginning-of-step triggers are scanned.
+//! beginning-of-step triggers are scanned. And the classification does not read inside an
+//! inline branch carrier (a die roll's results) or a node the parser left `Unimplemented`.
 //!
 //! The classification errs toward standing down, so it also releases activations that could
 //! have waited: a card put on the bottom changes this draw only on an empty library
@@ -77,8 +78,7 @@
 //! distribution on either side of the draw while the order is hidden. Those lose the hold, and
 //! the donor's line still sees a draw that Pass's does not, so the search may now prefer
 //! activating. For a blind mill that preference reads the real library order (no
-//! determinization ships). The classification does not read inside an inline branch carrier
-//! (a die roll's results).
+//! determinization ships).
 //!
 //! ## Why a soft penalty and not a `Reject`
 //!
@@ -119,7 +119,7 @@
 //! then acted on, a shuffle with no search. `draw_setup` reads the engine's wildcard-free library
 //! authorities. A new effect that moves a card to or from a library is a draw setup until it is
 //! named otherwise. A new reorder within a library is not seen by the authority, and needs its
-//! own arm beside `Scry`. In the draw step that draw is behind (CR 504.2), and an arrangement is
+//! own arm beside `Scry`. In the draw step that draw is behind (CR 504.2), and any such change is
 //! held like any other activation. The report names the other two times to activate early: when the
 //! damage is part of a lethal line, and (implicitly) when the ability's own condition is met *now* and might
 //! not be later. Those are lethal damage and `ability.condition`, in that order
@@ -184,8 +184,9 @@ pub struct ActivationPatiencePolicy;
 ///   pipeline rather than by timing.
 /// * A temporary combat modifier (CR 611.2 + CR 514.2 — the resolution
 ///   generates the continuous effect, and the cleanup step ends it). Waiting
-///   is not "free" for those; they are window-bound, and `EffectTimingPolicy`'s
-///   `combat_trick_score` already owns their timing.
+///   is not "free" for those; they are window-bound. `EffectTimingPolicy`'s
+///   `combat_trick_score` prices those whose whole value is combat
+///   (`CombatBinding::Whole`); out of combat, the rest are not priced.
 ///
 /// Cycling is excluded so this does not double-charge alongside
 /// `CyclingDisciplinePolicy`, which owns that class's timing.
@@ -193,8 +194,8 @@ fn activation_is_deferrable(state: &GameState, source_id: ObjectId, ability_inde
     printed_ability(state, source_id, ability_index).is_some_and(ability_is_deferrable)
 }
 
-/// The ability an activation candidate names, as `ctx.effects()` reads it: the source's
-/// printed ability at `ability_index`.
+/// The ability an activation candidate names, as `ctx.effects()` reads it: the entry at
+/// `ability_index` in the source's `abilities`, printed or granted by a layer.
 fn printed_ability(
     state: &GameState,
     source_id: ObjectId,
@@ -348,7 +349,7 @@ fn node_can_reach_ai_library(
 }
 
 /// Can the player slot `filter` of an ability `ai_player` activates from `source_id` name
-/// `ai_player`, so that the arrangement can be of the AI's own library?
+/// `ai_player`, so that the change can be to the AI's own library?
 ///
 /// The engine's player-filter authority answers the question. CR 109.5 + CR 602.2a: "you" on an
 /// activated ability is the player who activated it, here the AI, so it is the source controller
