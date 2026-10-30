@@ -46,9 +46,9 @@
 use engine::game::zones::create_object;
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{
-    AbilityCost, AbilityDefinition, ActivationRestriction, ControllerRef, DelayedTriggerCondition,
-    Effect, LibraryPosition, PlayerFilter, ResolvedAbility, TargetFilter, TriggerConstraint,
-    TriggerDefinition,
+    AbilityCondition, AbilityCost, AbilityDefinition, ActivationRestriction, ControllerRef,
+    DelayedTriggerCondition, Effect, LibraryPosition, PlayerFilter, ResolvedAbility, TargetFilter,
+    TriggerConstraint, TriggerDefinition,
 };
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
@@ -1477,9 +1477,9 @@ const EXCAVATED_WALL: &str =
 /// and each hold row's reason is its positive reach.
 ///
 /// Held: a draw (both draws take the same two cards), a search with its own instructions, a
-/// look that moves nothing, and a change that can only reach an opponent's library (a scope or
-/// slot that can't name the AI). Held in the draw step whatever the shape: CR 504.2 puts the
-/// draw behind that priority, so the main phase reproduces the activation.
+/// look whose card nothing then acts on, and a change that can only reach an opponent's library
+/// (a scope or slot that can't name the AI). Held in the draw step whatever the shape: CR 504.2
+/// puts the draw behind that priority, so the main phase reproduces the activation.
 ///
 /// Reito Lantern pins an accepted over-reach: bottom placement changes this draw only on an
 /// empty library (CR 704.5b), and a card slot names no player, so it fails closed.
@@ -1530,6 +1530,21 @@ fn an_upkeep_own_library_change_is_not_held_while_the_draw_is_ahead() {
                 ..
             }
         ) && ability.player_scope.is_none()
+    };
+    let reveal_gates_its_payoff = |ability: &AbilityDefinition| {
+        matches!(
+            *ability.effect,
+            Effect::RevealTop {
+                player: TargetFilter::Controller,
+                ..
+            }
+        ) && ability.condition.is_none()
+            && ability.sub_ability.as_ref().is_some_and(|sub| {
+                matches!(
+                    sub.condition,
+                    Some(AbilityCondition::RevealedHasCardType { .. })
+                )
+            })
     };
     let searches = |ability: &AbilityDefinition| {
         matches!(
@@ -1775,6 +1790,23 @@ fn an_upkeep_own_library_change_is_not_held_while_the_draw_is_ahead() {
             },
             TOP,
         ),
+        // A reveal whose card then gates a payoff: nothing moves, but which card it reads does.
+        row(
+            "Iron Lad, Diverging Destiny ability 1 (a reveal whose card gates a draw)",
+            "Iron Lad, Diverging Destiny",
+            "Flying, vigilance\nYou may look at the top card of your library any time.\n{T}: Reveal the top card of your library. If it's an artifact card, draw a card.",
+            1,
+            reveal_gates_its_payoff,
+            TOP,
+        ),
+        row(
+            "Brutal Deceiver ability 1 (a reveal whose card gates a pump)",
+            "Brutal Deceiver",
+            "{1}: Look at the top card of your library.\n{2}: Reveal the top card of your library. If it's a land card, this creature gets +1/+0 and gains first strike until end of turn. Activate only once each turn.",
+            1,
+            reveal_gates_its_payoff,
+            TOP,
+        ),
         // A shuffle with no search, and bottom placement.
         row(
             "Myr Mindservant (a bare shuffle)",
@@ -1942,7 +1974,7 @@ fn an_upkeep_own_library_change_is_not_held_while_the_draw_is_ahead() {
             searches,
             HOLD,
         ),
-        // Held: a look that moves nothing.
+        // Held: a look whose card nothing then acts on.
         row(
             "Orcish Spy (a look alone)",
             "Orcish Spy",

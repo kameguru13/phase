@@ -22143,8 +22143,10 @@ one on the bottom of your library.";
     /// reaches the stack, and the quiesce carries the line through the draw step to the main
     /// phase. With two, the donor would be scored at its target prompt, before the draw.
     ///
-    /// Two limits on what these values show. Most of `cont(donor) - cont(pass)` is the forward
-    /// quiesce: the donor's line sees a drawn card, and Pass's static eval doesn't. And
+    /// Two limits on what these values show. Nearly all of `cont(donor) - cont(pass)` is the
+    /// forward quiesce: the donor's line sees a drawn card, and Pass's static eval doesn't. The
+    /// Wall and Top rows compare no main-phase positions, so their gap shows only that a lend
+    /// would move Pass. And
     /// `zone_eval::hand_quality` reads mana value against available mana, not card identity. So
     /// the Ruins row also drives both lines to the main phase and compares their values: Sol Ring
     /// is castable with the Island left, Darksteel Colossus is not, and `v_r > v_p` is the

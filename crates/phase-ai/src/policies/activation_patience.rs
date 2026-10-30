@@ -59,7 +59,9 @@
 //! though nothing in the rule exempts them: with the order hidden (CR 401.2) and randomized
 //! (CR 701.24a) the draw takes a random card on either side of a fetch, and choosing the land
 //! after the draw is what the hold is for. It fails when the AI knows its top card, which a
-//! shuffle then replaces. And the trigger scans read only permanents already on the
+//! shuffle then replaces, and the lent value is not literally Pass's: with no determinization
+//! the fetch line's draw is one concrete post-shuffle card, not the top card Pass would draw.
+//! And the trigger scans read only permanents already on the
 //! battlefield, so a trigger whose source the held activation itself puts onto the battlefield
 //! is not seen: Quicksilver Amulet putting Avaricious Dragon onto the battlefield in the upkeep,
 //! and likewise for the main-phase stand-down. And the draw step's draw itself triggers
@@ -69,7 +71,8 @@
 //!
 //! The classification errs toward standing down, so it also releases activations that could
 //! have waited: a card put on the bottom changes this draw only on an empty library
-//! (CR 704.5b), a "target player" slot, a card slot or a tracked set is read as able to name
+//! (CR 704.5b), a "target player" slot, a card slot, a tracked set, an anaphoric player or a
+//! node with no slot is read as able to name
 //! the AI even when the line names an opponent, and a blind mill or exile is equal in
 //! distribution on either side of the draw while the order is hidden. Those lose the hold, and
 //! the donor's line still sees a draw that Pass's does not, so the search may now prefer
@@ -112,8 +115,8 @@
 //! dearer, and whether this draw's choice is worth the tap or the capped
 //! activation is a resource question the search's valuation answers. Any other change to that
 //! library before the draw gives up the same thing: a card put on top of it (Academy Ruins,
-//! whose artifact this draw then takes), cards taken from the top of it, a look whose card then
-//! moves, a shuffle with no search. `draw_setup` reads the engine's wildcard-free library
+//! whose artifact this draw then takes), cards taken from the top of it, a look whose card is
+//! then acted on, a shuffle with no search. `draw_setup` reads the engine's wildcard-free library
 //! authorities. A new effect that moves a card to or from a library is a draw setup until it is
 //! named otherwise. A new reorder within a library is not seen by the authority, and needs its
 //! own arm beside `Scry`. In the draw step that draw is behind (CR 504.2), and an arrangement is
@@ -230,7 +233,8 @@ enum DrawSetup {
 ///
 /// The question is whether the node commutes with that draw: does activating before it leave
 /// the game activating after it would? Fail-closed: anything the engine's wildcard-free library
-/// authorities call a move to or from a library is a setup, so a new library effect is one
+/// authorities call a move to or from a library is a setup, so a new effect that makes such a
+/// move is one
 /// until it is named below. What is named commutes with the draw, except a search, which stays
 /// held for the reason given there:
 ///
@@ -243,9 +247,11 @@ enum DrawSetup {
 ///   stays held because its payoff is a land or card better chosen after the draw. See "What a
 ///   hold rests on". A tutored card put back on the library is a setup. Seek has no CR entry;
 ///   it takes a random match and leaves the order alone.
-/// - A look or reveal that moves nothing (CR 701.20b, CR 701.20e). One whose card then moves
-///   is a setup: the moving node names it by anaphor, which the authority can't see through
-///   (`target` is `ParentTarget`, `origin` is `None`), so the look answers for it.
+/// - A look or reveal whose card nothing then acts on (CR 701.20b, CR 701.20e). One whose card
+///   is then acted on is a setup, because the draw changes which card that is. A later node may
+///   move it or only read it: Iron Lad's draw and a Deceiver's pump are gated on the card. Either
+///   way the authority can't see through the node, which names the card by anaphor (`target` is
+///   `ParentTarget`, `origin` is `None`) or by a condition, so the look answers for it.
 ///
 /// A scry and a shuffle with no search stay in their library, so the authority says no; both
 /// still change what the draw takes.
@@ -285,7 +291,7 @@ fn draw_setup(
             keep_count: Some(0),
             rest_destination: None,
             ..
-        } if !chain_moves_a_looked_at_card(chain) => None,
+        } if !chain_acts_on_a_looked_at_card(chain) => None,
         Effect::RevealTop { .. } | Effect::Scry { .. } | Effect::Shuffle { .. } => {
             setup_if_reaches()
         }
@@ -302,13 +308,14 @@ fn chain_searches(chain: &[&AbilityDefinition]) -> bool {
         .any(|node| matches!(*node.effect, Effect::SearchLibrary { .. }))
 }
 
-/// Does `chain` move a card, so that a look or reveal at the top of a library can be the first
-/// half of taking it?
-fn chain_moves_a_looked_at_card(chain: &[&AbilityDefinition]) -> bool {
+/// Does `chain` act on a card, so that a look or reveal at the top of a library can be the first
+/// half of moving it or reading it? Any node can, except another look or reveal and a delayed
+/// trigger, which acts later (Mishra's Bauble's draw is next turn's).
+fn chain_acts_on_a_looked_at_card(chain: &[&AbilityDefinition]) -> bool {
     chain.iter().any(|node| {
-        matches!(
+        !matches!(
             *node.effect,
-            Effect::ChangeZone { .. } | Effect::ChangeZoneAll { .. } | Effect::CastFromZone { .. }
+            Effect::RevealTop { .. } | Effect::Dig { .. } | Effect::CreateDelayedTrigger { .. }
         )
     })
 }
@@ -318,8 +325,9 @@ fn chain_moves_a_looked_at_card(chain: &[&AbilityDefinition]) -> bool {
 /// `player_scope` comes first: "each opponent mills" is `Mill { target: Controller }` under
 /// `player_scope: Opponent`, and each scoped player becomes the acting player, so its slot
 /// names nobody yet. Otherwise the node's slot answers (`slot_can_name`), and a node with no
-/// slot acts on its controller's library. A card slot names no player, so it counts as able to
-/// reach the AI: that card's owner may be the AI (Academy Ruins, Reito Lantern).
+/// slot counts as able to reach the AI: most act on their controller's library, and
+/// `ChangeZoneAll`, which surfaces none, fails closed (Jester's Mask). A card slot names no
+/// player, so it counts too: that card's owner may be the AI (Academy Ruins, Reito Lantern).
 fn node_can_reach_ai_library(
     state: &GameState,
     ai_player: PlayerId,
@@ -332,7 +340,7 @@ fn node_can_reach_ai_library(
         });
     }
     let slot = match &*node.effect {
-        // `target_filter` surfaces no slot for a reveal, whose player is never declared here.
+        // `target_filter` surfaces a reveal's player only for `Player`, so read the field itself.
         Effect::RevealTop { player, .. } => Some(player),
         effect => effect.target_filter(),
     };
