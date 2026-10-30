@@ -20801,8 +20801,10 @@ one on the bottom of your library.";
     /// abilities. The scry chooses the card the draw step's draw takes (CR 504.1 + CR 121.1,
     /// CR 701.22a), and by the main phase that draw has happened, so passing cannot reproduce
     /// the arrangement's line: patience does not hold it and Pass is not lent its continuation,
-    /// though that continuation is above Pass's own. The root's choice is then driven through
-    /// the draw step with the scry keeping the Bolt on top, and the Bolt is the card drawn.
+    /// though that continuation is above Pass's own. The ActivationPatience-only root's choice
+    /// (`roots.s1`) is then driven through the draw step with the scry keeping the Bolt on top,
+    /// and the Bolt is the card drawn. The default registry's choice on this board is a
+    /// valuation question and is not asserted here.
     #[test]
     fn own_upkeep_root_does_not_lend_a_tap_limited_arrangement_and_its_choice_is_drawn() {
         use engine::types::ability::CostCategory;
