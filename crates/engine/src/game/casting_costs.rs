@@ -13696,9 +13696,11 @@ fn finalize_cast_with_phyrexian_choices_inner(
     // CR 603.2h + CR 601.2i: the spell is now cast — the controller has taken a
     // "you may cast … Do this only once each turn" indicated action. Recorded before
     // this action's triggers are collected, so the SpellCast it causes cannot re-trigger.
-    // An event raised while paying for this cast (before CR 601.2i) is checked against a
-    // ledger this commit has already written by collection time; no card in the class can
-    // raise its own trigger event while paying.
+    // CR 601.2g + CR 605.3b + CR 603.2h: a mana ability activated while paying for this
+    // cast had its events collected before this commit — auto-payment's by
+    // `casting::settle_pre_spend_echoes` before the spend, a manual activation's at its
+    // own action — so a trigger event it raised (Cryptolith Fragment's life loss) still
+    // sees the action untaken.
     if let Some(limit) = resolution_cast_indicated_action.as_deref() {
         crate::game::triggers::record_indicated_action(state, limit);
     }

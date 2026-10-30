@@ -22,8 +22,8 @@ use engine::types::actions::{CastChoice, GameAction};
 use engine::types::card_type::{CardType, CoreType};
 use engine::types::counter::CounterType;
 use engine::types::game_state::{
-    AutoMayChoice, CastOfferKind, CastPaymentMode, MayTriggerAutoChoiceScope, StackEntryKind,
-    WaitingFor,
+    AutoMayChoice, CastOfferKind, CastPaymentMode, ManaChoice, MayTriggerAutoChoiceScope,
+    StackEntryKind, WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
@@ -1537,6 +1537,157 @@ fn emet_selch_top_instance_casting_leaves_the_lower_instance_with_nothing_to_do(
         "the lower instance cast nothing"
     );
     assert_eq!(indicated_actions(&runner), HashSet::from([(emet_ref, P0)]));
+}
+
+const CRYPTOLITH_FRAGMENT: &str = "This artifact enters tapped.\n{T}: Add one mana of any color. Each player loses 1 life.\nAt the beginning of your upkeep, if each player has 10 or less life, transform this artifact.";
+
+/// How P0 pays for Emet-Selch's offered cast with Cryptolith Fragment.
+#[derive(Clone, Copy)]
+enum FragmentPayment {
+    /// Pass priority at the payment prompt: auto-payment taps the fragment.
+    Auto,
+    /// Activate the fragment's mana ability at the payment prompt, then pay.
+    Manual,
+}
+
+/// E5 (CR 603.2 + CR 603.2h + CR 601.2g + CR 601.2i): Emet-Selch's offered card is
+/// paid for with Cryptolith Fragment (the only mana source), so each player loses 1
+/// life while the cast is being paid for — before the spell becomes cast. The
+/// controller has not yet taken the indicated action, so that life loss triggers
+/// Emet-Selch; the new instance resolves after the cast completed, so it does
+/// nothing.
+fn emet_selch_life_loss_while_paying_triggers_it_again(payment: FragmentPayment) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let emet = scenario
+        .add_creature_from_oracle(P0, "Emet-Selch of the Third Seat", 2, 2, EMET_SELCH)
+        .id();
+    let drain = scenario
+        .add_artifact_from_oracle(P0, "Life Drain Engine", LIFE_DRAIN_ENGINE)
+        .id();
+    let fragment = scenario
+        .add_artifact_from_oracle(P0, "Cryptolith Fragment", CRYPTOLITH_FRAGMENT)
+        .id();
+    let [cast_card, other_card] = ["Test Draw A", "Test Draw B"].map(|name| {
+        scenario
+            .add_spell_to_graveyard(P0, name, true)
+            .from_oracle_text("Draw a card.")
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 0,
+            })
+            .id()
+    });
+    scenario.with_library_top(P0, &["Card A", "Card B", "Card C", "Card D"]);
+    let mut runner = scenario.build();
+    assert!(
+        !runner.state().objects[&fragment].tapped,
+        "reach: the fragment is untapped and can pay for the cast"
+    );
+
+    drain_targeting(&mut runner, drain, emet, cast_card);
+    let emet_ref = stacked_emet_ref(&runner, emet);
+    runner.advance_until_stack_empty();
+    assert_optional_prompt(&runner, P0, "reach: Emet-Selch offers its may");
+    decide(&mut runner, true);
+    assert_eq!(offered_card(&runner), Some(cast_card));
+    let p1_life = runner.life(P1);
+    runner
+        .act(GameAction::GraveyardPaidCastChoice {
+            choice: CastChoice::Cast,
+        })
+        .expect("elect the offered cast");
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::ManaPayment { .. }),
+        "reach: the elected cast pauses at mana payment, got {:?}",
+        runner.state().waiting_for
+    );
+    if let FragmentPayment::Manual = payment {
+        activate_only_ability(&mut runner, fragment, &[]);
+        if matches!(
+            runner.state().waiting_for,
+            WaitingFor::ChooseManaColor { .. }
+        ) {
+            runner
+                .act(GameAction::ChooseManaColor {
+                    choice: ManaChoice::SingleColor(ManaType::Red),
+                    count: 1,
+                })
+                .expect("tap the fragment for red");
+        }
+        assert_eq!(
+            runner.life(P1),
+            p1_life - 1,
+            "reach: the opponent lost life before the cast was paid for"
+        );
+        assert!(
+            indicated_actions(&runner).is_empty(),
+            "the spell has not become cast yet (CR 601.2i)"
+        );
+    }
+    for _ in 0..8 {
+        if !matches!(runner.state().waiting_for, WaitingFor::ManaPayment { .. }) {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("pay the offered cast");
+    }
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::TriggerTargetSelection { .. }
+    ) {
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(other_card)),
+            })
+            .expect("target the remaining graveyard instant");
+    }
+    assert!(
+        runner.state().objects[&fragment].tapped,
+        "reach: the fragment paid for the cast"
+    );
+    assert_eq!(
+        runner.life(P1),
+        p1_life - 1,
+        "reach: the opponent lost life once, while the cast was being paid for"
+    );
+    assert_eq!(
+        runner.state().objects[&cast_card].zone,
+        Zone::Stack,
+        "reach: the offered card was cast"
+    );
+    assert_eq!(
+        indicated_actions(&runner),
+        HashSet::from([(emet_ref, P0)]),
+        "CR 601.2i: the spell became cast, so the controller took the indicated action"
+    );
+    assert_eq!(
+        stacked_trigger_refs(&runner, emet).len(),
+        1,
+        "CR 603.2h: the life loss came before the spell became cast, so it triggers Emet-Selch"
+    );
+
+    runner.advance_until_stack_empty();
+    assert_settled_priority(
+        &runner,
+        "the new instance resolves with no prompt once the action was taken",
+    );
+    assert_eq!(
+        runner.state().objects[&other_card].zone,
+        Zone::Graveyard,
+        "the new instance cast nothing"
+    );
+}
+
+#[test]
+fn emet_selch_life_loss_while_auto_paying_for_its_cast_triggers_it_again() {
+    emet_selch_life_loss_while_paying_triggers_it_again(FragmentPayment::Auto);
+}
+
+#[test]
+fn emet_selch_life_loss_while_manually_paying_for_its_cast_triggers_it_again() {
+    emet_selch_life_loss_while_paying_triggers_it_again(FragmentPayment::Manual);
 }
 
 /// Planetarium of Wan Shi Tong (full Oracle text) with `looked` on top of P0's

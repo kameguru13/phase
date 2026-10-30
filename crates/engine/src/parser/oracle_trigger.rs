@@ -4583,7 +4583,8 @@ fn chain_creates_reflexive_ability(def: &AbilityDefinition) -> bool {
 ///   controller ("they may", another player's payment, subject-anchored and scoped
 ///   instructions, a copy offered to a targeted player);
 /// - a cast indicated action that is not a single-card cast made during this resolution
-///   (CR 601.2i + CR 608.2g): only that shape reaches the commit that spends the limit.
+///   (CR 601.2i + CR 608.2g), or that can cast a spell copy the chain put on the stack
+///   (CR 707.10): only that shape reaches the commit that spends the limit.
 fn has_single_indicated_action_instruction(def: &AbilityDefinition) -> bool {
     fn spine<'a>(def: &'a AbilityDefinition, nodes: &mut Vec<&'a AbilityDefinition>) {
         nodes.push(def);
@@ -4608,9 +4609,19 @@ fn has_single_indicated_action_instruction(def: &AbilityDefinition) -> bool {
                 Some(TargetFilter::TriggeringSource)
             ))
     };
-    // CR 608.2g + CR 601.2i: only a single-card cast made during this resolution reaches
-    // the commit that spends the limit; a lingering grant, a window, a play, a borrowed
-    // alternative cost or any other cast instruction has no observable commit → strict
+    // CR 707.10: a spell copy this chain puts on the stack (Spellbinder's "copy the
+    // exiled card … you may cast the copy") is cast in place, outside the CR 601.2i
+    // cast finalization that spends the limit.
+    let chain_copies_a_spell = nodes.iter().any(|node| {
+        matches!(
+            &*node.effect,
+            Effect::CopySpell { .. } | Effect::EpicCopy { .. }
+        )
+    });
+    // CR 608.2g + CR 601.2i: only a single-card cast made during this resolution, of a
+    // card not already on the stack, reaches the commit that spends the limit; a
+    // lingering grant, a window, a play, a borrowed alternative cost, the cast of a
+    // stack spell copy or any other cast instruction has no observable commit → strict
     // failure.
     let commit_is_observable =
         |node: &AbilityDefinition| match indicated_action_commit(&node.effect) {
@@ -4626,6 +4637,7 @@ fn has_single_indicated_action_instruction(def: &AbilityDefinition) -> bool {
                         ..
                     }
                 ) && node.multi_target.is_none()
+                    && !chain_copies_a_spell
             }
         };
     def.modal.is_none()

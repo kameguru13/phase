@@ -42032,3 +42032,55 @@ fn granted_casting_permission_indicated_action_strict_fails() {
         execute.effect
     );
 }
+
+/// P-G4: casting a spell copy the chain put on the stack (Spellbinder's
+/// copy-then-cast body, with the copy made mandatory so the cast is the only "you
+/// may") completes in place, outside the CR 601.2i finalization that spends the
+/// limit (CR 707.10), so the CR 603.2h line strict-fails.
+#[test]
+fn stack_spell_copy_cast_indicated_action_strict_fails() {
+    const NAME: &str = "Synthetic Copy Caster";
+    let limited = parse_trigger_line(
+        "Whenever equipped creature deals combat damage to a player, copy the exiled card. You may cast the copy without paying its mana cost. Do this only once each turn.",
+        NAME,
+    );
+    assert!(
+        matches!(limited.mode, TriggerMode::Unknown(_)),
+        "{:?}",
+        limited.mode
+    );
+    // Reach guard: without the limit sentence the body is a mandatory `CopySpell`
+    // whose only optional instruction is a single-card during-resolution
+    // `CastFromZone` of that copy — the shape every other conjunct of the guard
+    // admits — so the Unknown above comes from the stack-copy conjunct.
+    let plain = parse_trigger_line(
+        "Whenever equipped creature deals combat damage to a player, copy the exiled card. You may cast the copy without paying its mana cost.",
+        NAME,
+    );
+    assert_eq!(plain.mode, TriggerMode::DamageDone);
+    let execute = plain.execute.as_deref().expect("copy body");
+    assert!(!execute.optional);
+    assert!(
+        matches!(&*execute.effect, Effect::CopySpell { .. }),
+        "{:?}",
+        execute.effect
+    );
+    let cast = execute.sub_ability.as_deref().expect("cast the copy");
+    assert!(cast.optional);
+    assert!(cast.multi_target.is_none());
+    assert!(
+        matches!(
+            &*cast.effect,
+            Effect::CastFromZone {
+                target: TargetFilter::ParentTarget,
+                mode: CardPlayMode::Cast,
+                driver: crate::types::ability::CastFromZoneDriver::DuringResolution,
+                duration: None,
+                alt_ability_cost: None,
+                ..
+            }
+        ),
+        "{:?}",
+        cast.effect
+    );
+}
