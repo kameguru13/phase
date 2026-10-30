@@ -1646,3 +1646,64 @@ fn a_refused_drain_keeps_the_released_entry_beside_the_dies_context() {
         assert_eq!(life(runner.state(), P0), p0_before + 1);
     }
 }
+
+/// R2 (coverage half). The as-enters roll line leaves no coverage gap on any
+/// class face; the game-side gap authority (`card_face_gaps`) agrees with the
+/// parse. Jumbo Imp's end-step line ("remove a number of +1/+1 counters …
+/// equal to the result") is a separate, pre-existing `unparsed_quantity` gap.
+#[test]
+fn as_enters_roll_faces_carry_no_enters_with_gap() {
+    const TEMP_OF_THE_DAMNED: &str = "As this creature enters, roll a six-sided die. This creature enters with a number of funk counters on it equal to the result.\nAt the beginning of your upkeep, remove a funk counter from this creature. If you can't, sacrifice it.";
+    for (name, oracle, keyword_names, expected_gaps) in [
+        (
+            "Neverwinter Hydra",
+            NEVERWINTER_HYDRA,
+            vec!["Trample", "Ward"],
+            vec![],
+        ),
+        ("Hydradoodle", HYDRADOODLE, vec!["Reach", "Trample"], vec![]),
+        ("Hammer Jammer", HAMMER_JAMMER, vec![], vec![]),
+        (
+            "Jumbo Imp",
+            JUMBO_IMP,
+            vec!["Flying"],
+            vec!["Effect:unparsed_quantity"],
+        ),
+        ("Temp of the Damned", TEMP_OF_THE_DAMNED, vec![], vec![]),
+    ] {
+        let keyword_names: Vec<String> = keyword_names.iter().map(|k| k.to_string()).collect();
+        let parsed = engine::parser::parse_oracle_text(
+            oracle,
+            name,
+            &keyword_names,
+            &["Creature".to_string()],
+            &[],
+        );
+        // Reach guard: the as-enters roll composed into one entry replacement.
+        assert!(
+            parsed.replacements.iter().any(|repl| repl
+                .execute
+                .as_deref()
+                .is_some_and(|execute| matches!(&*execute.effect, Effect::RollDie { .. }))),
+            "{name}: {:#?}",
+            parsed.replacements
+        );
+        let face = engine::types::card::CardFace {
+            name: name.to_string(),
+            oracle_text: Some(oracle.to_string()),
+            keywords: parsed.extracted_keywords.clone(),
+            abilities: parsed.abilities,
+            triggers: parsed.triggers,
+            static_abilities: parsed.statics,
+            replacements: parsed.replacements,
+            ..Default::default()
+        };
+        let gaps = engine::game::coverage::card_face_gaps(&face);
+        assert!(
+            gaps.iter().all(|gap| gap != "Effect:enters_with_clause"),
+            "{name}: {gaps:?}"
+        );
+        let expected: Vec<String> = expected_gaps.iter().map(|g| g.to_string()).collect();
+        assert_eq!(gaps, expected, "{name}");
+    }
+}

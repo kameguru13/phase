@@ -34715,22 +34715,6 @@ const HAMMER_JAMMER: &str = "As this creature enters, roll a six-sided die. This
 const JUMBO_IMP: &str = "Flying\nAs this creature enters, roll a six-sided die. This creature enters with a number of +1/+1 counters on it equal to the result.\nAt the beginning of your upkeep, roll a six-sided die and put a number of +1/+1 counters on this creature equal to the result.\nAt the beginning of your end step, roll a six-sided die and remove a number of +1/+1 counters from this creature equal to the result.";
 const TEMP_OF_THE_DAMNED: &str = "As this creature enters, roll a six-sided die. This creature enters with a number of funk counters on it equal to the result.\nAt the beginning of your upkeep, remove a funk counter from this creature. If you can't, sacrifice it.";
 
-fn face_of(
-    name: &str,
-    parsed: &ParsedAbilities,
-    keywords: Vec<Keyword>,
-) -> crate::types::card::CardFace {
-    crate::types::card::CardFace {
-        name: name.to_string(),
-        keywords,
-        abilities: parsed.abilities.clone(),
-        triggers: parsed.triggers.clone(),
-        static_abilities: parsed.statics.clone(),
-        replacements: parsed.replacements.clone(),
-        ..crate::types::card::CardFace::default()
-    }
-}
-
 /// R2. Every class line is one `Moved` + `SelfRef` replacement: the roll heads
 /// the execute chain (CR 603.6d: it happens as part of the entry) and the
 /// counter placement it determines follows it (CR 614.1c + CR 122.6). X is the
@@ -34826,20 +34810,8 @@ fn as_enters_roll_lines_compose_one_counter_replacement() {
             "{name}"
         );
         assert!(put.sub_ability.is_none(), "{name}");
-        // Coverage honesty: no gap on the face, and the gap authority agrees.
-        let face = face_of(name, &parsed, parsed.extracted_keywords.clone());
-        let gaps = crate::game::coverage::card_face_gaps(&face);
-        assert!(
-            gaps.iter().all(|gap| gap != "Effect:enters_with_clause"),
-            "{name}: {gaps:?}"
-        );
-        // Jumbo Imp's end-step line ("remove a number of +1/+1 counters … equal
-        // to the result") is a separate, pre-existing `unparsed_quantity` gap.
-        let expected_gaps: Vec<String> = match name {
-            "Jumbo Imp" => vec!["Effect:unparsed_quantity".to_string()],
-            _ => vec![],
-        };
-        assert_eq!(gaps, expected_gaps, "{name}");
+        // The coverage-gap half of this row (the game-side gap authority) lives
+        // in `tests/integration/as_enters_dice_counters.rs`.
         assert!(
             parsed.abilities.iter().all(|a| !matches!(
                 &*a.effect,
