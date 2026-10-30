@@ -603,7 +603,8 @@ fn combat_trick_score(ctx: &PolicyContext<'_>) -> f64 {
     }
 
     // Main phases with no active combat: in the precombat main an instant-speed trick can wait
-    // for combat, and a postcombat main has the turn's combat behind it (CR 505.1a).
+    // for combat, and a postcombat main usually has the turn's combat behind it (CR 505.1a); an
+    // added combat phase (CR 500.8) is not read here.
     // Apply a strong penalty that overrides other positive signals.
     if matches!(
         ctx.state.phase,
