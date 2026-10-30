@@ -503,9 +503,9 @@ pub fn resolve(
                     return Ok(());
                 }
                 // CR 701.9a + CR 609.3: a muzzled player is treated as unable to
-                // discard: a mandatory discard is a failed no-op (mirrors the
-                // empty-hand mandatory-discard path below), an "up to" discard
-                // simply discards zero.
+                // discard: a mandatory discard is a failed no-op (a mandatory
+                // discard that cannot move its required cards fails, as below),
+                // an "up to" discard simply discards zero.
                 PlayerHandDiscardPool::Muzzled => {
                     if !up_to {
                         state.cost_payment_failed_flag = true;
@@ -527,8 +527,14 @@ pub fn resolve(
             (num_cards as usize).min(hand_cards.len())
         };
         if count == 0 && !up_to {
-            // CR 608.2c: Effect resolved as no-op (empty hand) — veto downstream IfYouDo.
-            state.cost_payment_failed_flag = true;
+            // CR 118.12 + CR 118.3: "If you do" checks whether the player chose to pay an
+            // optional cost or started to pay a mandatory one. A discard that requires
+            // cards when none can be discarded never started, so veto downstream
+            // IfYouDo / WhenYouDo. A discard requiring zero cards — "discard your hand"
+            // with an empty hand (Moonveil Regent ruling) — is paid in full.
+            if num_cards > 0 {
+                state.cost_payment_failed_flag = true;
+            }
         } else if random {
             // CR 701.9a: this is a resolving effect, so Library-of-Leng-class
             // replacements DO apply — `DiscardCause::Effect`.
@@ -813,8 +819,8 @@ fn player_hand_discard_pool(
 /// a cost the player can only choose to pay in full; with fewer eligible cards
 /// than N it is an impossible option, so neither its "If you do" rider nor a
 /// reflexive "When you do" (Ill-Timed Explosion, CR 603.12) can follow from it.
-/// "Up to N" and "discard your hand" (zero cards is a legal hand — Balin,
-/// Loremaster ruling) are never impossible. Shapes this can't decide here
+/// "Up to N" and "discard your hand" (it requires exactly the cards in that
+/// hand, so zero cards pays it in full) are never impossible. Shapes this can't decide here
 /// (per-player fan-outs, repeats, specific-card discards, an unresolvable
 /// discarding player) answer `false`, so the prompt is offered.
 pub(crate) fn optional_discard_is_infeasible(state: &GameState, ability: &ResolvedAbility) -> bool {
@@ -2867,6 +2873,130 @@ mod tests {
         assert!(
             state.cost_payment_failed_flag,
             "cost_payment_failed_flag should be set when discard count is 0 (empty hand)"
+        );
+    }
+
+    /// CR 118.12 + CR 118.3: "discard your hand" requires exactly the cards in
+    /// that hand, so with an empty hand it requires zero cards and is paid in
+    /// full — its "If you do" stays on (Moonveil Regent ruling). The control is
+    /// the same empty hand under "discard a card", which requires a card it
+    /// cannot discard and still vetoes.
+    #[test]
+    fn whole_hand_discard_of_empty_hand_completes_without_veto() {
+        use crate::types::ability::{PlayerScope, QuantityRef};
+
+        let discard = |count: QuantityExpr| {
+            ResolvedAbility::new(
+                Effect::Discard {
+                    count,
+                    target: TargetFilter::Controller,
+                    selection: CardSelectionMode::Chosen,
+                    unless_filter: None,
+                    filter: None,
+                },
+                vec![],
+                ObjectId(100),
+                PlayerId(0),
+            )
+        };
+
+        let mut state = GameState::new_two_player(42);
+        assert!(state.players[0].hand.is_empty(), "P0 starts empty-handed");
+        let mut events = Vec::new();
+        resolve(
+            &mut state,
+            &discard(QuantityExpr::Ref {
+                qty: QuantityRef::HandSize {
+                    player: PlayerScope::Controller,
+                },
+            }),
+            &mut events,
+        )
+        .unwrap();
+        assert!(
+            !state.cost_payment_failed_flag,
+            "discarding an empty hand is paid in full and must not veto its rider"
+        );
+        assert!(
+            !matches!(state.waiting_for, WaitingFor::DiscardChoice { .. }),
+            "an empty hand offers no discard choice"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GameEvent::EffectResolved {
+                    kind: EffectKind::Discard,
+                    ..
+                }
+            )),
+            "the whole-hand discard publishes its completion marker"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, GameEvent::Discarded { .. })),
+            "an empty hand discards no card"
+        );
+
+        // Control: the same empty hand under "discard a card" still vetoes.
+        let mut control = GameState::new_two_player(42);
+        let mut control_events = Vec::new();
+        resolve(
+            &mut control,
+            &discard(QuantityExpr::Fixed { value: 1 }),
+            &mut control_events,
+        )
+        .unwrap();
+        assert!(
+            control.cost_payment_failed_flag,
+            "a discard requiring a card it cannot discard must still veto"
+        );
+    }
+
+    /// CR 118.12: a discard whose count resolves to zero requires
+    /// no card, so it is paid in full without touching the hand.
+    #[test]
+    fn zero_count_discard_is_paid_in_full() {
+        let mut state = GameState::new_two_player(42);
+        let held = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Held".into(),
+            Zone::Hand,
+        );
+        let ability = ResolvedAbility::new(
+            Effect::Discard {
+                count: QuantityExpr::Fixed { value: 0 },
+                target: TargetFilter::Controller,
+                selection: CardSelectionMode::Chosen,
+                unless_filter: None,
+                filter: None,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(
+            !state.cost_payment_failed_flag,
+            "a zero-card discard is paid in full"
+        );
+        assert!(
+            state.players[0].hand.contains(&held),
+            "a zero-card discard leaves the hand alone"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GameEvent::EffectResolved {
+                    kind: EffectKind::Discard,
+                    ..
+                }
+            )),
+            "the zero-card discard publishes its completion marker"
         );
     }
 
