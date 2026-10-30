@@ -775,8 +775,9 @@ fn referent_move_members(
 /// makes it a new object), ceased to exist (CR 111.7), or is an emblem
 /// (CR 114.5). An empty binding means the source is no longer the object "~"
 /// names — `resolve` moves nothing then (its CR 400.7 `SelfRef` guard) — so it
-/// is impossible too. Declining keeps an "If you do" rider from running on a
-/// move that never happened (CR 118.12).
+/// is impossible too. Declining keeps an "If you do" rider from running: that
+/// clause checks whether the player chose the move (CR 118.12), and an
+/// impossible move can't be chosen (CR 608.2d).
 pub(crate) fn optional_self_move_is_infeasible(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -794,8 +795,9 @@ pub(crate) fn optional_self_move_is_infeasible(
 /// TriggeringSource }`) is an impossible option once every bound object can no
 /// longer move — it left the zone the trigger event put it in (or the effect's
 /// explicit origin), ceased to exist (CR 111.7), or is an emblem (CR 114.5).
-/// Declining keeps an "If you do" rider (Academy Rector's search) from running
-/// on a move that never happened (CR 118.12). An empty binding stays feasible:
+/// Declining keeps an "If you do" rider (Academy Rector's search) from running:
+/// that clause checks whether the player chose the move (CR 118.12), and an
+/// impossible move can't be chosen (CR 608.2d). An empty binding stays feasible:
 /// `resolve` then reaches its untargeted zone-scan path, which this predicate
 /// does not model.
 pub(crate) fn optional_triggering_source_move_is_infeasible(
