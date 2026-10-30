@@ -17269,7 +17269,7 @@ pub(crate) fn optional_prompt_player(
                     return Some(player);
                 }
             }
-            // CR 503.1a + CR 608.2d (issue #1535): per-player upkeep optional effects
+            // CR 608.2d (issue #1535): per-player upkeep optional effects
             // ("that player may put a card from their hand ...") route the prompt to the
             // scoped player, not the ability's controller (Braids, Conjurer Adept).
             OptionalAddressRoute::ScopedPlayer => {

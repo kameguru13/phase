@@ -7040,7 +7040,7 @@ fn do_this_only_once_each_turn_on_an_each_player_may_fan_out_is_strict() {
     );
 }
 
-/// CR 603.2h + CR 503.1a: a per-player instruction scoped to the iterated player
+/// CR 603.2h + CR 608.2d: a per-player instruction scoped to the iterated player
 /// (Braids, Conjurer Adept: "that player may put … from their hand") is answered by the
 /// scoped player, so the shared routing classification rejects it. Reach guard: the same
 /// body under "triggers only once each turn" is a live upkeep trigger whose optional
@@ -41350,7 +41350,7 @@ fn granted_casting_permission_indicated_action_strict_fails() {
 /// P-G4: casting a spell copy the chain put on the stack (Spellbinder's
 /// copy-then-cast body, with the copy made mandatory so the cast is the only "you
 /// may") completes in place, outside the CR 601.2i finalization that spends the
-/// limit (CR 707.10), so the CR 603.2h line strict-fails.
+/// limit (CR 707.12), so the CR 603.2h line strict-fails.
 #[test]
 fn stack_spell_copy_cast_indicated_action_strict_fails() {
     const NAME: &str = "Synthetic Copy Caster";
