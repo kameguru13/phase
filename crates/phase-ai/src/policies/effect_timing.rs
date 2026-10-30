@@ -2857,11 +2857,31 @@ mod tests {
             (ca_bonus - gg_bonus).abs() < 1e-9,
             "an opposing Coordinated Assault earns the Giant Growth bonus {gg_bonus}, got {ca_bonus}"
         );
+        let undying = murder_delta(Some((PlayerId(1), "Undying Evil", UNDYING_EVIL))) - empty;
+        assert!(
+            undying.abs() < 1e-9,
+            "a grant bound to no combat is not a pump to answer, got {undying}"
+        );
         let own_ca = murder_delta(Some((P0, "Coordinated Assault", COORDINATED_ASSAULT))) - empty;
         assert!(
             own_ca.abs() < 1e-9,
             "the AI's own pump on the stack earns nothing, got {own_ca}"
         );
+    }
+
+    /// The opponent's main phase, with its Murder on the stack aimed at a creature of P0's.
+    fn under_murder() -> GameState {
+        let mut state = d1_board(Phase::PreCombatMain, PlayerId(1));
+        let victim = creature(&mut state, P0, "Victim");
+        push_spell(
+            &mut state,
+            PlayerId(1),
+            3,
+            None,
+            instant_effect(MURDER, "Murder"),
+            vec![TargetRef::Object(victim)],
+        );
+        state
     }
 
     /// CR 702.11b + CR 702.12b + CR 702.16b: hexproof, indestructible and protection pay off
@@ -2881,26 +2901,13 @@ mod tests {
         assert!(
             effect_is_temporary_combat_modifier(&adamant) && effect_has_defensive_payload(&adamant),
             "premise: Adamant Will is a temporary combat modifier with a protective payload, so \
-             the protective exclusion is what refuses it: {adamant:?}"
+             its protective keyword is what refuses it: {adamant:?}"
         );
         assert!(
             !is_self_protection_effect(&adamant),
             "premise: Adamant Will is not self-scoped, so the boundary must be scope-free"
         );
 
-        let under_murder = || {
-            let mut state = d1_board(Phase::PreCombatMain, PlayerId(1));
-            let victim = creature(&mut state, P0, "Victim");
-            push_spell(
-                &mut state,
-                PlayerId(1),
-                3,
-                None,
-                instant_effect(MURDER, "Murder"),
-                vec![TargetRef::Object(victim)],
-            );
-            state
-        };
         let boards = [
             ("opponent's main phase, Murder on the stack", under_murder()),
             ("own End step", d1_board(Phase::End, P0)),
@@ -2931,6 +2938,141 @@ mod tests {
                 (activate(mor) - activate(ww)).abs() < 1e-9,
                 "{label}: Mother of Runes' activation must price as Wellwisher's"
             );
+        }
+    }
+
+    const PAST_IN_FLAMES: &str = "Each instant and sorcery card in your graveyard gains flashback until end of turn. The flashback cost is equal to its mana cost.\nFlashback {4}{R} (You may cast this card from your graveyard for its flashback cost. Then exile it.)";
+    const FLASHBACK: &str = "Target instant or sorcery card in your graveyard gains flashback until end of turn. The flashback cost is equal to its mana cost. (You may cast that card from your graveyard for its flashback cost. Then exile it.)";
+    const UNDYING_EVIL: &str = "Target creature gains undying until end of turn. (When it dies, if it had no +1/+1 counters on it, return it to the battlefield under its owner's control with a +1/+1 counter on it.)";
+    const CAULDRON_HAZE: &str = "Choose any number of target creatures. Each of those creatures gains persist until end of turn. (When it dies, if it had no -1/-1 counters on it, return it to the battlefield under its owner's control with a -1/-1 counter on it.)";
+    const ANTLER_SKULKIN: &str = "{2}: Target white creature gains persist until end of turn. (When it dies, if it had no -1/-1 counters on it, return it to the battlefield under its owner's control with a -1/-1 counter on it.)";
+    const AMOEBOID_CHANGELING: &str = "Changeling (This card is every creature type.)\n{T}: Target creature gains all creature types until end of turn.\n{T}: Target creature loses all creature types until end of turn.";
+    const BLADES_OF_VELIS_VEL: &str = "Changeling (This card is every creature type.)\nUp to two target creatures each get +2/+0 and gain all creature types until end of turn.";
+    const CORPOREAL_PROJECTION: &str = "Target creature you control gains myriad until end of turn. (Whenever it attacks, for each opponent other than defending player, you may create a token copy that's tapped and attacking that player or a planeswalker they control. Exile the tokens at end of combat.)\nOverload {3}{U}{U}{R}{R} (You may cast this spell for its overload cost. If you do, change \"target\" in its text to \"each.\")";
+
+    /// CR 702.93a + CR 702.79a: undying and persist pay off when the creature dies, in whatever
+    /// phase that happens, and CR 702.34a: flashback when the card is cast from the graveyard.
+    /// None of that value is bound to this turn's combat, and a bare creature-type grant
+    /// (CR 702.73a) has none there either, so each cast reads as Dwarven Song and each
+    /// activation as Wellwisher's on every board. CR 702.116a: Corporeal Projection's myriad is
+    /// paid out when the creature attacks, and Blades of Velis Vel still gives +2/+0, so both
+    /// stay priced as Coordinated Assault is, and Akki Drillmaster's haste does too. The
+    /// sorcery-speed row is exempt only in a precombat main, where no later window opens for it.
+    #[test]
+    fn effect_timing_does_not_price_a_grant_whose_value_lands_outside_combat() {
+        use crate::policies::effect_classify::effect_is_temporary_combat_modifier;
+
+        for (name, oracle_text) in [
+            ("Past in Flames", PAST_IN_FLAMES),
+            ("Flashback", FLASHBACK),
+            ("Undying Evil", UNDYING_EVIL),
+            ("Cauldron Haze", CAULDRON_HAZE),
+            ("Blades of Velis Vel", BLADES_OF_VELIS_VEL),
+            ("Corporeal Projection", CORPOREAL_PROJECTION),
+        ] {
+            let abilities = parsed(oracle_text, name, "Instant");
+            assert!(
+                crate::cast_facts::collect_definition_effects(&abilities[0])
+                    .into_iter()
+                    .any(effect_is_temporary_combat_modifier),
+                "premise: {name} resolves a temporary combat modifier, so the keyword is what \
+                 refuses or keeps it: {abilities:?}"
+            );
+        }
+
+        let boards = [
+            ("own precombat main", d1_board(Phase::PreCombatMain, P0)),
+            ("own postcombat main", d1_board(Phase::PostCombatMain, P0)),
+            ("own End step", d1_board(Phase::End, P0)),
+            ("opponent's main phase, Murder on the stack", under_murder()),
+        ];
+        for (label, mut state) in boards {
+            let ds = oracle_instant(&mut state, P0, "Dwarven Song", DWARVEN_SONG);
+            let ca = oracle_instant(&mut state, P0, "Coordinated Assault", COORDINATED_ASSAULT);
+            let bv = oracle_instant(&mut state, P0, "Blades of Velis Vel", BLADES_OF_VELIS_VEL);
+            let cp = oracle_spell(
+                &mut state,
+                P0,
+                "Corporeal Projection",
+                CORPOREAL_PROJECTION,
+                CoreType::Sorcery,
+            );
+            let pif = oracle_spell(
+                &mut state,
+                P0,
+                "Past in Flames",
+                PAST_IN_FLAMES,
+                CoreType::Sorcery,
+            );
+            let unpriced_casts = [
+                ("Past in Flames", pif),
+                (
+                    "Flashback",
+                    oracle_instant(&mut state, P0, "Flashback", FLASHBACK),
+                ),
+                (
+                    "Undying Evil",
+                    oracle_instant(&mut state, P0, "Undying Evil", UNDYING_EVIL),
+                ),
+                (
+                    "Cauldron Haze",
+                    oracle_instant(&mut state, P0, "Cauldron Haze", CAULDRON_HAZE),
+                ),
+            ];
+            let ww = oracle_creature(&mut state, P0, "Wellwisher", WELLWISHER);
+            let akki = oracle_creature(&mut state, P0, "Akki Drillmaster", AKKI_DRILLMASTER);
+            let unpriced_activations = [
+                (
+                    "Antler Skulkin",
+                    oracle_creature(&mut state, P0, "Antler Skulkin", ANTLER_SKULKIN),
+                ),
+                (
+                    "Amoeboid Changeling",
+                    oracle_creature(&mut state, P0, "Amoeboid Changeling", AMOEBOID_CHANGELING),
+                ),
+            ];
+            let cast = |id| timing_delta(&state, &cast_candidate(&state, id));
+            let activate = |id| timing_delta(&state, &activate_candidate(id));
+            let (d_ds, d_ww) = (cast(ds), activate(ww));
+
+            for (name, id) in unpriced_casts {
+                let delta = cast(id);
+                assert!(
+                    (delta - d_ds).abs() < 1e-9,
+                    "{label}: {name} {delta} must price as Dwarven Song {d_ds}"
+                );
+            }
+            for (name, id) in unpriced_activations {
+                let delta = activate(id);
+                assert!(
+                    (delta - d_ww).abs() < 1e-9,
+                    "{label}: {name} {delta} must price as Wellwisher {d_ww}"
+                );
+            }
+
+            assert!(
+                cast(ca) < d_ds - 1.5,
+                "{label}: reach: the trick penalty fires on this board"
+            );
+            assert!(
+                (cast(bv) - cast(ca)).abs() < 1e-9,
+                "{label}: Blades of Velis Vel's +2/+0 is a trick, whatever types it adds"
+            );
+            assert!(
+                activate(akki) < d_ww - 1.5,
+                "{label}: Akki Drillmaster's haste stays priced"
+            );
+            if state.phase == Phase::PreCombatMain {
+                assert!(
+                    (cast(cp) - d_ds).abs() < 1e-9,
+                    "{label}: a sorcery's last window before combat prices nothing"
+                );
+            } else {
+                assert!(
+                    cast(cp) < d_ds - 1.5,
+                    "{label}: Corporeal Projection's myriad stays priced"
+                );
+            }
         }
     }
 

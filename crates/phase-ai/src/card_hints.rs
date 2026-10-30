@@ -780,6 +780,66 @@ mod tests {
         }
     }
 
+    /// The hint for an instant of P0's in the opponent's main phase, with its Murder on the stack
+    /// aimed at a creature of P0's.
+    fn hint_under_murder(name: &str, oracle_text: &str) -> f64 {
+        let mut state = make_state();
+        state.active_player = PlayerId(1);
+        let next_id = state.next_object_id;
+        let victim = create_object(
+            &mut state,
+            CardId(next_id),
+            PlayerId(0),
+            "Victim".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&victim)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        let next_id = state.next_object_id;
+        let murder = create_object(
+            &mut state,
+            CardId(next_id),
+            PlayerId(1),
+            "Murder".to_string(),
+            Zone::Stack,
+        );
+        let effect = (*engine::parser::oracle::parse_oracle_text(
+            "Destroy target creature.",
+            "Murder",
+            &[],
+            &["Instant".to_string()],
+            &[],
+        )
+        .abilities[0]
+            .effect)
+            .clone();
+        state
+            .stack
+            .push_back(engine::types::game_state::StackEntry {
+                id: murder,
+                source_id: murder,
+                controller: PlayerId(1),
+                kind: engine::types::game_state::StackEntryKind::Spell {
+                    ability: Some(Box::new(engine::types::ability::ResolvedAbility::new(
+                        effect,
+                        vec![engine::types::ability::TargetRef::Object(victim)],
+                        murder,
+                        PlayerId(1),
+                    ))),
+                    card_id: CardId(murder.0),
+                    casting_variant: Default::default(),
+                    actual_mana_spent: 0,
+                },
+            });
+        let action = oracle_instant(&mut state, name, oracle_text);
+        should_play_now(&state, &action, PlayerId(0))
+    }
+
     /// CR 702.11b + CR 702.12b: hexproof and indestructible pay off against removal in any
     /// phase, so a protective grant is not timed like a pump. In the AI's End step, and in the
     /// opponent's main phase with its Murder on the stack, Heroic Intervention and Adamant Will
@@ -798,66 +858,79 @@ mod tests {
         assert_eq!(end("Heroic Intervention", HEROIC_INTERVENTION), ds);
         assert_eq!(end("Adamant Will", ADAMANT_WILL), ds);
 
-        let under_murder = |name, oracle_text| {
+        let ds = hint_under_murder("Dwarven Song", DWARVEN_SONG);
+        assert_eq!(
+            hint_under_murder("Heroic Intervention", HEROIC_INTERVENTION),
+            ds
+        );
+        assert_eq!(hint_under_murder("Adamant Will", ADAMANT_WILL), ds);
+    }
+
+    const PAST_IN_FLAMES: &str = "Each instant and sorcery card in your graveyard gains flashback until end of turn. The flashback cost is equal to its mana cost.\nFlashback {4}{R} (You may cast this card from your graveyard for its flashback cost. Then exile it.)";
+    const FLASHBACK: &str = "Target instant or sorcery card in your graveyard gains flashback until end of turn. The flashback cost is equal to its mana cost. (You may cast that card from your graveyard for its flashback cost. Then exile it.)";
+    const UNDYING_EVIL: &str = "Target creature gains undying until end of turn. (When it dies, if it had no +1/+1 counters on it, return it to the battlefield under its owner's control with a +1/+1 counter on it.)";
+    const CAULDRON_HAZE: &str = "Choose any number of target creatures. Each of those creatures gains persist until end of turn. (When it dies, if it had no -1/-1 counters on it, return it to the battlefield under its owner's control with a -1/-1 counter on it.)";
+    const BLADES_OF_VELIS_VEL: &str = "Changeling (This card is every creature type.)\nUp to two target creatures each get +2/+0 and gain all creature types until end of turn.";
+    const CORPOREAL_PROJECTION: &str = "Target creature you control gains myriad until end of turn. (Whenever it attacks, for each opponent other than defending player, you may create a token copy that's tapped and attacking that player or a planeswalker they control. Exile the tokens at end of combat.)\nOverload {3}{U}{U}{R}{R} (You may cast this spell for its overload cost. If you do, change \"target\" in its text to \"each.\")";
+
+    /// CR 702.93a + CR 702.79a: undying and persist pay off when the creature dies, in whatever
+    /// phase that happens, and CR 702.34a: flashback when the card is cast from the graveyard,
+    /// so those grants read as Dwarven Song in every window, and under an opposing Murder.
+    /// CR 702.116a: Corporeal Projection's myriad is paid out when the creature attacks, and
+    /// Blades of Velis Vel still gives +2/+0, so both stay timed as Coordinated Assault is; only
+    /// the sorcery-speed row is exempt, in the precombat main that is its last window.
+    #[test]
+    fn should_play_now_does_not_time_a_grant_whose_value_lands_outside_combat() {
+        let sorcery = |phase, name, oracle_text| {
             let mut state = make_state();
-            state.active_player = PlayerId(1);
-            let next_id = state.next_object_id;
-            let victim = create_object(
-                &mut state,
-                CardId(next_id),
-                PlayerId(0),
-                "Victim".to_string(),
-                Zone::Battlefield,
-            );
-            state
-                .objects
-                .get_mut(&victim)
-                .unwrap()
-                .card_types
-                .core_types
-                .push(CoreType::Creature);
-            let next_id = state.next_object_id;
-            let murder = create_object(
-                &mut state,
-                CardId(next_id),
-                PlayerId(1),
-                "Murder".to_string(),
-                Zone::Stack,
-            );
-            let effect = (*engine::parser::oracle::parse_oracle_text(
-                "Destroy target creature.",
-                "Murder",
-                &[],
-                &["Instant".to_string()],
-                &[],
-            )
-            .abilities[0]
-                .effect)
-                .clone();
-            state
-                .stack
-                .push_back(engine::types::game_state::StackEntry {
-                    id: murder,
-                    source_id: murder,
-                    controller: PlayerId(1),
-                    kind: engine::types::game_state::StackEntryKind::Spell {
-                        ability: Some(Box::new(engine::types::ability::ResolvedAbility::new(
-                            effect,
-                            vec![engine::types::ability::TargetRef::Object(victim)],
-                            murder,
-                            PlayerId(1),
-                        ))),
-                        card_id: CardId(murder.0),
-                        casting_variant: Default::default(),
-                        actual_mana_spent: 0,
-                    },
-                });
-            let action = oracle_instant(&mut state, name, oracle_text);
+            state.phase = phase;
+            let action = oracle_spell(&mut state, name, oracle_text, CoreType::Sorcery);
             should_play_now(&state, &action, PlayerId(0))
         };
-        let ds = under_murder("Dwarven Song", DWARVEN_SONG);
-        assert_eq!(under_murder("Heroic Intervention", HEROIC_INTERVENTION), ds);
-        assert_eq!(under_murder("Adamant Will", ADAMANT_WILL), ds);
+        for phase in [Phase::PreCombatMain, Phase::PostCombatMain, Phase::End] {
+            let hint = |name, oracle_text| hint_in(phase, false, name, oracle_text);
+            let ds = hint("Dwarven Song", DWARVEN_SONG);
+            let pif = sorcery(phase, "Past in Flames", PAST_IN_FLAMES);
+            let fb = hint("Flashback", FLASHBACK);
+            let ue = hint("Undying Evil", UNDYING_EVIL);
+            let ch = hint("Cauldron Haze", CAULDRON_HAZE);
+
+            let ca = hint("Coordinated Assault", COORDINATED_ASSAULT);
+            assert_ne!(ca, ds, "{phase:?}: reach: the pump timing fires");
+            assert_eq!(
+                hint("Blades of Velis Vel", BLADES_OF_VELIS_VEL),
+                ca,
+                "{phase:?}: Blades of Velis Vel's +2/+0 is a trick, whatever types it adds"
+            );
+            let cp = sorcery(phase, "Corporeal Projection", CORPOREAL_PROJECTION);
+            if phase == Phase::PreCombatMain {
+                assert_eq!(cp, ds, "{phase:?}: a sorcery's last window times nothing");
+            } else {
+                assert_eq!(
+                    cp, ca,
+                    "{phase:?}: Corporeal Projection's myriad stays timed"
+                );
+            }
+
+            assert_eq!(
+                pif, ds,
+                "{phase:?}: Past in Flames must read as Dwarven Song"
+            );
+            assert_eq!(fb, ds, "{phase:?}: Flashback must read as Dwarven Song");
+            assert_eq!(ue, ds, "{phase:?}: Undying Evil must read as Dwarven Song");
+            assert_eq!(ch, ds, "{phase:?}: Cauldron Haze must read as Dwarven Song");
+        }
+
+        let ds = hint_under_murder("Dwarven Song", DWARVEN_SONG);
+        let ue = hint_under_murder("Undying Evil", UNDYING_EVIL);
+        let ch = hint_under_murder("Cauldron Haze", CAULDRON_HAZE);
+        assert_ne!(
+            hint_under_murder("Coordinated Assault", COORDINATED_ASSAULT),
+            ds,
+            "reach: the pump timing fires under Murder"
+        );
+        assert_eq!(ue, ds, "Undying Evil answers Murder in any phase");
+        assert_eq!(ch, ds, "Cauldron Haze answers Murder in any phase");
     }
 
     const BLADE_TRIBE_BERSERKERS: &str = "Metalcraft — When this creature enters, if you control three or more artifacts, this creature gets +3/+3 and gains haste until end of turn.";

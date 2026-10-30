@@ -22,7 +22,6 @@ use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
 
 use super::context::PolicyContext;
-use super::self_protection_classify::effect_has_defensive_payload;
 use crate::cast_facts::{cast_object_for_action, collect_definition_effects, CastFacts};
 
 /// Player-impact magnitude above which target selection has a directional
@@ -2086,12 +2085,100 @@ fn continuous_modification_is_temporary_combat_modifier(
     )
 }
 
+/// Is this keyword's value bound to this turn's combat (CR 506.1), so that granting it until
+/// end of turn is a combat trick's payload? The rules read each of these as attackers or
+/// blockers are declared or as combat damage is dealt: evasion and blocking restrictions,
+/// combat-damage modifiers, and attack, block and combat-damage triggers. Deathtouch, lifelink,
+/// wither, infect and haste are not confined to combat by their rules, but combat is where a
+/// grant of them pays out. Double team is Alchemy's and has no CR entry; it is an attack trigger.
+///
+/// A keyword whose value lands elsewhere is refused by not being listed: a dies trigger pays
+/// off in any phase (undying, persist, afterlife: CR 702.93a, CR 702.79a, CR 702.135a), a
+/// graveyard keyword pays off from the graveyard (flashback, escape, embalm: CR 702.34a,
+/// CR 702.138a, CR 702.128a), and a protective keyword pays off against removal in any phase
+/// (hexproof, indestructible, protection, shroud: CR 702.11b, CR 702.12b, CR 702.16b,
+/// CR 702.18a). This is an allowlist rather than an exhaustive `match`, as
+/// `keyword_is_defensive` is, so that an unclassified or future keyword fails closed and takes
+/// no combat-window penalty.
+fn keyword_is_bound_to_combat(keyword: &Keyword) -> bool {
+    matches!(
+        keyword,
+        Keyword::Flying
+            | Keyword::Fear
+            | Keyword::Intimidate
+            | Keyword::Skulk
+            | Keyword::Shadow
+            | Keyword::Horsemanship
+            | Keyword::Menace
+            | Keyword::Landwalk(_)
+            | Keyword::Reach
+            | Keyword::Defender
+            | Keyword::Banding
+            | Keyword::BandsWithOther(_)
+            | Keyword::FirstStrike
+            | Keyword::DoubleStrike
+            | Keyword::Trample
+            | Keyword::TrampleOverPlaneswalkers
+            | Keyword::Deathtouch
+            | Keyword::Lifelink
+            | Keyword::Wither
+            | Keyword::Infect
+            | Keyword::Toxic(_)
+            | Keyword::Poisonous(_)
+            | Keyword::Vigilance
+            | Keyword::Haste
+            | Keyword::Afflict(_)
+            | Keyword::Annihilator(_)
+            | Keyword::Battlecry
+            | Keyword::Bushido(_)
+            | Keyword::Decayed
+            | Keyword::Dethrone
+            | Keyword::DoubleTeam
+            | Keyword::Enlist
+            | Keyword::Exalted
+            | Keyword::Firebending(_)
+            | Keyword::Flanking
+            | Keyword::Frenzy(_)
+            | Keyword::Ingest
+            | Keyword::Melee
+            | Keyword::Mentor
+            | Keyword::Mobilize(_)
+            | Keyword::Myriad
+            | Keyword::Provoke
+            | Keyword::Rampage(_)
+            | Keyword::Renown(_)
+            | Keyword::Training
+    )
+}
+
+fn modification_is_bound_to_combat(modification: &ContinuousModification) -> bool {
+    match modification {
+        ContinuousModification::AddPower { .. } | ContinuousModification::AddToughness { .. } => {
+            true
+        }
+        ContinuousModification::AddKeyword { keyword } => keyword_is_bound_to_combat(keyword),
+        _ => false,
+    }
+}
+
+/// CR 702.73a: a creature-type grant pays off neither in combat nor anywhere else in
+/// particular. Beside a P/T change it leaves a trick a trick (Blades of Velis Vel), and alone
+/// it is none (Amoeboid Changeling).
+fn modification_is_creature_type_rider(modification: &ContinuousModification) -> bool {
+    matches!(
+        modification,
+        ContinuousModification::AddKeyword {
+            keyword: Keyword::Changeling
+        }
+    )
+}
+
 /// The payload of a combat trick, read one effect at a time: a P/T change (`Pump`,
 /// `DoublePT`) or an until-end-of-turn `GenericEffect` made only of P/T and keyword
 /// modifications (`effect_is_temporary_combat_modifier`), whose value is bound to the
-/// combat window (CR 611.2a + CR 514.2). A `GenericEffect` that also grants a protective
-/// quality is not one: hexproof, indestructible, protection and shroud (CR 702.11b,
-/// CR 702.12b, CR 702.16b, CR 702.18a) pay off against removal in any phase.
+/// combat window (CR 611.2a + CR 514.2). A `GenericEffect` needs a modification bound to
+/// that window and none whose value lands elsewhere ([`keyword_is_bound_to_combat`]), so
+/// a grant that also protects its creature or brings it back is not a trick in any part.
 /// `Pump`/`DoublePT` carry their duration on the ability, not the effect, so at this
 /// granularity they are accepted as the effect-timing and hint call sites always have;
 /// the ability-level [`ability_is_temporary_combat_modifier`] stays the authority where
@@ -2099,8 +2186,20 @@ fn continuous_modification_is_temporary_combat_modifier(
 pub(crate) fn effect_is_combat_trick_payload(effect: &Effect) -> bool {
     match effect {
         Effect::Pump { .. } | Effect::DoublePT { .. } => true,
-        Effect::GenericEffect { .. } => {
-            effect_is_temporary_combat_modifier(effect) && !effect_has_defensive_payload(effect)
+        Effect::GenericEffect {
+            static_abilities, ..
+        } => {
+            let modifications = || {
+                static_abilities
+                    .iter()
+                    .flat_map(|static_def| &static_def.modifications)
+            };
+            effect_is_temporary_combat_modifier(effect)
+                && modifications().any(modification_is_bound_to_combat)
+                && modifications().all(|modification| {
+                    modification_is_bound_to_combat(modification)
+                        || modification_is_creature_type_rider(modification)
+                })
         }
         _ => false,
     }
@@ -2418,6 +2517,7 @@ mod suspect_scope_tests {
 #[cfg(test)]
 mod temporary_combat_modifier_tests {
     use super::*;
+    use engine::types::keywords::{EmbalmCost, EscapeCost, FlashbackCost};
 
     fn until_end_of_turn(static_abilities: Vec<StaticDefinition>) -> Effect {
         Effect::GenericEffect {
@@ -2450,6 +2550,115 @@ mod temporary_combat_modifier_tests {
             vec![pump(vec![])]
         )));
         assert!(!effect_is_combat_trick_payload(&until_end_of_turn(vec![])));
+    }
+
+    fn grant(keyword: Keyword) -> ContinuousModification {
+        ContinuousModification::AddKeyword { keyword }
+    }
+
+    fn trick_payload(modifications: Vec<ContinuousModification>) -> bool {
+        effect_is_combat_trick_payload(&until_end_of_turn(vec![pump(modifications)]))
+    }
+
+    /// Every keyword kind an until-end-of-turn grant adds in the card pool whose value is bound
+    /// to combat, plus the class's other attack, block and combat-damage keywords.
+    #[test]
+    fn a_keyword_bound_to_combat_is_a_trick_payload_alone() {
+        for keyword in [
+            Keyword::Flying,
+            Keyword::Fear,
+            Keyword::Intimidate,
+            Keyword::Skulk,
+            Keyword::Shadow,
+            Keyword::Horsemanship,
+            Keyword::Menace,
+            Keyword::Landwalk("Island".to_string()),
+            Keyword::Reach,
+            Keyword::Defender,
+            Keyword::FirstStrike,
+            Keyword::DoubleStrike,
+            Keyword::Trample,
+            Keyword::TrampleOverPlaneswalkers,
+            Keyword::Deathtouch,
+            Keyword::Lifelink,
+            Keyword::Wither,
+            Keyword::Infect,
+            Keyword::Toxic(1),
+            Keyword::Banding,
+            Keyword::Vigilance,
+            Keyword::Haste,
+            Keyword::Annihilator(1),
+            Keyword::Myriad,
+            Keyword::Melee,
+            Keyword::Firebending(QuantityExpr::Fixed { value: 5 }),
+            Keyword::DoubleTeam,
+            Keyword::Exalted,
+            Keyword::Battlecry,
+            Keyword::Rampage(2),
+            Keyword::Bushido(1),
+            Keyword::Flanking,
+            Keyword::Provoke,
+        ] {
+            assert!(
+                trick_payload(vec![grant(keyword.clone())]),
+                "{keyword:?} pays out in combat"
+            );
+        }
+    }
+
+    /// CR 702.93a + CR 702.79a + CR 702.135a: a dies trigger pays off in any phase. CR 702.34a +
+    /// CR 702.138a + CR 702.128a: a graveyard keyword pays off from the graveyard. CR 702.73a: a
+    /// creature-type grant has no combat value. An unclassified keyword fails closed. Beside a
+    /// +1/+0 reach guard, none of them is a payload alone.
+    #[test]
+    fn a_keyword_whose_value_lands_elsewhere_is_no_trick_payload() {
+        let mana = || engine::types::mana::ManaCost::zero();
+        assert!(
+            trick_payload(vec![ContinuousModification::AddPower { value: 1 }]),
+            "reach-guard: a +1/+0 grant is a trick payload"
+        );
+        for keyword in [
+            Keyword::Undying,
+            Keyword::Persist,
+            Keyword::Afterlife(1),
+            Keyword::Flashback(FlashbackCost::Mana(mana())),
+            Keyword::Escape(EscapeCost::Mana(mana())),
+            Keyword::Embalm(EmbalmCost::Mana(mana())),
+            Keyword::JumpStart,
+            Keyword::Unearth(mana()),
+            Keyword::Changeling,
+            Keyword::Flash,
+            Keyword::Absorb(1),
+            Keyword::Unknown("unclassified".to_string()),
+        ] {
+            assert!(
+                !trick_payload(vec![grant(keyword.clone())]),
+                "{keyword:?} is not bound to combat"
+            );
+        }
+    }
+
+    /// A mixed grant reads as the protective one does: value that lands elsewhere refuses the
+    /// whole payload, however much of it is bound to combat. A creature-type grant does not,
+    /// since it pays off nowhere else either, but it does not make a payload by itself.
+    #[test]
+    fn a_mixed_grant_is_a_trick_payload_only_if_nothing_in_it_lands_elsewhere() {
+        let plus_one = || ContinuousModification::AddPower { value: 1 };
+        assert!(trick_payload(vec![plus_one(), grant(Keyword::Trample)]));
+        assert!(trick_payload(vec![plus_one(), grant(Keyword::Changeling)]));
+        assert!(trick_payload(vec![
+            grant(Keyword::Flying),
+            grant(Keyword::Changeling)
+        ]));
+        assert!(!trick_payload(vec![plus_one(), grant(Keyword::Undying)]));
+        assert!(!trick_payload(vec![
+            grant(Keyword::Flying),
+            grant(Keyword::Persist)
+        ]));
+        assert!(!trick_payload(vec![
+            plus_one(),
+            grant(Keyword::Indestructible)
+        ]));
     }
 }
 
