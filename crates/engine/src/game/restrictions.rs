@@ -179,14 +179,17 @@ pub fn flash_timing_cost(
 /// later state is predicted, and the sorcery window is not tested; a permission
 /// bound to a turn answers for the turn it is asked in. Casts made during
 /// another object's resolution (CR 608.2g) are not routes here, and an
-/// opponent's prohibition on casting outside sorcery timing is not read. A
-/// missing object makes no claim.
+/// opponent's prohibition on casting outside sorcery timing is not read. Nor is
+/// a window narrower than the object's own timing: its `casting_restrictions`,
+/// or a plotted instant's main-phase cast (CR 702.170d). A missing object makes
+/// no claim.
 ///
 /// The object's current characteristics are read: a face chosen later in the
 /// cast (CR 709.3, CR 715.3a) is not projected, and a fused split spell is
-/// read unfused. While the object's own cast is being proposed, until
-/// `finalize_cast` moves it to the stack (its mode prompt, for example), it
-/// keeps its origin zone, so the answer is the one its proposal got.
+/// read unfused. While the object's own cast is being proposed (its mode
+/// prompt, for example), it keeps its origin zone, so the answer is the one its
+/// proposal got. The zone holds until `finalize_cast`, but a cost paid before
+/// then is gone: an Offering sacrifice closes its own route.
 pub fn spell_confined_to_sorcery_timing(
     state: &crate::types::game_state::GameState,
     player: PlayerId,
