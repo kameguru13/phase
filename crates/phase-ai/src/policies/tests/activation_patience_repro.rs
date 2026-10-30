@@ -45,10 +45,13 @@
 
 use engine::game::zones::create_object;
 use engine::parser::oracle::parse_oracle_text;
-use engine::types::ability::ActivationRestriction;
+use engine::types::ability::{
+    ActivationRestriction, DelayedTriggerCondition, ResolvedAbility, TriggerConstraint,
+    TriggerDefinition,
+};
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
-use engine::types::game_state::{GameState, WaitingFor};
+use engine::types::game_state::{DelayedTrigger, GameState, WaitingFor};
 use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
@@ -436,33 +439,39 @@ fn a_precombat_main_trigger_stands_the_draw_step_down() {
     assert_eq!(delta, 0.0);
 }
 
+/// A delayed trigger (CR 603.7) the AI created, firing on `condition` and drawing a card.
+fn delayed_trigger(condition: DelayedTriggerCondition) -> DelayedTrigger {
+    let effect = parse_oracle_text("Draw a card.", "Probe", &[], &["Sorcery".to_string()], &[])
+        .abilities
+        .into_iter()
+        .next()
+        .expect("a one-line spell parses")
+        .effect;
+    DelayedTrigger::new(
+        condition,
+        Box::new(ResolvedAbility::new(*effect, vec![], ObjectId(1), AI)),
+        AI,
+        ObjectId(1),
+        true,
+    )
+}
+
+/// `AtNextPhaseForPlayer { phase, player }` with default gate and binding.
+fn at_next_phase_for(phase: Phase, player: PlayerId) -> DelayedTriggerCondition {
+    DelayedTriggerCondition::AtNextPhaseForPlayer {
+        phase,
+        player,
+        gate: Default::default(),
+        binding: Default::default(),
+    }
+}
+
 /// CR 603.7: a delayed trigger set for the AI's next precombat main phase fires as it
 /// begins (Mana Drain, "at the beginning of your next main phase"), so the draw step is
 /// not held; one set for an opponent's next main phase does not stand it down.
 #[test]
 fn a_delayed_main_phase_trigger_stands_the_draw_step_down() {
-    use engine::types::ability::{DelayedTriggerCondition, ResolvedAbility};
-    use engine::types::game_state::DelayedTrigger;
-    let delayed = |player| {
-        let effect = parse_oracle_text("Draw a card.", "Probe", &[], &["Sorcery".to_string()], &[])
-            .abilities
-            .into_iter()
-            .next()
-            .expect("a one-line spell parses")
-            .effect;
-        DelayedTrigger::new(
-            DelayedTriggerCondition::AtNextPhaseForPlayer {
-                phase: Phase::PreCombatMain,
-                player,
-                gate: Default::default(),
-                binding: Default::default(),
-            },
-            Box::new(ResolvedAbility::new(*effect, vec![], ObjectId(1), AI)),
-            AI,
-            ObjectId(1),
-            true,
-        )
-    };
+    let delayed = |player| delayed_trigger(at_next_phase_for(Phase::PreCombatMain, player));
     let mut board = build_board(Phase::Draw, 20, 20);
     board.state.delayed_triggers.push(delayed(OPP));
     let (_, reason) = score_and_reason(&verdict_for(&board));
@@ -771,7 +780,12 @@ fn retained_floating_mana_leaves_the_hold() {
 }
 
 /// A permanent `owner` controls carrying the first trigger parsed from `text`.
-fn add_trigger_permanent(state: &mut GameState, owner: PlayerId, name: &str, text: &str) {
+fn add_trigger_permanent(
+    state: &mut GameState,
+    owner: PlayerId,
+    name: &str,
+    text: &str,
+) -> ObjectId {
     let trigger = parse_oracle_text(text, name, &[], &["Artifact".to_string()], &[])
         .triggers
         .into_iter()
@@ -784,6 +798,7 @@ fn add_trigger_permanent(state: &mut GameState, owner: PlayerId, name: &str, tex
         .unwrap()
         .trigger_definitions
         .push(trigger);
+    id
 }
 
 /// CR 117.3a + CR 603.4: an opponent's Blinkmoth Urn ("At the beginning of each player's first
@@ -841,6 +856,183 @@ fn an_opponents_each_player_upkeep_trigger_ends_the_pristine_upkeep() {
         score_and_reason(&verdict_for(&board)).1,
         "activation_patience_hold_for_main"
     );
+}
+
+/// Voltaic Key, verified against MTGJSON AtomicCards.
+const VOLTAIC_KEY: &str = "{1}, {T}: Untap target artifact.";
+/// Howling Mine, verified against MTGJSON AtomicCards.
+const HOWLING_MINE: &str = "At the beginning of each player's draw step, if this artifact is untapped, that player draws an additional card.";
+/// Avaricious Dragon, verified against MTGJSON AtomicCards.
+const AVARICIOUS_DRAGON: &str = "Flying\nAt the beginning of your draw step, draw an additional card.\nAt the beginning of your end step, discard your hand.";
+
+/// [`build_board`] in `phase` with Voltaic Key as `board.pinger`, as in the Blinkmoth row. The
+/// Prodigal Sorcerer it replaced stays on the battlefield; its id is returned beside the board.
+fn voltaic_key_board(phase: Phase) -> (Board, ObjectId) {
+    let mut board = build_board(phase, 20, 20);
+    let sorcerer = board.pinger;
+    board.pinger = creature(
+        &mut board.state,
+        &mut Ids(8_800),
+        AI,
+        "Voltaic Key",
+        0,
+        1,
+        Some(VOLTAIC_KEY),
+    );
+    (board, sorcerer)
+}
+
+/// The trigger definition `add_trigger_permanent` put on `id`, read back for a premise.
+fn only_trigger(state: &GameState, id: ObjectId) -> &TriggerDefinition {
+    let mut entries = state.objects[&id].trigger_definitions.iter_unchecked();
+    let entry = entries
+        .next()
+        .expect("premise: the permanent carries a trigger");
+    assert!(entries.next().is_none(), "premise: exactly one trigger");
+    entry.definition()
+}
+
+/// The policy stands down: neutral, under the not-applicable reason.
+fn assert_stands_down(board: &Board, label: &str) {
+    let (delta, reason) = score_and_reason(&verdict_for(board));
+    assert_eq!(reason, "activation_patience_na", "{label}");
+    assert_eq!(delta, 0.0, "{label}");
+}
+
+/// CR 117.3a + CR 603.4: a trigger at the beginning of the AI's draw step goes on the stack
+/// before the AI next has priority, and checks its intervening-if as the step begins. Howling
+/// Mine ("At the beginning of each player's draw step, if this artifact is untapped, that player
+/// draws an additional card.") untapped by Voltaic Key ("{1}, {T}: Untap target artifact.") in
+/// the upkeep draws the extra card; untapped in the main phase it does not, so the Key's
+/// activation is not held. Any reaching draw-step trigger stands the whole upkeep down, whatever
+/// the activation and whatever the trigger's condition reads now: the AI's tapped Mine, the
+/// Prodigal Sorcerer's ping beside it, an opponent's Mine ("each player's"), and the AI's
+/// Avaricious Dragon ("At the beginning of your draw step, draw an additional card."). An
+/// opponent's Dragon triggers on its controller's draw step only, so it leaves the hold. In the
+/// draw step the trigger is behind its priority (CR 504.2), so the draw step still holds.
+#[test]
+fn a_draw_step_trigger_stands_the_upkeep_down() {
+    let (board, _) = voltaic_key_board(Phase::Upkeep);
+    let (delta, reason) = score_and_reason(&verdict_for(&board));
+    assert_eq!(
+        reason, "activation_patience_hold",
+        "reach: the Key alone is held in the upkeep"
+    );
+    assert!(delta < 0.0, "reach: got {delta}");
+
+    // (1) The AI's own Howling Mine, tapped: its intervening-if is false now.
+    let (mut board, sorcerer) = voltaic_key_board(Phase::Upkeep);
+    let mine = add_trigger_permanent(&mut board.state, AI, "Howling Mine", HOWLING_MINE);
+    let trigger = only_trigger(&board.state, mine);
+    assert!(
+        trigger.phase == Some(Phase::Draw) && trigger.condition.is_some(),
+        "premise: Howling Mine is a beginning-of-draw-step trigger with an intervening-if, got \
+         {:?} / {:?}",
+        trigger.phase,
+        trigger.condition
+    );
+    board.state.objects.get_mut(&mine).unwrap().tapped = true;
+    assert_stands_down(&board, "(1) the AI's tapped Howling Mine");
+
+    // (2) The same board, the Prodigal Sorcerer's ping: the whole upkeep stands down.
+    board.pinger = sorcerer;
+    assert_stands_down(&board, "(2) the ping beside the AI's Howling Mine");
+
+    // (3) An opponent's Howling Mine: "each player's" reaches the AI's draw step too.
+    let (mut board, _) = voltaic_key_board(Phase::Upkeep);
+    add_trigger_permanent(&mut board.state, OPP, "Howling Mine", HOWLING_MINE);
+    assert_stands_down(&board, "(3) an opponent's Howling Mine");
+
+    // An opponent's Avaricious Dragon: "your draw step" is its controller's, not the AI's.
+    let (mut board, _) = voltaic_key_board(Phase::Upkeep);
+    add_trigger_permanent(
+        &mut board.state,
+        OPP,
+        "Avaricious Dragon",
+        AVARICIOUS_DRAGON,
+    );
+    assert_eq!(
+        score_and_reason(&verdict_for(&board)).1,
+        "activation_patience_hold",
+        "an opponent's \"your draw step\" trigger does not reach the AI's draw step"
+    );
+
+    // (4) The AI's own Avaricious Dragon.
+    let (mut board, _) = voltaic_key_board(Phase::Upkeep);
+    let dragon =
+        add_trigger_permanent(&mut board.state, AI, "Avaricious Dragon", AVARICIOUS_DRAGON);
+    let trigger = only_trigger(&board.state, dragon);
+    assert!(
+        trigger.phase == Some(Phase::Draw)
+            && trigger.constraint == Some(TriggerConstraint::OnlyDuringYourTurn),
+        "premise: Avaricious Dragon's first trigger is a \"your draw step\" trigger, got {:?} / \
+         {:?}",
+        trigger.phase,
+        trigger.constraint
+    );
+    assert_stands_down(&board, "(4) the AI's Avaricious Dragon");
+
+    // CR 504.2: in the draw step the Mine's trigger is behind the AI's priority.
+    let (mut board, _) = voltaic_key_board(Phase::Draw);
+    add_trigger_permanent(&mut board.state, AI, "Howling Mine", HOWLING_MINE);
+    assert_eq!(
+        score_and_reason(&verdict_for(&board)).1,
+        "activation_patience_hold_for_main",
+        "the draw step is unaffected"
+    );
+}
+
+/// The same stand-down from an upkeep whose triggers resolved (Phyrexian Arena's upkeep
+/// trigger), which is otherwise held for the main phase: the draw step is still ahead of it
+/// (CR 117.3a + CR 603.4). An upkeep trigger is not a draw-step trigger, so Arena alone
+/// leaves that hold in place.
+#[test]
+fn a_draw_step_trigger_stands_an_upkeep_with_triggers_down() {
+    let (mut board, _) = voltaic_key_board(Phase::Upkeep);
+    add_upkeep_trigger_source(&mut board.state);
+    assert_eq!(
+        score_and_reason(&verdict_for(&board)).1,
+        "activation_patience_hold_for_main",
+        "reach: with Phyrexian Arena alone the upkeep is held for the main phase"
+    );
+    add_trigger_permanent(&mut board.state, AI, "Howling Mine", HOWLING_MINE);
+    assert_stands_down(&board, "Phyrexian Arena and the AI's Howling Mine");
+}
+
+/// CR 603.7: a delayed trigger set for the AI's next draw step fires as that step begins, so it
+/// stands the upkeep down like a printed one; one set for an opponent's next draw step does not.
+/// No card creates one today; this is the delayed arm of the phase-parameterized trigger scan.
+#[test]
+fn a_delayed_draw_step_trigger_stands_the_upkeep_down() {
+    let (mut board, _) = voltaic_key_board(Phase::Upkeep);
+    assert_eq!(
+        score_and_reason(&verdict_for(&board)).1,
+        "activation_patience_hold",
+        "reach: without a delayed trigger the Key is held"
+    );
+    board
+        .state
+        .delayed_triggers
+        .push(delayed_trigger(at_next_phase_for(Phase::Draw, OPP)));
+    assert_eq!(
+        score_and_reason(&verdict_for(&board)).1,
+        "activation_patience_hold",
+        "an opponent's next draw step is not the AI's"
+    );
+    board
+        .state
+        .delayed_triggers
+        .push(delayed_trigger(at_next_phase_for(Phase::Draw, AI)));
+    assert_stands_down(&board, "(1) a delayed trigger at the AI's next draw step");
+
+    let (mut board, _) = voltaic_key_board(Phase::Upkeep);
+    board
+        .state
+        .delayed_triggers
+        .push(delayed_trigger(DelayedTriggerCondition::AtNextPhase {
+            phase: Phase::Draw,
+        }));
+    assert_stands_down(&board, "(2) a delayed trigger at the next draw step");
 }
 
 /// CR 614.4: Words of Worship ("{1}: The next time you would draw a card this turn, you gain

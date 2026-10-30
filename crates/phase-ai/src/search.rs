@@ -21417,6 +21417,476 @@ one on the bottom of your library.";
         );
     }
 
+    /// Voltaic Key, verbatim.
+    const VOLTAIC_KEY: &str = "{1}, {T}: Untap target artifact.";
+    /// Howling Mine, verbatim (the integration fixture holds the same card).
+    const HOWLING_MINE: &str = "At the beginning of each player's draw step, if this artifact is untapped, that player draws an additional card.";
+
+    /// The tapped artifact beside Voltaic Key on [`key_board`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum UntapTarget {
+        /// Howling Mine, from the integration card database.
+        HowlingMine,
+        /// An artifact with no abilities and no triggers.
+        Blank,
+    }
+
+    /// P0's own Upkeep, empty stack: Voltaic Key, one Mountain for its {1}, the tapped
+    /// `target` artifact, and five library cards per player. Returns the runner, the Key, and
+    /// the tapped artifact.
+    fn key_board(target: UntapTarget) -> (GameRunner, ObjectId, ObjectId) {
+        let db = shared_integration_card_db();
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::Upkeep);
+        let key = scenario
+            .add_artifact_from_oracle(P0, "Voltaic Key", VOLTAIC_KEY)
+            .id();
+        scenario.add_basic_land(P0, ManaColor::Red);
+        let mine = match target {
+            UntapTarget::HowlingMine => {
+                Some(scenario.add_real_card(P0, "Howling Mine", Zone::Battlefield, db))
+            }
+            UntapTarget::Blank => None,
+        };
+        let mut runner = scenario.build();
+        rehydrate_game_from_card_db(runner.state_mut(), db);
+        let state = runner.state_mut();
+        let tapped = mine.unwrap_or_else(|| {
+            let id = create_object(
+                state,
+                CardId(state.next_object_id),
+                P0,
+                "Blank Artifact".to_string(),
+                Zone::Battlefield,
+            );
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Artifact);
+            obj.base_card_types = obj.card_types.clone();
+            id
+        });
+        state.objects.get_mut(&tapped).unwrap().tapped = true;
+        add_libraries(state, 5);
+        (runner, key, tapped)
+    }
+
+    /// P0's hand size.
+    fn p0_hand(state: &GameState) -> usize {
+        state
+            .players
+            .iter()
+            .find(|player| player.id == P0)
+            .unwrap()
+            .hand
+            .len()
+    }
+
+    /// Activates Voltaic Key on `target` through the activation pipeline, answering its target
+    /// prompt, then passes priority until the ability has resolved and P0 again holds priority
+    /// on an empty stack in the same step. Any other prompt panics.
+    fn untap_with_key(runner: &mut GameRunner, key: ObjectId, target: ObjectId) {
+        let phase = runner.state().phase;
+        runner
+            .act(activate(key, 0))
+            .expect("Voltaic Key's activation is accepted");
+        let WaitingFor::TargetSelection { target_slots, .. } = runner.state().waiting_for.clone()
+        else {
+            panic!(
+                "the activation asks for its target first, got {:?}",
+                runner.state().waiting_for
+            );
+        };
+        assert!(
+            target_slots.len() == 1
+                && target_slots[0]
+                    .legal_targets
+                    .contains(&TargetRef::Object(target)),
+            "one target slot, and the tapped artifact is a legal target: {target_slots:?}"
+        );
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(target)),
+            })
+            .expect("the target is accepted");
+        assert!(
+            !runner.state().stack.is_empty(),
+            "the untap is on the stack, got {:?}",
+            runner.state().waiting_for
+        );
+        for _ in 0..8 {
+            let state = runner.state();
+            if state.stack.is_empty()
+                && matches!(state.waiting_for, WaitingFor::Priority { player } if player == P0)
+            {
+                break;
+            }
+            match state.waiting_for.clone() {
+                WaitingFor::Priority { .. } => {
+                    runner
+                        .act(GameAction::PassPriority)
+                        .expect("priority passes to resolve the untap");
+                }
+                other => panic!("unexpected prompt while resolving the untap: {other:?}"),
+            }
+        }
+        let state = runner.state();
+        assert!(
+            state.phase == phase
+                && state.stack.is_empty()
+                && matches!(state.waiting_for, WaitingFor::Priority { player } if player == P0),
+            "the untap resolved within {phase:?} and P0 holds priority on an empty stack"
+        );
+    }
+
+    /// Passes priority until P0 holds priority in `phase` on an empty stack. Any other prompt
+    /// panics.
+    fn pass_to_priority_in(runner: &mut GameRunner, phase: Phase) {
+        for _ in 0..32 {
+            let state = runner.state();
+            if state.phase == phase
+                && state.stack.is_empty()
+                && matches!(state.waiting_for, WaitingFor::Priority { player } if player == P0)
+            {
+                return;
+            }
+            match state.waiting_for.clone() {
+                WaitingFor::Priority { .. } => {
+                    runner
+                        .act(GameAction::PassPriority)
+                        .expect("priority passes");
+                }
+                other => panic!("unexpected prompt before {phase:?}: {other:?}"),
+            }
+        }
+        panic!(
+            "P0 did not reach priority in {phase:?} on an empty stack, at {:?} / {:?}",
+            runner.state().phase,
+            runner.state().waiting_for
+        );
+    }
+
+    /// Maintainer review 3, item 2: Voltaic Key ("{1}, {T}: Untap target artifact.") beside a
+    /// tapped Howling Mine ("At the beginning of each player's draw step, if this artifact is
+    /// untapped, that player draws an additional card.") in the AI's own Upkeep. The Key line
+    /// untaps the Mine before the draw step, whose trigger checks its intervening-if as the step
+    /// begins (CR 117.3a + CR 603.4), and so draws the extra card; activating the Key in the
+    /// main phase cannot, because the draw step is behind it (CR 504.1). Waiting does not
+    /// reproduce the line, so ActivationPatience does not hold the activation and Pass is not
+    /// lent its continuation, at rung 0 and on a searched rung.
+    ///
+    /// The paired control replaces the Mine with a tapped artifact that has no abilities: the
+    /// Key is then held at full strength, so the zeros on the Mine board come from the
+    /// draw-step guard and not from a candidate the root dropped. The two driven lines show
+    /// the Mine's trigger wired with its condition: the Upkeep untap draws two cards in the
+    /// draw step, and passing draws one, with the main-phase untap adding none.
+    ///
+    /// Like the Elemental Augury row's, the Key line's continuation is not above Pass's on this
+    /// board, at rung 0 or at rung 1: the root does not see the extra card. So on this board a
+    /// lend would not move Pass, and the "Pass is not lent" rows are observables, not the pin.
+    /// The pin is the Key's `deferral == None` in both beams: `lend_deferral_witness` takes its
+    /// donors from exactly the entries with a deferral (as
+    /// `lend_deferral_witness_lends_only_between_open_lines` pins), so with none there is no
+    /// donor.
+    ///
+    /// Every observable is printed; regenerate them with
+    /// `cargo test -p phase-ai own_upkeep_root_does_not_lend_a_line_a_draw_step_trigger_reads -- --nocapture`.
+    #[test]
+    fn own_upkeep_root_does_not_lend_a_line_a_draw_step_trigger_reads() {
+        use crate::policies::activation_patience::ActivationPatiencePolicy;
+        use crate::policies::registry::NUDGE_MAX;
+        use engine::types::ability::{TapStateChange, TriggerCondition, TypeFilter};
+
+        let (runner, key, mine) = key_board(UntapTarget::HowlingMine);
+        let state = runner.state().clone();
+
+        // Premises.
+        assert_eq!(
+            shared_integration_card_db()
+                .get_face_by_name("Howling Mine")
+                .and_then(|face| face.oracle_text.as_deref()),
+            Some(HOWLING_MINE),
+            "premise: the fixture's Howling Mine is the card, verbatim"
+        );
+        let ability = &state.objects[&key].abilities[0];
+        assert!(
+            matches!(
+                &*ability.effect,
+                Effect::SetTapState {
+                    state: TapStateChange::Untap,
+                    target: TargetFilter::Typed(typed),
+                    ..
+                } if typed.type_filters.contains(&TypeFilter::Artifact)
+            ),
+            "premise: Voltaic Key untaps target artifact, got {:?}",
+            ability.effect
+        );
+        let mine_triggers: Vec<&TriggerDefinition> = state.objects[&mine]
+            .trigger_definitions
+            .iter_unchecked()
+            .map(|entry| entry.definition())
+            .collect();
+        assert!(
+            matches!(
+                mine_triggers.as_slice(),
+                [trigger] if trigger.mode == TriggerMode::Phase
+                    && trigger.phase == Some(Phase::Draw)
+                    && matches!(
+                        &trigger.condition,
+                        Some(TriggerCondition::Not { condition })
+                            if **condition == TriggerCondition::SourceIsTapped
+                    )
+            ),
+            "premise: Howling Mine's one trigger is a draw-step trigger gated on the Mine being \
+             untapped, got {mine_triggers:?}"
+        );
+        assert!(
+            matches!(state.waiting_for, WaitingFor::Priority { player } if player == P0)
+                && state.active_player == P0
+                && state.phase == Phase::Upkeep
+                && state.stack.is_empty()
+                && state.objects[&mine].tapped
+                && !state.objects[&key].tapped,
+            "premise: P0 holds priority in its own Upkeep on an empty stack, the Mine tapped and \
+             the Key untapped"
+        );
+        let tw = RootDecisionContext::classify(&state, P0).tactical_weight();
+        assert_eq!(tw, 0.35, "premise: the own Upkeep root weight");
+
+        let pass = GameAction::PassPriority;
+        let untap = activate(key, 0);
+        let patience_registry = PolicyRegistry::for_tests(vec![Box::new(ActivationPatiencePolicy)]);
+        let empty = PolicyRegistry::for_tests(vec![]);
+        let beam_deferral = |beam: &[RankedCandidate]| {
+            beam.iter()
+                .find(|ranked| ranked.candidate.action == untap)
+                .map(|ranked| ranked.deferral)
+        };
+
+        // Observables, all computed before the first non-premise assertion so that one run
+        // records every value.
+        let cfg = hard_rung0_config();
+        let roots = PatienceRoots::score(&state, &cfg);
+        let beam0 = build_root_beam(
+            &state,
+            &PlannerServices::new_default(P0, &cfg, &patience_registry),
+        );
+        let beam0_deferral = beam_deferral(&beam0);
+
+        let mut searched = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(7);
+        searched.search.planner_mode = PlannerMode::BeamPlusRollout;
+        searched.search.max_depth = 2;
+        searched.search.determinization_samples = 0;
+        let r0 = build_root_beam(&state, &PlannerServices::new_default(P0, &searched, &empty));
+        let r1_ranked = build_root_beam(
+            &state,
+            &PlannerServices::new_default(P0, &searched, &patience_registry),
+        );
+        let r1_deferral = beam_deferral(&r1_ranked);
+        let r1: Vec<RankedCandidate> = r0
+            .iter()
+            .map(|r| {
+                r1_ranked
+                    .iter()
+                    .find(|candidate| candidate.candidate.action == r.candidate.action)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("{:?} absent from R1's beam", r.candidate.action))
+            })
+            .collect();
+        let rung1_tactical = |action: &GameAction| {
+            r0.iter()
+                .find(|r| &r.candidate.action == action)
+                .map(|r| r.score)
+                .unwrap_or_else(|| panic!("reach: {action:?} in the beam"))
+        };
+        let mut services0 = PlannerServices::new_default(P0, &searched, &empty);
+        let s0 = run_iterative_deepening(&state, r0.clone(), tw, &searched, &mut services0)
+            .expect("services that simulate every answer admit none unsimulated");
+        let mut services1 = PlannerServices::new_default(P0, &searched, &empty);
+        let s1 = run_iterative_deepening(&state, r1.clone(), tw, &searched, &mut services1)
+            .expect("services that simulate every answer admit none unsimulated");
+        let rung1_cont = |action: &GameAction| score_of(&s0, action) - rung1_tactical(action) * tw;
+
+        let (control_runner, control_key, blank) = key_board(UntapTarget::Blank);
+        let control_state = control_runner.state().clone();
+        let control_untap = activate(control_key, 0);
+        let control = PatienceRoots::score(&control_state, &cfg);
+        let control_beam = build_root_beam(
+            &control_state,
+            &PlannerServices::new_default(P0, &cfg, &patience_registry),
+        );
+        let control_deferral = control_beam
+            .iter()
+            .find(|ranked| ranked.candidate.action == control_untap)
+            .map(|ranked| ranked.deferral);
+
+        eprintln!("K-1 Mine board, rung 0 (PatienceRoots, tw {}):", roots.tw);
+        eprintln!("  s0 = {:?}", roots.s0);
+        eprintln!("  s1 = {:?}", roots.s1);
+        eprintln!("  h0 = {:?}", roots.h0);
+        eprintln!("  h1 = {:?}", roots.h1);
+        eprintln!(
+            "  ap(key) = {}, ap(pass) = {}",
+            roots.ap(&untap),
+            roots.ap(&pass)
+        );
+        eprintln!(
+            "  cont(key) = {}, cont(pass) = {}",
+            roots.cont(&untap),
+            roots.cont(&pass)
+        );
+        eprintln!("K-1 beams, Key deferral: rung-0 beam {beam0_deferral:?}, R1 {r1_deferral:?}");
+        eprintln!("K-1 rung 1 (empty-registry services):");
+        eprintln!("  R0 run = {s0:?}");
+        eprintln!("  R1 run = {s1:?}");
+        eprintln!("  rung stats R0 {:?}", services0.rung_stats);
+        eprintln!("  rung stats R1 {:?}", services1.rung_stats);
+        eprintln!(
+            "  cont(key) = {}, cont(pass) = {}",
+            rung1_cont(&untap),
+            rung1_cont(&pass)
+        );
+        eprintln!(
+            "K-1 control (blank artifact): ap(key) = {}, s0(key) = {}, s1(key) = {}, beam deferral {:?}",
+            control.ap(&control_untap),
+            score_of(&control.s0, &control_untap),
+            score_of(&control.s1, &control_untap),
+            control_deferral
+        );
+
+        // Reach.
+        roots.assert_scored("Voltaic Key + Howling Mine upkeep", &[&untap, &pass]);
+        assert!(
+            beam0_deferral.is_some() && r1_deferral.is_some(),
+            "reach: the Key's activation is in both beams"
+        );
+        for services in [&services0, &services1] {
+            assert_eq!(services.rung_stats.len(), 2, "rungs 0 and 1 ran");
+            assert!(
+                services.rung_stats.iter().all(|r| r.completed),
+                "every rung completed"
+            );
+            let rung1 = &services.rung_stats[1];
+            assert!(
+                rung1.nodes_used > 0 && rung1.nodes_used < rung1.max_nodes,
+                "rung 1 searched within its budget: {rung1:?}"
+            );
+        }
+
+        // Rung 0.
+        assert_eq!(roots.ap(&untap), 0.0, "the Key's untap is not held");
+        assert_eq!(
+            score_of(&roots.s1, &untap),
+            score_of(&roots.s0, &untap),
+            "the root does not move the Key"
+        );
+        assert_eq!(
+            score_of(&roots.s1, &pass),
+            score_of(&roots.s0, &pass),
+            "Pass is not lent the Key line's continuation"
+        );
+
+        // The beams: no deferral, so `lend_deferral_witness` has no donor.
+        assert_eq!(
+            beam0_deferral,
+            Some(None),
+            "the Key carries no deferral in the root beam"
+        );
+
+        // Rung 1.
+        assert_eq!(r1_deferral, Some(None), "the Key carries no deferral in R1");
+        for (left, right) in r0.iter().zip(&r1) {
+            assert_eq!(left.candidate.action, right.candidate.action);
+            assert_eq!(left.score.to_bits(), right.score.to_bits());
+        }
+        assert_eq!(s0.len(), s1.len(), "both runs score the same actions");
+        for (action, score) in &s0 {
+            assert_eq!(
+                score.to_bits(),
+                score_of(&s1, action).to_bits(),
+                "rung 1 moves nothing: {action:?}"
+            );
+        }
+        assert_eq!(
+            score_of(&s1, &pass),
+            score_of(&s0, &pass),
+            "Pass is not lent the Key line's continuation at rung 1"
+        );
+
+        // Paired positive control: with a blank artifact in the Mine's place the Key is held at
+        // full strength, so the zeros above come from the draw-step guard.
+        control.assert_scored(
+            "Voltaic Key + blank artifact upkeep",
+            &[&control_untap, &pass],
+        );
+        let control_ap = control.ap(&control_untap);
+        assert!(
+            control_ap < -NUDGE_MAX,
+            "control: patience holds the Key, got {control_ap}"
+        );
+        assert!(
+            matches!(control_deferral, Some(Some(_))),
+            "control: the Key carries a deferral in the root beam, got {control_deferral:?}"
+        );
+        let control_margin =
+            score_of(&control.s0, &control_untap) - score_of(&control.s1, &control_untap);
+        assert!(
+            (control_margin + control_ap).abs() < 1e-9,
+            "control: the root margin {control_margin} is the full hold {control_ap}"
+        );
+        assert!(
+            control_state.objects[&blank].tapped,
+            "control premise: the blank artifact is tapped"
+        );
+
+        // Line K (CR 504.1 + CR 117.3a + CR 603.4): untap the Mine in the Upkeep, then reach
+        // the draw step's priority.
+        let (mut line_k, key_k, mine_k) = key_board(UntapTarget::HowlingMine);
+        let hand0 = p0_hand(line_k.state());
+        untap_with_key(&mut line_k, key_k, mine_k);
+        assert!(
+            !line_k.state().objects[&mine_k].tapped,
+            "line K: the Key untapped the Mine in the Upkeep"
+        );
+        pass_to_priority_in(&mut line_k, Phase::Draw);
+        assert!(
+            !line_k.state().objects[&mine_k].tapped,
+            "line K: the Mine is untapped as the draw step begins"
+        );
+        assert_eq!(
+            p0_hand(line_k.state()),
+            hand0 + 2,
+            "line K: the draw step's draw and the Mine's additional card"
+        );
+
+        // Line P: pass to the draw step, then untap the Mine in the main phase.
+        let (mut line_p, key_p, mine_p) = key_board(UntapTarget::HowlingMine);
+        assert_eq!(
+            p0_hand(line_p.state()),
+            hand0,
+            "line P starts from the same hand"
+        );
+        pass_to_priority_in(&mut line_p, Phase::Draw);
+        assert!(
+            line_p.state().objects[&mine_p].tapped,
+            "line P: the Mine is still tapped in the draw step"
+        );
+        assert_eq!(
+            p0_hand(line_p.state()),
+            hand0 + 1,
+            "line P: the draw step ran, and the tapped Mine added nothing"
+        );
+        pass_to_priority_in(&mut line_p, Phase::PreCombatMain);
+        untap_with_key(&mut line_p, key_p, mine_p);
+        assert!(
+            !line_p.state().objects[&mine_p].tapped,
+            "line P: the Key untapped the Mine in the main phase"
+        );
+        assert_eq!(
+            p0_hand(line_p.state()),
+            hand0 + 1,
+            "line P: untapping the Mine in the main phase draws nothing this turn"
+        );
+    }
+
     /// D1 at the root (the mtg-bot Coordinated Assault regression): in the AI's own Draw step
     /// EffectTiming prices Coordinated Assault's until-end-of-turn `GenericEffect` pump as a
     /// combat trick (CR 611.2a + CR 514.2), and the searched root carries that verdict at the

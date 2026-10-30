@@ -32,6 +32,37 @@
 //! So this policy asks one question — **does waiting cost anything?** — and
 //! penalises the activation when the answer is no.
 //!
+//! ## What a hold rests on
+//!
+//! Holding an activation, and lending its line to passing (`search::lend_deferral_witness`),
+//! rest on one premise: activating in the main phase reproduces it, because nothing between
+//! this priority and the main phase can depend on it. Every stand-down and every draw-setup
+//! escape hatch below is an instance of that rule. From the upkeep, these lie in between:
+//!
+//! - The draw step's beginning triggers (CR 117.3a). An intervening-if is checked as the step
+//!   begins (CR 603.4), so the activation may be what makes it true: Voltaic Key untapping a
+//!   tapped Howling Mine. Any trigger that reaches the AI's draw step (its own "your"
+//!   triggers, anyone's "each player's", and delayed triggers set for it, CR 603.7) stands
+//!   the whole upkeep down (`patient_window`).
+//! - The draw step's draw (CR 504.1 + CR 121.1). An activation that replaces it (CR 614.4) or
+//!   arranges the cards it takes stands itself down (`DrawSetup`, escape hatch 2).
+//! - The main phase's opening events (CR 505.3-505.5, CR 117.3a), which stand the upkeep and
+//!   the draw step down (`main_phase_opens_with_events`).
+//!
+//! From the draw step only the last of these remains: its draw and its triggers are behind its
+//! priority (CR 504.2). The upkeep's own triggers resolve before its stack is next empty, so
+//! they only end its claim to being the low-information window (`PatientWindow::BeforeMain`).
+//!
+//! Three cases of the rule are not yet classified. Other changes to the AI's library top
+//! before the draw, such as a card put on top or a mill of the AI's library, also change what
+//! the draw takes, and `DrawSetup` does not classify them. And the trigger scans read only
+//! permanents already on the battlefield, so a trigger whose source the held activation itself
+//! puts onto the battlefield is not seen: Quicksilver Amulet putting Avaricious Dragon onto
+//! the battlefield in the upkeep, and likewise for the main-phase stand-down. And the draw
+//! step's draw itself triggers "whenever you draw a card" abilities (CR 603.2), whose
+//! intervening-if (CR 603.4) an upkeep activation may make true: Starving Revenant's descend 8
+//! after an upkeep sacrifice. Only beginning-of-step triggers are scanned.
+//!
 //! ## Why a soft penalty and not a `Reject`
 //!
 //! "Later is better" is a judgement about information, not a rule-derived
@@ -242,7 +273,8 @@ enum PatientWindow {
     Upkeep,
     /// The draw step (CR 504.2: its priority comes after the draw) or an upkeep whose triggers
     /// have resolved: waiting buys no information, but it gives nothing up either, provided
-    /// nothing happens as the main phase begins (see [`main_phase_opens_with_events`]). Every
+    /// nothing happens as the main phase begins (see [`main_phase_opens_with_events`]) or, from
+    /// the upkeep, as the draw step begins (see [`patient_window`]). Every
     /// instant-speed use of the ability is still on offer in the main phase, and the mana and
     /// untapped permanents it would spend now are still there for the sorcery-speed plays
     /// (CR 307.1) that only the main phase allows.
@@ -288,6 +320,18 @@ enum PatientWindow {
 /// is provably unreachable whenever one exists — there is no non-conservative
 /// case being given up. Such an upkeep is still a [`PatientWindow::BeforeMain`], whose case
 /// never rested on information.
+///
+/// # Why, from the upkeep, no beginning-of-draw-step trigger may reach `ai_player`'s draw step
+///
+/// A hold, and the line it lends to passing, rest on activating in the main phase reproducing
+/// it. A trigger at the beginning of the AI's draw step lies between the upkeep and that main
+/// phase. An intervening-if checked as the step begins (CR 603.4), or anything else the trigger
+/// reads, may depend on an activation made now. So any such trigger stands the whole upkeep
+/// down, pristine or not ([`phase_opens_with_triggers`]: the AI's own "your" triggers, anyone's
+/// "each player's" triggers, and delayed triggers set for it). Like the upkeep check, this is
+/// deliberately not gated on the trigger functioning or on its condition. The draw step itself
+/// is unaffected: by its priority, its triggers and its draw are behind it (CR 504.2,
+/// CR 117.3a).
 fn patient_window(state: &GameState, ai_player: PlayerId) -> Option<PatientWindow> {
     if state.active_player != ai_player
         || !state.stack.is_empty()
@@ -302,6 +346,13 @@ fn patient_window(state: &GameState, ai_player: PlayerId) -> Option<PatientWindo
     {
         return None;
     }
+    // CR 504.1 + CR 117.3a + CR 603.4: from the upkeep the draw step is still ahead, and a
+    // trigger at its beginning checks its intervening-if as the step begins, so it can read
+    // what an activation now changes (Voltaic Key untapping a tapped Howling Mine). Activating
+    // in the main phase cannot reach it, so waiting is not free: no upkeep is a patient window.
+    if state.phase == Phase::Upkeep && phase_opens_with_triggers(state, ai_player, Phase::Draw) {
+        return None;
+    }
     if state.phase == Phase::Upkeep
         && !beginning_of_phase_trigger_reaches(state, ai_player, Phase::Upkeep)
     {
@@ -311,32 +362,23 @@ fn patient_window(state: &GameState, ai_player: PlayerId) -> Option<PatientWindo
     }
 }
 
-/// Does `player`'s precombat main phase open with something that happens before they receive
-/// priority in it, which an activation now could still change? CR 505.3: they are the archenemy
-/// and set a scheme in motion. CR 505.4: they put a lore counter on each of their Sagas.
-/// CR 505.5: they roll to visit their Attractions. CR 117.3a: "at the beginning of your
-/// precombat main phase" triggers go on the stack, and so do CR 603.7 delayed triggers set for
-/// the next precombat main phase (Mana Drain's "at the beginning of your next main phase").
-/// Coarse in the safe direction, like
-/// [`beginning_of_phase_trigger_reaches`]: any such permanent stands the window down. Triggers
-/// worded "at the beginning of each of your main phases" (parsed without a phase) are not
-/// counted; today they only add mana, which the main phase does not need earlier.
-///
-/// Sagas are read the way `turns::add_lore_counters_to_sagas` reads them, and Attractions
-/// through the engine's own `is_attraction_permanent`.
-fn main_phase_opens_with_events(state: &GameState, player: PlayerId) -> bool {
-    state.archenemy == Some(player)
-        || beginning_of_phase_trigger_reaches(state, player, Phase::PreCombatMain)
+/// Does `player`'s next `phase` open with a trigger, which goes on the stack before they
+/// receive priority in it (CR 117.3a)? Either a printed "at the beginning of [phase]" trigger
+/// that reaches it ([`beginning_of_phase_trigger_reaches`]) or a delayed trigger set for it
+/// (CR 603.7: Mana Drain's "at the beginning of your next main phase"). Coarse in the safe
+/// direction, like the printed scan: neither arm reads whether the trigger will do anything.
+fn phase_opens_with_triggers(state: &GameState, player: PlayerId, phase: Phase) -> bool {
+    beginning_of_phase_trigger_reaches(state, player, phase)
         || state
             .delayed_triggers
             .iter()
             .any(|delayed| match delayed.condition {
-                DelayedTriggerCondition::AtNextPhase { phase } => phase == Phase::PreCombatMain,
+                DelayedTriggerCondition::AtNextPhase { phase: at } => at == phase,
                 DelayedTriggerCondition::AtNextPhaseForPlayer {
-                    phase,
+                    phase: at,
                     player: for_player,
                     ..
-                } => phase == Phase::PreCombatMain && for_player == player,
+                } => at == phase && for_player == player,
                 DelayedTriggerCondition::AtBeginningOfAddedPhase { .. }
                 | DelayedTriggerCondition::WhenLeavesPlay { .. }
                 | DelayedTriggerCondition::WhenDies { .. }
@@ -346,6 +388,24 @@ fn main_phase_opens_with_events(state: &GameState, player: PlayerId) -> bool {
                 | DelayedTriggerCondition::WheneverEvent { .. }
                 | DelayedTriggerCondition::WhenNextEvent { .. } => false,
             })
+}
+
+/// Does `player`'s precombat main phase open with something that happens before they receive
+/// priority in it, which an activation now could still change? CR 505.3: they are the archenemy
+/// and set a scheme in motion. CR 505.4: they put a lore counter on each of their Sagas.
+/// CR 505.5: they roll to visit their Attractions. CR 117.3a: "at the beginning of your
+/// precombat main phase" triggers go on the stack, and so do CR 603.7 delayed triggers set for
+/// it ([`phase_opens_with_triggers`]).
+/// Coarse in the safe direction, like
+/// [`beginning_of_phase_trigger_reaches`]: any such permanent stands the window down. Triggers
+/// worded "at the beginning of each of your main phases" (parsed without a phase) are not
+/// counted; today they only add mana, which the main phase does not need earlier.
+///
+/// Sagas are read the way `turns::add_lore_counters_to_sagas` reads them, and Attractions
+/// through the engine's own `is_attraction_permanent`.
+fn main_phase_opens_with_events(state: &GameState, player: PlayerId) -> bool {
+    state.archenemy == Some(player)
+        || phase_opens_with_triggers(state, player, Phase::PreCombatMain)
         || state.battlefield.iter().any(|&id| {
             state.objects.get(&id).is_some_and(|object| {
                 object.controller == player
@@ -451,7 +511,8 @@ impl TacticalPolicy for ActivationPatiencePolicy {
             return PolicyVerdict::neutral(PolicyReason::new("activation_patience_floating_mana"));
         }
 
-        // Escape hatch 2 — CR 504.1 + CR 121.1: the draw step's turn-based draw takes the top card
+        // Escape hatch 2 — the draw-step instance of the rule in the module doc ("What a hold
+        // rests on"): CR 504.1 + CR 121.1: the draw step's turn-based draw takes the top card
         // of the library, and in the upkeep it is still ahead (CR 502.4: no priority in the untap
         // step; CR 503.1: the upkeep's is the last before that draw). An activation that sets up
         // that draw gives its payoff up by waiting for the main phase: a draw replacement must
