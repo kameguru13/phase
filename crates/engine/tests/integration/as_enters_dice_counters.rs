@@ -454,7 +454,7 @@ fn counters_equal_the_total_of_the_rolled_dice() {
     }
 }
 
-/// R5. CR 706.1 + CR 706.4 + CR 704.5f: X = 0 rolls no dice and gives no
+/// R5. CR 706.1 + CR 704.5f (Hydradoodle's ruling): X = 0 rolls no dice and gives no
 /// counters, so the 0/0 dies; an anthem keeps it alive with none. A non-cast
 /// entry (X = 0 by CR 107.3m) whose producer stamps an effect count still
 /// gives none, and a roll-count replacement does not roll a zero-die roll.

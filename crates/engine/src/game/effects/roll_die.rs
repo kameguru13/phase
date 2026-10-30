@@ -1465,8 +1465,9 @@ mod tests {
         );
     }
 
-    /// CR 706.1 + CR 706.4: If the requested number of dice resolves to 0, no
-    /// die is rolled and the total of those (zero) results is 0, so an inline
+    /// CR 706.1: If the requested number of dice resolves to 0, no die is
+    /// rolled. CR 706.4 leaves the use of the results to the ability's text, and
+    /// the total of no results is 0 (Hydradoodle's ruling), so an inline
     /// `EventContextAmount` consumer reads 0 — never the stale die result.
     #[test]
     fn roll_die_count_zero_clears_stale_die_result() {

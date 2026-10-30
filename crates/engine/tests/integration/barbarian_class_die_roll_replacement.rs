@@ -569,8 +569,8 @@ fn die_roll_replacement_is_scoped_to_its_controller() {
 }
 
 /// V11 — the aggregate "equal to the result(s)" value is summed over SURVIVING
-/// dice only (CR 706.4 + CR 706.6), and the `rolled_any == false` branch clears
-/// it rather than stamping `Some(0)`.
+/// dice only (CR 706.4 + CR 706.6), and a zero-count instruction rolls no dice
+/// and stamps `Some(0)` (the total of no results is 0; Hydradoodle's ruling).
 #[test]
 fn aggregate_die_result_covers_survivors_only() {
     let mut scenario = GameScenario::new();

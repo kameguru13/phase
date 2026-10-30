@@ -2093,7 +2093,7 @@ pub(crate) fn parse_event_context_quantity_with_context(
     // is exposed via the same EventContextAmount channel that "that much" /
     // "that many" use (Adorable Kitten "You gain life equal to the result"
     // after roll-a-die). Both compile to the same runtime resolver.
-    // CR 706.4 + CR 706.2: "the total of those results" is the aggregate of
+    // CR 706.4 + CR 706.2 + CR 706.6: "the total of those results" is the aggregate of
     // the surviving dice's results; the same runtime channel, with
     // `die_result_this_resolution` holding the survivors' total.
     if all_consuming(alt((

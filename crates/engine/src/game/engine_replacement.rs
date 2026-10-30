@@ -3650,8 +3650,9 @@ pub(crate) fn take_entry_continuation_custody(
     }
 }
 
-/// CR 800.4a: has the entrant this parked event describes left the game with
-/// its owner or controller of record? A `ZoneChanged` reads its record; a
+/// CR 800.4a: has the owner or the controller of record of the entrant this
+/// parked event describes left the game (its owner's objects leave the game;
+/// objects its controller still controls are exiled)? A `ZoneChanged` reads its record; a
 /// `LandPlayed` / attach event follows the parked `ZoneChanged` for the same
 /// object, else the object in `state.objects`.
 fn parked_entrant_left_the_game(state: &GameState, event: &GameEvent, park: &[GameEvent]) -> bool {
