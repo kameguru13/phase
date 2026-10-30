@@ -42,8 +42,8 @@
 //! - The draw step's beginning triggers (CR 117.3a). An intervening-if is checked as the step
 //!   begins (CR 603.4), so the activation may be what makes it true: Voltaic Key untapping a
 //!   tapped Howling Mine. Any trigger that reaches the AI's draw step (its own "your"
-//!   triggers, anyone's "each player's", and delayed triggers set for it, CR 603.7) stands
-//!   the whole upkeep down (`patient_window`).
+//!   triggers, anyone's "each player's", an opponent's "each opponent's", and delayed
+//!   triggers set for it, CR 603.7) stands the whole upkeep down (`patient_window`).
 //! - The draw step's draw (CR 504.1 + CR 121.1). An activation that replaces it (CR 614.4) or
 //!   arranges the cards it takes stands itself down (`DrawSetup`, escape hatch 2).
 //! - The main phase's opening events (CR 505.3-505.5, CR 117.3a), which stand the upkeep and
@@ -328,7 +328,8 @@ enum PatientWindow {
 /// phase. An intervening-if checked as the step begins (CR 603.4), or anything else the trigger
 /// reads, may depend on an activation made now. So any such trigger stands the whole upkeep
 /// down, pristine or not ([`phase_opens_with_triggers`]: the AI's own "your" triggers, anyone's
-/// "each player's" triggers, and delayed triggers set for it). Like the upkeep check, this is
+/// "each player's" triggers, an opponent's "each opponent's" triggers, and delayed triggers set
+/// for it). Like the upkeep check, this is
 /// deliberately not gated on the trigger functioning or on its condition. The draw step itself
 /// is unaffected: by its priority, its triggers and its draw are behind it (CR 504.2,
 /// CR 117.3a).
@@ -349,7 +350,8 @@ fn patient_window(state: &GameState, ai_player: PlayerId) -> Option<PatientWindo
     // CR 504.1 + CR 117.3a + CR 603.4: from the upkeep the draw step is still ahead, and a
     // trigger at its beginning checks its intervening-if as the step begins, so it can read
     // what an activation now changes (Voltaic Key untapping a tapped Howling Mine). Activating
-    // in the main phase cannot reach it, so waiting is not free: no upkeep is a patient window.
+    // in the main phase cannot reach it, so waiting is not free: this upkeep, pristine or not,
+    // is not a patient window.
     if state.phase == Phase::Upkeep && phase_opens_with_triggers(state, ai_player, Phase::Draw) {
         return None;
     }
