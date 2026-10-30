@@ -2024,7 +2024,8 @@ fn filter_excludes_parent_target(filter: &TargetFilter) -> bool {
 
 /// CR 611.2a + CR 514.2: a continuous effect from resolution lasts as stated, and "until end of
 /// turn" effects end in the cleanup step, so a P/T (CR 613.4c) or keyword grant that lasts until
-/// end of turn is a combat-window effect.
+/// end of turn is bound to this turn, whatever the keyword. [`effect_is_combat_trick_payload`]
+/// is the narrower reading of which such grants are priced as combat tricks.
 pub(crate) fn ability_is_temporary_combat_modifier(ability: &AbilityDefinition) -> bool {
     ability_effect_is_temporary_combat_modifier(ability)
         && ability
@@ -2097,9 +2098,9 @@ fn continuous_modification_is_temporary_combat_modifier(
 /// graveyard keyword pays off from the graveyard (flashback, escape, embalm: CR 702.34a,
 /// CR 702.138a, CR 702.128a), and a protective keyword pays off against removal in any phase
 /// (hexproof, indestructible, protection, shroud: CR 702.11b, CR 702.12b, CR 702.16b,
-/// CR 702.18a). This is an allowlist rather than an exhaustive `match`, as
-/// `keyword_is_defensive` is, so that an unclassified or future keyword fails closed and takes
-/// no combat-window penalty.
+/// CR 702.18a). Like `keyword_is_defensive`, this is an allowlist rather than an exhaustive
+/// `match`, so that an unclassified or future keyword fails closed and takes no combat-window
+/// penalty.
 fn keyword_is_bound_to_combat(keyword: &Keyword) -> bool {
     matches!(
         keyword,
@@ -2182,7 +2183,7 @@ fn modification_is_creature_type_rider(modification: &ContinuousModification) ->
 /// `Pump`/`DoublePT` carry their duration on the ability, not the effect, so at this
 /// granularity they are accepted as the effect-timing and hint call sites always have;
 /// the ability-level [`ability_is_temporary_combat_modifier`] stays the authority where
-/// the definition is in hand.
+/// the definition is in hand. [`CombatBinding`] reads a candidate's whole resolution.
 pub(crate) fn effect_is_combat_trick_payload(effect: &Effect) -> bool {
     match effect {
         Effect::Pump { .. } | Effect::DoublePT { .. } => true,
@@ -2203,6 +2204,123 @@ pub(crate) fn effect_is_combat_trick_payload(effect: &Effect) -> bool {
         }
         _ => false,
     }
+}
+
+/// How much of a candidate's resolution is bound to the combat window. CR 601.2b + CR 700.2a:
+/// the caller's walk decides which modes are read: every mode of a spell not yet announced,
+/// only the chosen modes at the prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CombatBinding {
+    /// No combat-trick payload.
+    Unbound,
+    /// A payload beside value that lands elsewhere. Combat still pays the payload, but
+    /// waiting costs the rest, so timing takes no penalty out of the window.
+    Partial,
+    /// A payload and only riders of it: the combat window is the candidate's whole value
+    /// (CR 611.2a + CR 514.2).
+    Whole,
+}
+
+impl CombatBinding {
+    pub(crate) fn of_resolution(effects: &[&Effect]) -> Self {
+        if !effects.iter().copied().any(effect_is_combat_trick_payload) {
+            return Self::Unbound;
+        }
+        if effects.iter().copied().all(|effect| {
+            effect_is_combat_trick_payload(effect) || effect_has_no_value_outside_combat(effect)
+        }) {
+            Self::Whole
+        } else {
+            Self::Partial
+        }
+    }
+}
+
+/// Does this effect, beside a combat-trick payload, add no value outside the combat window?
+/// This is an allowlist, as [`keyword_is_bound_to_combat`] is, so that an unclassified or
+/// future effect fails closed: it reads as value elsewhere and takes no combat-window penalty.
+fn effect_has_no_value_outside_combat(effect: &Effect) -> bool {
+    match effect {
+        // CR 613.4c: a group's P/T change, in the window a `Pump` is.
+        Effect::PumpAll { .. }
+        // CR 701.26a + CR 701.26b: a tap or untap beside a pump decides a combat's attackers
+        // and blockers.
+        | Effect::SetTapState { .. }
+        // CR 509.1c: a requirement on this turn's blocks.
+        | Effect::ForceBlock { .. } => true,
+        Effect::GenericEffect {
+            static_abilities,
+            duration: Some(Duration::UntilEndOfTurn),
+            ..
+        } => {
+            !static_abilities.is_empty()
+                && static_abilities.iter().all(|static_def| {
+                    !static_def.modifications.is_empty()
+                        && static_def
+                            .modifications
+                            .iter()
+                            .all(modification_rides_a_trick)
+                })
+        }
+        // CR 603.7: a delayed removal of what was pumped is the pump's drawback, not a payoff.
+        Effect::CreateDelayedTrigger { effect, .. } => collect_definition_effects(effect)
+            .into_iter()
+            .all(effect_removes_its_own_subject),
+        _ => false,
+    }
+}
+
+fn modification_rides_a_trick(modification: &ContinuousModification) -> bool {
+    modification_is_bound_to_combat(modification)
+        || modification_is_creature_type_rider(modification)
+        || matches!(
+            modification,
+            ContinuousModification::AddStaticMode { mode } if static_mode_is_bound_to_combat(mode)
+        )
+}
+
+/// CR 508.1c + CR 508.1d + CR 509.1b + CR 509.1c: the restrictions and requirements read as
+/// attackers and blockers are declared, among them goad's (CR 701.15b), plus the permission to
+/// attack despite defender (CR 702.3b). Unlisted modes fail closed.
+fn static_mode_is_bound_to_combat(mode: &StaticMode) -> bool {
+    matches!(
+        mode,
+        StaticMode::CantAttack
+            | StaticMode::CantBlock
+            | StaticMode::CantAttackOrBlock
+            | StaticMode::AttackOnlyNeighbor
+            | StaticMode::MaxAttackersEachCombat { .. }
+            | StaticMode::MaxBlockersEachCombat { .. }
+            | StaticMode::MustAttack
+            | StaticMode::MustAttackDefender { .. }
+            | StaticMode::MustAttackAwayFromSource
+            | StaticMode::Goaded
+            | StaticMode::MustBlock
+            | StaticMode::MustBlockAttacker { .. }
+            | StaticMode::ExtraBlockers { .. }
+            | StaticMode::BlockRestriction { .. }
+            | StaticMode::CombatAlone { .. }
+            | StaticMode::CantBeBlocked
+            | StaticMode::CantBeBlockedExceptBy { .. }
+            | StaticMode::CantBeBlockedBy { .. }
+            | StaticMode::CantBeBlockedByMoreThan { .. }
+            | StaticMode::CantBeBlockedUnlessAllBlock
+            | StaticMode::MustBeBlocked { .. }
+            | StaticMode::MustBeBlockedByAll { .. }
+            | StaticMode::CanAttackWithDefender
+    )
+}
+
+/// CR 701.21a + CR 701.8a: sacrificing, destroying or bouncing the creature that was pumped, or
+/// the source, only takes it away. Any other subject is a payoff, or fails closed.
+fn effect_removes_its_own_subject(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::Sacrifice { target, .. }
+            | Effect::Destroy { target, .. }
+            | Effect::Bounce { target, .. }
+            if matches!(target, TargetFilter::ParentTarget | TargetFilter::SelfRef)
+    )
 }
 
 /// The effects a cast spell itself resolves: its spell abilities (CR 113.3a + CR 608.2), read
@@ -2517,7 +2635,15 @@ mod suspect_scope_tests {
 #[cfg(test)]
 mod temporary_combat_modifier_tests {
     use super::*;
+    use crate::cast_facts::{collect_definition_effects_with, ModeWalk};
+    use engine::types::ability::{
+        BounceSelection, DelayedTriggerCondition, EffectKind, TypedFilter,
+    };
+    use engine::types::identifiers::ObjectIncarnationRef;
     use engine::types::keywords::{EmbalmCost, EscapeCost, FlashbackCost};
+    use engine::types::statics::{
+        BlockExceptionKind, CombatAloneAction, CombatAloneRequirement, RequiredDefender,
+    };
 
     fn until_end_of_turn(static_abilities: Vec<StaticDefinition>) -> Effect {
         Effect::GenericEffect {
@@ -2659,6 +2785,480 @@ mod temporary_combat_modifier_tests {
             plus_one(),
             grant(Keyword::Indestructible)
         ]));
+    }
+
+    fn parsed(oracle_text: &str, name: &str, core_type: &str) -> Vec<AbilityDefinition> {
+        engine::parser::oracle::parse_oracle_text(
+            oracle_text,
+            name,
+            &[],
+            &[core_type.to_string()],
+            &[],
+        )
+        .abilities
+    }
+
+    /// A cast reads every Spell ability and every mode (CR 601.2b).
+    fn cast_walk(abilities: &[AbilityDefinition]) -> Vec<&Effect> {
+        abilities
+            .iter()
+            .filter(|ability| ability.kind == AbilityKind::Spell)
+            .flat_map(collect_definition_effects)
+            .collect()
+    }
+
+    /// An activation reads the one ability it activates, here the card's first.
+    fn activation_walk(abilities: &[AbilityDefinition]) -> Vec<&Effect> {
+        let ability = abilities
+            .iter()
+            .find(|ability| ability.kind == AbilityKind::Activated)
+            .expect("the card prints an activated ability");
+        collect_definition_effects_with(ability, ModeWalk::RootOnly)
+    }
+
+    /// `Whole` needs every effect to be a payload or a rider of one; the premise pins each
+    /// card's parsed shape, so a row cannot pass by parsing into a different chain.
+    #[test]
+    fn combat_binding_reads_the_whole_resolution() {
+        use CombatBinding::{Partial, Whole};
+        use EffectKind as K;
+
+        type Row = (
+            &'static str,
+            &'static str,
+            &'static str,
+            &'static [EffectKind],
+            CombatBinding,
+        );
+
+        let instant_or_sorcery: [Row; 22] = [
+            (
+                "Giant Growth",
+                "Instant",
+                "Target creature gets +3/+3 until end of turn.",
+                &[K::Pump],
+                Whole,
+            ),
+            (
+                "Barge In",
+                "Instant",
+                "Target attacking creature gets +2/+2 until end of turn. Each attacking non-Human creature gains trample until end of turn.",
+                &[K::Pump, K::GenericEffect],
+                Whole,
+            ),
+            (
+                "Arm the Cathars",
+                "Sorcery",
+                "Until end of turn, target creature gets +3/+3, up to one other target creature gets +2/+2, and up to one other target creature gets +1/+1. Those creatures gain vigilance until end of turn.",
+                &[K::Pump, K::Pump, K::Pump, K::GenericEffect],
+                Whole,
+            ),
+            (
+                "Coordinated Assault",
+                "Instant",
+                "Up to two target creatures each get +1/+0 and gain first strike until end of turn. (They deal combat damage before creatures without first strike.)",
+                &[K::GenericEffect],
+                Whole,
+            ),
+            (
+                "Gerrard's Command",
+                "Instant",
+                "Untap target creature. It gets +3/+3 until end of turn.",
+                &[K::Untap, K::Pump],
+                Whole,
+            ),
+            (
+                "Stabbing Pain",
+                "Instant",
+                "Target creature gets -1/-1 until end of turn. Tap that creature.",
+                &[K::Pump, K::Tap],
+                Whole,
+            ),
+            (
+                "Echoing Courage",
+                "Instant",
+                "Target creature and all other creatures with the same name as that creature get +2/+2 until end of turn.",
+                &[K::Pump, K::PumpAll],
+                Whole,
+            ),
+            (
+                "Monstrous Step",
+                "Sorcery",
+                "Target creature gets +7/+7 until end of turn. Up to one other target creature blocks it this turn if able.\nCycling {2} ({2}, Discard this card: Draw a card.)",
+                &[K::Pump, K::ForceBlock],
+                Whole,
+            ),
+            (
+                "Give No Ground",
+                "Instant",
+                "Target creature gets +2/+6 until end of turn and can block any number of creatures this turn.",
+                &[K::Pump, K::GenericEffect],
+                Whole,
+            ),
+            (
+                "Emergent Growth",
+                "Sorcery",
+                "Target creature gets +5/+5 until end of turn and must be blocked this turn if able.",
+                &[K::Pump, K::GenericEffect],
+                Whole,
+            ),
+            (
+                "Blood Frenzy",
+                "Instant",
+                "Cast this spell only before the combat damage step.\nTarget attacking or blocking creature gets +4/+0 until end of turn. Destroy that creature at the beginning of the next end step.",
+                &[K::Pump, K::CreateDelayedTrigger],
+                Whole,
+            ),
+            (
+                "Invigorated Rampage",
+                "Instant",
+                "Choose one —\n• Target creature gets +4/+0 and gains trample until end of turn.\n• Two target creatures each get +2/+0 and gain trample until end of turn.",
+                &[K::GenericEffect, K::GenericEffect],
+                Whole,
+            ),
+            (
+                "Heroic Reinforcements",
+                "Sorcery",
+                "Create two 1/1 white Soldier creature tokens. Until end of turn, creatures you control get +1/+1 and gain haste. (They can attack and {T} this turn.)",
+                &[K::Token, K::GenericEffect],
+                Partial,
+            ),
+            (
+                "Deafening Clarion",
+                "Sorcery",
+                "Choose one or both —\n• Deafening Clarion deals 3 damage to each creature.\n• Creatures you control gain lifelink until end of turn.",
+                &[K::DamageAll, K::GenericEffect],
+                Partial,
+            ),
+            (
+                "Goblin War Party",
+                "Sorcery",
+                "Choose one —\n• Create three 1/1 red Goblin creature tokens.\n• Creatures you control get +1/+1 and gain haste until end of turn.\nEntwine {2}{R} (Choose both if you pay the entwine cost.)",
+                &[K::Token, K::GenericEffect],
+                Partial,
+            ),
+            (
+                "Monstrous Rage",
+                "Instant",
+                "Target creature gets +2/+0 until end of turn. Create a Monster Role token attached to it. (If you control another Role on it, put that one into the graveyard. Enchanted creature gets +1/+1 and has trample.)",
+                &[K::Pump, K::Token],
+                Partial,
+            ),
+            (
+                "Afflict",
+                "Instant",
+                "Target creature gets -1/-1 until end of turn.\nDraw a card.",
+                &[K::Pump, K::Draw],
+                Partial,
+            ),
+            (
+                "Moment of Triumph",
+                "Instant",
+                "Target creature gets +2/+2 until end of turn. You gain 2 life.",
+                &[K::Pump, K::GainLife],
+                Partial,
+            ),
+            (
+                "A Good Day to Die",
+                "Instant",
+                "Target creature gets +2/+0 until end of turn. When that creature dies this turn, you draw a card.",
+                &[K::Pump, K::CreateDelayedTrigger],
+                Partial,
+            ),
+            (
+                "Karametra's Blessing",
+                "Instant",
+                "Target creature gets +2/+2 until end of turn. If it's an enchanted creature or enchantment creature, it also gains hexproof and indestructible until end of turn. (It can't be the target of spells or abilities your opponents control. Damage and effects that say \"destroy\" don't destroy it.)",
+                &[K::Pump, K::GenericEffect],
+                Partial,
+            ),
+            (
+                "Unnatural Endurance",
+                "Instant",
+                "Devoid (This card has no color.)\nTarget creature gets +2/+0 until end of turn. Regenerate it.",
+                &[K::Pump, K::Regenerate],
+                Partial,
+            ),
+            (
+                "Act of Treason",
+                "Sorcery",
+                "Gain control of target creature until end of turn. Untap that creature. It gains haste until end of turn. (It can attack and {T} this turn.)",
+                &[K::GainControl, K::Untap, K::GenericEffect],
+                Partial,
+            ),
+        ];
+        let activated: [Row; 5] = [
+            (
+                "Vectis Agents",
+                "Creature",
+                "{U}{B}: This creature gets -2/-0 until end of turn and can't be blocked this turn.",
+                &[K::Pump, K::GenericEffect],
+                Whole,
+            ),
+            (
+                "Mobile Fort",
+                "Creature",
+                "Defender (This creature can't attack.)\n{3}: This creature gets +3/-1 until end of turn and can attack this turn as though it didn't have defender. Activate only once each turn.",
+                &[K::Pump, K::GenericEffect],
+                Whole,
+            ),
+            (
+                "Pyric Salamander",
+                "Creature",
+                "{R}: This creature gets +1/+0 until end of turn. Sacrifice this creature at the beginning of the next end step.",
+                &[K::Pump, K::CreateDelayedTrigger],
+                Whole,
+            ),
+            (
+                "Dragon Mask",
+                "Artifact",
+                "{3}, {T}: Target creature you control gets +2/+2 until end of turn. Return it to its owner's hand at the beginning of the next end step. (Return it only if it's on the battlefield.)",
+                &[K::Pump, K::CreateDelayedTrigger],
+                Whole,
+            ),
+            (
+                "The Wandering Emperor",
+                "Planeswalker",
+                "Flash\nAs long as The Wandering Emperor entered this turn, you may activate her loyalty abilities any time you could cast an instant.\n[+1]: Put a +1/+1 counter on up to one target creature. It gains first strike until end of turn.\n[−1]: Create a 2/2 white Samurai creature token with vigilance.\n[−2]: Exile target tapped creature. You gain 2 life.",
+                &[K::PutCounter, K::GenericEffect],
+                Partial,
+            ),
+        ];
+
+        let check = |name: &str, walk: Vec<&Effect>, kinds: &[EffectKind], binding| {
+            let parsed_kinds: Vec<EffectKind> = walk
+                .iter()
+                .map(|effect| EffectKind::from(*effect))
+                .collect();
+            assert_eq!(parsed_kinds, kinds, "premise: {name} parses to this chain");
+            assert_eq!(CombatBinding::of_resolution(&walk), binding, "{name}");
+        };
+        for (name, core_type, oracle_text, kinds, binding) in instant_or_sorcery {
+            let abilities = parsed(oracle_text, name, core_type);
+            check(name, cast_walk(&abilities), kinds, binding);
+        }
+        for (name, core_type, oracle_text, kinds, binding) in activated {
+            let abilities = parsed(oracle_text, name, core_type);
+            check(name, activation_walk(&abilities), kinds, binding);
+        }
+    }
+
+    fn bare_pump() -> Effect {
+        Effect::Pump {
+            power: PtValue::Fixed(1),
+            toughness: PtValue::Fixed(1),
+            target: TargetFilter::ParentTarget,
+        }
+    }
+
+    fn static_grant(mode: StaticMode, duration: Option<Duration>) -> Effect {
+        Effect::GenericEffect {
+            static_abilities: vec![StaticDefinition::new(mode.clone())
+                .affected(TargetFilter::ParentTarget)
+                .modifications(vec![ContinuousModification::AddStaticMode { mode }])],
+            target: Some(TargetFilter::ParentTarget),
+            duration,
+            end_cost: None,
+        }
+    }
+
+    fn delayed(ability: AbilityDefinition) -> Effect {
+        Effect::CreateDelayedTrigger {
+            condition: DelayedTriggerCondition::AtNextPhase { phase: Phase::End },
+            effect: Box::new(ability),
+            uses_tracked_set: false,
+        }
+    }
+
+    fn sacrifice(target: TargetFilter) -> Effect {
+        Effect::Sacrifice {
+            target,
+            count: QuantityExpr::Fixed { value: 1 },
+            min_count: 0,
+        }
+    }
+
+    fn draw() -> Effect {
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        }
+    }
+
+    fn set_tap_state() -> Effect {
+        Effect::SetTapState {
+            target: TargetFilter::ParentTarget,
+            scope: EffectScope::Single,
+            state: TapStateChange::Untap,
+        }
+    }
+
+    fn pump_all() -> Effect {
+        Effect::PumpAll {
+            power: PtValue::Fixed(1),
+            toughness: PtValue::Fixed(1),
+            target: TargetFilter::ParentTarget,
+        }
+    }
+
+    fn beside_a_pump(effect: &Effect) -> CombatBinding {
+        CombatBinding::of_resolution(&[&bare_pump(), effect])
+    }
+
+    /// The riders read in full: every attack and block static of CR 508.1c, CR 508.1d, CR 509.1b
+    /// and CR 509.1c, with the permission beside them, and a delayed removal of what was pumped.
+    /// A rider alone is no payload, and anything else beside a payload fails closed.
+    #[test]
+    fn only_attack_and_block_statics_and_self_removal_ride_a_trick() {
+        use CombatBinding::{Partial, Unbound, Whole};
+
+        let until_eot = Some(Duration::UntilEndOfTurn);
+        for mode in [
+            StaticMode::CantAttack,
+            StaticMode::CantBlock,
+            StaticMode::CantAttackOrBlock,
+            StaticMode::AttackOnlyNeighbor,
+            StaticMode::MaxAttackersEachCombat {
+                max: 1,
+                defender: None,
+            },
+            StaticMode::MaxBlockersEachCombat { max: 1 },
+            StaticMode::MustAttack,
+            StaticMode::MustAttackDefender {
+                defender: RequiredDefender::Fixed {
+                    player: PlayerId(1),
+                },
+            },
+            StaticMode::MustAttackAwayFromSource,
+            StaticMode::Goaded,
+            StaticMode::MustBlock,
+            StaticMode::MustBlockAttacker {
+                attacker: ObjectIncarnationRef::of(ObjectId(1), 0),
+            },
+            StaticMode::ExtraBlockers { count: None },
+            StaticMode::BlockRestriction {
+                filter: TargetFilter::Any,
+            },
+            StaticMode::CombatAlone {
+                action: CombatAloneAction::Attack,
+                requirement: CombatAloneRequirement::NeedsCompanion,
+            },
+            StaticMode::CantBeBlocked,
+            StaticMode::CantBeBlockedExceptBy {
+                kind: BlockExceptionKind::MinBlockers { min: 2 },
+            },
+            StaticMode::CantBeBlockedBy {
+                filter: TargetFilter::Any,
+            },
+            StaticMode::CantBeBlockedByMoreThan { max: 1 },
+            StaticMode::CantBeBlockedUnlessAllBlock,
+            StaticMode::MustBeBlocked { by: None },
+            StaticMode::MustBeBlockedByAll { blockers: None },
+            StaticMode::CanAttackWithDefender,
+        ] {
+            let rider = static_grant(mode.clone(), until_eot.clone());
+            assert_eq!(beside_a_pump(&rider), Whole, "{mode:?} rides a pump");
+            assert_eq!(
+                CombatBinding::of_resolution(&[&rider]),
+                Unbound,
+                "{mode:?} alone is no payload"
+            );
+        }
+
+        assert_eq!(CombatBinding::of_resolution(&[]), Unbound);
+        let forced_block = Effect::ForceBlock {
+            target: TargetFilter::ParentTarget,
+            attacker: None,
+            duration: Duration::UntilEndOfTurn,
+        };
+        for rider in [set_tap_state(), pump_all(), forced_block] {
+            assert_eq!(beside_a_pump(&rider), Whole, "{rider:?} rides a pump");
+            assert_eq!(
+                CombatBinding::of_resolution(&[&rider]),
+                Unbound,
+                "{rider:?} alone is no payload"
+            );
+        }
+
+        for target in [TargetFilter::ParentTarget, TargetFilter::SelfRef] {
+            for removal in [
+                sacrifice(target.clone()),
+                Effect::Destroy {
+                    target: target.clone(),
+                    cant_regenerate: false,
+                },
+                Effect::Bounce {
+                    target: target.clone(),
+                    destination: None,
+                    selection: BounceSelection::Targeted,
+                },
+            ] {
+                let rider = delayed(AbilityDefinition::new(AbilityKind::Spell, removal));
+                assert_eq!(beside_a_pump(&rider), Whole, "{rider:?} rides a pump");
+                assert_eq!(
+                    CombatBinding::of_resolution(&[&rider]),
+                    Unbound,
+                    "{rider:?} alone is no payload"
+                );
+            }
+        }
+
+        for (why, effect) in [
+            (
+                "a rule modification outside declarations",
+                static_grant(StaticMode::CantGainLife, until_eot.clone()),
+            ),
+            (
+                "a protective grant",
+                until_end_of_turn(vec![pump(vec![grant(Keyword::Hexproof)])]),
+            ),
+            (
+                "a grant that outlasts the turn",
+                static_grant(StaticMode::CantBlock, Some(Duration::Permanent)),
+            ),
+            ("an empty grant", until_end_of_turn(vec![])),
+            ("empty modifications", until_end_of_turn(vec![pump(vec![])])),
+            (
+                "an empty static beside a rider",
+                until_end_of_turn(vec![
+                    pump(vec![]),
+                    pump(vec![ContinuousModification::AddStaticMode {
+                        mode: StaticMode::CantBlock,
+                    }]),
+                ]),
+            ),
+            (
+                "another creature's sacrifice",
+                delayed(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    sacrifice(TargetFilter::Typed(TypedFilter::default())),
+                )),
+            ),
+            (
+                "a token's sacrifice",
+                delayed(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    sacrifice(TargetFilter::LastCreated),
+                )),
+            ),
+            (
+                "a delayed draw",
+                delayed(AbilityDefinition::new(AbilityKind::Spell, draw())),
+            ),
+            (
+                "a delayed draw behind a removal",
+                delayed(
+                    AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        sacrifice(TargetFilter::ParentTarget),
+                    )
+                    .sub_ability(AbilityDefinition::new(AbilityKind::Spell, draw())),
+                ),
+            ),
+            ("a draw", draw()),
+        ] {
+            assert_eq!(beside_a_pump(&effect), Partial, "{why} is value elsewhere");
+        }
     }
 }
 

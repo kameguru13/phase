@@ -21,7 +21,7 @@ use super::activation::turn_only;
 use super::context::{collect_ability_effects, PolicyContext};
 use super::effect_classify::{
     effect_is_combat_trick_payload, extract_target_filter, precombat_main_is_last_trick_window,
-    spell_resolution_effects, targets_creatures_only, TimingSubject,
+    spell_resolution_effects, targets_creatures_only, CombatBinding, TimingSubject,
 };
 use super::registry::{
     DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy, STRONG_MAX,
@@ -52,14 +52,14 @@ impl EffectTimingPolicy {
         }
 
         // CR 611.2a + CR 514.2: a combat-window payload is priced only when the candidate itself
-        // resolves it, so a permanent spell is not timed by what its abilities do later. The
-        // trick is priced once per candidate, however many payload effects its chain carries.
-        if own_resolution_effects(ctx)
-            .into_iter()
-            .any(effect_is_combat_trick_payload)
-        {
-            score += combat_trick_score(ctx);
-        }
+        // resolves it, so a permanent spell is not timed by what its abilities do later, and it is
+        // priced once per candidate. A payload beside value that lands elsewhere keeps the combat
+        // window and takes no penalty out of it: waiting would cost the rest.
+        score += match CombatBinding::of_resolution(&own_resolution_effects(ctx)) {
+            CombatBinding::Whole => combat_trick_score(ctx),
+            CombatBinding::Partial => combat_trick_score(ctx).max(0.0),
+            CombatBinding::Unbound => 0.0,
+        };
 
         score
     }
@@ -431,6 +431,8 @@ fn removal_score(ctx: &PolicyContext<'_>) -> f64 {
 
     // Incentivize casting removal now when opponent has pump spells on the stack —
     // killing the pumped creature wastes both the creature and the pump (2-for-1).
+    // This asks whether a pump is on the stack, not whether combat is its whole value, so it
+    // reads any payload on the entry.
     let pump_response = if !ctx.state.stack.is_empty()
         && ctx.state.stack.iter().any(|entry| {
             entry.controller != ctx.ai_player
@@ -3252,6 +3254,25 @@ mod tests {
     const ROCKFACE_VILLAGE: &str = "{T}: Add {C}.\n{T}: Add {R}. Spend this mana only to cast a creature spell.\n{R}, {T}: Target Lizard, Mouse, Otter, or Raccoon you control gets +1/+0 and gains haste until end of turn. Activate only as a sorcery.";
     const THE_WANDERING_EMPEROR: &str = "Flash\nAs long as The Wandering Emperor entered this turn, you may activate her loyalty abilities any time you could cast an instant.\n[+1]: Put a +1/+1 counter on up to one target creature. It gains first strike until end of turn.\n[−1]: Create a 2/2 white Samurai creature token with vigilance.\n[−2]: Exile target tapped creature. You gain 2 life.";
     const LEYLINE_OF_ANTICIPATION: &str = "If this card is in your opening hand, you may begin the game with it on the battlefield.\nYou may cast spells as though they had flash.";
+    const HEROIC_REINFORCEMENTS: &str = "Create two 1/1 white Soldier creature tokens. Until end of turn, creatures you control get +1/+1 and gain haste. (They can attack and {T} this turn.)";
+    const GOBLIN_WAR_PARTY: &str = "Choose one —\n• Create three 1/1 red Goblin creature tokens.\n• Creatures you control get +1/+1 and gain haste until end of turn.\nEntwine {2}{R} (Choose both if you pay the entwine cost.)";
+    const MONSTROUS_RAGE: &str = "Target creature gets +2/+0 until end of turn. Create a Monster Role token attached to it. (If you control another Role on it, put that one into the graveyard. Enchanted creature gets +1/+1 and has trample.)";
+    const AFFLICT: &str = "Target creature gets -1/-1 until end of turn.\nDraw a card.";
+    const MOMENT_OF_TRIUMPH: &str =
+        "Target creature gets +2/+2 until end of turn. You gain 2 life.";
+    const GERRARDS_COMMAND: &str = "Untap target creature. It gets +3/+3 until end of turn.";
+    const STABBING_PAIN: &str = "Target creature gets -1/-1 until end of turn. Tap that creature.";
+    const ECHOING_COURAGE: &str = "Target creature and all other creatures with the same name as that creature get +2/+2 until end of turn.";
+    const MONSTROUS_STEP: &str = "Target creature gets +7/+7 until end of turn. Up to one other target creature blocks it this turn if able.\nCycling {2} ({2}, Discard this card: Draw a card.)";
+    const GIVE_NO_GROUND: &str = "Target creature gets +2/+6 until end of turn and can block any number of creatures this turn.";
+    const EMERGENT_GROWTH: &str =
+        "Target creature gets +5/+5 until end of turn and must be blocked this turn if able.";
+    const INVIGORATED_RAMPAGE: &str = "Choose one —\n• Target creature gets +4/+0 and gains trample until end of turn.\n• Two target creatures each get +2/+0 and gain trample until end of turn.";
+    const PYRIC_SALAMANDER: &str = "{R}: This creature gets +1/+0 until end of turn. Sacrifice this creature at the beginning of the next end step.";
+    const VECTIS_AGENTS: &str =
+        "{U}{B}: This creature gets -2/-0 until end of turn and can't be blocked this turn.";
+    const MOBILE_FORT: &str = "Defender (This creature can't attack.)\n{3}: This creature gets +3/-1 until end of turn and can attack this turn as though it didn't have defender. Activate only once each turn.";
+    const DRAGON_MASK: &str = "{3}, {T}: Target creature you control gets +2/+2 until end of turn. Return it to its owner's hand at the beginning of the next end step. (Return it only if it's on the battlefield.)";
 
     fn mana(generic: u32, shards: Vec<ManaCostShard>) -> ManaCost {
         ManaCost::Cost { shards, generic }
@@ -3568,8 +3589,8 @@ mod tests {
     /// CR 601.3b + CR 702.8a + CR 304.5: the engine's authority decides, not the card type. With
     /// its controller's Leyline of Anticipation, Overrun can wait for combat and prices as
     /// Coordinated Assault; an opponent's Leyline opens nothing for P0. The Wandering Emperor's
-    /// +1 stays priced in the turn she entered, the permission's window, and is neutral on a
-    /// later turn.
+    /// counter keeps her +1 neutral in both rows: the turn she entered, the permission's window,
+    /// and a later turn.
     #[test]
     fn a_timing_permission_keeps_a_sorcery_speed_trick_priced() {
         for (leyline_controller, confined) in [(P0, false), (P1, true)] {
@@ -3608,6 +3629,10 @@ mod tests {
                     THE_WANDERING_EMPEROR,
                 )
                 .id();
+            let shivan = s
+                .add_creature_from_oracle(P0, "Shivan Dragon", 5, 5, SHIVAN_DRAGON)
+                .with_mana_cost(mana(4, vec![ManaCostShard::Red, ManaCostShard::Red]))
+                .id();
             let mut runner = s.build();
             settle(&mut runner);
             set_emperor_entered(&mut runner, emperor, entered_this_turn);
@@ -3619,44 +3644,45 @@ mod tests {
                 confined,
                 "premise: the query, entered this turn: {entered_this_turn}"
             );
-            let d_plus_one = activation_delta(state, emperor, plus_one);
-            if confined {
-                assert_eq!(d_plus_one, 0.0, "her +1 outside the permission is neutral");
-            } else {
-                // Decided residual: the card reads 0.0 (her counter stays); a rider fix flips this.
-                assert!(d_plus_one < -1.5, "her +1 under the permission is priced");
-            }
+            let d_shivan = activation_delta(state, shivan, last_activated_index(state, shivan));
+            assert!(
+                d_shivan < -1.5,
+                "reach: Shivan Dragon is priced, {d_shivan}"
+            );
+            assert_eq!(
+                activation_delta(state, emperor, plus_one),
+                0.0,
+                "her counter stays, entered this turn: {entered_this_turn}"
+            );
         }
     }
 
-    /// Own-turn Deafening Clarion, cast in `phase` with no modes chosen: its `[0]`, `[1]` and
+    /// Own-turn sorcery `name`, cast in `phase` with no modes chosen: its `[0]`, `[1]` and
     /// `[0, 1]` deltas at the mode prompt. The prompt and all three candidates are unconditional.
-    fn clarion_mode_deltas(phase: Phase, leyline: bool) -> [f64; 3] {
-        use ManaCostShard::{Red, White};
-
+    fn mode_deltas(
+        phase: Phase,
+        leyline: bool,
+        name: &str,
+        oracle_text: &str,
+        cost: ManaCost,
+    ) -> [f64; 3] {
         let mut s = trick_scenario();
-        let clarion = add_spell(
-            &mut s,
-            "Deafening Clarion",
-            false,
-            DEAFENING_CLARION,
-            mana(1, vec![Red, White]),
-        );
+        let spell = add_spell(&mut s, name, false, oracle_text, cost);
         if leyline {
             add_leyline(&mut s, P0);
         }
         let mut runner = s.build();
         runner.state_mut().phase = phase;
         settle(&mut runner);
-        let card_id = runner.state().objects[&clarion].card_id;
+        let card_id = runner.state().objects[&spell].card_id;
         runner
             .act(GameAction::CastSpell {
-                object_id: clarion,
+                object_id: spell,
                 card_id,
                 targets: Vec::new(),
                 payment_mode: CastPaymentMode::Auto,
             })
-            .expect("reach: Deafening Clarion's cast begins");
+            .expect("reach: the cast begins");
         let state = runner.state();
         let WaitingFor::ModeChoice {
             player,
@@ -3667,7 +3693,12 @@ mod tests {
             panic!("reach: expected the mode prompt: {:?}", state.waiting_for);
         };
         assert_eq!(*player, P0);
-        assert_eq!(pending_cast.object_id, clarion);
+        assert_eq!(pending_cast.object_id, spell);
+        assert_eq!(
+            spell_confined_to_sorcery_timing(state, P0, spell),
+            !leyline,
+            "premise: the engine query, read mid-cast"
+        );
 
         let candidates = build_decision_context(state).candidates;
         [vec![0], vec![1], vec![0, 1]].map(|indices| {
@@ -3684,10 +3715,18 @@ mod tests {
         })
     }
 
+    fn clarion_mode_deltas(phase: Phase, leyline: bool) -> [f64; 3] {
+        use ManaCostShard::{Red, White};
+
+        let cost = mana(1, vec![Red, White]);
+        mode_deltas(phase, leyline, "Deafening Clarion", DEAFENING_CLARION, cost)
+    }
+
     /// CR 601.2b + CR 700.2a: a spell's modes are chosen while it is being cast, so the mode
     /// prompt reads the pending cast's object. Deafening Clarion's lifelink mode (CR 611.2a +
     /// CR 514.2) has its last window in the precombat main and reads as its damage mode; a
-    /// postcombat main keeps the penalty, and so does a Leyline's permission, read mid-cast.
+    /// postcombat main keeps the penalty. The Leyline run reads the engine query mid-cast, and
+    /// there a selection with a lasting mode is neutral.
     #[test]
     fn mode_prompt_of_a_sorcery_confined_spell_prices_its_pump_mode_neutral() {
         let [damage, lifelink, _] = clarion_mode_deltas(Phase::PostCombatMain, false);
@@ -3701,11 +3740,247 @@ mod tests {
         assert_eq!(lifelink, 0.0, "the lifelink mode is in its last window");
         assert_eq!(both, 0.0, "both modes together are in their last window");
 
-        let [damage, lifelink, _] = clarion_mode_deltas(Phase::PreCombatMain, true);
-        // Decided residual: the card reads [1] = [0] (cast committed); a prompt fix flips this.
+        let [damage, _, both] = clarion_mode_deltas(Phase::PreCombatMain, true);
+        assert_eq!(damage, 0.0, "the damage mode carries no timing term");
+        assert_eq!(both, 0.0, "the damage in both modes lands in any phase");
+    }
+
+    /// CR 700.2a: only the chosen modes are read at the prompt. A selection with a lasting mode
+    /// is neutral out of combat (CR 611.2a: the tokens stay), the pump mode alone keeps the
+    /// price, and entwine's `[0, 1]` (CR 702.42a) reads as any other pair.
+    #[test]
+    fn mode_prompt_prices_a_selection_by_its_own_modes() {
+        use ManaCostShard::Red;
+
+        let phase = Phase::PostCombatMain;
+        for (name, [lasting, pump, both]) in [
+            ("Deafening Clarion", clarion_mode_deltas(phase, false)),
+            (
+                "Goblin War Party",
+                mode_deltas(
+                    phase,
+                    false,
+                    "Goblin War Party",
+                    GOBLIN_WAR_PARTY,
+                    mana(3, vec![Red]),
+                ),
+            ),
+        ] {
+            assert_eq!(lasting, 0.0, "{name}: the lasting mode carries no price");
+            assert!(pump < -1.5, "{name}: the pump mode is priced, {pump}");
+            assert_eq!(both, 0.0, "{name}: both modes keep the lasting value");
+        }
+    }
+
+    /// CR 611.2a + CR 514.2: the trick price needs combat to be the candidate's whole value. A
+    /// counter, tokens, a card, life, a damage mode or a Role lands outside combat, so those
+    /// candidates take no penalty there, while a pump with only riders does: an untap or a tap,
+    /// a group pump, a forced block, an attack or block static, or a delayed removal of what was
+    /// pumped. In combat the payload still earns the window (combat is priced by policy, so only
+    /// the sign is the card's).
+    #[test]
+    fn trick_price_needs_combat_to_be_the_whole_value() {
+        use ManaCostShard::{Black, Blue, Green, Red, White};
+
+        let mut s = trick_scenario();
+        let reinforcements = add_spell(
+            &mut s,
+            "Heroic Reinforcements",
+            false,
+            HEROIC_REINFORCEMENTS,
+            mana(2, vec![Red, White]),
+        );
+        let war_party = add_spell(
+            &mut s,
+            "Goblin War Party",
+            false,
+            GOBLIN_WAR_PARTY,
+            mana(3, vec![Red]),
+        );
+        let clarion = add_spell(
+            &mut s,
+            "Deafening Clarion",
+            false,
+            DEAFENING_CLARION,
+            mana(1, vec![Red, White]),
+        );
+        let suns = add_spell(
+            &mut s,
+            "Sweltering Suns",
+            false,
+            SWELTERING_SUNS,
+            mana(1, vec![Red, Red]),
+        );
+        let rage = add_spell(
+            &mut s,
+            "Monstrous Rage",
+            true,
+            MONSTROUS_RAGE,
+            mana(0, vec![Red]),
+        );
+        let triumph = add_spell(
+            &mut s,
+            "Moment of Triumph",
+            true,
+            MOMENT_OF_TRIUMPH,
+            mana(0, vec![White]),
+        );
+        let afflict = add_spell(&mut s, "Afflict", true, AFFLICT, mana(2, vec![Black]));
+        let assault = add_assault(&mut s);
+        let giant_growth = add_spell(
+            &mut s,
+            "Giant Growth",
+            true,
+            GIANT_GROWTH,
+            mana(0, vec![Green]),
+        );
+        let riders = [
+            add_spell(
+                &mut s,
+                "Gerrard's Command",
+                true,
+                GERRARDS_COMMAND,
+                mana(0, vec![Green, White]),
+            ),
+            add_spell(
+                &mut s,
+                "Echoing Courage",
+                true,
+                ECHOING_COURAGE,
+                mana(1, vec![Green]),
+            ),
+            add_spell(
+                &mut s,
+                "Stabbing Pain",
+                true,
+                STABBING_PAIN,
+                mana(0, vec![Black]),
+            ),
+            add_spell(
+                &mut s,
+                "Monstrous Step",
+                false,
+                MONSTROUS_STEP,
+                mana(4, vec![Green]),
+            ),
+            add_spell(
+                &mut s,
+                "Give No Ground",
+                true,
+                GIVE_NO_GROUND,
+                mana(3, vec![White]),
+            ),
+            add_spell(
+                &mut s,
+                "Emergent Growth",
+                false,
+                EMERGENT_GROWTH,
+                mana(3, vec![Green]),
+            ),
+            add_spell(
+                &mut s,
+                "Invigorated Rampage",
+                true,
+                INVIGORATED_RAMPAGE,
+                mana(1, vec![Red]),
+            ),
+        ];
+        let emperor = s
+            .add_planeswalker_from_oracle(P0, "The Wandering Emperor", "", 3, THE_WANDERING_EMPEROR)
+            .id();
+        let salamander = s
+            .add_creature_from_oracle(P0, "Pyric Salamander", 1, 1, PYRIC_SALAMANDER)
+            .with_mana_cost(mana(1, vec![Red]))
+            .id();
+        let vectis = s
+            .add_creature_from_oracle(P0, "Vectis Agents", 4, 3, VECTIS_AGENTS)
+            .with_mana_cost(mana(3, vec![Blue, Black]))
+            .id();
+        let fort = s
+            .add_creature_from_oracle(P0, "Mobile Fort", 0, 6, MOBILE_FORT)
+            .with_mana_cost(mana(4, vec![]))
+            .id();
+        let mask = s
+            .add_artifact_from_oracle(P0, "Dragon Mask", DRAGON_MASK)
+            .with_mana_cost(mana(3, vec![]))
+            .id();
+        let mut runner = s.build();
+        runner.state_mut().phase = Phase::PostCombatMain;
+        settle(&mut runner);
+        set_emperor_entered(&mut runner, emperor, false);
+        settle(&mut runner);
+        let state = runner.state();
+
+        let d_giant_growth = cast_delta(state, giant_growth);
+        assert!(d_giant_growth < -1.5, "reach, got {d_giant_growth}");
+        let d_assault = cast_delta(state, assault);
+        assert!(d_assault < -1.5, "reach, got {d_assault}");
+
+        for (name, delta) in [
+            ("Heroic Reinforcements", cast_delta(state, reinforcements)),
+            ("Goblin War Party", cast_delta(state, war_party)),
+            ("Monstrous Rage", cast_delta(state, rage)),
+            ("Moment of Triumph", cast_delta(state, triumph)),
+            (
+                "The Wandering Emperor's +1",
+                activation_delta(state, emperor, loyalty_index(state, emperor, 1)),
+            ),
+        ] {
+            assert_eq!(delta, 0.0, "{name}'s lasting value takes no penalty");
+        }
+        let (d_clarion, d_suns) = (cast_delta(state, clarion), cast_delta(state, suns));
         assert!(
-            lifelink < damage - 1.5,
-            "the prompt reads the engine query under Leyline, {lifelink} vs {damage}"
+            (d_clarion - d_suns).abs() < 1e-9,
+            "Deafening Clarion {d_clarion} prices as Sweltering Suns {d_suns}"
+        );
+        let d_afflict = cast_delta(state, afflict);
+        assert!(
+            (d_afflict - 0.15).abs() < 1e-9,
+            "Afflict keeps only the postcombat draw bonus, got {d_afflict}"
+        );
+
+        for rider in riders {
+            let delta = cast_delta(state, rider);
+            assert!(
+                (delta - d_giant_growth).abs() < 1e-9,
+                "{} {delta} must price as Giant Growth {d_giant_growth}",
+                state.objects[&rider].name
+            );
+        }
+        for id in [salamander, vectis, fort, mask] {
+            let delta = activation_delta(state, id, last_activated_index(state, id));
+            assert!(
+                delta < -1.5,
+                "{} is priced, got {delta}",
+                state.objects[&id].name
+            );
+        }
+
+        // The payload still earns the window, and the rest does not cost it.
+        let mut state = d1_board(Phase::DeclareAttackers, P0);
+        state.combat = Some(engine::game::combat::CombatState::default());
+        let growth = oracle_instant(&mut state, P0, "Giant Growth", GIANT_GROWTH);
+        let rage = oracle_instant(&mut state, P0, "Monstrous Rage", MONSTROUS_RAGE);
+        let afflict = oracle_instant(&mut state, P0, "Afflict", AFFLICT);
+        let d_growth = timing_delta(&state, &cast_candidate(&state, growth));
+        assert!(d_growth > 0.0, "reach: the window pays, got {d_growth}");
+        for (name, id) in [("Monstrous Rage", rage), ("Afflict", afflict)] {
+            let delta = timing_delta(&state, &cast_candidate(&state, id));
+            assert!(
+                (delta - d_growth).abs() < 1e-9,
+                "{name} {delta} must keep Giant Growth's window {d_growth}"
+            );
+        }
+
+        let mut state = d1_board(Phase::End, P0);
+        let growth = oracle_instant(&mut state, P0, "Giant Growth", GIANT_GROWTH);
+        let rage = oracle_instant(&mut state, P0, "Monstrous Rage", MONSTROUS_RAGE);
+        let d_growth = timing_delta(&state, &cast_candidate(&state, growth));
+        assert!(d_growth < -1.5, "reach, got {d_growth}");
+        assert_eq!(
+            timing_delta(&state, &cast_candidate(&state, rage)),
+            0.0,
+            "the Role outlasts the End step"
         );
     }
 }

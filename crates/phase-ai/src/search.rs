@@ -22580,4 +22580,142 @@ one on the bottom of your library.";
             "the hint does not time Overrun: default 0.5 against the instant's 0.3, got {hint_gap}"
         );
     }
+
+    const HEROIC_REINFORCEMENTS: &str = "Create two 1/1 white Soldier creature tokens. Until end of turn, creatures you control get +1/+1 and gain haste. (They can attack and {T} this turn.)";
+    const DEAFENING_CLARION: &str = "Choose one or both —\n• Deafening Clarion deals 3 damage to each creature.\n• Creatures you control gain lifelink until end of turn.";
+    const THE_WANDERING_EMPEROR: &str = "Flash\nAs long as The Wandering Emperor entered this turn, you may activate her loyalty abilities any time you could cast an instant.\n[+1]: Put a +1/+1 counter on up to one target creature. It gains first strike until end of turn.\n[−1]: Create a 2/2 white Samurai creature token with vigilance.\n[−2]: Exile target tapped creature. You gain 2 life.";
+
+    /// The postcombat root beside the Overrun one: the turn's combat is behind every candidate
+    /// here (CR 505.1a), and an instant's combat-window payload carries the verdict, but a
+    /// candidate with value that lands elsewhere is neither priced nor timed as a trick, so the
+    /// tokens, the damage mode and the Emperor's counter score as they would without the policy.
+    /// Clarion's child stops at its mode prompt with or without the registry, and the policy
+    /// reads every mode of a cast that has chosen none (CR 601.2b).
+    #[test]
+    fn own_postcombat_main_root_does_not_price_a_lasting_payoff_as_a_trick() {
+        use crate::policies::registry::NUDGE_MAX;
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PostCombatMain);
+        let reinforcements = scenario
+            .add_spell_to_hand_from_oracle(
+                P0,
+                "Heroic Reinforcements",
+                false,
+                HEROIC_REINFORCEMENTS,
+            )
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Red, ManaCostShard::White],
+                generic: 2,
+            })
+            .id();
+        let clarion = scenario
+            .add_spell_to_hand_from_oracle(P0, "Deafening Clarion", false, DEAFENING_CLARION)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Red, ManaCostShard::White],
+                generic: 1,
+            })
+            .id();
+        let assault = scenario
+            .add_spell_to_hand_from_oracle(P0, "Coordinated Assault", true, COORDINATED_ASSAULT)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 0,
+            })
+            .id();
+        let emperor = scenario
+            .add_planeswalker_from_oracle(P0, "The Wandering Emperor", "", 3, THE_WANDERING_EMPEROR)
+            .id();
+        for _ in 0..3 {
+            scenario.add_basic_land(P0, ManaColor::Red);
+            scenario.add_basic_land(P0, ManaColor::White);
+        }
+        scenario.add_creature(P0, "Bear", 2, 2);
+        scenario.add_creature(P1, "Bear", 2, 2);
+        let mut runner = scenario.build();
+        add_libraries(runner.state_mut(), 5);
+        {
+            let obj = runner.state_mut().objects.get_mut(&emperor).unwrap();
+            obj.card_types.subtypes.clear();
+            obj.base_card_types = obj.card_types.clone();
+        }
+        engine::game::layers::evaluate_layers(runner.state_mut());
+        let state = runner.state().clone();
+        assert_eq!(
+            RootDecisionContext::classify(&state, P0).tactical_weight(),
+            0.1,
+            "premise: the own postcombat main is an ordinary root"
+        );
+        let plus_one = state.objects[&emperor]
+            .abilities
+            .iter()
+            .position(|a| matches!(a.cost, Some(AbilityCost::Loyalty { amount: 1 })))
+            .expect("her +1 is printed");
+
+        let effect_timing = || PolicyRegistry::default_subset_for_tests(&[PolicyId::EffectTiming]);
+        let mut cfg = hard_rung0_config();
+        // The Emperor's −1 is a sixth candidate; every candidate here must survive the beam.
+        cfg.search.max_branching = 8;
+        let mut heuristic = cfg.clone();
+        heuristic.search.enabled = false;
+        let cast = |id: ObjectId| move |action: &GameAction| matches!(action, GameAction::CastSpell { object_id, .. } if *object_id == id);
+        let activation = |action: &GameAction| {
+            matches!(
+                action,
+                GameAction::ActivateAbility { source_id, ability_index, .. }
+                    if *source_id == emperor && *ability_index == plus_one
+            )
+        };
+        let score_of = |scored: &[(GameAction, f64)],
+                        is_candidate: &dyn Fn(&GameAction) -> bool| {
+            scored
+                .iter()
+                .find(|(action, _)| is_candidate(action))
+                .map(|(_, score)| *score)
+                .unwrap_or_else(|| panic!("reach: the candidate is scored, got {scored:?}"))
+        };
+        let delta = |config: &AiConfig, is_candidate: &dyn Fn(&GameAction) -> bool| {
+            score_of(
+                &score_with_registry(&state, effect_timing(), config),
+                is_candidate,
+            ) - score_of(&score_with(&state, vec![], config), is_candidate)
+        };
+
+        let d_h_assault = delta(&heuristic, &cast(assault));
+        let d_s_assault = delta(&cfg, &cast(assault));
+        assert!(
+            d_h_assault < -NUDGE_MAX,
+            "reach: EffectTiming prices Coordinated Assault as a trick here, got {d_h_assault}"
+        );
+        assert!(
+            (d_s_assault - 0.1 * d_h_assault).abs() < 1e-9,
+            "reach: the root carries the verdict at 0.1: {d_s_assault} vs {d_h_assault}"
+        );
+
+        for (name, is_candidate) in [
+            (
+                "Heroic Reinforcements",
+                &cast(reinforcements) as &dyn Fn(&GameAction) -> bool,
+            ),
+            ("Deafening Clarion", &cast(clarion)),
+            ("The Wandering Emperor's +1", &activation),
+        ] {
+            let (d_h, d_s) = (delta(&heuristic, is_candidate), delta(&cfg, is_candidate));
+            assert!(d_h.abs() < 1e-9, "EffectTiming prices {name}, got {d_h}");
+            assert!(d_s.abs() < 1e-9, "the root prices {name}, got {d_s}");
+        }
+
+        let scored = score_with(&state, vec![], &heuristic);
+        let assault_score = score_of(&scored, &cast(assault));
+        for (name, id, gap) in [
+            ("Heroic Reinforcements", reinforcements, 0.24),
+            ("Deafening Clarion", clarion, 0.2),
+        ] {
+            let got = score_of(&scored, &cast(id)) - assault_score;
+            assert!(
+                (got - gap).abs() < 1e-9,
+                "the hint does not time {name}: {gap} over the instant's 0.3, got {got}"
+            );
+        }
+    }
 }

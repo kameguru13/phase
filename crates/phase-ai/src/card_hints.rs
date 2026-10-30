@@ -9,8 +9,7 @@ use engine::types::player::PlayerId;
 use crate::cast_facts::{cast_facts_for_action, CastFacts};
 use crate::eval::opponent_battlefield_creature_threat_value;
 use crate::policies::effect_classify::{
-    effect_is_combat_trick_payload, precombat_main_is_last_trick_window, spell_resolution_effects,
-    TimingSubject,
+    precombat_main_is_last_trick_window, spell_resolution_effects, CombatBinding, TimingSubject,
 };
 use crate::policies::hand_disruption::disruption_window_score;
 #[cfg(test)]
@@ -57,16 +56,10 @@ pub(crate) fn should_play_now_with_facts(
                 .iter()
                 .any(|effect| matches!(effect, Effect::DealDamage { .. }));
             // CR 611.2a + CR 514.2: only the spell's own resolution times it as a combat trick;
-            // an enters-trigger pump on a permanent cast precombat lasts through that combat.
-            // CR 505.1a + CR 307.1: nor does a sorcery-speed pump's last window before combat.
-            let timed_as_trick = spell_resolution_effects(facts)
-                .into_iter()
-                .any(effect_is_combat_trick_payload)
-                && !precombat_main_is_last_trick_window(
-                    state,
-                    player,
-                    TimingSubject::Spell(facts.object.id),
-                );
+            // an enters-trigger pump on a permanent cast precombat lasts through that combat. A
+            // payload beside value that lands elsewhere still earns the combat window, but
+            // nothing keeps the spell for it.
+            let combat_binding = CombatBinding::of_resolution(&spell_resolution_effects(facts));
             let has_counter = immediate_effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::Counter { .. }));
@@ -88,10 +81,19 @@ pub(crate) fn should_play_now_with_facts(
 
             // Combat tricks: highest during combat, near-zero during end/cleanup
             // (pump effects expire at cleanup — casting then has no lasting impact)
-            if timed_as_trick {
-                return if is_combat {
-                    0.9
-                } else if matches!(state.phase, Phase::End | Phase::Cleanup) {
+            if is_combat && combat_binding != CombatBinding::Unbound {
+                return 0.9;
+            }
+            // CR 505.1a + CR 307.1: a sorcery-speed pump's last window before combat is not
+            // mistimed.
+            if combat_binding == CombatBinding::Whole
+                && !precombat_main_is_last_trick_window(
+                    state,
+                    player,
+                    TimingSubject::Spell(facts.object.id),
+                )
+            {
+                return if matches!(state.phase, Phase::End | Phase::Cleanup) {
                     0.05
                 } else {
                     0.3
@@ -188,6 +190,7 @@ mod tests {
 
     use super::*;
     use crate::cast_facts::collect_definition_effects;
+    use crate::policies::effect_classify::effect_is_combat_trick_payload;
     use engine::game::layers::evaluate_layers;
     use engine::game::restrictions::spell_confined_to_sorcery_timing;
     use engine::game::scenario::{GameScenario, P0, P1};
@@ -1023,6 +1026,70 @@ mod tests {
     const DEAFENING_CLARION: &str = "Choose one or both —\n• Deafening Clarion deals 3 damage to each creature.\n• Creatures you control gain lifelink until end of turn.";
     const GOBLIN_WAR_PARTY: &str = "Choose one —\n• Create three 1/1 red Goblin creature tokens.\n• Creatures you control get +1/+1 and gain haste until end of turn.\nEntwine {2}{R} (Choose both if you pay the entwine cost.)";
     const LEYLINE_OF_ANTICIPATION: &str = "If this card is in your opening hand, you may begin the game with it on the battlefield.\nYou may cast spells as though they had flash.";
+    const HEROIC_REINFORCEMENTS: &str = "Create two 1/1 white Soldier creature tokens. Until end of turn, creatures you control get +1/+1 and gain haste. (They can attack and {T} this turn.)";
+    const MONSTROUS_RAGE: &str = "Target creature gets +2/+0 until end of turn. Create a Monster Role token attached to it. (If you control another Role on it, put that one into the graveyard. Enchanted creature gets +1/+1 and has trample.)";
+    const GERRARDS_COMMAND: &str = "Untap target creature. It gets +3/+3 until end of turn.";
+    const INVIGORATED_RAMPAGE: &str = "Choose one —\n• Target creature gets +4/+0 and gains trample until end of turn.\n• Two target creatures each get +2/+0 and gain trample until end of turn.";
+
+    /// CR 611.2a + CR 514.2: the trick hints need combat to be the spell's whole value. A spell
+    /// with value elsewhere is not held back out of combat and takes its untimed arm, the
+    /// default or the token arm, but its payload still earns the combat arm. A pump with only
+    /// riders keeps the trick hints.
+    #[test]
+    fn should_play_now_times_a_candidate_only_when_combat_is_its_whole_value() {
+        let sorcery = |phase, name, oracle_text| {
+            let mut state = make_state();
+            state.phase = phase;
+            let action = oracle_spell(&mut state, name, oracle_text, CoreType::Sorcery);
+            should_play_now(&state, &action, PlayerId(0))
+        };
+        let postcombat = Phase::PostCombatMain;
+
+        assert_eq!(
+            sorcery(postcombat, "Deafening Clarion", DEAFENING_CLARION),
+            0.5,
+            "Deafening Clarion takes the default arm"
+        );
+        for (name, oracle_text) in [
+            ("Heroic Reinforcements", HEROIC_REINFORCEMENTS),
+            ("Goblin War Party", GOBLIN_WAR_PARTY),
+        ] {
+            assert_eq!(
+                sorcery(postcombat, name, oracle_text),
+                0.54,
+                "{name} takes the token arm"
+            );
+        }
+
+        let rage = |phase, combat| hint_in(phase, combat, "Monstrous Rage", MONSTROUS_RAGE);
+        assert_eq!(rage(Phase::PreCombatMain, false), 0.66, "the token arm");
+        assert_eq!(
+            rage(Phase::End, false),
+            0.54,
+            "the Role outlasts the End step"
+        );
+        assert_eq!(
+            rage(Phase::DeclareAttackers, true),
+            0.9,
+            "the payload still earns the combat arm"
+        );
+
+        for (name, oracle_text) in [
+            ("Gerrard's Command", GERRARDS_COMMAND),
+            ("Invigorated Rampage", INVIGORATED_RAMPAGE),
+        ] {
+            assert_eq!(
+                hint_in(Phase::PreCombatMain, false, name, oracle_text),
+                0.3,
+                "{name} can wait for combat"
+            );
+        }
+        assert_eq!(
+            sorcery(postcombat, "Arm the Cathars", ARM_THE_CATHARS),
+            0.3,
+            "postcombat, the turn's combat is behind Arm the Cathars"
+        );
+    }
 
     /// CR 505.1a + CR 307.1 + CR 307.5: a sorcery's precombat main is its last window before this
     /// turn's combat, and its until-end-of-turn payload lasts through it (CR 611.2a + CR 514.2),
