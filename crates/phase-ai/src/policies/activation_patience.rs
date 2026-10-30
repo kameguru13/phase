@@ -46,7 +46,8 @@
 //!   triggers, anyone's "each player's", an opponent's "each opponent's", and delayed
 //!   triggers set for it, CR 603.7) stands the whole upkeep down (`patient_window`).
 //! - The draw step's draw (CR 504.1 + CR 121.1). An activation that replaces it (CR 614.4) or
-//!   arranges the cards it takes stands itself down (`DrawSetup`, escape hatch 2).
+//!   changes what it takes from a library that can be the AI's own stands itself down
+//!   (`DrawSetup`, escape hatch 2).
 //! - The main phase's opening events (CR 505.3-505.5, CR 117.3a), which stand the upkeep and
 //!   the draw step down (`main_phase_opens_with_events`).
 //!
@@ -54,15 +55,27 @@
 //! priority (CR 504.2). The upkeep's own triggers resolve before its stack is next empty, so
 //! they only end its claim to being the low-information window (`PatientWindow::BeforeMain`).
 //!
-//! Three cases of the rule are not yet classified. Other changes to the AI's library top
-//! before the draw, such as a card put on top or a mill of the AI's library, also change what
-//! the draw takes, and `DrawSetup` does not classify them. And the trigger scans read only
-//! permanents already on the battlefield, so a trigger whose source the held activation itself
-//! puts onto the battlefield is not seen: Quicksilver Amulet putting Avaricious Dragon onto
-//! the battlefield in the upkeep, and likewise for the main-phase stand-down. And the draw
-//! step's draw itself triggers "whenever you draw a card" abilities (CR 603.2), whose
-//! intervening-if (CR 603.4) an upkeep activation may make true: Starving Revenant's descend 8
-//! after an upkeep sacrifice. Only beginning-of-step triggers are scanned.
+//! Three cases of the rule are not yet classified. A search and its shuffle stay held and lent,
+//! though nothing in the rule exempts them: with the order hidden (CR 401.2) and randomized
+//! (CR 701.24a) the draw takes a random card on either side of a fetch, and choosing the land
+//! after the draw is what the hold is for. It fails when the AI knows its top card, which a
+//! shuffle then replaces. And the trigger scans read only permanents already on the
+//! battlefield, so a trigger whose source the held activation itself puts onto the battlefield
+//! is not seen: Quicksilver Amulet putting Avaricious Dragon onto the battlefield in the upkeep,
+//! and likewise for the main-phase stand-down. And the draw step's draw itself triggers
+//! "whenever you draw a card" abilities (CR 603.2), whose intervening-if (CR 603.4) an upkeep
+//! activation may make true: Starving Revenant's descend 8 after an upkeep sacrifice. Only
+//! beginning-of-step triggers are scanned.
+//!
+//! The classification errs toward standing down, so it also releases activations that could
+//! have waited: a card put on the bottom changes this draw only on an empty library
+//! (CR 704.5b), a "target player" slot, a card slot or a tracked set is read as able to name
+//! the AI even when the line names an opponent, and a blind mill or exile is equal in
+//! distribution on either side of the draw while the order is hidden. Those lose the hold, and
+//! the donor's line still sees a draw that Pass's does not, so the search may now prefer
+//! activating. For a blind mill that preference reads the real library order (no
+//! determinization ships). The classification does not read inside an inline branch carrier
+//! (a die roll's results).
 //!
 //! ## Why a soft penalty and not a `Reject`
 //!
@@ -97,9 +110,14 @@
 //! value of arranging this one, whatever the ability costs. A tap cost or a
 //! once-each-turn cap does not make the hold right: it only makes the activation
 //! dearer, and whether this draw's choice is worth the tap or the capped
-//! activation is a resource question the search's valuation answers. In the draw
-//! step that draw is behind (CR 504.2), and an arrangement is held like any other
-//! activation. The report names the other two times to activate early: when the
+//! activation is a resource question the search's valuation answers. Any other change to that
+//! library before the draw gives up the same thing: a card put on top of it (Academy Ruins,
+//! whose artifact this draw then takes), cards taken from the top of it, a look whose card then
+//! moves, a shuffle with no search. `draw_setup` reads the engine's wildcard-free library
+//! authorities. A new effect that moves a card to or from a library is a draw setup until it is
+//! named otherwise. A new reorder within a library is not seen by the authority, and needs its
+//! own arm beside `Scry`. In the draw step that draw is behind (CR 504.2), and an arrangement is
+//! held like any other activation. The report names the other two times to activate early: when the
 //! damage is part of a lethal line, and (implicitly) when the ability's own condition is met *now* and might
 //! not be later. Those are lethal damage and `ability.condition`, in that order
 //! below. Its third exception, a source that "is going to die or leave play
@@ -109,8 +127,8 @@
 
 use engine::game::{attractions, mana_abilities};
 use engine::types::ability::{
-    AbilityDefinition, AbilityTag, ActivationRestriction, DelayedTriggerCondition, Effect,
-    TargetFilter,
+    AbilityCost, AbilityDefinition, AbilityTag, ActivationRestriction, DelayedTriggerCondition,
+    Effect, TargetFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::game_state::{GameState, WaitingFor};
@@ -124,6 +142,7 @@ use super::anti_self_harm::extract_damage_amount;
 use super::context::PolicyContext;
 use super::effect_classify::ability_is_temporary_combat_modifier;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
+use crate::ability_chain::{collect_scoped_nodes, AbilityScope};
 use crate::features::DeckFeatures;
 use engine::game::players;
 
@@ -200,33 +219,124 @@ fn ability_is_deferrable(ability: &AbilityDefinition) -> bool {
 enum DrawSetup {
     /// CR 614.4: a replacement for that draw must exist before it.
     Replacement,
-    /// CR 701.22a / CR 701.25a / CR 701.20e: an arrangement of the top of a library that can be the
-    /// AI's own, which then chooses the card that draw takes.
+    /// CR 121.1: a change to a library that can be the AI's own, after which that draw takes a
+    /// different card or a chosen one: an arrangement of its top (CR 701.22a, CR 701.25a,
+    /// CR 701.20e), a card put on it, or cards taken from it (CR 701.17a).
     LibraryTop,
 }
 
-/// What `effect`, in an ability `ai_player` activates from `source_id`, does to the draw step's
-/// coming draw.
+/// What `node`, of an ability `ai_player` activates from `source_id`, does to the draw step's
+/// coming draw. `chain` is every node of that ability.
+///
+/// The question is whether the node commutes with that draw: does activating before it leave
+/// the game activating after it would? Fail-closed: anything the engine's wildcard-free library
+/// authorities call a move to or from a library is a setup, so a new library effect is one
+/// until it is named below. What is named commutes with the draw, except a search, which stays
+/// held for the reason given there:
+///
+/// - A draw (CR 121.1): this draw and that one take the same two cards, in either order. So do
+///   connive and learn (CR 701.50a, CR 701.48a), which draw. A chain that also puts a card
+///   back is a setup through that other node (Sensei's Divining Top, Brainstone).
+/// - A search and its own instructions (CR 701.23a): the order is hidden (CR 401.2) and the
+///   shuffle randomizes it (CR 701.24a), so the draw takes a random card either way, which is
+///   no peek at the real top. It does not commute (the fetched card has left the pool); it
+///   stays held because its payoff is a land or card better chosen after the draw. See "What a
+///   hold rests on". A tutored card put back on the library is a setup. Seek has no CR entry;
+///   it takes a random match and leaves the order alone.
+/// - A look or reveal that moves nothing (CR 701.20b, CR 701.20e). One whose card then moves
+///   is a setup: the moving node names it by anaphor, which the authority can't see through
+///   (`target` is `ParentTarget`, `origin` is `None`), so the look answers for it.
+///
+/// A scry and a shuffle with no search stay in their library, so the authority says no; both
+/// still change what the draw takes.
 fn draw_setup(
     state: &GameState,
     ai_player: PlayerId,
     source_id: ObjectId,
-    effect: &Effect,
+    chain: &[&AbilityDefinition],
+    node: &AbilityDefinition,
 ) -> Option<DrawSetup> {
-    match effect {
+    // CR 602.1a: an activation cost is paid by the activator, so it is the AI's own library.
+    // CR 118.12: a chain link's cost is paid as the ability resolves.
+    if node
+        .cost
+        .as_ref()
+        .is_some_and(AbilityCost::moves_card_to_or_from_library)
+    {
+        return Some(DrawSetup::LibraryTop);
+    }
+    let setup_if_reaches = || {
+        node_can_reach_ai_library(state, ai_player, source_id, node)
+            .then_some(DrawSetup::LibraryTop)
+    };
+    match &*node.effect {
         Effect::CreateDrawReplacement { .. } => Some(DrawSetup::Replacement),
-        Effect::Scry { target: player, .. }
-        | Effect::Surveil { target: player, .. }
-        | Effect::Dig {
-            player,
-            destination: Some(Zone::Library),
-            rest_destination: Some(Zone::Library),
-            keep_count: None,
-            keep_count_expr: None,
+        Effect::Draw { .. } | Effect::Connive { .. } | Effect::Learn => None,
+        Effect::SearchLibrary { .. } | Effect::Seek { .. } => None,
+        Effect::ChangeZone {
+            origin: Some(Zone::Library),
+            destination,
             ..
-        } if slot_can_name(state, ai_player, source_id, player) => Some(DrawSetup::LibraryTop),
+        } if *destination != Zone::Library && chain_searches(chain) => None,
+        Effect::Shuffle { .. } if chain_searches(chain) => None,
+        Effect::RevealTop { .. }
+        | Effect::Dig {
+            destination: None,
+            keep_count: Some(0),
+            rest_destination: None,
+            ..
+        } if !chain_moves_a_looked_at_card(chain) => None,
+        Effect::RevealTop { .. } | Effect::Scry { .. } | Effect::Shuffle { .. } => {
+            setup_if_reaches()
+        }
+        effect if effect.moves_card_to_or_from_library() => setup_if_reaches(),
+        // Moves no card to or from a library; a reorder must be named above it.
         _ => None,
     }
+}
+
+/// Does `chain` search a library (CR 701.23a)?
+fn chain_searches(chain: &[&AbilityDefinition]) -> bool {
+    chain
+        .iter()
+        .any(|node| matches!(*node.effect, Effect::SearchLibrary { .. }))
+}
+
+/// Does `chain` move a card, so that a look or reveal at the top of a library can be the first
+/// half of taking it?
+fn chain_moves_a_looked_at_card(chain: &[&AbilityDefinition]) -> bool {
+    chain.iter().any(|node| {
+        matches!(
+            *node.effect,
+            Effect::ChangeZone { .. } | Effect::ChangeZoneAll { .. } | Effect::CastFromZone { .. }
+        )
+    })
+}
+
+/// Can `node` act on a library that is `ai_player`'s own?
+///
+/// `player_scope` comes first: "each opponent mills" is `Mill { target: Controller }` under
+/// `player_scope: Opponent`, and each scoped player becomes the acting player, so its slot
+/// names nobody yet. Otherwise the node's slot answers (`slot_can_name`), and a node with no
+/// slot acts on its controller's library. A card slot names no player, so it counts as able to
+/// reach the AI: that card's owner may be the AI (Academy Ruins, Reito Lantern).
+fn node_can_reach_ai_library(
+    state: &GameState,
+    ai_player: PlayerId,
+    source_id: ObjectId,
+    node: &AbilityDefinition,
+) -> bool {
+    if let Some(scope) = &node.player_scope {
+        return can_name_ai(state, ai_player, |player| {
+            engine::game::effects::matches_player_scope(state, player, scope, ai_player, source_id)
+        });
+    }
+    let slot = match &*node.effect {
+        // `target_filter` surfaces no slot for a reveal, whose player is never declared here.
+        Effect::RevealTop { player, .. } => Some(player),
+        effect => effect.target_filter(),
+    };
+    slot.is_none_or(|slot| slot_can_name(state, ai_player, source_id, slot))
 }
 
 /// Can the player slot `filter` of an ability `ai_player` activates from `source_id` name
@@ -248,7 +358,7 @@ fn slot_can_name(
     source_id: ObjectId,
     filter: &TargetFilter,
 ) -> bool {
-    let matches = |player: PlayerId| {
+    can_name_ai(state, ai_player, |player| {
         engine::game::filter::player_matches_target_filter_in_state(
             state,
             filter,
@@ -256,7 +366,11 @@ fn slot_can_name(
             Some(ai_player),
             Some(source_id),
         )
-    };
+    })
+}
+
+/// Does `matches` admit `ai_player`, or fail closed by matching no living player at all?
+fn can_name_ai(state: &GameState, ai_player: PlayerId, matches: impl Fn(PlayerId) -> bool) -> bool {
     matches(ai_player)
         || !state
             .players
@@ -519,20 +633,24 @@ impl TacticalPolicy for ActivationPatiencePolicy {
         // of the library, and in the upkeep it is still ahead (CR 502.4: no priority in the untap
         // step; CR 503.1: the upkeep's is the last before that draw). An activation that sets up
         // that draw gives its payoff up by waiting for the main phase: a draw replacement must
-        // exist before the draw it replaces (CR 614.4), and an arrangement of the top of the AI's
-        // own library chooses the card that draw takes (CR 701.22a, CR 701.25a, CR 701.20e). So
-        // does one whose player slot the AI may fill with itself, such as Elemental Augury's
-        // "target player's library" (CR 115.1, `slot_can_name`): the line that names the AI
-        // arranges this draw, which passing cannot. An arrangement made later arranges a later
-        // draw, so waiting loses the value of arranging this one whatever the ability costs: one
-        // that taps its source or is capped (CR 602.5b) is exempt as much as one paid in mana
-        // alone. Whether spending the tap or the capped activation on this draw is worth it is a
-        // resource question for the search's valuation, not a timing question this policy answers.
+        // exist before the draw it replaces (CR 614.4), an arrangement of the top of the AI's
+        // own library chooses the card that draw takes (CR 701.22a, CR 701.25a, CR 701.20e), and
+        // any other change to that library changes the card it takes. So does one whose player
+        // slot the AI may fill with itself, such as Elemental Augury's "target player's library"
+        // (CR 115.1, `slot_can_name`): the line that names the AI arranges this draw, which
+        // passing cannot. A change made later changes a later draw, so waiting loses the value
+        // of changing this one whatever the ability costs: one that taps its source or is capped
+        // (CR 602.5b) is exempt as much as one paid in mana alone. Whether spending the tap or
+        // the capped activation on this draw is worth it is a resource question for the search's
+        // valuation, not a timing question this policy answers. Every branch is read: the line
+        // the search takes through a mode is the one passing does not reproduce.
         if ctx.state.phase == Phase::Upkeep {
-            let effects = ctx.effects();
+            let chain = printed_ability(ctx.state, *source_id, *ability_index)
+                .map(|ability| collect_scoped_nodes(ability, AbilityScope::Potential))
+                .unwrap_or_default();
             let sets_up = |setup: DrawSetup| {
-                effects.iter().any(|effect| {
-                    draw_setup(ctx.state, ctx.ai_player, *source_id, effect) == Some(setup)
+                chain.iter().any(|node| {
+                    draw_setup(ctx.state, ctx.ai_player, *source_id, &chain, node) == Some(setup)
                 })
             };
             if sets_up(DrawSetup::Replacement) {

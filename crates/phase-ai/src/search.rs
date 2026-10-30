@@ -21888,6 +21888,532 @@ one on the bottom of your library.";
         );
     }
 
+    /// Academy Ruins, verbatim: a card put on top of the AI's library.
+    const ACADEMY_RUINS: &str = "{T}: Add {C}.\n{1}{U}, {T}: Put target artifact card from your graveyard on top of your library.";
+    /// Excavated Wall, verbatim: a mill of the AI's library.
+    const EXCAVATED_WALL: &str =
+        "Defender\n{1}, {T}: Mill a card. (Put the top card of your library into your graveyard.)";
+
+    fn p0_player(state: &GameState) -> &engine::types::player::Player {
+        state.players.iter().find(|player| player.id == P0).unwrap()
+    }
+
+    fn p0_tapped_permanents(state: &GameState) -> usize {
+        state
+            .battlefield
+            .iter()
+            .filter(|id| state.objects[*id].controller == P0 && state.objects[*id].tapped)
+            .count()
+    }
+
+    /// Whether the card named `name` is in P0's hand.
+    fn p0_hand_holds(state: &GameState, name: &str) -> bool {
+        p0_player(state)
+            .hand
+            .iter()
+            .any(|id| state.objects[id].name == name)
+    }
+
+    /// Puts `top` on top of P0's library, `next` (if any) beneath it.
+    fn stack_p0_library(state: &mut GameState, top: ObjectId, next: Option<ObjectId>) {
+        let library = &mut state
+            .players
+            .iter_mut()
+            .find(|player| player.id == P0)
+            .unwrap()
+            .library;
+        library.retain(|id| *id != top && Some(*id) != next);
+        if let Some(next) = next {
+            library.insert(0, next);
+        }
+        library.insert(0, top);
+    }
+
+    /// The ActivationPatience-only root beam's deferral for `donor`, `None` if it is absent.
+    fn patience_beam_deferral(
+        state: &GameState,
+        donor: &GameAction,
+        config: &AiConfig,
+    ) -> Option<Option<f64>> {
+        use crate::policies::activation_patience::ActivationPatiencePolicy;
+        let registry = PolicyRegistry::for_tests(vec![Box::new(ActivationPatiencePolicy)]);
+        let beam = build_root_beam(state, &PlannerServices::new_default(P0, config, &registry));
+        beam.iter()
+            .find(|ranked| ranked.candidate.action == *donor)
+            .map(|ranked| ranked.deferral)
+    }
+
+    /// One own-library donor at the root: its Upkeep board, and the same board in the Draw step,
+    /// where the draw is behind and it must be held. Printed as it is built, so one run records
+    /// every row's values before the first assertion.
+    struct UpkeepDonorRow {
+        label: &'static str,
+        donor: GameAction,
+        roots: PatienceRoots,
+        deferral: Option<Option<f64>>,
+        control_donor: GameAction,
+        control: PatienceRoots,
+        control_deferral: Option<Option<f64>>,
+    }
+
+    impl UpkeepDonorRow {
+        fn score(
+            label: &'static str,
+            upkeep: (&GameState, GameAction),
+            draw_step: (&GameState, GameAction),
+            config: &AiConfig,
+        ) -> Self {
+            let (upkeep, donor) = upkeep;
+            let (draw_step, control_donor) = draw_step;
+            let pass = GameAction::PassPriority;
+            let roots = PatienceRoots::score(upkeep, config);
+            let deferral = patience_beam_deferral(upkeep, &donor, config);
+            let control = PatienceRoots::score(draw_step, config);
+            let control_deferral = patience_beam_deferral(draw_step, &control_donor, config);
+            let top_scored = roots
+                .s1
+                .iter()
+                .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                .map(|(action, _)| action);
+            eprintln!("{label} upkeep root (PatienceRoots, tw {}):", roots.tw);
+            eprintln!("  s0 = {:?}", roots.s0);
+            eprintln!("  s1 = {:?}", roots.s1);
+            eprintln!("  h0 = {:?}", roots.h0);
+            eprintln!("  h1 = {:?}", roots.h1);
+            eprintln!(
+                "  ap(donor) = {}, ap(pass) = {}",
+                roots.ap(&donor),
+                roots.ap(&pass)
+            );
+            eprintln!(
+                "  cont(donor) = {}, cont(pass) = {}",
+                roots.cont(&donor),
+                roots.cont(&pass)
+            );
+            eprintln!(
+                "  s0(pass) = {}, s1(pass) = {}, lift {}",
+                score_of(&roots.s0, &pass),
+                score_of(&roots.s1, &pass),
+                score_of(&roots.s1, &pass) - score_of(&roots.s0, &pass)
+            );
+            eprintln!(
+                "  s0(donor) = {}, s1(donor) = {}",
+                score_of(&roots.s0, &donor),
+                score_of(&roots.s1, &donor)
+            );
+            eprintln!("  beam deferral = {deferral:?}, top of s1 = {top_scored:?}");
+            eprintln!(
+                "{label} draw-step control: ap(donor) = {}, beam deferral = {control_deferral:?}",
+                control.ap(&control_donor)
+            );
+            Self {
+                label,
+                donor,
+                roots,
+                deferral,
+                control_donor,
+                control,
+                control_deferral,
+            }
+        }
+
+        /// The donor is neither held nor lent, though a lend would move Pass: nothing moves from
+        /// the no-policy root, and the beam gives `lend_deferral_witness` no donor. The paired
+        /// Draw-step control is held, so these zeros come from the upkeep hatch and not from a
+        /// candidate the root dropped.
+        fn assert_not_held_or_lent(&self) {
+            use crate::policies::registry::NUDGE_MAX;
+
+            let Self {
+                label,
+                donor,
+                roots,
+                ..
+            } = self;
+            let pass = GameAction::PassPriority;
+            roots.assert_scored(label, &[donor, &pass]);
+            assert!(
+                roots.cont(donor) > roots.cont(&pass),
+                "{label}: reach: the donor's continuation {} is above Pass's {}, so a lend would \
+                 move Pass",
+                roots.cont(donor),
+                roots.cont(&pass)
+            );
+            assert_eq!(roots.ap(donor), 0.0, "{label}: the donor is not held");
+            assert_eq!(
+                score_of(&roots.s1, donor),
+                score_of(&roots.s0, donor),
+                "{label}: the root does not move the donor"
+            );
+            assert_eq!(
+                score_of(&roots.s1, &pass),
+                score_of(&roots.s0, &pass),
+                "{label}: Pass is not lent the donor's continuation"
+            );
+            assert_eq!(
+                self.deferral,
+                Some(None),
+                "{label}: the donor carries no deferral in the root beam"
+            );
+
+            self.control
+                .assert_scored(label, &[&self.control_donor, &pass]);
+            let control_ap = self.control.ap(&self.control_donor);
+            assert!(
+                control_ap < -NUDGE_MAX,
+                "{label}: control: the draw step holds the donor, got {control_ap}"
+            );
+            assert!(
+                matches!(self.control_deferral, Some(Some(_))),
+                "{label}: control: the donor carries a deferral in the root beam, got {:?}",
+                self.control_deferral
+            );
+        }
+    }
+
+    /// P0's `phase`, empty stack: Academy Ruins, three Islands, a Sol Ring as the graveyard's only
+    /// artifact, and Darksteel Colossus on top of the library. Returns the runner and Ruins.
+    fn ruins_board(phase: Phase) -> (GameRunner, ObjectId) {
+        let db = shared_integration_card_db();
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(phase);
+        let ruins = scenario
+            .add_land_from_oracle(P0, "Academy Ruins", ACADEMY_RUINS)
+            .id();
+        for _ in 0..3 {
+            scenario.add_basic_land(P0, ManaColor::Blue);
+        }
+        scenario.add_real_card(P0, "Sol Ring", Zone::Graveyard, db);
+        let colossus = scenario.add_real_card(P0, "Darksteel Colossus", Zone::Library, db);
+        let mut runner = scenario.build();
+        rehydrate_game_from_card_db(runner.state_mut(), db);
+        add_libraries(runner.state_mut(), 5);
+        stack_p0_library(runner.state_mut(), colossus, None);
+        (runner, ruins)
+    }
+
+    /// P0's `phase`, empty stack: Sensei's Divining Top, no land on the battlefield (so its {1}
+    /// ability is unaffordable while its draw is on the stack, and no second candidate stops the
+    /// quiesce there), an Island in hand (so the main phase does), and a blank card on top of
+    /// the library. Returns the runner and the Top.
+    fn divining_top_board(phase: Phase) -> (GameRunner, ObjectId) {
+        let db = shared_integration_card_db();
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(phase);
+        let top = scenario.add_real_card(P0, "Sensei's Divining Top", Zone::Battlefield, db);
+        scenario.add_real_card(P0, "Island", Zone::Hand, db);
+        let blank = scenario.add_card_to_library_top(P0, "Blank Card");
+        let mut runner = scenario.build();
+        rehydrate_game_from_card_db(runner.state_mut(), db);
+        add_libraries(runner.state_mut(), 5);
+        stack_p0_library(runner.state_mut(), blank, None);
+        (runner, top)
+    }
+
+    /// P0's `phase`, empty stack: the Crystal Ball board with Excavated Wall in Ball's place.
+    /// Returns the runner, the Wall, the blank card on top and the Lightning Bolt beneath it.
+    fn wall_board(phase: Phase) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+        let db = shared_integration_card_db();
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(phase);
+        let wall = scenario
+            .add_artifact_from_oracle(P0, "Excavated Wall", EXCAVATED_WALL)
+            .id();
+        for _ in 0..2 {
+            scenario.add_real_card(P0, "Mountain", Zone::Battlefield, db);
+        }
+        let bolt = scenario.add_real_card(P0, "Lightning Bolt", Zone::Library, db);
+        let blank = scenario.add_card_to_library_top(P0, "Blank Card");
+        let mut runner = scenario.build();
+        rehydrate_game_from_card_db(runner.state_mut(), db);
+        add_libraries(runner.state_mut(), 5);
+        stack_p0_library(runner.state_mut(), blank, Some(bolt));
+        (runner, wall, blank, bolt)
+    }
+
+    /// Maintainer review 4, item 2: a change to the AI's own library in its own Upkeep changes
+    /// what the draw step's draw takes (CR 504.1 + CR 121.1), so activating in the main phase
+    /// does not reproduce it. Patience does not hold the activation and Pass is not lent its
+    /// continuation, though that continuation is above Pass's own, so a lend would move Pass.
+    /// The rows are Academy Ruins (a card put on top), Sensei's Divining Top (a draw, then the
+    /// Top put back), and Excavated Wall (a self-mill). Each row's Draw-step control is held, and
+    /// each row's driven lines show the draws differ.
+    ///
+    /// Ruins needs exactly one legal target: the target is then auto-selected, the activation
+    /// reaches the stack, and the quiesce carries the line through the draw step to the main
+    /// phase. With two, the donor would be scored at its target prompt, before the draw.
+    ///
+    /// Two limits on what these values show. Most of `cont(donor) - cont(pass)` is the forward
+    /// quiesce: the donor's line sees a drawn card, and Pass's static eval doesn't. And
+    /// `zone_eval::hand_quality` reads mana value against available mana, not card identity. So
+    /// the Ruins row also drives both lines to the main phase and compares their values: Sol Ring
+    /// is castable with the Island left, Darksteel Colossus is not, and `v_r > v_p` is the
+    /// invariant itself, a position passing can't reach. With a castable top card that gap is
+    /// zero. The printed `q_r` is the donor's quiesced line on `v_r`'s services: equal to `v_r`,
+    /// it shows the root's quiesce stops at that position. `cont` is on the session's services,
+    /// a different scale, so it isn't compared with either.
+    ///
+    /// Every observable is printed; regenerate them with
+    /// `cargo test -p phase-ai own_upkeep_root_does_not_lend_an_own_library_change -- --nocapture`.
+    #[test]
+    fn own_upkeep_root_does_not_lend_an_own_library_change_and_the_draw_differs() {
+        let db = shared_integration_card_db();
+        let cfg = hard_rung0_config();
+        let pass = GameAction::PassPriority;
+        let in_own_upkeep = |state: &GameState| {
+            matches!(state.waiting_for, WaitingFor::Priority { player } if player == P0)
+                && state.active_player == P0
+                && state.phase == Phase::Upkeep
+                && state.stack.is_empty()
+        };
+
+        // Premises and boards. Ruins' card is absent from the fixture, so its text is the
+        // constant above; the other two fixture cards' abilities are read through the database.
+        let (ruins_runner, ruins) = ruins_board(Phase::Upkeep);
+        let ruins_state = ruins_runner.state().clone();
+        assert!(
+            in_own_upkeep(&ruins_state),
+            "premise: P0 holds priority in its own Upkeep on an empty stack"
+        );
+        let ability = &ruins_state.objects[&ruins].abilities[1];
+        assert!(
+            matches!(
+                *ability.effect,
+                Effect::PutAtLibraryPosition {
+                    position: engine::types::ability::LibraryPosition::Top,
+                    ..
+                }
+            ) && ability.condition.is_none(),
+            "premise: Academy Ruins puts a card on top with no condition, got {ability:?}"
+        );
+        let graveyard_artifacts = p0_player(&ruins_state)
+            .graveyard
+            .iter()
+            .filter(|id| {
+                ruins_state.objects[*id]
+                    .card_types
+                    .core_types
+                    .contains(&CoreType::Artifact)
+            })
+            .count();
+        assert_eq!(
+            graveyard_artifacts, 1,
+            "premise: exactly one legal target, so the activation reaches the stack"
+        );
+        let ring = p0_player(&ruins_state).graveyard[0];
+        let colossus = p0_player(&ruins_state).library[0];
+        assert_eq!(
+            (
+                ruins_state.objects[&ring].name.as_str(),
+                ruins_state.objects[&colossus].name.as_str()
+            ),
+            ("Sol Ring", "Darksteel Colossus"),
+            "premise: the Ring in the graveyard, the Colossus on top"
+        );
+
+        let (top_runner, top) = divining_top_board(Phase::Upkeep);
+        let top_state = top_runner.state().clone();
+        assert!(
+            in_own_upkeep(&top_state),
+            "premise: P0 holds priority in its own Upkeep on an empty stack"
+        );
+        assert_eq!(
+            db.get_face_by_name("Sensei's Divining Top")
+                .and_then(|face| face.oracle_text.as_deref()),
+            Some(
+                "{1}: Look at the top three cards of your library, then put them back in any \
+                 order.\n{T}: Draw a card, then put this artifact on top of its owner's library."
+            ),
+            "premise: the fixture's Top is the card, verbatim"
+        );
+        let draws_then_puts_back =
+            crate::ability_chain::collect_chain_effects(&top_state.objects[&top].abilities[1]);
+        assert!(
+            matches!(
+                draws_then_puts_back.as_slice(),
+                [
+                    Effect::Draw { .. },
+                    Effect::PutAtLibraryPosition {
+                        target: TargetFilter::SelfRef,
+                        ..
+                    }
+                ]
+            ),
+            "premise: the Top's ability 1 draws, then puts it back, got {draws_then_puts_back:?}"
+        );
+
+        let (wall_runner, wall, wall_blank, bolt) = wall_board(Phase::Upkeep);
+        let wall_state = wall_runner.state().clone();
+        assert!(
+            in_own_upkeep(&wall_state),
+            "premise: P0 holds priority in its own Upkeep on an empty stack"
+        );
+        assert!(
+            matches!(
+                *wall_state.objects[&wall].abilities[0].effect,
+                Effect::Mill {
+                    target: TargetFilter::Controller,
+                    ..
+                }
+            ),
+            "premise: the Wall mills its controller, got {:?}",
+            wall_state.objects[&wall].abilities[0]
+        );
+        assert_eq!(
+            (
+                p0_player(&wall_state).library[0],
+                p0_player(&wall_state).library[1]
+            ),
+            (wall_blank, bolt),
+            "premise: the blank card is on top of the AI's library, the Bolt beneath it"
+        );
+
+        let empty = PolicyRegistry::for_tests(vec![]);
+
+        // Line R (CR 504.1 + CR 121.1): Ruins in the Upkeep, so the draw takes the Ring.
+        let (mut line_r, ruins_r) = ruins_board(Phase::Upkeep);
+        line_r
+            .act(activate(ruins_r, 1))
+            .expect("Ruins' activation is accepted");
+        assert!(
+            !line_r.state().stack.is_empty(),
+            "line R: the one legal target is auto-selected and Ruins' ability is on the stack, \
+             got {:?}",
+            line_r.state().waiting_for
+        );
+        // Before the first pass: the donor's line as the root's quiesce carries it, on `v_r`'s
+        // services, to read beside `v_r`.
+        let q_r =
+            PlannerServices::new_default(P0, &cfg, &empty).evaluate_state_quiesced(line_r.state());
+        pass_to_priority_in(&mut line_r, Phase::Draw);
+        let hand_r = &p0_player(line_r.state()).hand;
+        assert!(
+            hand_r.contains(&ring) && !hand_r.contains(&colossus),
+            "line R: the draw takes the Ring, hand {hand_r:?}"
+        );
+        assert_eq!(
+            p0_player(line_r.state()).library[0],
+            colossus,
+            "line R: the Colossus is the next card"
+        );
+        pass_to_priority_in(&mut line_r, Phase::PreCombatMain);
+
+        // Line P: pass, so the draw takes the Colossus, then activate Ruins in the main phase.
+        let (mut line_p, ruins_p) = ruins_board(Phase::Upkeep);
+        pass_to_priority_in(&mut line_p, Phase::Draw);
+        let hand_p = &p0_player(line_p.state()).hand;
+        assert!(
+            hand_p.contains(&colossus) && !hand_p.contains(&ring),
+            "line P: the draw takes the Colossus, hand {hand_p:?}"
+        );
+        pass_to_priority_in(&mut line_p, Phase::PreCombatMain);
+        let hand_before = p0_player(line_p.state()).hand.clone();
+        line_p
+            .act(activate(ruins_p, 1))
+            .expect("Ruins' activation is accepted");
+        pass_to_priority_in(&mut line_p, Phase::PreCombatMain);
+        assert_eq!(
+            p0_player(line_p.state()).library[0],
+            ring,
+            "line P: the Ring is on top of the library, too late for this draw"
+        );
+        assert_eq!(
+            p0_player(line_p.state()).hand,
+            hand_before,
+            "line P: the main-phase activation adds nothing to the hand"
+        );
+        assert_eq!(
+            p0_tapped_permanents(line_r.state()),
+            p0_tapped_permanents(line_p.state()),
+            "premise: both lines spent the same mana sources"
+        );
+        // Each on its own services instance: the eval cache is keyed by state hash.
+        let v_r =
+            PlannerServices::new_default(P0, &cfg, &empty).evaluate_state_cached(line_r.state());
+        let v_p =
+            PlannerServices::new_default(P0, &cfg, &empty).evaluate_state_cached(line_p.state());
+
+        // Line T: the Top's draw takes the blank, the Top goes back, and the draw step redraws it.
+        let (mut line_t, top_t) = divining_top_board(Phase::Upkeep);
+        line_t
+            .act(activate(top_t, 1))
+            .expect("the Top's activation is accepted");
+        pass_to_priority_in(&mut line_t, Phase::Draw);
+        assert!(
+            p0_hand_holds(line_t.state(), "Sensei's Divining Top")
+                && p0_hand_holds(line_t.state(), "Blank Card"),
+            "line T: the blank, then the Top, are drawn"
+        );
+        // Line P: pass, and the Top stays on the battlefield with the blank drawn.
+        let (mut line_top_p, top_p) = divining_top_board(Phase::Upkeep);
+        pass_to_priority_in(&mut line_top_p, Phase::Draw);
+        assert!(
+            line_top_p.state().battlefield.contains(&top_p)
+                && p0_hand_holds(line_top_p.state(), "Blank Card")
+                && !p0_hand_holds(line_top_p.state(), "Sensei's Divining Top"),
+            "line P: the Top is still on the battlefield"
+        );
+
+        // Line M: the mill takes the blank, so the draw takes the Bolt.
+        let (mut line_m, wall_m, blank_m, bolt_m) = wall_board(Phase::Upkeep);
+        line_m
+            .act(activate(wall_m, 0))
+            .expect("the Wall's activation is accepted");
+        pass_to_priority_in(&mut line_m, Phase::Draw);
+        assert!(
+            p0_player(line_m.state()).hand.contains(&bolt_m)
+                && p0_player(line_m.state()).graveyard.contains(&blank_m),
+            "line M: the Bolt is drawn, the blank milled"
+        );
+        // Line P: pass, and the draw takes the blank.
+        let (mut line_wall_p, _, blank_p, bolt_p) = wall_board(Phase::Upkeep);
+        pass_to_priority_in(&mut line_wall_p, Phase::Draw);
+        assert!(
+            p0_player(line_wall_p.state()).hand.contains(&blank_p)
+                && !p0_player(line_wall_p.state()).hand.contains(&bolt_p),
+            "line P: the blank is drawn"
+        );
+
+        let (ruins_control, ruins_c) = ruins_board(Phase::Draw);
+        let (top_control, top_c) = divining_top_board(Phase::Draw);
+        let (wall_control, wall_c, ..) = wall_board(Phase::Draw);
+        let rows = [
+            UpkeepDonorRow::score(
+                "Academy Ruins",
+                (&ruins_state, activate(ruins, 1)),
+                (ruins_control.state(), activate(ruins_c, 1)),
+                &cfg,
+            ),
+            UpkeepDonorRow::score(
+                "Sensei's Divining Top",
+                (&top_state, activate(top, 1)),
+                (top_control.state(), activate(top_c, 1)),
+                &cfg,
+            ),
+            UpkeepDonorRow::score(
+                "Excavated Wall",
+                (&wall_state, activate(wall, 0)),
+                (wall_control.state(), activate(wall_c, 0)),
+                &cfg,
+            ),
+        ];
+        let ruins_row = &rows[0];
+        eprintln!(
+            "Academy Ruins lines: v_r = {v_r}, q_r = {q_r}, v_p = {v_p}, cont(donor) = {}, \
+             cont(pass) = {}",
+            ruins_row.roots.cont(&ruins_row.donor),
+            ruins_row.roots.cont(&pass)
+        );
+
+        for row in &rows {
+            row.assert_not_held_or_lent();
+        }
+        assert!(
+            v_r > v_p,
+            "the main-phase position the Ruins line reaches is one passing can't: {v_r} vs {v_p}"
+        );
+    }
+
     /// D1 at the root (the mtg-bot Coordinated Assault regression): in the AI's own Draw step
     /// EffectTiming prices Coordinated Assault's until-end-of-turn `GenericEffect` pump as a
     /// combat trick (CR 611.2a + CR 514.2), and the searched root carries that verdict at the
