@@ -1647,10 +1647,15 @@ fn a_refused_drain_keeps_the_released_entry_beside_the_dies_context() {
     }
 }
 
-/// R2 (coverage half). The as-enters roll line leaves no coverage gap on any
-/// class face; the game-side gap authority (`card_face_gaps`) agrees with the
-/// parse. Jumbo Imp's end-step line ("remove a number of +1/+1 counters …
-/// equal to the result") is a separate, pre-existing `unparsed_quantity` gap.
+/// R2 (coverage half). The as-enters roll line leaves no `enters_with_clause`
+/// gap on any class face; the game-side gap authority (`card_face_gaps`)
+/// agrees with the parse. Temp of the Damned's upkeep "If you can't,
+/// sacrifice it" rider is a separate strict-failure gap
+/// (`cant_rider_without_zone_change_antecedent`, CR 608.2c): its generic guard
+/// reads the zone-change ledger, which a counter removal never writes, so it
+/// stays a gap until the guard is repaired. Jumbo Imp's end-step line ("remove
+/// a number of +1/+1 counters … equal to the result") is a separate,
+/// pre-existing `unparsed_quantity` gap.
 #[test]
 fn as_enters_roll_faces_carry_no_enters_with_gap() {
     const TEMP_OF_THE_DAMNED: &str = "As this creature enters, roll a six-sided die. This creature enters with a number of funk counters on it equal to the result.\nAt the beginning of your upkeep, remove a funk counter from this creature. If you can't, sacrifice it.";
@@ -1669,7 +1674,12 @@ fn as_enters_roll_faces_carry_no_enters_with_gap() {
             vec!["Flying"],
             vec!["Effect:unparsed_quantity"],
         ),
-        ("Temp of the Damned", TEMP_OF_THE_DAMNED, vec![], vec![]),
+        (
+            "Temp of the Damned",
+            TEMP_OF_THE_DAMNED,
+            vec![],
+            vec!["Effect:cant_rider_without_zone_change_antecedent"],
+        ),
     ] {
         let keyword_names: Vec<String> = keyword_names.iter().map(|k| k.to_string()).collect();
         let parsed = engine::parser::parse_oracle_text(
