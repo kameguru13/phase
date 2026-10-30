@@ -7652,8 +7652,8 @@ impl ParkedEntry {
 
 /// An object with an `event` key is the current shape. Anything else is a
 /// pre-[`ParkedEntry`] bare `GameEvent`: a legacy paused drain has no binding, so
-/// such an entry could never complete, and `Completed` preserves what its take
-/// did at that version.
+/// such an entry could never complete, and `Completed` keeps it collectable, as
+/// its take did for an entrant whose owner and controller were still in the game.
 impl<'de> Deserialize<'de> for ParkedEntry {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
@@ -30113,7 +30113,8 @@ impl GameState {
     }
 
     /// Bind `entrant` to the active frame's resident drain. `false` when there
-    /// is no resident to carry it.
+    /// is no resident, or the resident carries another entrant, whose abandonment
+    /// would end this binding too: the caller parks `entrant`'s own owner.
     pub(crate) fn bind_parked_entrant_to_active_drain(
         &mut self,
         entrant: crate::types::identifiers::ObjectIncarnationRef,
@@ -30121,6 +30122,12 @@ impl GameState {
         let Some(resident) = self
             .active_post_replacement_drains_mut()
             .and_then(PostReplacementDrainStack::resident_mut)
+            .filter(|drain| {
+                drain
+                    .parked_entrants
+                    .iter()
+                    .all(|bound| bound.object_id == entrant.object_id)
+            })
         else {
             return false;
         };

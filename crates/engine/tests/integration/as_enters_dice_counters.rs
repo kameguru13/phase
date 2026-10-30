@@ -1258,7 +1258,6 @@ fn breach_board(seed: u64) -> (GameRunner, ObjectId, ObjectId) {
     (scenario.build(), imp, breach)
 }
 
-/// Cast Through the Breach and accept the put, stopping at the next prompt.
 /// Cast a "you may put" `spell` and put `entrant`, up to its entry's first prompt.
 fn put_until_roll(runner: &mut GameRunner, spell: ObjectId, entrant: ObjectId) -> Vec<GameEvent> {
     let mut events = Vec::new();
@@ -1781,6 +1780,154 @@ fn both_seats_entries_complete_on_eureka() {
     assert_eq!(zone(runner.state(), peacekeeper), Zone::Battlefield);
 }
 
+/// Eureka with Jumbo Imp as P0's card, Anointed Peacekeeper as P1's and Clone as
+/// P2's, Adaptive Automaton on the battlefield, and Soul Warden with P0.
+fn eureka_three_entrants_board(
+    seed: u64,
+) -> (GameRunner, ObjectId, ObjectId, ObjectId, ObjectId, ObjectId) {
+    let mut scenario = board3(seed);
+    scenario.add_enchantment_from_oracle(P0, "Barbarian Class", BARBARIAN_CLASS_L1);
+    scenario.add_creature_from_oracle(P0, "Soul Warden", 1, 1, SOUL_WARDEN);
+    let donor = scenario
+        .add_creature_from_oracle(P0, "Adaptive Automaton", 2, 1, ADAPTIVE_AUTOMATON)
+        .id();
+    let imp = free_creature(&mut scenario, "Jumbo Imp", 0, 0, JUMBO_IMP);
+    let eureka = free_spell(&mut scenario, "Eureka", false, EUREKA);
+    let peacekeeper = {
+        let mut builder = scenario.add_creature_to_hand(P1, "Anointed Peacekeeper", 3, 3);
+        builder.from_oracle_text_with_keywords(&["vigilance"], ANOINTED_PEACEKEEPER);
+        builder.with_mana_cost(ManaCost::generic(0));
+        builder.id()
+    };
+    let clone = scenario
+        .add_creature_to_hand_from_oracle(P2, "Clone", 0, 0, CLONE)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+    let mut runner = scenario.build();
+    seed_card_names(&mut runner);
+    (runner, imp, eureka, peacekeeper, clone, donor)
+}
+
+fn stack_frames(state: &GameState) -> Vec<FrameKind> {
+    state
+        .resolution_stack
+        .iter()
+        .map(ResolutionFrame::kind)
+        .collect()
+}
+
+fn named_choice_player(state: &GameState) -> Option<PlayerId> {
+    match state.waiting_for {
+        WaitingFor::NamedChoice { player, .. } => Some(player),
+        _ => None,
+    }
+}
+
+/// V21. CR 603.2 + CR 800.4a: Clone's copied choice resolves under the drain of
+/// Peacekeeper's unfinished entry, so it parks its own owner and its entry
+/// completes with the answer. P1 leaving at CardName abandons only Peacekeeper's
+/// entry, and Soul Warden sees Imp and Clone. P1 answering is the pair.
+#[test]
+fn a_copied_choice_outlives_another_entrants_abandonment() {
+    let seed = find_seed("a Eureka Imp tie", |seed| {
+        let (mut runner, imp, eureka, ..) = eureka_three_entrants_board(seed);
+        put_until_roll(&mut runner, eureka, imp);
+        tie_prompt_results(runner.state()).is_some()
+    });
+    for p1_concedes in [true, false] {
+        let (mut runner, imp, eureka, peacekeeper, clone, donor) =
+            eureka_three_entrants_board(seed);
+        let before = life(runner.state(), P0);
+        let mut events = eureka_to_peacekeeper_choice(&mut runner, imp, eureka);
+        answer_named_choice(&mut runner, &mut events);
+        assert!(
+            matches!(
+                runner.state().waiting_for,
+                WaitingFor::OptionalEffectChoice { player, .. } if player == P2
+            ),
+            "{:?}",
+            runner.state().waiting_for
+        );
+        act(
+            &mut runner,
+            GameAction::DecideOptionalEffect { accept: true },
+            &mut events,
+        );
+        accept_replacement(&mut runner, &mut events);
+        choose_copy_target(&mut runner, donor, &mut events);
+
+        // Reach: the copied prompt, with Clone's owner parked above Peacekeeper's
+        // drain and P2's continuation.
+        assert_eq!(named_choice_player(runner.state()), Some(P2));
+        assert_eq!(
+            stack_frames(runner.state()),
+            vec![
+                FrameKind::PostReplacement,
+                FrameKind::AbilityContinuation,
+                FrameKind::PostReplacement
+            ]
+        );
+        assert_eq!(
+            runner
+                .state()
+                .resolution_stack
+                .validate(&runner.state().waiting_for),
+            Ok(())
+        );
+        assert!(is_pending(runner.state(), clone));
+        let chosen = answer_named_choice(&mut runner, &mut events);
+
+        // Reach: CardName is open in P1's seat, with only Peacekeeper's drain left.
+        assert!(is_card_name_choice(runner.state()));
+        assert_eq!(named_choice_player(runner.state()), Some(P1));
+        assert_eq!(
+            stack_frames(runner.state()),
+            vec![FrameKind::PostReplacement]
+        );
+        assert_eq!(
+            runner
+                .state()
+                .resolution_stack
+                .validate(&runner.state().waiting_for),
+            Ok(())
+        );
+        assert_eq!(
+            parked_state_of(runner.state(), imp),
+            Some(ParkedEntryState::Completed)
+        );
+        assert_eq!(
+            parked_state_of(runner.state(), clone),
+            Some(ParkedEntryState::Completed)
+        );
+        assert!(is_pending(runner.state(), peacekeeper));
+
+        if p1_concedes {
+            concede(&mut runner, P1, &mut events);
+        } else {
+            answer_card_name(&mut runner, &mut events);
+        }
+        settle(&mut runner, &mut events, DECLINE_ANSWERS);
+
+        assert_eq!(
+            life(runner.state(), P0),
+            before + if p1_concedes { 2 } else { 3 },
+            "p1_concedes = {p1_concedes}"
+        );
+        assert_eq!(zone(runner.state(), clone), Zone::Battlefield);
+        assert!(runner.state().objects[&clone]
+            .card_types
+            .subtypes
+            .contains(&chosen));
+        assert_eq!(runner.state().players[1].is_eliminated, p1_concedes);
+        assert_eq!(
+            zone(runner.state(), peacekeeper) == Zone::Battlefield,
+            !p1_concedes
+        );
+        assert!(runner.state().deferred_entry_events.is_empty());
+        assert!(runner.state().resolution_stack.is_empty());
+    }
+}
+
 /// A donor on P1's battlefield, Clone in P0's hand, Soul Warden with P2.
 fn clone_board3(
     seed: u64,
@@ -2245,8 +2392,8 @@ fn replacement_decline_index(state: &GameState) -> usize {
 }
 
 /// V10. A capture leaves another entrant's entry parked: Clone's copy prompt in
-/// P1's seat does not erase Imp's completed entry, so a third player's Soul Warden
-/// sees both. Declining P1's put is the pair.
+/// P2's seat does not erase Imp's completed entry, so P1's Soul Warden sees both.
+/// Declining P2's put is the pair.
 #[test]
 fn a_mid_entry_capture_keeps_another_entrants_entry() {
     fn eureka_clone_board(seed: u64) -> (GameRunner, ObjectId, ObjectId, ObjectId) {

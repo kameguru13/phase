@@ -414,8 +414,9 @@ fn handle_replacement_choice_inner(
         .pending_replacement
         .as_ref()
         .and_then(|pending| pending.proposed.affected_object_id());
-    // The object of a parked zone move, for the `Prevented` arm: a replaced land
-    // play has no resumed event left to name it by then.
+    // The object of a parked zone move, for the `Prevented` arm. No applier
+    // prevents a move onto the battlefield today; if one does, a played land's
+    // `LandPlayed` stays collectable, as it did before the park recorded state.
     let parked_zone_change_object_id = state
         .pending_replacement
         .as_ref()
@@ -10974,5 +10975,33 @@ mod entry_continuation_release_tests {
             Some(reference(&state, id))
         );
         assert!(state.active_post_replacement_drains().is_none());
+
+        // A resident bound to another entrant: nothing is written, and the caller
+        // parks the owner.
+        let mut state = settled_state(2);
+        let (id, entry) = parked_entry(&mut state, 900, P0, P0, PENDING);
+        let (other, _) = entered(&mut state, 901, P1, P1);
+        let bound = reference(&state, other);
+        let mut drains = PostReplacementDrainStack::default();
+        drains.install(
+            PostReplacementDrain {
+                status: DrainStatus::Paused,
+                source: Some(host),
+                parked_entrants: vec![bound],
+                ..PostReplacementDrain::ready(inert_continuation())
+            },
+            ResidentDrainPolicy::Replace,
+        );
+        state.resolution_stack.push_post_replacement(drains);
+        assert_eq!(
+            bind_copied_choice_entrant(&mut state, id),
+            Some(reference(&state, id))
+        );
+        let resident = state
+            .active_post_replacement_drains()
+            .and_then(PostReplacementDrainStack::resident)
+            .expect("the resident");
+        assert_eq!(resident.parked_entrants, vec![bound]);
+        assert_eq!(state.deferred_entry_events, vec![seeded(entry, PENDING)]);
     }
 }
