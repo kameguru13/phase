@@ -117,6 +117,7 @@ fn ironscale_single_blocker_prevents_and_adds_one_counter() {
         .declare_blockers(&[(blocker, hydra)])
         .expect("P1 blocks the Hydra with the 3/3");
     runner.combat_damage();
+    assert_combat_settled(&runner);
 
     // Reach guard + negative: the Hydra's 5 damage to the blocker landed (the
     // shield is scoped to damage dealt TO the Hydra), so combat damage happened.
