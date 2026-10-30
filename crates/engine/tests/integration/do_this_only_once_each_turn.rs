@@ -23,7 +23,7 @@ use engine::types::card_type::{CardType, CoreType};
 use engine::types::counter::CounterType;
 use engine::types::game_state::{
     AutoMayChoice, CastOfferKind, CastPaymentMode, ManaChoice, MayTriggerAutoChoiceScope,
-    StackEntryKind, WaitingFor,
+    ShardChoice, StackEntryKind, WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
@@ -1688,6 +1688,129 @@ fn emet_selch_life_loss_while_auto_paying_for_its_cast_triggers_it_again() {
 #[test]
 fn emet_selch_life_loss_while_manually_paying_for_its_cast_triggers_it_again() {
     emet_selch_life_loss_while_paying_triggers_it_again(FragmentPayment::Manual);
+}
+
+/// A synthetic trigger card (no printed card makes this reachable): Emet-Selch's
+/// cast instruction, verbatim, on a "Whenever you lose life" trigger, so a non-mana
+/// cost of the offered cast — Phyrexian mana paid with life — raises the trigger event.
+const LIFE_LOSS_RECASTER: &str = "Whenever you lose life, you may cast target instant or sorcery card from your graveyard. If that spell would be put into your graveyard, exile it instead. Do this only once each turn.";
+
+const LOSE_ONE_LIFE: &str = "{0}: You lose 1 life.";
+
+/// E6 (CR 603.2 + CR 603.2h + CR 107.4f + CR 119.4 + CR 601.2h + CR 601.2i): the
+/// offered card costs {R/P} and P0 pays it with 2 life, a CR 601.2h cost paid in the
+/// same action that commits the cast. That life loss comes before the spell becomes
+/// cast, so it triggers the ability again even though the cast then takes the
+/// indicated action; the new instance resolves after the cast and does nothing.
+#[test]
+fn life_paid_for_the_offered_cast_triggers_the_indicated_action_ability_again() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let recaster = scenario
+        .add_creature_from_oracle(P0, "Life-Loss Recaster", 2, 2, LIFE_LOSS_RECASTER)
+        .id();
+    let life_loss = scenario
+        .add_artifact_from_oracle(P0, "Life Loss Engine", LOSE_ONE_LIFE)
+        .id();
+    let [cast_card, other_card] = ["Phyrexian Draw A", "Phyrexian Draw B"].map(|name| {
+        scenario
+            .add_spell_to_graveyard(P0, name, true)
+            .from_oracle_text("Draw a card.")
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::PhyrexianRed],
+                generic: 0,
+            })
+            .id()
+    });
+    scenario.with_library_top(P0, &["Card A", "Card B", "Card C", "Card D"]);
+    let mut runner = scenario.build();
+
+    let p0_life = runner.life(P0);
+    activate_and_resolve(&mut runner, life_loss);
+    assert_eq!(runner.life(P0), p0_life - 1, "reach: P0 lost life");
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::TriggerTargetSelection { .. }
+    ) {
+        runner
+            .act(GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(cast_card)),
+            })
+            .expect("target the graveyard instant");
+    }
+    let recaster_ref = stacked_emet_ref(&runner, recaster);
+    runner.advance_until_stack_empty();
+    assert_optional_prompt(&runner, P0, "reach: the trigger offers its may");
+    decide(&mut runner, true);
+    assert_eq!(
+        offered_card(&runner),
+        Some(cast_card),
+        "reach: accepting opens the cast offer"
+    );
+    let life_before_paying = runner.life(P0);
+    runner
+        .act(GameAction::GraveyardPaidCastChoice {
+            choice: CastChoice::Cast,
+        })
+        .expect("elect the offered cast");
+    let mut paid_with_life = false;
+    for _ in 0..8 {
+        match runner.state().waiting_for {
+            WaitingFor::PhyrexianPayment { .. } => {
+                runner
+                    .act(GameAction::SubmitPhyrexianChoices {
+                        choices: vec![ShardChoice::PayLife],
+                    })
+                    .expect("pay {R/P} with 2 life");
+                paid_with_life = true;
+            }
+            WaitingFor::ManaPayment { .. } => {
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("finish paying the offered cast");
+            }
+            WaitingFor::TriggerTargetSelection { .. } => {
+                runner
+                    .act(GameAction::ChooseTarget {
+                        target: Some(TargetRef::Object(other_card)),
+                    })
+                    .expect("target the remaining graveyard instant");
+            }
+            _ => break,
+        }
+    }
+    assert!(paid_with_life, "reach: P0 chose to pay {{R/P}} with life");
+    assert_eq!(
+        runner.life(P0),
+        life_before_paying - 2,
+        "reach: P0 paid 2 life for the offered cast"
+    );
+    assert_eq!(
+        runner.state().objects[&cast_card].zone,
+        Zone::Stack,
+        "reach: the offered card was cast"
+    );
+    assert_eq!(
+        indicated_actions(&runner),
+        HashSet::from([(recaster_ref, P0)]),
+        "CR 601.2i: the spell became cast, so the controller took the indicated action"
+    );
+    assert_eq!(
+        stacked_trigger_refs(&runner, recaster).len(),
+        1,
+        "CR 603.2h: the life was paid before the spell became cast, so it triggers again"
+    );
+
+    runner.advance_until_stack_empty();
+    assert_settled_priority(
+        &runner,
+        "the new instance resolves with no prompt once the action was taken",
+    );
+    assert_eq!(
+        runner.state().objects[&other_card].zone,
+        Zone::Graveyard,
+        "the new instance cast nothing"
+    );
 }
 
 /// Planetarium of Wan Shi Tong (full Oracle text) with `looked` on top of P0's

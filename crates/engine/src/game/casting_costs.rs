@@ -12902,6 +12902,54 @@ enum ReturnedCreatureCostMove {
     Delivered,
 }
 
+/// CR 603.2 + CR 603.2h + CR 601.2h + CR 601.2i: collect the ordinary triggers of the
+/// events the spell `object_id`'s announcement raised in this action before the spell
+/// becomes cast — its CR 601.2a move to the stack and the costs paid at CR 601.2h
+/// (Phyrexian life, for one). A "Do this only once each turn" limit spent
+/// by casting this spell is checked as each trigger event occurs, so these events must
+/// be collected before the commit records the indicated action as taken.
+///
+/// Mirrors the announcement's own commit: the not-yet-collected part of its span
+/// (minus the occurrences a paused logical zone-change owner retains) is collected into
+/// the spell's in-flight carrier when the announcement has one, so its staged ledger
+/// operations stay in force, and otherwise straight into the deferred queue; either way
+/// the triggered abilities wait for the next release boundary (CR 603.3). The span's
+/// occurrences are claimed for ordinary collectors (CR 603.2c); delayed collectors keep
+/// their CR 603.7 visibility of them.
+fn collect_triggers_raised_before_spell_becomes_cast(
+    state: &mut GameState,
+    object_id: ObjectId,
+    events: &[GameEvent],
+) {
+    let start = match state.announcement_event_scope {
+        crate::types::game_state::AnnouncementEventScope::From { start } => start.min(events.len()),
+        crate::types::game_state::AnnouncementEventScope::Unowned => events.len(),
+    };
+    let retained = super::engine_priority::retained_logical_zone_events(state);
+    let new_events: Vec<GameEvent> =
+        super::announcement_triggers::unclaimed_events(state, events, start)
+            .into_iter()
+            .filter(|event| !retained.contains(event))
+            .collect();
+    if !new_events.is_empty() {
+        match state
+            .in_flight_spell_trigger_carrier
+            .take_if(|carrier| carrier.object_id == object_id)
+        {
+            Some(mut carrier) => {
+                carrier.collection.collect(state, &new_events);
+                state.in_flight_spell_trigger_carrier = Some(carrier);
+            }
+            None => crate::game::triggers::collect_triggers_into_deferred(state, &new_events),
+        }
+    }
+    crate::game::triggers::claim_event_indices_for_ordinary_collection(
+        state,
+        events,
+        (start..events.len()).filter(|&index| !retained.contains(&events[index])),
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize_cast_with_phyrexian_choices_inner(
     state: &mut GameState,
@@ -13663,6 +13711,13 @@ fn finalize_cast_with_phyrexian_choices_inner(
     {
         state.spell_cast_reversal = None;
     }
+    // CR 603.2 + CR 603.2h + CR 601.2i: a "you may cast … Do this only once each
+    // turn" indicated action is taken when this spell becomes cast, below. Every event
+    // this cast raised before then triggers against a limit not yet spent, so its
+    // triggers are collected now, ahead of the record.
+    if resolution_cast_indicated_action.is_some() {
+        collect_triggers_raised_before_spell_becomes_cast(state, object_id, events);
+    }
     events.push(GameEvent::SpellCast {
         card_id,
         controller: player,
@@ -13700,7 +13755,9 @@ fn finalize_cast_with_phyrexian_choices_inner(
     // cast had its events collected before this commit — auto-payment's by
     // `casting::settle_pre_spend_echoes` before the spend, a manual activation's at its
     // own action — so a trigger event it raised (Cryptolith Fragment's life loss) still
-    // sees the action untaken.
+    // sees the action untaken. Every other event of this cast (its CR 601.2a move, a
+    // CR 601.2h cost such as Phyrexian life) was collected just before `SpellCast` by
+    // `collect_triggers_raised_before_spell_becomes_cast`.
     if let Some(limit) = resolution_cast_indicated_action.as_deref() {
         crate::game::triggers::record_indicated_action(state, limit);
     }

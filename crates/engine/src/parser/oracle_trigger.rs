@@ -4584,7 +4584,8 @@ fn chain_creates_reflexive_ability(def: &AbilityDefinition) -> bool {
 ///   instructions, a copy offered to a targeted player);
 /// - a cast indicated action that is not a single-card cast made during this resolution
 ///   (CR 601.2i + CR 608.2g), or that can cast a spell copy the chain put on the stack
-///   (CR 707.10): only that shape reaches the commit that spends the limit.
+///   (CR 707.12; the engine's stack-copy cast route carries no limit): only that shape
+///   reaches the commit that spends the limit.
 fn has_single_indicated_action_instruction(def: &AbilityDefinition) -> bool {
     fn spine<'a>(def: &'a AbilityDefinition, nodes: &mut Vec<&'a AbilityDefinition>) {
         nodes.push(def);
@@ -4609,9 +4610,10 @@ fn has_single_indicated_action_instruction(def: &AbilityDefinition) -> bool {
                 Some(TargetFilter::TriggeringSource)
             ))
     };
-    // CR 707.10: a spell copy this chain puts on the stack (Spellbinder's "copy the
-    // exiled card … you may cast the copy") is cast in place, outside the CR 601.2i
-    // cast finalization that spends the limit.
+    // CR 707.12 + CR 603.2h: casting a copy this chain put on the stack (Spellbinder's
+    // "copy the exiled card … you may cast the copy") is a cast, but the engine completes
+    // it through `cast_stack_spell_copy_during_resolution` → `casting_costs::commit_copy_cast`,
+    // which carries no indicated-action limit, so the guard fails closed.
     let chain_copies_a_spell = nodes.iter().any(|node| {
         matches!(
             &*node.effect,
