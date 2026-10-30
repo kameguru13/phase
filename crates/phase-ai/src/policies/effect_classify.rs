@@ -5,8 +5,8 @@ use engine::game::restrictions::{
     ability_confined_to_sorcery_timing, spell_confined_to_sorcery_timing,
 };
 use engine::types::ability::{
-    AbilityDefinition, AbilityKind, ContinuousModification, ControllerRef, Duration, Effect,
-    EffectScope, PerpetualGrantModification, PerpetualModification, PlayerFilter, PtValue,
+    AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification, ControllerRef, Duration,
+    Effect, EffectScope, PerpetualGrantModification, PerpetualModification, PlayerFilter, PtValue,
     QuantityExpr, ResolvedAbility, StaticDefinition, SubAbilityLink, TapStateChange,
     TargetChoiceTiming, TargetFilter, TargetRef, TriggerDefinition, TypeFilter,
 };
@@ -2234,6 +2234,36 @@ impl CombatBinding {
             Self::Partial
         }
     }
+
+    /// The binding of the candidate that resolves `effects`: [`Self::of_resolution`], except
+    /// that an activation putting loyalty counters on its permanent keeps them whatever the
+    /// phase (CR 606.4), and the permanent's one loyalty activation of the turn (CR 606.3) is
+    /// not banked by passing, so combat is not its whole value. The cost is read through
+    /// [`PolicyContext::effective_activated_ability`], so a granted loyalty ability counts.
+    pub(crate) fn of_candidate(ctx: &PolicyContext<'_>, effects: &[&Effect]) -> Self {
+        match Self::of_resolution(effects) {
+            Self::Whole
+                if ctx
+                    .effective_activated_ability()
+                    .and_then(|ability| ability.cost)
+                    .is_some_and(|cost| net_loyalty_cost(&cost) > 0) =>
+            {
+                Self::Partial
+            }
+            binding => binding,
+        }
+    }
+}
+
+/// CR 606.4 + CR 606.5: the loyalty counters a cost puts on its permanent, net of those it
+/// removes, its loyalty costs combining into one. A `[−X]` ability, modeled as removing counters,
+/// reads 0: it puts none on.
+fn net_loyalty_cost(cost: &AbilityCost) -> i32 {
+    match cost {
+        AbilityCost::Loyalty { amount } => *amount,
+        AbilityCost::Composite { costs } => costs.iter().map(net_loyalty_cost).sum(),
+        _ => 0,
+    }
 }
 
 /// Does this effect, beside a combat-trick payload, add no value outside the combat window?
@@ -2280,8 +2310,9 @@ fn modification_rides_a_trick(modification: &ContinuousModification) -> bool {
 }
 
 /// CR 508.1c + CR 508.1d + CR 509.1b + CR 509.1c: the restrictions and requirements read as
-/// attackers and blockers are declared, among them goad's (CR 701.15b), plus the permission to
-/// attack despite defender (CR 702.3b). Unlisted modes fail closed.
+/// attackers and blockers are declared, among them goad's (CR 701.15b), plus the permissions to
+/// attack despite defender (CR 702.3b) and to block more than the one attacker of CR 509.1a.
+/// Unlisted modes fail closed.
 fn static_mode_is_bound_to_combat(mode: &StaticMode) -> bool {
     matches!(
         mode,
@@ -3043,6 +3074,32 @@ mod temporary_combat_modifier_tests {
         }
     }
 
+    /// CR 606.5: loyalty costs combine into one, so its example's `[−4]` with an additional
+    /// `[+1]` removes counters and an added mana cost changes nothing. A `[0]` puts no counter.
+    #[test]
+    fn net_loyalty_cost_combines_the_loyalty_parts_of_a_cost() {
+        let loyalty = |amount| AbilityCost::Loyalty { amount };
+        let mana = || AbilityCost::Mana {
+            cost: engine::types::mana::ManaCost::generic(2),
+        };
+        let composite = |costs| AbilityCost::Composite { costs };
+
+        for (cost, net) in [
+            (loyalty(1), 1),
+            (loyalty(0), 0),
+            (loyalty(-3), -3),
+            (mana(), 0),
+            (AbilityCost::Tap, 0),
+            (composite(vec![mana(), loyalty(1)]), 1),
+            (composite(vec![mana(), loyalty(-1)]), -1),
+            (composite(vec![loyalty(-4), loyalty(1)]), -3),
+            (composite(vec![loyalty(1), loyalty(1)]), 2),
+            (composite(vec![mana(), composite(vec![loyalty(2)])]), 2),
+        ] {
+            assert_eq!(net_loyalty_cost(&cost), net, "{cost:?}");
+        }
+    }
+
     fn bare_pump() -> Effect {
         Effect::Pump {
             power: PtValue::Fixed(1),
@@ -3106,7 +3163,7 @@ mod temporary_combat_modifier_tests {
     }
 
     /// The riders read in full: every attack and block static of CR 508.1c, CR 508.1d, CR 509.1b
-    /// and CR 509.1c, with the permission beside them, and a delayed removal of what was pumped.
+    /// and CR 509.1c, with the permissions beside them, and a delayed removal of what was pumped.
     /// A rider alone is no payload, and anything else beside a payload fails closed.
     #[test]
     fn only_attack_and_block_statics_and_self_removal_ride_a_trick() {

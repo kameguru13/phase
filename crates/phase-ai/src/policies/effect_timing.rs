@@ -55,7 +55,7 @@ impl EffectTimingPolicy {
         // resolves it, so a permanent spell is not timed by what its abilities do later, and it is
         // priced once per candidate. A payload beside value that lands elsewhere keeps the combat
         // window and takes no penalty out of it: waiting would cost the rest.
-        score += match CombatBinding::of_resolution(&own_resolution_effects(ctx)) {
+        score += match CombatBinding::of_candidate(ctx, &own_resolution_effects(ctx)) {
             CombatBinding::Whole => combat_trick_score(ctx),
             CombatBinding::Partial => combat_trick_score(ctx).max(0.0),
             CombatBinding::Unbound => 0.0,
@@ -3252,6 +3252,10 @@ mod tests {
     const BRAVE_KIN_DUO: &str =
         "{1}, {T}: Target creature gets +1/+1 until end of turn. Activate only as a sorcery.";
     const ROCKFACE_VILLAGE: &str = "{T}: Add {C}.\n{T}: Add {R}. Spend this mana only to cast a creature spell.\n{R}, {T}: Target Lizard, Mouse, Otter, or Raccoon you control gets +1/+0 and gains haste until end of turn. Activate only as a sorcery.";
+    const ELSPETH_KNIGHT_ERRANT: &str = "[+1]: Create a 1/1 white Soldier creature token.\n[+1]: Target creature gets +3/+3 and gains flying until end of turn.\n[−8]: You get an emblem with \"Artifacts, creatures, enchantments, and lands you control have indestructible.\"";
+    const SORIN_VAMPIRE_LORD: &str = "[+1]: Up to one target creature gets +2/+0 until end of turn.\n[−2]: Sorin deals 4 damage to any target. You gain 4 life.\n[−8]: Until end of turn, each Vampire you control gains \"{T}: Gain control of target creature.\"";
+    const NISSA_GENESIS_MAGE: &str = "[+2]: Untap up to two target creatures and up to two target lands.\n[−3]: Target creature gets +5/+5 until end of turn.\n[−10]: Look at the top ten cards of your library. You may put any number of creature and/or land cards from among them onto the battlefield. Put the rest on the bottom of your library in a random order.";
+    const ROWANS_TALENT: &str = "Enchant planeswalker\nEnchanted planeswalker has \"[+1]: Up to one target creature gets +2/+0 and gains first strike and trample until end of turn.\"\nWhenever you activate a loyalty ability of enchanted planeswalker, copy that ability. You may choose new targets for the copy.";
     const THE_WANDERING_EMPEROR: &str = "Flash\nAs long as The Wandering Emperor entered this turn, you may activate her loyalty abilities any time you could cast an instant.\n[+1]: Put a +1/+1 counter on up to one target creature. It gains first strike until end of turn.\n[−1]: Create a 2/2 white Samurai creature token with vigilance.\n[−2]: Exile target tapped creature. You gain 2 life.";
     const LEYLINE_OF_ANTICIPATION: &str = "If this card is in your opening hand, you may begin the game with it on the battlefield.\nYou may cast spells as though they had flash.";
     const HEROIC_REINFORCEMENTS: &str = "Create two 1/1 white Soldier creature tokens. Until end of turn, creatures you control get +1/+1 and gain haste. (They can attack and {T} this turn.)";
@@ -3364,6 +3368,18 @@ mod tests {
             .iter()
             .position(|a| matches!(a.cost, Some(AbilityCost::Loyalty { amount: n }) if n == amount))
             .expect("the loyalty ability is printed")
+    }
+
+    /// The last ability at this loyalty cost: Elspeth's second [+1], or a granted one, which
+    /// follows the printed abilities.
+    fn last_loyalty_index(state: &GameState, id: ObjectId, amount: i32) -> usize {
+        state.objects[&id]
+            .abilities
+            .iter()
+            .rposition(
+                |a| matches!(a.cost, Some(AbilityCost::Loyalty { amount: n }) if n == amount),
+            )
+            .expect("the loyalty ability is on the permanent")
     }
 
     /// The printed index of the card's last activated ability: its only one, or the one after
@@ -3982,5 +3998,91 @@ mod tests {
             0.0,
             "the Role outlasts the End step"
         );
+    }
+
+    /// CR 606.4 + CR 606.3: a positive loyalty cost keeps its counters whatever the phase, and a
+    /// permanent's one loyalty activation of the turn is not banked by passing, so combat is not
+    /// the activation's whole value. A negative cost pays counters out for the pump alone. The
+    /// effect reading is `Whole` on every row, so the cost is the whole difference; a cost read
+    /// through the printed abilities would miss Rowan's Talent's grant.
+    #[test]
+    fn a_positive_loyalty_cost_is_value_outside_combat() {
+        use crate::cast_facts::{collect_definition_effects_with, ModeWalk};
+
+        let mut s = trick_scenario();
+        let elspeth = s
+            .add_planeswalker_from_oracle(
+                P0,
+                "Elspeth, Knight-Errant",
+                "Elspeth",
+                4,
+                ELSPETH_KNIGHT_ERRANT,
+            )
+            .id();
+        let sorin = s
+            .add_planeswalker_from_oracle(P0, "Sorin, Vampire Lord", "Sorin", 4, SORIN_VAMPIRE_LORD)
+            .id();
+        let nissa = s
+            .add_planeswalker_from_oracle(P0, "Nissa, Genesis Mage", "Nissa", 5, NISSA_GENESIS_MAGE)
+            .id();
+        let garruk = s
+            .add_planeswalker_from_oracle(P0, "Garruk Wildspeaker", "Garruk", 4, GARRUK_WILDSPEAKER)
+            .id();
+        let talent = s
+            .add_enchantment_from_oracle(P0, "Rowan's Talent", ROWANS_TALENT)
+            .with_subtypes(vec!["Aura"])
+            .id();
+        let mut runner = s.build();
+        runner.state_mut().phase = Phase::PostCombatMain;
+        engine::game::effects::attach::attach_to(runner.state_mut(), talent, garruk);
+        settle(&mut runner);
+        let state = runner.state();
+
+        let elspeth_pump = last_loyalty_index(state, elspeth, 1);
+        let granted = last_loyalty_index(state, garruk, 1);
+        assert!(
+            granted >= GARRUK_WILDSPEAKER.lines().count(),
+            "reach: Rowan's Talent's [+1] follows Garruk's printed abilities, got {granted}"
+        );
+        let sorin_pump = loyalty_index(state, sorin, 1);
+        let nissa_pump = loyalty_index(state, nissa, -3);
+        let garruk_pump = loyalty_index(state, garruk, -4);
+        for (name, source, index) in [
+            ("Elspeth's +1", elspeth, elspeth_pump),
+            ("Sorin's +1", sorin, sorin_pump),
+            ("Rowan's Talent's +1", garruk, granted),
+            ("Nissa's −3", nissa, nissa_pump),
+            ("Garruk's −4", garruk, garruk_pump),
+        ] {
+            let walk = collect_definition_effects_with(
+                &state.objects[&source].abilities[index],
+                ModeWalk::RootOnly,
+            );
+            assert_eq!(
+                CombatBinding::of_resolution(&walk),
+                CombatBinding::Whole,
+                "premise: {name}'s effects read as a whole trick"
+            );
+        }
+
+        for (name, delta) in [
+            (
+                "Elspeth's +1",
+                activation_delta(state, elspeth, elspeth_pump),
+            ),
+            ("Sorin's +1", activation_delta(state, sorin, sorin_pump)),
+            (
+                "Rowan's Talent's +1",
+                activation_delta(state, garruk, granted),
+            ),
+        ] {
+            assert_eq!(delta, 0.0, "{name} keeps its counter out of combat");
+        }
+        for (name, delta) in [
+            ("Nissa's −3", activation_delta(state, nissa, nissa_pump)),
+            ("Garruk's −4", activation_delta(state, garruk, garruk_pump)),
+        ] {
+            assert!(delta < -1.5, "{name} is priced, got {delta}");
+        }
     }
 }
