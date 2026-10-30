@@ -20149,8 +20149,9 @@ one on the bottom of your library.";
         }
     }
 
-    /// An AI enchantment with the Saga subtype and no chapter abilities: CR 505.4 opens the
-    /// main phase with a lore counter on it, and CR 714.4 never sacrifices it.
+    /// An AI enchantment with the Saga subtype and no chapter abilities. Its presence is what
+    /// `activation_patience::main_phase_opens_with_events` reads: that predicate stands the
+    /// patience window down for any Saga its player controls, whatever its chapter abilities.
     fn add_saga(state: &mut GameState, controller: PlayerId) -> ObjectId {
         let id = create_object(
             state,
@@ -20262,8 +20263,8 @@ one on the bottom of your library.";
     /// The searched root in the AI's own Upkeep and Draw step on an empty stack applies
     /// `ActivationPatiencePolicy`'s verdict at full strength (`RankedCandidate::root_tactical`):
     /// the root margin moves by exactly the heuristic branch's raw delta. Outside the policy's
-    /// window (the main phase; an upkeep whose main phase opens with a Saga's lore counter,
-    /// CR 505.4) the verdict is silent and nothing moves.
+    /// window (the main phase; an upkeep in which the AI controls a Saga, where the policy
+    /// stands down) the verdict is silent and nothing moves.
     #[test]
     fn own_upkeep_and_draw_root_carry_activation_patience_at_full_strength() {
         use crate::policies::registry::NUDGE_MAX;
@@ -20359,7 +20360,7 @@ one on the bottom of your library.";
 
     /// Only an open line that ActivationPatience holds lends Pass its continuation. A better
     /// line the policy does not hold lends nothing: an upkeep-only ability (CR 602.5, Balduvian
-    /// Hydra), a Draw step whose main phase opens with a Saga's lore counter (CR 505.4), and the
+    /// Hydra), a Draw step in which the AI controls a Saga (the policy stands down), and the
     /// main phase. A held line that wins the game lends nothing either: Lobber Crew's 1 damage
     /// to each opponent at 1 life ends the game (CR 704.5a + CR 104.2a), which waiting cannot
     /// inherit, because passing hands the opponents priority first (CR 117.3d).
@@ -20938,6 +20939,100 @@ one on the bottom of your library.";
             hand.contains(&bolt) && !hand.contains(&blank),
             "the draw step's draw takes the card the arrangement selected (root chose {chosen:?}), \
              hand {hand:?}"
+        );
+    }
+
+    /// Elemental Augury, verbatim: a library-top arrangement of a targeted player's library.
+    const ELEMENTAL_AUGURY: &str = "{3}: Look at the top three cards of target player's library, then put them back in any order.";
+
+    /// The targeted-player sibling of the Crystal Ball row: Elemental Augury's "{3}: Look at the
+    /// top three cards of target player's library, then put them back in any order." in the AI's
+    /// own Upkeep, with a Lightning Bolt buried under a card that has no types and no abilities.
+    /// The AI may name itself as the target (CR 115.1), and that line chooses the card the draw
+    /// step's draw takes (CR 504.1 + CR 121.1, CR 701.20e), which passing cannot reproduce: by the
+    /// main phase that draw has happened. So patience does not hold the activation, and Pass is
+    /// not lent its continuation.
+    ///
+    /// Unlike Crystal Ball's, this arrangement's rung-0 continuation is not above Pass's, so on
+    /// this board a lend would not move Pass and the `ap` assertion is the one that pins the
+    /// hold. Measured on this board: the activation's first decision is its target, where naming
+    /// the AI and naming the opponent score alike, and the dig's `DigChoice` candidates enumerate
+    /// which cards are kept, not their order, so keeping all three leaves the blank card on top.
+    #[test]
+    fn own_upkeep_root_does_not_hold_a_targeted_player_arrangement() {
+        let db = shared_integration_card_db();
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::Upkeep);
+        let augury = scenario
+            .add_enchantment_from_oracle(P0, "Elemental Augury", ELEMENTAL_AUGURY)
+            .id();
+        for _ in 0..3 {
+            scenario.add_real_card(P0, "Mountain", Zone::Battlefield, db);
+        }
+        let bolt = scenario.add_real_card(P0, "Lightning Bolt", Zone::Library, db);
+        let blank = scenario.add_card_to_library_top(P0, "Blank Card");
+        let mut runner = scenario.build();
+        rehydrate_game_from_card_db(runner.state_mut(), db);
+        add_libraries(runner.state_mut(), 5);
+        {
+            let library = &mut runner
+                .state_mut()
+                .players
+                .iter_mut()
+                .find(|player| player.id == P0)
+                .unwrap()
+                .library;
+            library.retain(|id| *id != blank && *id != bolt);
+            library.insert(0, bolt);
+            library.insert(0, blank);
+        }
+        let state = runner.state().clone();
+        let p0_library = &state.players.iter().find(|p| p.id == P0).unwrap().library;
+        assert_eq!(
+            (p0_library[0], p0_library[1]),
+            (blank, bolt),
+            "premise: the blank card is on top of the AI's library, the Bolt beneath it"
+        );
+        let ability = &state.objects[&augury].abilities[0];
+        assert!(
+            matches!(
+                *ability.effect,
+                Effect::Dig {
+                    player: TargetFilter::Player,
+                    count: QuantityExpr::Fixed { value: 3 },
+                    destination: Some(Zone::Library),
+                    rest_destination: Some(Zone::Library),
+                    keep_count: None,
+                    keep_count_expr: None,
+                    ..
+                }
+            ),
+            "premise: Elemental Augury looks at and reorders the top three of target player's \
+             library, got {:?}",
+            ability.effect
+        );
+        assert!(
+            matches!(state.waiting_for, WaitingFor::Priority { player } if player == P0)
+                && state.active_player == P0
+                && state.phase == Phase::Upkeep
+                && state.stack.is_empty(),
+            "reach: P0 holds priority in its own Upkeep on an empty stack"
+        );
+
+        let cfg = hard_rung0_config();
+        let pass = GameAction::PassPriority;
+        let arrange = activate(augury, 0);
+        let roots = PatienceRoots::score(&state, &cfg);
+        roots.assert_scored("Elemental Augury upkeep", &[&arrange, &pass]);
+        assert_eq!(
+            roots.ap(&arrange),
+            0.0,
+            "the upkeep arrangement is not held"
+        );
+        assert_eq!(
+            score_of(&roots.s1, &pass),
+            score_of(&roots.s0, &pass),
+            "Pass is not lent the arrangement's continuation"
         );
     }
 

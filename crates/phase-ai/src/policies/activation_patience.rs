@@ -55,8 +55,10 @@
 //! Floating mana the activation may spend comes first: it empties as the step
 //! ends (CR 500.5), so for it waiting is not free. A draw replacement made in the
 //! upkeep comes next: it must exist before the draw it replaces (CR 614.4). So
-//! does an arrangement of the top of the AI's own library — scry, surveil, or
-//! looking at the top cards and putting them back in any order: the draw step's
+//! does an arrangement that can reach the top of the AI's own library — scry,
+//! surveil, or looking at the top cards and putting them back in any order, on the
+//! AI's library or on a player the AI may name (CR 115.1: Elemental Augury's
+//! "target player's library" can be the AI's own): the draw step's
 //! draw takes the top card (CR 504.1 + CR 121.1), and the upkeep's priority is the
 //! last before it (CR 502.4, CR 503.1), so only an upkeep activation chooses that
 //! card. An arrangement made later arranges a later draw, so waiting loses the
@@ -166,32 +168,69 @@ fn ability_is_deferrable(ability: &AbilityDefinition) -> bool {
 enum DrawSetup {
     /// CR 614.4: a replacement for that draw must exist before it.
     Replacement,
-    /// CR 701.22a / CR 701.25a / CR 701.20e: an arrangement of the top of the AI's own library,
-    /// which chooses the card that draw takes.
+    /// CR 701.22a / CR 701.25a / CR 701.20e: an arrangement of the top of a library that can be the
+    /// AI's own, which then chooses the card that draw takes.
     LibraryTop,
 }
 
-fn draw_setup(effect: &Effect) -> Option<DrawSetup> {
+/// What `effect`, in an ability `ai_player` activates from `source_id`, does to the draw step's
+/// coming draw.
+fn draw_setup(
+    state: &GameState,
+    ai_player: PlayerId,
+    source_id: ObjectId,
+    effect: &Effect,
+) -> Option<DrawSetup> {
     match effect {
         Effect::CreateDrawReplacement { .. } => Some(DrawSetup::Replacement),
-        Effect::Scry {
-            target: TargetFilter::Controller,
-            ..
-        }
-        | Effect::Surveil {
-            target: TargetFilter::Controller,
-            ..
-        }
+        Effect::Scry { target: player, .. }
+        | Effect::Surveil { target: player, .. }
         | Effect::Dig {
-            player: TargetFilter::Controller,
+            player,
             destination: Some(Zone::Library),
             rest_destination: Some(Zone::Library),
             keep_count: None,
             keep_count_expr: None,
             ..
-        } => Some(DrawSetup::LibraryTop),
+        } if slot_can_name(state, ai_player, source_id, player) => Some(DrawSetup::LibraryTop),
         _ => None,
     }
+}
+
+/// Can the player slot `filter` of an ability `ai_player` activates from `source_id` name
+/// `ai_player`, so that the arrangement can be of the AI's own library?
+///
+/// The engine's player-filter authority answers the question. CR 109.5 + CR 602.2a: "you" on an
+/// activated ability is the player who activated it, here the AI, so it is the source controller
+/// the filter is read against. `Controller` names the AI, and `Player` ("target player", CR 115.1)
+/// admits it as a legal choice, as does any filter the authority matches the AI with.
+///
+/// The authority fails closed on a filter it cannot answer without ability context (a parent
+/// target's controller, a chosen or triggering player): it then matches no player at all. Such a
+/// slot still names some player when the ability resolves, and that player may be the AI, so a
+/// filter matching no living player counts as able to name it. Only a filter the authority
+/// answers with other players but not the AI, such as "target opponent's library", cannot.
+fn slot_can_name(
+    state: &GameState,
+    ai_player: PlayerId,
+    source_id: ObjectId,
+    filter: &TargetFilter,
+) -> bool {
+    let matches = |player: PlayerId| {
+        engine::game::filter::player_matches_target_filter_in_state(
+            state,
+            filter,
+            player,
+            Some(ai_player),
+            Some(source_id),
+        )
+    };
+    matches(ai_player)
+        || !state
+            .players
+            .iter()
+            .filter(|player| !player.is_eliminated)
+            .any(|player| matches(player.id))
 }
 
 /// The AI's own windows before its precombat main phase in which it holds priority with an empty
@@ -417,18 +456,20 @@ impl TacticalPolicy for ActivationPatiencePolicy {
         // step; CR 503.1: the upkeep's is the last before that draw). An activation that sets up
         // that draw gives its payoff up by waiting for the main phase: a draw replacement must
         // exist before the draw it replaces (CR 614.4), and an arrangement of the top of the AI's
-        // own library chooses the card that draw takes (CR 701.22a, CR 701.25a, CR 701.20e). An
-        // arrangement made later arranges a later draw, so waiting loses the value of arranging
-        // this one whatever the ability costs: one that taps its source or is capped (CR 602.5b)
-        // is exempt as much as one paid in mana alone. Whether spending the tap or the capped
-        // activation on this draw is worth it is a resource question for the search's valuation,
-        // not a timing question this policy answers.
+        // own library chooses the card that draw takes (CR 701.22a, CR 701.25a, CR 701.20e). So
+        // does one whose player slot the AI may fill with itself, such as Elemental Augury's
+        // "target player's library" (CR 115.1, `slot_can_name`): the line that names the AI
+        // arranges this draw, which passing cannot. An arrangement made later arranges a later
+        // draw, so waiting loses the value of arranging this one whatever the ability costs: one
+        // that taps its source or is capped (CR 602.5b) is exempt as much as one paid in mana
+        // alone. Whether spending the tap or the capped activation on this draw is worth it is a
+        // resource question for the search's valuation, not a timing question this policy answers.
         if ctx.state.phase == Phase::Upkeep {
             let effects = ctx.effects();
             let sets_up = |setup: DrawSetup| {
-                effects
-                    .iter()
-                    .any(|effect| draw_setup(effect) == Some(setup))
+                effects.iter().any(|effect| {
+                    draw_setup(ctx.state, ctx.ai_player, *source_id, effect) == Some(setup)
+                })
             };
             if sets_up(DrawSetup::Replacement) {
                 return PolicyVerdict::neutral(PolicyReason::new(

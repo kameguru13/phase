@@ -893,6 +893,8 @@ fn a_draw_replacement_is_not_held_while_the_draw_is_ahead() {
 const SENSEIS_DIVINING_TOP: &str = "{1}: Look at the top three cards of your library, then put them back in any order.\n{T}: Draw a card, then put this artifact on top of its owner's library.";
 const WATCHFUL_AUTOMATON: &str =
     "{2}{U}: Scry 1. (Look at the top card of your library. You may put that card on the bottom.)";
+const ELEMENTAL_AUGURY: &str =
+    "{3}: Look at the top three cards of target player's library, then put them back in any order.";
 const CRYSTAL_BALL: &str = "{1}, {T}: Scry 2. (Look at the top two cards of your library, then put any number of them on the bottom and the rest on top in any order.)";
 
 /// Put `name` (built from its verbatim Oracle text) on the AI's battlefield as the board's
@@ -911,27 +913,61 @@ fn set_arranger(board: &mut Board, name: &str, oracle_text: &str) -> ObjectId {
     id
 }
 
-/// The arrangement shapes the hatch reads (CR 701.22a scry, CR 701.25a surveil, CR 701.20e a
-/// look-and-reorder dig): each on the AI's own library.
-fn arranges_own_library_top(effect: &engine::types::ability::Effect) -> bool {
-    use engine::types::ability::{Effect, TargetFilter};
-    matches!(
-        effect,
-        Effect::Scry {
-            target: TargetFilter::Controller,
-            ..
-        } | Effect::Surveil {
-            target: TargetFilter::Controller,
-            ..
-        } | Effect::Dig {
-            player: TargetFilter::Controller,
+/// Whose library an arrangement's player slot names, as the rows pin it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    /// "your library" (`TargetFilter::Controller`).
+    Controller,
+    /// "target player's library" (`TargetFilter::Player`, CR 115.1): the AI may name itself.
+    AnyPlayer,
+    /// "target opponent's library": the AI can't name itself.
+    Opponent,
+    /// "its controller" read off a parent target, which the player-filter authority can't answer
+    /// without ability context.
+    ParentTargetController,
+}
+
+/// The player slot of an arrangement shape the hatch reads (CR 701.22a scry, CR 701.25a
+/// surveil, CR 701.20e a look-and-reorder dig), or `None` when `effect` is not one.
+fn arrangement_slot(effect: &engine::types::ability::Effect) -> Option<Slot> {
+    use engine::types::ability::{ControllerRef, Effect, TargetFilter};
+    let player = match effect {
+        Effect::Scry { target: player, .. }
+        | Effect::Surveil { target: player, .. }
+        | Effect::Dig {
+            player,
             destination: Some(Zone::Library),
             rest_destination: Some(Zone::Library),
             keep_count: None,
             keep_count_expr: None,
             ..
+        } => player,
+        _ => return None,
+    };
+    Some(match player {
+        TargetFilter::Controller => Slot::Controller,
+        TargetFilter::Player => Slot::AnyPlayer,
+        TargetFilter::ParentTargetController => Slot::ParentTargetController,
+        TargetFilter::Typed(typed)
+            if typed.type_filters.is_empty()
+                && typed.properties.is_empty()
+                && typed.controller == Some(ControllerRef::Opponent) =>
+        {
+            Slot::Opponent
         }
-    )
+        other => panic!("no row pins an arrangement slot of {other:?}"),
+    })
+}
+
+/// Rewrite Elemental Augury's `Dig` player slot to `player`, keeping the rest of its arrangement.
+fn set_dig_player(
+    ability: &mut engine::types::ability::AbilityDefinition,
+    player: engine::types::ability::TargetFilter,
+) {
+    match &mut *ability.effect {
+        engine::types::ability::Effect::Dig { player: slot, .. } => *slot = player,
+        other => panic!("premise: Elemental Augury parses as a Dig, got {other:?}"),
+    }
 }
 
 /// CR 504.1 + CR 121.1: the draw step's draw takes the top card, and in the upkeep it is still
@@ -941,7 +977,12 @@ fn arranges_own_library_top(effect: &engine::types::ability::Effect) -> bool {
 /// or energy, one that taps its source, and one capped by a restriction (CR 602.5b, CR 702.177a
 /// exhaust) are all exempt, and whether the tap or the capped activation is worth spending is
 /// left to resource valuation. In the draw step the draw is behind and every arrangement is
-/// held; an ability that is not an arrangement of the AI's own library is held in the upkeep.
+/// held; an ability that is not an arrangement is held in the upkeep.
+///
+/// The arrangement need not name the AI's library outright. Elemental Augury's "target player's
+/// library" (CR 115.1) can be the AI's own, so it is exempt; so is a slot the player-filter
+/// authority can't answer without ability context, which may still name the AI when the ability
+/// resolves. Only a slot that can't name the AI, "target opponent's library", is held.
 #[test]
 fn an_upkeep_library_top_arrangement_is_not_held_while_the_draw_is_ahead() {
     use engine::types::ability::{AbilityCost, CostCategory, QuantityExpr};
@@ -955,7 +996,7 @@ fn an_upkeep_library_top_arrangement_is_not_held_while_the_draw_is_ahead() {
         phase: Phase,
         edit: Option<fn(&mut engine::types::ability::AbilityDefinition)>,
         categories: &'static [CostCategory],
-        arranges: bool,
+        slot: Option<Slot>,
         expected: &'static str,
     }
     let row = |label, name, oracle_text, expected| Row {
@@ -967,7 +1008,7 @@ fn an_upkeep_library_top_arrangement_is_not_held_while_the_draw_is_ahead() {
         phase: Phase::Upkeep,
         edit: None,
         categories: &[CostCategory::ManaOnly],
-        arranges: true,
+        slot: Some(Slot::Controller),
         expected,
     };
     let rows = [
@@ -1097,9 +1138,40 @@ fn an_upkeep_library_top_arrangement_is_not_held_while_the_draw_is_ahead() {
             )
         },
         Row {
+            slot: Some(Slot::AnyPlayer),
+            ..row(
+                "Elemental Augury (target player's library), pristine upkeep",
+                "Elemental Augury",
+                ELEMENTAL_AUGURY,
+                "activation_patience_library_top",
+            )
+        },
+        Row {
+            edit: Some(|ability| {
+                set_dig_player(ability, engine::types::ability::TargetFilter::ParentTargetController);
+            }),
+            slot: Some(Slot::ParentTargetController),
+            ..row(
+                "Elemental Augury with a slot the authority can't answer, pristine upkeep",
+                "Elemental Augury",
+                ELEMENTAL_AUGURY,
+                "activation_patience_library_top",
+            )
+        },
+        Row {
+            phase: Phase::Draw,
+            slot: Some(Slot::AnyPlayer),
+            ..row(
+                "Elemental Augury in the draw step (the draw is behind)",
+                "Elemental Augury",
+                ELEMENTAL_AUGURY,
+                "activation_patience_hold_for_main",
+            )
+        },
+        Row {
             ability_index: 1,
             categories: &[CostCategory::TapsSelf],
-            arranges: false,
+            slot: None,
             ..row(
                 "Top ability 1 (a draw, not an arrangement), pristine upkeep",
                 "Sensei's Divining Top",
@@ -1108,11 +1180,22 @@ fn an_upkeep_library_top_arrangement_is_not_held_while_the_draw_is_ahead() {
             )
         },
         Row {
-            arranges: false,
+            // Second Sight's and Tahngarth's Glare's "target opponent's library" slot, on an
+            // activated ability: the AI can't name itself, so the arrangement can't reach its draw.
+            edit: Some(|ability| {
+                set_dig_player(
+                    ability,
+                    engine::types::ability::TargetFilter::Typed(
+                        engine::types::ability::TypedFilter::default()
+                            .controller(engine::types::ability::ControllerRef::Opponent),
+                    ),
+                );
+            }),
+            slot: Some(Slot::Opponent),
             ..row(
-                "Elemental Augury (target player's library), pristine upkeep",
+                "Elemental Augury on target opponent's library, pristine upkeep",
                 "Elemental Augury",
-                "{3}: Look at the top three cards of target player's library, then put them back in any order.",
+                ELEMENTAL_AUGURY,
                 "activation_patience_hold",
             )
         },
@@ -1132,9 +1215,9 @@ fn an_upkeep_library_top_arrangement_is_not_held_while_the_draw_is_ahead() {
         }
         let ability = &board.state.objects[&id].abilities[row.ability_index];
         assert_eq!(
-            arranges_own_library_top(&ability.effect),
-            row.arranges,
-            "{}: premise: the effect is (or is not) an own-library arrangement, got {:?}",
+            arrangement_slot(&ability.effect),
+            row.slot,
+            "{}: premise: the effect's arrangement slot, got {:?}",
             row.label,
             ability.effect
         );
