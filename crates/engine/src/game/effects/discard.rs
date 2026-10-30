@@ -502,10 +502,10 @@ pub fn resolve(
                     });
                     return Ok(());
                 }
-                // CR 701.9a + CR 609.3: a muzzled player is treated as unable to
-                // discard: a mandatory discard that requires cards fails (as
-                // below), a discard requiring zero cards is paid in full, and an
-                // "up to" discard simply discards zero.
+                // CR 701.9a + CR 609.3 + CR 118.12: a muzzled player is treated as
+                // unable to discard: a mandatory discard that requires cards fails (as
+                // below), a discard requiring zero cards is paid in full, and an "up to"
+                // discard simply discards zero.
                 PlayerHandDiscardPool::Muzzled => {
                     if !up_to && num_cards > 0 {
                         state.cost_payment_failed_flag = true;
@@ -819,8 +819,9 @@ fn player_hand_discard_pool(
 /// a cost the player can only choose to pay in full; with fewer eligible cards
 /// than N it is an impossible option, so neither its "If you do" rider nor a
 /// reflexive "When you do" (Ill-Timed Explosion, CR 603.12) can follow from it.
-/// "Up to N" and "discard your hand" (it requires exactly the cards in that
-/// hand, so zero cards pays it in full) are never impossible. Shapes this can't decide here
+/// "Up to N" is never impossible, and neither is "discard your hand" (it requires
+/// exactly the cards in that hand, so zero cards pays it in full) unless the player
+/// is muzzled against it while holding cards. Shapes this can't decide here
 /// (per-player fan-outs, repeats, specific-card discards, an unresolvable
 /// discarding player) answer `false`, so the prompt is offered.
 pub(crate) fn optional_discard_is_infeasible(state: &GameState, ability: &ResolvedAbility) -> bool {
