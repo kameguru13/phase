@@ -893,6 +893,7 @@ fn a_draw_replacement_is_not_held_while_the_draw_is_ahead() {
 const SENSEIS_DIVINING_TOP: &str = "{1}: Look at the top three cards of your library, then put them back in any order.\n{T}: Draw a card, then put this artifact on top of its owner's library.";
 const WATCHFUL_AUTOMATON: &str =
     "{2}{U}: Scry 1. (Look at the top card of your library. You may put that card on the bottom.)";
+const CRYSTAL_BALL: &str = "{1}, {T}: Scry 2. (Look at the top two cards of your library, then put any number of them on the bottom and the rest on top in any order.)";
 
 /// Put `name` (built from its verbatim Oracle text) on the AI's battlefield as the board's
 /// activation source.
@@ -934,14 +935,15 @@ fn arranges_own_library_top(effect: &engine::types::ability::Effect) -> bool {
 }
 
 /// CR 504.1 + CR 121.1: the draw step's draw takes the top card, and in the upkeep it is still
-/// ahead. An arrangement of the top of the AI's own library that the AI can activate again
-/// before that draw (every cost category mana, life or energy, and no activation cap) chooses
-/// the card it takes, and waiting forfeits that choice, so it is not held. An arrangement that
-/// taps its source (CR 502.3) or is capped (CR 602.5b, CR 702.177a exhaust) arranges one draw
-/// per cycle wherever it is made, so it is held like any other activation. In the draw step
-/// the draw is behind and every arrangement is held.
+/// ahead. An arrangement of the top of the AI's own library made in the upkeep chooses the card
+/// that draw takes; one made later arranges a later draw, so waiting forfeits that choice and
+/// the arrangement is not held. That holds whatever the ability costs: one paid in mana, life
+/// or energy, one that taps its source, and one capped by a restriction (CR 602.5b, CR 702.177a
+/// exhaust) are all exempt, and whether the tap or the capped activation is worth spending is
+/// left to resource valuation. In the draw step the draw is behind and every arrangement is
+/// held; an ability that is not an arrangement of the AI's own library is held in the upkeep.
 #[test]
-fn a_repeatable_library_top_arrangement_is_not_held_while_the_draw_is_ahead() {
+fn an_upkeep_library_top_arrangement_is_not_held_while_the_draw_is_ahead() {
     use engine::types::ability::{AbilityCost, CostCategory, QuantityExpr};
 
     struct Row {
@@ -969,7 +971,7 @@ fn a_repeatable_library_top_arrangement_is_not_held_while_the_draw_is_ahead() {
         expected,
     };
     let rows = [
-        // Positives: repeatable arrangements in the upkeep.
+        // Positives: arrangements in the upkeep, whatever their cost.
         row(
             "Top ability 0 (Dig reorder), pristine upkeep",
             "Sensei's Divining Top",
@@ -1017,14 +1019,14 @@ fn a_repeatable_library_top_arrangement_is_not_held_while_the_draw_is_ahead() {
                 "activation_patience_library_top",
             )
         },
-        // Held negatives: once per cycle, or capped.
+        // Positives that spend a tap or a capped activation: still exempt in the upkeep.
         Row {
             categories: &[CostCategory::ManaOnly, CostCategory::TapsSelf],
             ..row(
                 "Crystal Ball (taps its source), pristine upkeep",
                 "Crystal Ball",
-                "{1}, {T}: Scry 2. (Look at the top two cards of your library, then put any number of them on the bottom and the rest on top in any order.)",
-                "activation_patience_hold",
+                CRYSTAL_BALL,
+                "activation_patience_library_top",
             )
         },
         Row {
@@ -1036,7 +1038,7 @@ fn a_repeatable_library_top_arrangement_is_not_held_while_the_draw_is_ahead() {
                 "Coastal Bulwark (taps its source), upkeep after a trigger",
                 "Coastal Bulwark",
                 "Defender\nThis creature gets +2/+0 as long as you control an Island.\n{2}, {T}: Surveil 1. (Look at the top card of your library. You may put that card into your graveyard.)",
-                "activation_patience_hold_for_main",
+                "activation_patience_library_top",
             )
         },
         Row {
@@ -1045,7 +1047,7 @@ fn a_repeatable_library_top_arrangement_is_not_held_while_the_draw_is_ahead() {
                 "Audacious Knuckleblade ability 1 (exhaust), pristine upkeep",
                 "Audacious Knuckleblade",
                 "Exhaust — {2}{G}: Seek a card named Audacious Knuckleblade and put it onto the battlefield tapped.\nExhaust — {1}{U}: Surveil 2, then untap this creature.\nExhaust — {R}: Creatures you control gain haste until end of turn.",
-                "activation_patience_hold",
+                "activation_patience_library_top",
             )
         },
         Row {
@@ -1058,7 +1060,7 @@ fn a_repeatable_library_top_arrangement_is_not_held_while_the_draw_is_ahead() {
                 "Watchful Automaton, once each turn, pristine upkeep",
                 "Watchful Automaton",
                 WATCHFUL_AUTOMATON,
-                "activation_patience_hold",
+                "activation_patience_library_top",
             )
         },
         Row {
@@ -1071,7 +1073,7 @@ fn a_repeatable_library_top_arrangement_is_not_held_while_the_draw_is_ahead() {
                 "Watchful Automaton, at most twice each turn, pristine upkeep",
                 "Watchful Automaton",
                 WATCHFUL_AUTOMATON,
-                "activation_patience_hold",
+                "activation_patience_library_top",
             )
         },
         // Siblings and boundaries.
@@ -1081,6 +1083,16 @@ fn a_repeatable_library_top_arrangement_is_not_held_while_the_draw_is_ahead() {
                 "Top ability 0 in the draw step (the draw is behind)",
                 "Sensei's Divining Top",
                 SENSEIS_DIVINING_TOP,
+                "activation_patience_hold_for_main",
+            )
+        },
+        Row {
+            phase: Phase::Draw,
+            categories: &[CostCategory::ManaOnly, CostCategory::TapsSelf],
+            ..row(
+                "Crystal Ball in the draw step (the draw is behind)",
+                "Crystal Ball",
+                CRYSTAL_BALL,
                 "activation_patience_hold_for_main",
             )
         },

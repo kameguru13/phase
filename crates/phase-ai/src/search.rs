@@ -20722,10 +20722,10 @@ one on the bottom of your library.";
 
     /// The P1 hatch at the root: Sensei's Divining Top's "{1}: Look at the top three cards of
     /// your library, then put them back in any order." in the AI's own Upkeep chooses the card
-    /// the draw step's draw takes (CR 504.1 + CR 121.1), and its cost is mana only, so patience
-    /// does not hold it: no full-strength term and no lending. Top is tapped, so its "{T}:
-    /// Draw a card" ability cannot be paid and no other held donor exists. In the Draw step the
-    /// draw is behind and the same activation is held at full strength.
+    /// the draw step's draw takes (CR 504.1 + CR 121.1), so patience does not hold it: no
+    /// full-strength term and no lending. Top is tapped, so its "{T}: Draw a card" ability
+    /// cannot be paid and no other held donor exists. In the Draw step the draw is behind and
+    /// the same activation is held at full strength.
     #[test]
     fn own_upkeep_root_neither_holds_nor_lends_a_library_top_arrangement() {
         use crate::policies::registry::NUDGE_MAX;
@@ -20791,6 +20791,152 @@ one on the bottom of your library.";
                 );
             }
         }
+    }
+
+    /// Crystal Ball, verbatim: a library-top arrangement that taps its source.
+    const CRYSTAL_BALL: &str = "{1}, {T}: Scry 2. (Look at the top two cards of your library, then put any number of them on the bottom and the rest on top in any order.)";
+
+    /// The tap-limited sibling of the Divining Top row: Crystal Ball's "{1}, {T}: Scry 2." in
+    /// the AI's own Upkeep, with a Lightning Bolt buried under a card that has no types and no
+    /// abilities. The scry chooses the card the draw step's draw takes (CR 504.1 + CR 121.1,
+    /// CR 701.22a), and by the main phase that draw has happened, so passing cannot reproduce
+    /// the arrangement's line: patience does not hold it and Pass is not lent its continuation,
+    /// though that continuation is above Pass's own. The root's choice is then driven through
+    /// the draw step with the scry keeping the Bolt on top, and the Bolt is the card drawn.
+    #[test]
+    fn own_upkeep_root_does_not_lend_a_tap_limited_arrangement_and_its_choice_is_drawn() {
+        use engine::types::ability::CostCategory;
+
+        let db = shared_integration_card_db();
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::Upkeep);
+        let ball = scenario
+            .add_artifact_from_oracle(P0, "Crystal Ball", CRYSTAL_BALL)
+            .id();
+        for _ in 0..2 {
+            scenario.add_real_card(P0, "Mountain", Zone::Battlefield, db);
+        }
+        let bolt = scenario.add_real_card(P0, "Lightning Bolt", Zone::Library, db);
+        let blank = scenario.add_card_to_library_top(P0, "Blank Card");
+        let mut runner = scenario.build();
+        rehydrate_game_from_card_db(runner.state_mut(), db);
+        add_libraries(runner.state_mut(), 5);
+        {
+            let library = &mut runner
+                .state_mut()
+                .players
+                .iter_mut()
+                .find(|player| player.id == P0)
+                .unwrap()
+                .library;
+            library.retain(|id| *id != blank && *id != bolt);
+            library.insert(0, bolt);
+            library.insert(0, blank);
+        }
+        let state = runner.state().clone();
+        let p0_library = &state.players.iter().find(|p| p.id == P0).unwrap().library;
+        assert_eq!(
+            (p0_library[0], p0_library[1]),
+            (blank, bolt),
+            "premise: the blank card is on top of the AI's library, the Bolt beneath it"
+        );
+        let ability = &state.objects[&ball].abilities[0];
+        assert!(
+            matches!(
+                *ability.effect,
+                Effect::Scry {
+                    count: QuantityExpr::Fixed { value: 2 },
+                    target: TargetFilter::Controller,
+                }
+            ),
+            "premise: Crystal Ball scries 2 on its controller's library, got {:?}",
+            ability.effect
+        );
+        assert_eq!(
+            ability.cost_categories(),
+            [CostCategory::ManaOnly, CostCategory::TapsSelf],
+            "premise: Crystal Ball's cost taps its source"
+        );
+        assert!(
+            matches!(state.waiting_for, WaitingFor::Priority { player } if player == P0)
+                && state.active_player == P0
+                && state.phase == Phase::Upkeep
+                && state.stack.is_empty()
+                && !state.objects[&ball].tapped,
+            "reach: P0 holds priority in its own Upkeep on an empty stack with Crystal Ball untapped"
+        );
+
+        let cfg = hard_rung0_config();
+        let pass = GameAction::PassPriority;
+        let arrange = activate(ball, 0);
+        let roots = PatienceRoots::score(&state, &cfg);
+        roots.assert_scored("Crystal Ball upkeep", &[&arrange, &pass]);
+        assert!(
+            roots.cont(&arrange) > roots.cont(&pass),
+            "reach: the arrangement's continuation {} is above Pass's {}, so a lend would move Pass",
+            roots.cont(&arrange),
+            roots.cont(&pass)
+        );
+        assert_eq!(
+            roots.ap(&arrange),
+            0.0,
+            "the upkeep arrangement is not held"
+        );
+        assert_eq!(
+            score_of(&roots.s1, &pass),
+            score_of(&roots.s0, &pass),
+            "Pass is not lent the arrangement's continuation"
+        );
+
+        // Drive the root's choice through the draw step (CR 504.1).
+        let chosen = roots
+            .s1
+            .iter()
+            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(action, _)| action.clone())
+            .expect("the root scored at least one action");
+        runner
+            .act(chosen.clone())
+            .expect("the root's choice applies");
+        for _ in 0..32 {
+            let state = runner.state();
+            if state.phase == Phase::Draw
+                && matches!(state.waiting_for, WaitingFor::Priority { player } if player == P0)
+            {
+                break;
+            }
+            match state.waiting_for.clone() {
+                // CR 701.22a: keep the Bolt on top; the blank card goes to the bottom.
+                WaitingFor::ScryChoice { player, cards } => {
+                    assert_eq!(player, P0);
+                    assert!(
+                        cards.len() == 2 && cards.contains(&blank) && cards.contains(&bolt),
+                        "the scry looks at the top two cards, got {cards:?}"
+                    );
+                    runner
+                        .act(GameAction::SelectCards { cards: vec![bolt] })
+                        .expect("the scry choice applies");
+                }
+                WaitingFor::Priority { .. } => {
+                    runner
+                        .act(GameAction::PassPriority)
+                        .expect("priority passes toward the draw step");
+                }
+                other => panic!("unexpected prompt before the draw step: {other:?}"),
+            }
+        }
+        let state = runner.state();
+        assert_eq!(
+            state.phase,
+            Phase::Draw,
+            "reach: the game reached the draw step"
+        );
+        let hand = &state.players.iter().find(|p| p.id == P0).unwrap().hand;
+        assert!(
+            hand.contains(&bolt) && !hand.contains(&blank),
+            "the draw step's draw takes the card the arrangement selected (root chose {chosen:?}), \
+             hand {hand:?}"
+        );
     }
 
     /// D1 at the root (the mtg-bot Coordinated Assault regression): in the AI's own Draw step

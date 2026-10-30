@@ -56,19 +56,17 @@
 //! ends (CR 500.5), so for it waiting is not free. A draw replacement made in the
 //! upkeep comes next: it must exist before the draw it replaces (CR 614.4). So
 //! does an arrangement of the top of the AI's own library — scry, surveil, or
-//! looking at the top cards and putting them back in any order — that the AI can
-//! activate again before the next draw: the draw step's draw takes the top card
-//! (CR 504.1 + CR 121.1), and the upkeep's priority is the last before it
-//! (CR 502.4, CR 503.1), so only an upkeep activation chooses that card. When the
-//! cost is paid only from mana, life or energy and no restriction caps the
-//! ability, an upkeep activation is an extra choice that waiting forfeits. An
-//! arrangement that taps its source, or spends a permanent, a card or a counter,
-//! or is limited to once each turn, makes one arrangement per untap cycle
-//! (CR 502.3): made in the end step instead (CR 513.1), it arranges the next
-//! draw, so waiting only moves which draw it arranges, and it is held like any
-//! other activation. The
-//! report names the other two times to activate early: when the damage is part of a lethal
-//! line, and (implicitly) when the ability's own condition is met *now* and might
+//! looking at the top cards and putting them back in any order: the draw step's
+//! draw takes the top card (CR 504.1 + CR 121.1), and the upkeep's priority is the
+//! last before it (CR 502.4, CR 503.1), so only an upkeep activation chooses that
+//! card. An arrangement made later arranges a later draw, so waiting loses the
+//! value of arranging this one, whatever the ability costs. A tap cost or a
+//! once-each-turn cap does not make the hold right: it only makes the activation
+//! dearer, and whether this draw's choice is worth the tap or the capped
+//! activation is a resource question the search's valuation answers. In the draw
+//! step that draw is behind (CR 504.2), and an arrangement is held like any other
+//! activation. The report names the other two times to activate early: when the
+//! damage is part of a lethal line, and (implicitly) when the ability's own condition is met *now* and might
 //! not be later. Those are lethal damage and `ability.condition`, in that order
 //! below. Its third exception, a source that "is going to die or leave play
 //! before the AI draws a card", has no reading in these windows: both are the
@@ -77,8 +75,8 @@
 
 use engine::game::{attractions, mana_abilities};
 use engine::types::ability::{
-    AbilityDefinition, AbilityTag, ActivationRestriction, CostCategory, DelayedTriggerCondition,
-    Effect, TargetFilter,
+    AbilityDefinition, AbilityTag, ActivationRestriction, DelayedTriggerCondition, Effect,
+    TargetFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::game_state::{GameState, WaitingFor};
@@ -193,85 +191,6 @@ fn draw_setup(effect: &Effect) -> Option<DrawSetup> {
             ..
         } => Some(DrawSetup::LibraryTop),
         _ => None,
-    }
-}
-
-/// Can this ability be activated again later in the same turn cycle, whatever is done with it
-/// now? True when every category of its cost is paid as an amount from the player's own
-/// resources and no restriction caps how often it is activated; then an activation now is one
-/// more use, not one taken from a later window. A cost with no category (none, or only legs
-/// `AbilityCost::categories` leaves unclassified) is not admitted.
-fn activation_is_repeatable(ability: &AbilityDefinition) -> bool {
-    let categories = ability.cost_categories();
-    !categories.is_empty()
-        && categories.into_iter().all(cost_category_is_repeatable)
-        && !ability
-            .activation_restrictions
-            .iter()
-            .any(restriction_caps_activations)
-}
-
-/// Does a cost of this category leave the ability free to be activated again this turn cycle?
-fn cost_category_is_repeatable(category: CostCategory) -> bool {
-    match category {
-        // CR 106.4 + CR 119.4 + CR 107.14: mana is paid from the pool, life from the life total,
-        // energy by removing energy counters from the player. Each is an amount from the
-        // player's own resources, not tied to the source, so any number of activations can
-        // draw on it.
-        CostCategory::ManaOnly | CostCategory::PaysLife | CostCategory::PaysEnergy => true,
-        // CR 502.3: permanents untap once per untap step, so a tap cost (the source's or other
-        // creatures') allows one activation per turn cycle. An untap cost needs the source
-        // tapped again first, and an exerted permanent skips its next untap (CR 701.43a).
-        CostCategory::TapsSelf
-        | CostCategory::UntapsSelf
-        | CostCategory::TapsOtherCreatures
-        | CostCategory::Exerts => false,
-        // The payment is made with specific objects (a permanent, a card in hand, graveyard or
-        // library, an attachment, counters on a permanent), not an amount from the player's
-        // own resources.
-        CostCategory::SacrificesPermanent
-        | CostCategory::ExilesCards
-        | CostCategory::Discards
-        | CostCategory::Mills
-        | CostCategory::Reveals
-        | CostCategory::ReturnsToHand
-        | CostCategory::Unattaches
-        | CostCategory::RemovesCounters => false,
-        // Counters put on a permanent or a player accumulate (Blight's -1/-1 counters, Mazemind
-        // Tome's page counters).
-        CostCategory::PutsCounters => false,
-        // CR 606.3: a loyalty ability is activated at most once each turn, in a main phase.
-        // CR 702.179d: speed's inherent trigger increases it by 1 at most once each turn.
-        CostCategory::PaysLoyalty | CostCategory::PaysSpeed => false,
-        // Waterbend taps artifacts and creatures to help pay; ninjutsu returns an unblocked
-        // attacker.
-        CostCategory::KeywordCost => false,
-    }
-}
-
-/// Does this restriction cap how often the ability is activated?
-fn restriction_caps_activations(restriction: &ActivationRestriction) -> bool {
-    match restriction {
-        // CR 602.5b names "Activate only once each turn" as a restriction on an ability's use;
-        // CR 702.177a: exhaust means "Activate only once".
-        ActivationRestriction::OnlyOnceEachTurn
-        | ActivationRestriction::OnlyOnce
-        | ActivationRestriction::MaxTimesEachTurn { .. } => true,
-        // Timing and state gates: they decide when the ability can be activated, not how often.
-        ActivationRestriction::AsSorcery
-        | ActivationRestriction::AsInstant
-        | ActivationRestriction::DuringYourTurn
-        | ActivationRestriction::DuringYourUpkeep
-        | ActivationRestriction::DuringCombat
-        | ActivationRestriction::BeforeAttackersDeclared
-        | ActivationRestriction::BeforeCombatDamage
-        | ActivationRestriction::RequiresCondition { .. }
-        | ActivationRestriction::IsSolved
-        | ActivationRestriction::SourceIsHarnessed
-        | ActivationRestriction::ClassLevelIs { .. }
-        | ActivationRestriction::LevelCounterRange { .. }
-        | ActivationRestriction::CounterThreshold { .. }
-        | ActivationRestriction::MatchesCardCastTiming => false,
     }
 }
 
@@ -499,11 +418,11 @@ impl TacticalPolicy for ActivationPatiencePolicy {
         // that draw gives its payoff up by waiting for the main phase: a draw replacement must
         // exist before the draw it replaces (CR 614.4), and an arrangement of the top of the AI's
         // own library chooses the card that draw takes (CR 701.22a, CR 701.25a, CR 701.20e). An
-        // arrangement forfeits that choice only when the ability can be activated again this turn
-        // cycle (`activation_is_repeatable`: mana, life or energy only, no cap). One that taps its
-        // source, or spends a permanent, a card or a counter, makes one arrangement per untap
-        // cycle (CR 502.3); made in the end step instead (CR 513.1) it arranges the next draw, so
-        // waiting moves which draw it arranges and the hold applies.
+        // arrangement made later arranges a later draw, so waiting loses the value of arranging
+        // this one whatever the ability costs: one that taps its source or is capped (CR 602.5b)
+        // is exempt as much as one paid in mana alone. Whether spending the tap or the capped
+        // activation on this draw is worth it is a resource question for the search's valuation,
+        // not a timing question this policy answers.
         if ctx.state.phase == Phase::Upkeep {
             let effects = ctx.effects();
             let sets_up = |setup: DrawSetup| {
@@ -516,10 +435,7 @@ impl TacticalPolicy for ActivationPatiencePolicy {
                     "activation_patience_draw_replacement",
                 ));
             }
-            if sets_up(DrawSetup::LibraryTop)
-                && printed_ability(ctx.state, *source_id, *ability_index)
-                    .is_some_and(activation_is_repeatable)
-            {
+            if sets_up(DrawSetup::LibraryTop) {
                 return PolicyVerdict::neutral(PolicyReason::new(
                     "activation_patience_library_top",
                 ));
