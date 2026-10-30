@@ -1021,8 +1021,9 @@ fn if_you_do_object_anchor(
 /// one of these zone-change-ledger-invisible effect classes; other effects
 /// (Sacrifice, Exile, Discard, Mill, …) keep the zone-change proxy unchanged,
 /// since their success IS a `ZoneChanged`/`PermanentSacrificed` event.
-/// A generic rider whose every antecedent is another ledger-invisible effect
-/// is not re-expressed here; it strict-fails through
+/// A generic rider this rewrite does not claim, whose every antecedent passes
+/// `effect_success_is_zone_ledger_invisible`, is not re-expressed here; it
+/// strict-fails through
 /// `cant_rider_reads_only_zone_ledger_invisible_antecedents` below.
 fn rewrite_cant_rider_for_non_zone_change_parent(
     condition: Option<AbilityCondition>,
