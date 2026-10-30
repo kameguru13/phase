@@ -1213,19 +1213,7 @@ pub(crate) fn claim_events_for_ordinary_collection(
     events: &[GameEvent],
     event_start: usize,
 ) {
-    claim_event_indices_for_ordinary_collection(state, events, event_start..events.len());
-}
-
-/// CR 603.2c: [`claim_events_for_ordinary_collection`] for the occurrences at
-/// `indices` of the full action buffer `events` only, for an owner that leaves
-/// some occurrences of its span to another collector.
-pub(crate) fn claim_event_indices_for_ordinary_collection(
-    state: &mut GameState,
-    events: &[GameEvent],
-    indices: impl IntoIterator<Item = usize>,
-) {
-    let occurrences = indices
-        .into_iter()
+    let occurrences = (event_start..events.len())
         .map(|index| ConsumedTriggerEventOccurrence {
             event: events[index].clone(),
             occurrence: trigger_event_occurrence(events, index),

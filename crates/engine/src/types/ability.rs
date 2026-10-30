@@ -16725,7 +16725,7 @@ pub(crate) enum OptionalAddressRoute<'a> {
     /// CR 707.10c: "that player may copy this spell" is answered by a player among the
     /// instruction's targets.
     TargetedPlayer,
-    /// CR 503.1a + CR 608.2d: a per-player instruction ("that player may put a card from
+    /// CR 608.2d: a per-player instruction ("that player may put a card from
     /// their hand …") is answered by the scoped player when one is bound.
     ScopedPlayer,
 }

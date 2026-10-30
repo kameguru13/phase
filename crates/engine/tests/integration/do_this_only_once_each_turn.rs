@@ -23,7 +23,7 @@ use engine::types::card_type::{CardType, CoreType};
 use engine::types::counter::CounterType;
 use engine::types::game_state::{
     AutoMayChoice, CastOfferKind, CastPaymentMode, ManaChoice, MayTriggerAutoChoiceScope,
-    ShardChoice, StackEntryKind, WaitingFor,
+    StackEntryKind, WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
@@ -1690,115 +1690,130 @@ fn emet_selch_life_loss_while_manually_paying_for_its_cast_triggers_it_again() {
     emet_selch_life_loss_while_paying_triggers_it_again(FragmentPayment::Manual);
 }
 
-/// A synthetic trigger card (no printed card makes this reachable): Emet-Selch's
-/// cast instruction, verbatim, on a "Whenever you lose life" trigger, so a non-mana
-/// cost of the offered cast — Phyrexian mana paid with life — raises the trigger event.
-const LIFE_LOSS_RECASTER: &str = "Whenever you lose life, you may cast target instant or sorcery card from your graveyard. If that spell would be put into your graveyard, exile it instead. Do this only once each turn.";
+const PLAY_OF_THE_GAME: &str =
+    "Assist (Another player can pay up to {6} of this spell's cost.)\nExile all nonland permanents.";
 
-const LOSE_ONE_LIFE: &str = "{0}: You lose 1 life.";
-
-/// E6 (CR 603.2 + CR 603.2h + CR 107.4f + CR 119.4 + CR 601.2h + CR 601.2i): the
-/// offered card costs {R/P} and P0 pays it with 2 life, a CR 601.2h cost paid in the
-/// same action that commits the cast. That life loss comes before the spell becomes
-/// cast, so it triggers the ability again even though the cast then takes the
-/// indicated action; the new instance resolves after the cast and does nothing.
+/// E5b (CR 603.2 + CR 603.2h + CR 702.132a + CR 601.2h + CR 601.2i): Emet-Selch
+/// offers Play of the Game from P0's graveyard and P1 assists with one generic
+/// mana from Cryptolith Fragment, their only mana source. The helper's tap makes
+/// each player lose 1 life while the cast is being paid for — before the spell
+/// becomes cast — so P1's life loss triggers Emet-Selch again. A second eligible
+/// instant stays in the graveyard, so the new instance always has a target.
 #[test]
-fn life_paid_for_the_offered_cast_triggers_the_indicated_action_ability_again() {
+fn emet_selch_life_loss_while_an_assisting_opponent_pays_triggers_it_again() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    let recaster = scenario
-        .add_creature_from_oracle(P0, "Life-Loss Recaster", 2, 2, LIFE_LOSS_RECASTER)
+    let emet = scenario
+        .add_creature_from_oracle(P0, "Emet-Selch of the Third Seat", 2, 2, EMET_SELCH)
         .id();
-    let life_loss = scenario
-        .add_artifact_from_oracle(P0, "Life Loss Engine", LOSE_ONE_LIFE)
+    let drain = scenario
+        .add_artifact_from_oracle(P0, "Life Drain Engine", LIFE_DRAIN_ENGINE)
         .id();
-    let [cast_card, other_card] = ["Phyrexian Draw A", "Phyrexian Draw B"].map(|name| {
-        scenario
-            .add_spell_to_graveyard(P0, name, true)
-            .from_oracle_text("Draw a card.")
-            .with_mana_cost(ManaCost::Cost {
-                shards: vec![ManaCostShard::PhyrexianRed],
-                generic: 0,
-            })
-            .id()
-    });
+    let fragment = scenario
+        .add_artifact_from_oracle(P1, "Cryptolith Fragment", CRYPTOLITH_FRAGMENT)
+        .id();
+    let play_of_the_game = scenario
+        .add_spell_to_graveyard(P0, "Play of the Game", false)
+        .from_oracle_text_with_keywords(&["Assist"], PLAY_OF_THE_GAME)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::White, ManaCostShard::White],
+            generic: 6,
+        })
+        .id();
+    let other_card = scenario
+        .add_spell_to_graveyard(P0, "Test Draw", true)
+        .from_oracle_text("Draw a card.")
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Red],
+            generic: 0,
+        })
+        .id();
+    // CR 118.7a + CR 702.132a: {6}{W}{W} less Emet-Selch's {2} is {4}{W}{W}; P1
+    // pays one generic, P0 the remaining {3}{W}{W}.
+    for _ in 0..5 {
+        scenario.add_basic_land(P0, ManaColor::White);
+    }
     scenario.with_library_top(P0, &["Card A", "Card B", "Card C", "Card D"]);
     let mut runner = scenario.build();
+    assert!(
+        runner.state().objects[&play_of_the_game]
+            .keywords
+            .contains(&Keyword::Assist),
+        "reach: Play of the Game has Assist"
+    );
+    assert!(
+        !runner.state().objects[&fragment].tapped,
+        "reach: the helper's fragment is untapped and can assist"
+    );
 
-    let p0_life = runner.life(P0);
-    activate_and_resolve(&mut runner, life_loss);
-    assert_eq!(runner.life(P0), p0_life - 1, "reach: P0 lost life");
+    drain_targeting(&mut runner, drain, emet, play_of_the_game);
+    let emet_ref = stacked_emet_ref(&runner, emet);
+    runner.advance_until_stack_empty();
+    assert_optional_prompt(&runner, P0, "reach: Emet-Selch offers its may");
+    decide(&mut runner, true);
+    assert_eq!(offered_card(&runner), Some(play_of_the_game));
+    runner
+        .act(GameAction::GraveyardPaidCastChoice {
+            choice: CastChoice::Cast,
+        })
+        .expect("elect the offered cast");
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::AssistChoosePlayer { player: P0, .. }
+        ),
+        "reach: the elected cast offers Assist, got {:?}",
+        runner.state().waiting_for
+    );
+    runner
+        .act(GameAction::ChooseAssistPlayer { player: Some(P1) })
+        .expect("choose the opponent to assist");
+    let (p0_life, p1_life) = (runner.life(P0), runner.life(P1));
+    runner
+        .act(GameAction::CommitAssistPayment { generic: 1 })
+        .expect("the opponent commits one generic mana");
+    for _ in 0..8 {
+        if !matches!(runner.state().waiting_for, WaitingFor::ManaPayment { .. }) {
+            break;
+        }
+        runner
+            .act(GameAction::PassPriority)
+            .expect("pay the offered cast");
+    }
     if matches!(
         runner.state().waiting_for,
         WaitingFor::TriggerTargetSelection { .. }
     ) {
         runner
             .act(GameAction::ChooseTarget {
-                target: Some(TargetRef::Object(cast_card)),
+                target: Some(TargetRef::Object(other_card)),
             })
-            .expect("target the graveyard instant");
+            .expect("target the remaining graveyard instant");
     }
-    let recaster_ref = stacked_emet_ref(&runner, recaster);
-    runner.advance_until_stack_empty();
-    assert_optional_prompt(&runner, P0, "reach: the trigger offers its may");
-    decide(&mut runner, true);
-    assert_eq!(
-        offered_card(&runner),
-        Some(cast_card),
-        "reach: accepting opens the cast offer"
-    );
-    let life_before_paying = runner.life(P0);
-    runner
-        .act(GameAction::GraveyardPaidCastChoice {
-            choice: CastChoice::Cast,
-        })
-        .expect("elect the offered cast");
-    let mut paid_with_life = false;
-    for _ in 0..8 {
-        match runner.state().waiting_for {
-            WaitingFor::PhyrexianPayment { .. } => {
-                runner
-                    .act(GameAction::SubmitPhyrexianChoices {
-                        choices: vec![ShardChoice::PayLife],
-                    })
-                    .expect("pay {R/P} with 2 life");
-                paid_with_life = true;
-            }
-            WaitingFor::ManaPayment { .. } => {
-                runner
-                    .act(GameAction::PassPriority)
-                    .expect("finish paying the offered cast");
-            }
-            WaitingFor::TriggerTargetSelection { .. } => {
-                runner
-                    .act(GameAction::ChooseTarget {
-                        target: Some(TargetRef::Object(other_card)),
-                    })
-                    .expect("target the remaining graveyard instant");
-            }
-            _ => break,
-        }
-    }
-    assert!(paid_with_life, "reach: P0 chose to pay {{R/P}} with life");
-    assert_eq!(
-        runner.life(P0),
-        life_before_paying - 2,
-        "reach: P0 paid 2 life for the offered cast"
+    assert!(
+        runner.state().objects[&fragment].tapped,
+        "reach: the helper paid with the fragment"
     );
     assert_eq!(
-        runner.state().objects[&cast_card].zone,
+        (runner.life(P0), runner.life(P1)),
+        (p0_life - 1, p1_life - 1),
+        "reach: each player lost 1 life while the cast was being paid for"
+    );
+    assert_eq!(
+        runner.state().objects[&play_of_the_game].zone,
         Zone::Stack,
         "reach: the offered card was cast"
     );
     assert_eq!(
         indicated_actions(&runner),
-        HashSet::from([(recaster_ref, P0)]),
+        HashSet::from([(emet_ref, P0)]),
         "CR 601.2i: the spell became cast, so the controller took the indicated action"
     );
     assert_eq!(
-        stacked_trigger_refs(&runner, recaster).len(),
+        stacked_trigger_refs(&runner, emet).len(),
         1,
-        "CR 603.2h: the life was paid before the spell became cast, so it triggers again"
+        "CR 603.2h: the assisting opponent's life loss came before the spell became cast, \
+         so it triggers Emet-Selch"
     );
 
     runner.advance_until_stack_empty();
@@ -1810,6 +1825,11 @@ fn life_paid_for_the_offered_cast_triggers_the_indicated_action_ability_again() 
         runner.state().objects[&other_card].zone,
         Zone::Graveyard,
         "the new instance cast nothing"
+    );
+    assert_eq!(
+        runner.state().objects[&emet].zone,
+        Zone::Exile,
+        "reach: Play of the Game resolved and exiled every nonland permanent"
     );
 }
 
