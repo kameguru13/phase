@@ -21950,4 +21950,107 @@ one on the bottom of your library.";
             "the own-Draw root carries the verdict at 0.35: {d_searched} vs {d_heuristic}"
         );
     }
+
+    const OVERRUN: &str = "Creatures you control get +3/+3 and gain trample until end of turn. (Each of those creatures can deal excess combat damage to the player or planeswalker it's attacking.)";
+
+    /// The Overrun root beside the Coordinated Assault one: in its own precombat main, the first
+    /// main phase (CR 505.1a), a sorcery has no later window before this turn's combat (CR 307.1),
+    /// so neither EffectTiming nor the hint prices Overrun as a trick at the searched root, while
+    /// the instant on the same root carries the verdict at the ordinary weight 0.1 and the 0.3
+    /// hint. Overrun is a `GenericEffect`, so tactical_gate::assess_pre_cast's pump gate does not
+    /// read it.
+    #[test]
+    fn own_precombat_main_root_does_not_price_a_sorcery_pump_as_a_trick() {
+        use crate::policies::registry::NUDGE_MAX;
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let overrun = scenario
+            .add_spell_to_hand_from_oracle(P0, "Overrun", false, OVERRUN)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![
+                    ManaCostShard::Green,
+                    ManaCostShard::Green,
+                    ManaCostShard::Green,
+                ],
+                generic: 2,
+            })
+            .id();
+        let assault = scenario
+            .add_spell_to_hand_from_oracle(P0, "Coordinated Assault", true, COORDINATED_ASSAULT)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 0,
+            })
+            .id();
+        for _ in 0..5 {
+            scenario.add_basic_land(P0, ManaColor::Green);
+        }
+        scenario.add_basic_land(P0, ManaColor::Red);
+        scenario.add_creature(P0, "Bear", 2, 2);
+        scenario.add_creature(P1, "Bear", 2, 2);
+        let mut runner = scenario.build();
+        add_libraries(runner.state_mut(), 5);
+        let state = runner.state().clone();
+        assert!(
+            matches!(
+                *state.objects[&overrun].abilities[0].effect,
+                Effect::GenericEffect {
+                    duration: Some(Duration::UntilEndOfTurn),
+                    ..
+                }
+            ),
+            "premise: Overrun parses as an until-end-of-turn GenericEffect"
+        );
+        assert_eq!(
+            RootDecisionContext::classify(&state, P0).tactical_weight(),
+            0.1,
+            "premise: the own precombat main is an ordinary root"
+        );
+
+        let effect_timing = || PolicyRegistry::default_subset_for_tests(&[PolicyId::EffectTiming]);
+        let cfg = hard_rung0_config();
+        let mut heuristic = cfg.clone();
+        heuristic.search.enabled = false;
+        let cast_score = |scored: &[(GameAction, f64)], id: ObjectId| {
+            scored
+                .iter()
+                .find(|(action, _)| {
+                    matches!(action, GameAction::CastSpell { object_id, .. } if *object_id == id)
+                })
+                .map(|(_, score)| *score)
+                .unwrap_or_else(|| panic!("reach: {id:?}'s CastSpell is scored, got {scored:?}"))
+        };
+        let delta = |config: &AiConfig, id: ObjectId| {
+            cast_score(&score_with_registry(&state, effect_timing(), config), id)
+                - cast_score(&score_with(&state, vec![], config), id)
+        };
+        let (d_h_assault, d_s_assault) = (delta(&heuristic, assault), delta(&cfg, assault));
+        let (d_h_overrun, d_s_overrun) = (delta(&heuristic, overrun), delta(&cfg, overrun));
+        let hint_gap = {
+            let scored = score_with(&state, vec![], &heuristic);
+            cast_score(&scored, overrun) - cast_score(&scored, assault)
+        };
+
+        assert!(
+            d_h_assault < -NUDGE_MAX,
+            "reach: EffectTiming prices Coordinated Assault as a trick here, got {d_h_assault}"
+        );
+        assert!(
+            (d_s_assault - 0.1 * d_h_assault).abs() < 1e-9,
+            "reach: the root carries the verdict at 0.1: {d_s_assault} vs {d_h_assault}"
+        );
+        assert!(
+            d_h_overrun.abs() < 1e-9,
+            "EffectTiming does not price Overrun in its last window, got {d_h_overrun}"
+        );
+        assert!(
+            d_s_overrun.abs() < 1e-9,
+            "the searched root does not price Overrun in its last window, got {d_s_overrun}"
+        );
+        assert!(
+            (hint_gap - 0.2).abs() < 1e-9,
+            "the hint does not time Overrun: default 0.5 against the instant's 0.3, got {hint_gap}"
+        );
+    }
 }

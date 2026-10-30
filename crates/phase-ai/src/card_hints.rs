@@ -8,7 +8,10 @@ use engine::types::player::PlayerId;
 
 use crate::cast_facts::{cast_facts_for_action, CastFacts};
 use crate::eval::opponent_battlefield_creature_threat_value;
-use crate::policies::effect_classify::{effect_is_combat_trick_payload, spell_resolution_effects};
+use crate::policies::effect_classify::{
+    effect_is_combat_trick_payload, precombat_main_is_last_trick_window, spell_resolution_effects,
+    TimingSubject,
+};
 use crate::policies::hand_disruption::disruption_window_score;
 #[cfg(test)]
 use engine::types::game_state::CastPaymentMode;
@@ -55,9 +58,15 @@ pub(crate) fn should_play_now_with_facts(
                 .any(|effect| matches!(effect, Effect::DealDamage { .. }));
             // CR 611.2a + CR 514.2: only the spell's own resolution times it as a combat trick;
             // an enters-trigger pump on a permanent cast precombat lasts through that combat.
-            let has_pump = spell_resolution_effects(facts)
+            // CR 505.1a + CR 307.1: nor does a sorcery-speed pump's last window before combat.
+            let timed_as_trick = spell_resolution_effects(facts)
                 .into_iter()
-                .any(effect_is_combat_trick_payload);
+                .any(effect_is_combat_trick_payload)
+                && !precombat_main_is_last_trick_window(
+                    state,
+                    player,
+                    TimingSubject::Spell(facts.object.id),
+                );
             let has_counter = immediate_effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::Counter { .. }));
@@ -79,7 +88,7 @@ pub(crate) fn should_play_now_with_facts(
 
             // Combat tricks: highest during combat, near-zero during end/cleanup
             // (pump effects expire at cleanup — casting then has no lasting impact)
-            if has_pump {
+            if timed_as_trick {
                 return if is_combat {
                     0.9
                 } else if matches!(state.phase, Phase::End | Phase::Cleanup) {
@@ -179,6 +188,9 @@ mod tests {
 
     use super::*;
     use crate::cast_facts::collect_definition_effects;
+    use engine::game::layers::evaluate_layers;
+    use engine::game::restrictions::spell_confined_to_sorcery_timing;
+    use engine::game::scenario::{GameScenario, P0, P1};
     use engine::game::zones::create_object;
     use engine::types::ability::{
         AbilityDefinition, AbilityKind, Effect, PtValue, TargetFilter, TriggerDefinition,
@@ -695,15 +707,26 @@ mod tests {
 
     /// An instant in P0's hand built from its verbatim Oracle text; returns its cast action.
     fn oracle_instant(state: &mut GameState, name: &str, oracle_text: &str) -> GameAction {
+        oracle_spell(state, name, oracle_text, CoreType::Instant)
+    }
+
+    /// An instant or sorcery in P0's hand built from its verbatim Oracle text; returns its cast
+    /// action.
+    fn oracle_spell(
+        state: &mut GameState,
+        name: &str,
+        oracle_text: &str,
+        core_type: CoreType,
+    ) -> GameAction {
         let abilities = engine::parser::oracle::parse_oracle_text(
             oracle_text,
             name,
             &[],
-            &["Instant".to_string()],
+            &[core_type.to_string()],
             &[],
         )
         .abilities;
-        let card_id = add_spell_to_hand(state, PlayerId(0), name, CoreType::Instant, abilities);
+        let card_id = add_spell_to_hand(state, PlayerId(0), name, core_type, abilities);
         let object_id = state
             .objects
             .values()
@@ -917,6 +940,105 @@ mod tests {
         assert!(
             berserkers >= vanilla,
             "Blade-Tribe Berserkers {berserkers} must not fall below a vanilla 3/3's {vanilla}"
+        );
+    }
+
+    const OVERRUN: &str = "Creatures you control get +3/+3 and gain trample until end of turn. (Each of those creatures can deal excess combat damage to the player or planeswalker it's attacking.)";
+    const OVERCOME: &str = "Creatures you control get +2/+2 and gain trample until end of turn. (Each of those creatures can deal excess combat damage to the player or planeswalker it's attacking.)";
+    const BURST_OF_SPEED: &str = "Creatures you control gain haste until end of turn. (They can attack and {T} even if they just came under your control.)";
+    const ARM_THE_CATHARS: &str = "Until end of turn, target creature gets +3/+3, up to one other target creature gets +2/+2, and up to one other target creature gets +1/+1. Those creatures gain vigilance until end of turn.";
+    const DEAFENING_CLARION: &str = "Choose one or both —\n• Deafening Clarion deals 3 damage to each creature.\n• Creatures you control gain lifelink until end of turn.";
+    const GOBLIN_WAR_PARTY: &str = "Choose one —\n• Create three 1/1 red Goblin creature tokens.\n• Creatures you control get +1/+1 and gain haste until end of turn.\nEntwine {2}{R} (Choose both if you pay the entwine cost.)";
+    const LEYLINE_OF_ANTICIPATION: &str = "If this card is in your opening hand, you may begin the game with it on the battlefield.\nYou may cast spells as though they had flash.";
+
+    /// CR 505.1a + CR 307.1 + CR 307.5: a sorcery's precombat main is its last window before this
+    /// turn's combat, and its until-end-of-turn payload lasts through it (CR 611.2a + CR 514.2),
+    /// so the pump hint does not apply and the cast takes its untimed arm: the default, or the
+    /// token arm for Goblin War Party's other mode. Instants on the same board, and Overrun in a
+    /// postcombat main (CR 505.1a) or under its controller's Leyline of Anticipation (CR 601.3b),
+    /// can still be timed. An opponent's Leyline opens nothing for it.
+    #[test]
+    fn should_play_now_does_not_time_a_sorcery_confined_pump_in_its_precombat_main() {
+        let sorcery = |phase, name, oracle_text| {
+            let mut state = make_state();
+            state.phase = phase;
+            let action = oracle_spell(&mut state, name, oracle_text, CoreType::Sorcery);
+            should_play_now(&state, &action, PlayerId(0))
+        };
+        let main = Phase::PreCombatMain;
+
+        assert_eq!(
+            hint_in(main, false, "Giant Growth", GIANT_GROWTH),
+            0.3,
+            "reach: an instant pump keeps its main-phase hint"
+        );
+        assert_eq!(
+            hint_in(main, false, "Coordinated Assault", COORDINATED_ASSAULT),
+            0.3,
+            "reach: a GenericEffect instant pump keeps its main-phase hint"
+        );
+
+        for (name, oracle_text) in [
+            ("Overrun", OVERRUN),
+            ("Overcome", OVERCOME),
+            ("Burst of Speed", BURST_OF_SPEED),
+            ("Arm the Cathars", ARM_THE_CATHARS),
+            ("Deafening Clarion", DEAFENING_CLARION),
+        ] {
+            assert_eq!(
+                sorcery(main, name, oracle_text),
+                0.5,
+                "{name} takes the default arm"
+            );
+        }
+        assert_eq!(
+            sorcery(main, "Goblin War Party", GOBLIN_WAR_PARTY),
+            0.66,
+            "Goblin War Party falls through to the token arm"
+        );
+
+        assert_eq!(
+            sorcery(Phase::PostCombatMain, "Overrun", OVERRUN),
+            0.3,
+            "postcombat, the turn's combat is behind Overrun"
+        );
+
+        let with_leyline = |controller, confined| {
+            let mut s = GameScenario::new_n_player(2, 42);
+            s.at_phase(Phase::PreCombatMain);
+            let overrun = s
+                .add_spell_to_hand_from_oracle(P0, "Overrun", false, OVERRUN)
+                .id();
+            s.add_enchantment_from_oracle(
+                controller,
+                "Leyline of Anticipation",
+                LEYLINE_OF_ANTICIPATION,
+            );
+            let mut runner = s.build();
+            evaluate_layers(runner.state_mut());
+            let state = runner.state();
+            assert_eq!(
+                spell_confined_to_sorcery_timing(state, P0, overrun),
+                confined,
+                "premise: the query, {controller:?}'s Leyline"
+            );
+            let action = GameAction::CastSpell {
+                object_id: overrun,
+                card_id: state.objects[&overrun].card_id,
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::Auto,
+            };
+            should_play_now(state, &action, P0)
+        };
+        assert_eq!(
+            with_leyline(P0, false),
+            0.3,
+            "Overrun under its controller's Leyline can wait for combat"
+        );
+        assert_eq!(
+            with_leyline(P1, true),
+            0.5,
+            "an opponent's Leyline opens nothing for Overrun"
         );
     }
 }

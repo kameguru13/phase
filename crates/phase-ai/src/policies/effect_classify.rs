@@ -1,16 +1,21 @@
 use engine::game::filter::{matches_target_filter, FilterContext};
 use engine::game::game_object::GameObject;
 use engine::game::quantity::try_resolve_quantity_in_source_context;
+use engine::game::restrictions::{
+    ability_confined_to_sorcery_timing, spell_confined_to_sorcery_timing,
+};
 use engine::types::ability::{
     AbilityDefinition, AbilityKind, ContinuousModification, ControllerRef, Duration, Effect,
     EffectScope, PerpetualGrantModification, PerpetualModification, PlayerFilter, PtValue,
     QuantityExpr, ResolvedAbility, StaticDefinition, SubAbilityLink, TapStateChange,
     TargetChoiceTiming, TargetFilter, TargetRef, TriggerDefinition, TypeFilter,
 };
+use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::game_state::{CastingVariant, GameState, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::{Keyword, KeywordKind};
+use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::statics::StaticMode;
 use engine::types::triggers::TriggerMode;
@@ -18,7 +23,7 @@ use engine::types::zones::Zone;
 
 use super::context::PolicyContext;
 use super::self_protection_classify::effect_has_defensive_payload;
-use crate::cast_facts::{collect_definition_effects, CastFacts};
+use crate::cast_facts::{cast_object_for_action, collect_definition_effects, CastFacts};
 
 /// Player-impact magnitude above which target selection has a directional
 /// preference rather than falling back to the spell's broader polarity.
@@ -2113,6 +2118,67 @@ pub(crate) fn spell_resolution_effects<'a>(facts: &CastFacts<'a>) -> Vec<&'a Eff
         .copied()
         .flat_map(collect_definition_effects)
         .collect()
+}
+
+/// The object whose timing governs a candidate's own resolution: a spell being cast
+/// (CR 601.2a), or having its modes chosen (CR 601.2b + CR 700.2a), or an activated ability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimingSubject {
+    Spell(ObjectId),
+    Ability {
+        source_id: ObjectId,
+        ability_index: usize,
+    },
+}
+
+impl TimingSubject {
+    /// A cast through the AI's cast object authority, an activation by its engine index, a
+    /// spell's mode prompt by the pending cast's object. Anything else has no subject, so a
+    /// modal ability's prompt keeps its pricing.
+    pub(crate) fn of_candidate(ctx: &PolicyContext<'_>) -> Option<Self> {
+        match (&ctx.candidate.action, &ctx.decision.waiting_for) {
+            (GameAction::CastSpell { .. }, _) => {
+                cast_object_for_action(ctx.state, &ctx.candidate.action, ctx.ai_player)
+                    .map(|object| Self::Spell(object.id))
+            }
+            (
+                GameAction::ActivateAbility {
+                    source_id,
+                    ability_index,
+                    ..
+                },
+                _,
+            ) => Some(Self::Ability {
+                source_id: *source_id,
+                ability_index: *ability_index,
+            }),
+            (GameAction::SelectModes { .. }, WaitingFor::ModeChoice { pending_cast, .. }) => {
+                Some(Self::Spell(pending_cast.object_id))
+            }
+            _ => None,
+        }
+    }
+
+    fn confined_to_sorcery_timing(self, state: &GameState, player: PlayerId) -> bool {
+        match self {
+            Self::Spell(object_id) => spell_confined_to_sorcery_timing(state, player, object_id),
+            Self::Ability {
+                source_id,
+                ability_index,
+            } => ability_confined_to_sorcery_timing(state, player, source_id, ability_index),
+        }
+    }
+}
+
+/// CR 505.1a + CR 307.1 + CR 307.5: is this the precombat main phase, the first main phase of
+/// the turn, for a subject confined to sorcery timing? Then no later window reaches this turn's
+/// combat, and an until-end-of-turn payload lasts through it (CR 611.2a + CR 514.2).
+pub(crate) fn precombat_main_is_last_trick_window(
+    state: &GameState,
+    player: PlayerId,
+    subject: TimingSubject,
+) -> bool {
+    state.phase == Phase::PreCombatMain && subject.confined_to_sorcery_timing(state, player)
 }
 
 #[cfg(test)]

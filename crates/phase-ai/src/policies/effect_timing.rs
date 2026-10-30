@@ -20,8 +20,8 @@ use crate::features::DeckFeatures;
 use super::activation::turn_only;
 use super::context::{collect_ability_effects, PolicyContext};
 use super::effect_classify::{
-    effect_is_combat_trick_payload, extract_target_filter, spell_resolution_effects,
-    targets_creatures_only,
+    effect_is_combat_trick_payload, extract_target_filter, precombat_main_is_last_trick_window,
+    spell_resolution_effects, targets_creatures_only, TimingSubject,
 };
 use super::registry::{
     DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy, STRONG_MAX,
@@ -592,7 +592,18 @@ fn combat_trick_score(ctx: &PolicyContext<'_>) -> f64 {
         return -2.0;
     }
 
-    // Main phases with no active combat: pump spells waste mana for zero board impact.
+    // CR 505.1a + CR 307.1 + CR 307.5: a payload the candidate can deliver only at sorcery
+    // speed has no later window before this turn's combat, and it lasts through that combat
+    // (CR 611.2a + CR 514.2), so timing has nothing to price. Whether it is worth casting is
+    // the continuation's and the other policies' question.
+    if TimingSubject::of_candidate(ctx).is_some_and(|subject| {
+        precombat_main_is_last_trick_window(ctx.state, ctx.ai_player, subject)
+    }) {
+        return 0.0;
+    }
+
+    // Main phases with no active combat: in the precombat main an instant-speed trick can wait
+    // for combat, and a postcombat main has the turn's combat behind it (CR 505.1a).
     // Apply a strong penalty that overrides other positive signals.
     if matches!(
         ctx.state.phase,
@@ -630,7 +641,11 @@ mod tests {
     use engine::game::combat::{
         get_valid_attacker_ids, get_valid_block_targets, AttackTarget, AttackerInfo, CombatState,
     };
-    use engine::game::scenario::{GameScenario, P0};
+    use engine::game::layers::evaluate_layers;
+    use engine::game::restrictions::{
+        ability_confined_to_sorcery_timing, spell_confined_to_sorcery_timing,
+    };
+    use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
     use engine::game::zones::create_object;
     use engine::types::ability::{
         AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification,
@@ -643,7 +658,7 @@ mod tests {
         TargetSelectionProgress, TargetSelectionSlot, WaitingFor,
     };
     use engine::types::identifiers::{CardId, ExtraPhaseId, ObjectId};
-    use engine::types::mana::ManaCost;
+    use engine::types::mana::{ManaColor, ManaCost, ManaCostShard};
     use engine::types::phase::{PhaseGroup, TurnSegment};
     use engine::types::player::PlayerId;
     use engine::types::statics::StaticMode;
@@ -3021,7 +3036,7 @@ mod tests {
     /// payloads its resolution carries. Barge In's `Pump` plus trample grant, and Arm the
     /// Cathars' three `Pump`s plus vigilance grant, price as Giant Growth's single `Pump` does:
     /// the trick penalty out of combat, the combat bonus in DeclareAttackers. Arm the Cathars is a
-    /// sorcery, so it is priced in its controller's precombat main phase, a window it can be cast in (CR 307.1).
+    /// sorcery, so it is priced in its controller's postcombat main phase, a window it can be cast in (CR 307.1) with the turn's combat behind it (CR 505.1a).
     #[test]
     fn effect_timing_prices_a_multi_payload_trick_once() {
         let barge_in = trick_payloads(BARGE_IN, "Barge In", CoreType::Instant);
@@ -3062,7 +3077,7 @@ mod tests {
             );
         }
 
-        let mut state = d1_board(Phase::PreCombatMain, P0);
+        let mut state = d1_board(Phase::PostCombatMain, P0);
         let arm = oracle_spell(
             &mut state,
             P0,
@@ -3077,6 +3092,477 @@ mod tests {
         assert!(
             (d_arm - d_gg).abs() < 1e-9,
             "Arm the Cathars {d_arm} must price as Giant Growth {d_gg}"
+        );
+    }
+
+    // ---- A payload confined to sorcery timing has no later window before combat ----
+
+    const OVERRUN: &str = "Creatures you control get +3/+3 and gain trample until end of turn. (Each of those creatures can deal excess combat damage to the player or planeswalker it's attacking.)";
+    const OVERCOME: &str = "Creatures you control get +2/+2 and gain trample until end of turn. (Each of those creatures can deal excess combat damage to the player or planeswalker it's attacking.)";
+    const BURST_OF_SPEED: &str = "Creatures you control gain haste until end of turn. (They can attack and {T} even if they just came under your control.)";
+    const DEAFENING_CLARION: &str = "Choose one or both —\n• Deafening Clarion deals 3 damage to each creature.\n• Creatures you control gain lifelink until end of turn.";
+    const SWELTERING_SUNS: &str =
+        "Sweltering Suns deals 3 damage to each creature.\nCycling {3} ({3}, Discard this card: Draw a card.)";
+    const GARRUK_WILDSPEAKER: &str = "[+1]: Untap two target lands.\n[−1]: Create a 3/3 green Beast creature token.\n[−4]: Creatures you control get +3/+3 and gain trample until end of turn.";
+    const BRAVE_KIN_DUO: &str =
+        "{1}, {T}: Target creature gets +1/+1 until end of turn. Activate only as a sorcery.";
+    const ROCKFACE_VILLAGE: &str = "{T}: Add {C}.\n{T}: Add {R}. Spend this mana only to cast a creature spell.\n{R}, {T}: Target Lizard, Mouse, Otter, or Raccoon you control gets +1/+0 and gains haste until end of turn. Activate only as a sorcery.";
+    const THE_WANDERING_EMPEROR: &str = "Flash\nAs long as The Wandering Emperor entered this turn, you may activate her loyalty abilities any time you could cast an instant.\n[+1]: Put a +1/+1 counter on up to one target creature. It gains first strike until end of turn.\n[−1]: Create a 2/2 white Samurai creature token with vigilance.\n[−2]: Exile target tapped creature. You gain 2 life.";
+    const LEYLINE_OF_ANTICIPATION: &str = "If this card is in your opening hand, you may begin the game with it on the battlefield.\nYou may cast spells as though they had flash.";
+
+    fn mana(generic: u32, shards: Vec<ManaCostShard>) -> ManaCost {
+        ManaCost::Cost { shards, generic }
+    }
+
+    /// P0 at its precombat main with three of each basic land and a Bear on each side.
+    fn trick_scenario() -> GameScenario {
+        let mut s = GameScenario::new_n_player(2, 42);
+        s.at_phase(Phase::PreCombatMain);
+        for color in [
+            ManaColor::White,
+            ManaColor::Blue,
+            ManaColor::Black,
+            ManaColor::Red,
+            ManaColor::Green,
+        ] {
+            for _ in 0..3 {
+                s.add_basic_land(P0, color);
+            }
+        }
+        s.add_creature(P0, "Bear", 2, 2);
+        s.add_creature(P1, "Bear", 2, 2);
+        s
+    }
+
+    fn add_spell(
+        s: &mut GameScenario,
+        name: &str,
+        is_instant: bool,
+        oracle_text: &str,
+        cost: ManaCost,
+    ) -> ObjectId {
+        s.add_spell_to_hand_from_oracle(P0, name, is_instant, oracle_text)
+            .with_mana_cost(cost)
+            .id()
+    }
+
+    fn add_overrun(s: &mut GameScenario) -> ObjectId {
+        use ManaCostShard::Green;
+        add_spell(
+            s,
+            "Overrun",
+            false,
+            OVERRUN,
+            mana(2, vec![Green, Green, Green]),
+        )
+    }
+
+    fn add_assault(s: &mut GameScenario) -> ObjectId {
+        add_spell(
+            s,
+            "Coordinated Assault",
+            true,
+            COORDINATED_ASSAULT,
+            mana(0, vec![ManaCostShard::Red]),
+        )
+    }
+
+    fn add_leyline(s: &mut GameScenario, controller: PlayerId) {
+        s.add_enchantment_from_oracle(
+            controller,
+            "Leyline of Anticipation",
+            LEYLINE_OF_ANTICIPATION,
+        );
+    }
+
+    /// Turn 5, so the turn-phase activation is 1.0, and a layer pass, which refreshes the
+    /// static-mode presence index the timing authorities read.
+    fn settle(runner: &mut GameRunner) {
+        let state = runner.state_mut();
+        state.turn_number = 5;
+        evaluate_layers(state);
+    }
+
+    /// As `granted_loyalty_ability_timing.rs` builds her: she has no planeswalker subtype, and
+    /// "entered this turn" reads `entered_battlefield_turn`.
+    fn set_emperor_entered(runner: &mut GameRunner, emperor: ObjectId, entered_this_turn: bool) {
+        let state = runner.state_mut();
+        let turn = state.turn_number;
+        let obj = state.objects.get_mut(&emperor).unwrap();
+        obj.card_types.subtypes.clear();
+        obj.base_card_types = obj.card_types.clone();
+        obj.entered_battlefield_turn = Some(if entered_this_turn { turn } else { turn - 1 });
+    }
+
+    fn loyalty_index(state: &GameState, id: ObjectId, amount: i32) -> usize {
+        state.objects[&id]
+            .abilities
+            .iter()
+            .position(|a| matches!(a.cost, Some(AbilityCost::Loyalty { amount: n }) if n == amount))
+            .expect("the loyalty ability is printed")
+    }
+
+    /// The printed index of the card's last activated ability: its only one, or the one after
+    /// its mana abilities.
+    fn last_activated_index(state: &GameState, id: ObjectId) -> usize {
+        state.objects[&id]
+            .abilities
+            .iter()
+            .rposition(|a| a.kind == AbilityKind::Activated)
+            .expect("the card prints an activated ability")
+    }
+
+    /// The engine's own candidate for casting `id`. A cast it does not offer is a reach failure.
+    fn offered_cast(state: &GameState, id: ObjectId) -> CandidateAction {
+        build_decision_context(state)
+            .candidates
+            .into_iter()
+            .find(
+                |c| matches!(c.action, GameAction::CastSpell { object_id, .. } if object_id == id),
+            )
+            .unwrap_or_else(|| panic!("reach: {}'s cast must be offered", state.objects[&id].name))
+    }
+
+    /// The engine's own candidate for activating `index` of `source`.
+    fn offered_activation(state: &GameState, source: ObjectId, index: usize) -> CandidateAction {
+        build_decision_context(state)
+            .candidates
+            .into_iter()
+            .find(|c| {
+                matches!(
+                    c.action,
+                    GameAction::ActivateAbility { source_id, ability_index, .. }
+                        if source_id == source && ability_index == index
+                )
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "reach: {}'s ability {index} must be offered",
+                    state.objects[&source].name
+                )
+            })
+    }
+
+    fn cast_delta(state: &GameState, id: ObjectId) -> f64 {
+        timing_delta(state, &offered_cast(state, id))
+    }
+
+    fn activation_delta(state: &GameState, source: ObjectId, index: usize) -> f64 {
+        timing_delta(state, &offered_activation(state, source, index))
+    }
+
+    /// CR 505.1a + CR 307.1 + CR 307.5: a sorcery's cast (Overrun, Overcome, Burst of Speed, Arm
+    /// the Cathars), a loyalty ability (CR 606.3: Garruk's −4) and an "activate only as a
+    /// sorcery" ability (CR 602.5d: Rockface Village, Brave-Kin Duo) have no later window before
+    /// this turn's combat, and their until-end-of-turn payload lasts through it (CR 611.2a +
+    /// CR 514.2), so timing prices them neutral in the precombat main, while the instants and the
+    /// unrestricted Shivan Dragon on the same board keep the trick penalty. Deafening Clarion's
+    /// cast reads as Sweltering Suns, which has only its damage clause. In a postcombat main the
+    /// turn's combat is behind every one of them (CR 505.1a), so the penalty stands.
+    #[test]
+    fn sorcery_confined_trick_is_neutral_in_its_own_precombat_main() {
+        use ManaCostShard::{Green, Red, White};
+
+        let mut s = trick_scenario();
+        let overrun = add_overrun(&mut s);
+        let overcome = add_spell(
+            &mut s,
+            "Overcome",
+            false,
+            OVERCOME,
+            mana(3, vec![Green, Green]),
+        );
+        let burst = add_spell(
+            &mut s,
+            "Burst of Speed",
+            false,
+            BURST_OF_SPEED,
+            mana(0, vec![Red]),
+        );
+        let arm = add_spell(
+            &mut s,
+            "Arm the Cathars",
+            false,
+            ARM_THE_CATHARS,
+            mana(1, vec![White, White]),
+        );
+        let clarion = add_spell(
+            &mut s,
+            "Deafening Clarion",
+            false,
+            DEAFENING_CLARION,
+            mana(1, vec![Red, White]),
+        );
+        let suns = add_spell(
+            &mut s,
+            "Sweltering Suns",
+            false,
+            SWELTERING_SUNS,
+            mana(1, vec![Red, Red]),
+        );
+        let assault = add_assault(&mut s);
+        let giant_growth = add_spell(
+            &mut s,
+            "Giant Growth",
+            true,
+            GIANT_GROWTH,
+            mana(0, vec![Green]),
+        );
+        // Printed loyalty 3; 4 is the first board that can pay the −4.
+        let garruk = s
+            .add_planeswalker_from_oracle(P0, "Garruk Wildspeaker", "Garruk", 4, GARRUK_WILDSPEAKER)
+            .id();
+        let brave_kin = s
+            .add_creature_from_oracle(P0, "Brave-Kin Duo", 1, 1, BRAVE_KIN_DUO)
+            .with_mana_cost(mana(0, vec![White]))
+            .with_subtypes(vec!["Rabbit", "Mouse"])
+            .id();
+        let rockface = s
+            .add_land_from_oracle(P0, "Rockface Village", ROCKFACE_VILLAGE)
+            .id();
+        let shivan = s
+            .add_creature_from_oracle(P0, "Shivan Dragon", 5, 5, SHIVAN_DRAGON)
+            .with_mana_cost(mana(4, vec![Red, Red]))
+            .id();
+        let wellwisher = s
+            .add_creature_from_oracle(P0, "Wellwisher", 1, 1, WELLWISHER)
+            .with_mana_cost(mana(1, vec![Green]))
+            .with_subtypes(vec!["Elf"])
+            .id();
+        let mut runner = s.build();
+        settle(&mut runner);
+        let state = runner.state();
+        assert!(
+            matches!(
+                *state.objects[&overrun].abilities[0].effect,
+                Effect::GenericEffect {
+                    duration: Some(Duration::UntilEndOfTurn),
+                    ..
+                }
+            ),
+            "premise: Overrun parses as an until-end-of-turn GenericEffect"
+        );
+        let minus_four = loyalty_index(state, garruk, -4);
+        let brave_kin_ix = last_activated_index(state, brave_kin);
+        let rockface_ix = last_activated_index(state, rockface);
+        let shivan_ix = last_activated_index(state, shivan);
+        let wellwisher_ix = last_activated_index(state, wellwisher);
+
+        let d_wellwisher = activation_delta(state, wellwisher, wellwisher_ix);
+        assert!(
+            cast_delta(state, assault) < -1.5 && cast_delta(state, giant_growth) < -1.5,
+            "reach: the instants keep the trick penalty on this board"
+        );
+        assert!(
+            activation_delta(state, shivan, shivan_ix) < d_wellwisher - 1.5,
+            "reach: the activation path fires on this board"
+        );
+
+        for (name, id) in [
+            ("Overrun", overrun),
+            ("Overcome", overcome),
+            ("Burst of Speed", burst),
+            ("Arm the Cathars", arm),
+        ] {
+            assert_eq!(cast_delta(state, id), 0.0, "{name} is neutral");
+        }
+        assert_eq!(
+            activation_delta(state, garruk, minus_four),
+            0.0,
+            "Garruk's −4 is neutral"
+        );
+        assert_eq!(
+            activation_delta(state, rockface, rockface_ix),
+            0.0,
+            "Rockface Village's ability is neutral"
+        );
+        assert!(
+            (activation_delta(state, brave_kin, brave_kin_ix) - d_wellwisher).abs() < 1e-9,
+            "Brave-Kin Duo's activation prices as Wellwisher's {d_wellwisher}"
+        );
+        assert!(
+            (cast_delta(state, clarion) - cast_delta(state, suns)).abs() < 1e-9,
+            "Deafening Clarion's cast prices as Sweltering Suns'"
+        );
+
+        // A stale candidate reads the object the cast authority falls back to, in hand.
+        let stale = CandidateAction {
+            action: GameAction::CastSpell {
+                object_id: ObjectId(u64::MAX),
+                card_id: state.objects[&overrun].card_id,
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::Auto,
+            },
+            metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Spell),
+        };
+        assert_eq!(
+            timing_delta(state, &stale),
+            0.0,
+            "the subject is the cast authority's object, not the candidate's id"
+        );
+
+        let mut postcombat = state.clone();
+        postcombat.phase = Phase::PostCombatMain;
+        let state = &postcombat;
+        let d_giant_growth = cast_delta(state, giant_growth);
+        assert!(d_giant_growth < -1.5, "reach, got {d_giant_growth}");
+        for (name, delta) in [
+            ("Overrun", cast_delta(state, overrun)),
+            ("Arm the Cathars", cast_delta(state, arm)),
+            ("Garruk's −4", activation_delta(state, garruk, minus_four)),
+            (
+                "Rockface Village",
+                activation_delta(state, rockface, rockface_ix),
+            ),
+        ] {
+            assert!(
+                (delta - d_giant_growth).abs() < 1e-9,
+                "{name} {delta} must price as Giant Growth {d_giant_growth} postcombat"
+            );
+        }
+    }
+
+    /// CR 601.3b + CR 702.8a + CR 304.5: the engine's authority decides, not the card type. With
+    /// its controller's Leyline of Anticipation, Overrun can wait for combat and prices as
+    /// Coordinated Assault; an opponent's Leyline opens nothing for P0. The Wandering Emperor's
+    /// +1 stays priced in the turn she entered, the permission's window, and is neutral on a
+    /// later turn.
+    #[test]
+    fn a_timing_permission_keeps_a_sorcery_speed_trick_priced() {
+        for (leyline_controller, confined) in [(P0, false), (P1, true)] {
+            let mut s = trick_scenario();
+            let overrun = add_overrun(&mut s);
+            let assault = add_assault(&mut s);
+            add_leyline(&mut s, leyline_controller);
+            let mut runner = s.build();
+            settle(&mut runner);
+            let state = runner.state();
+            assert_eq!(
+                spell_confined_to_sorcery_timing(state, P0, overrun),
+                confined,
+                "premise: the query, {leyline_controller:?}'s Leyline"
+            );
+            let (d_overrun, d_assault) = (cast_delta(state, overrun), cast_delta(state, assault));
+            assert!(d_assault < -1.5, "reach: the instant is priced");
+            if confined {
+                assert_eq!(d_overrun, 0.0, "an opponent's Leyline opens nothing for P0");
+            } else {
+                assert!(
+                    (d_overrun - d_assault).abs() < 1e-9,
+                    "Overrun {d_overrun} under its Leyline must price as Assault {d_assault}"
+                );
+            }
+        }
+
+        for (entered_this_turn, confined) in [(true, false), (false, true)] {
+            let mut s = trick_scenario();
+            let emperor = s
+                .add_planeswalker_from_oracle(
+                    P0,
+                    "The Wandering Emperor",
+                    "",
+                    3,
+                    THE_WANDERING_EMPEROR,
+                )
+                .id();
+            let mut runner = s.build();
+            settle(&mut runner);
+            set_emperor_entered(&mut runner, emperor, entered_this_turn);
+            settle(&mut runner);
+            let state = runner.state();
+            let plus_one = loyalty_index(state, emperor, 1);
+            assert_eq!(
+                ability_confined_to_sorcery_timing(state, P0, emperor, plus_one),
+                confined,
+                "premise: the query, entered this turn: {entered_this_turn}"
+            );
+            let d_plus_one = activation_delta(state, emperor, plus_one);
+            if confined {
+                assert_eq!(d_plus_one, 0.0, "her +1 outside the permission is neutral");
+            } else {
+                // Decided residual: the card reads 0.0 (her counter stays); a rider fix flips this.
+                assert!(d_plus_one < -1.5, "her +1 under the permission is priced");
+            }
+        }
+    }
+
+    /// Own-turn Deafening Clarion, cast in `phase` with no modes chosen: its `[0]`, `[1]` and
+    /// `[0, 1]` deltas at the mode prompt. The prompt and all three candidates are unconditional.
+    fn clarion_mode_deltas(phase: Phase, leyline: bool) -> [f64; 3] {
+        use ManaCostShard::{Red, White};
+
+        let mut s = trick_scenario();
+        let clarion = add_spell(
+            &mut s,
+            "Deafening Clarion",
+            false,
+            DEAFENING_CLARION,
+            mana(1, vec![Red, White]),
+        );
+        if leyline {
+            add_leyline(&mut s, P0);
+        }
+        let mut runner = s.build();
+        runner.state_mut().phase = phase;
+        settle(&mut runner);
+        let card_id = runner.state().objects[&clarion].card_id;
+        runner
+            .act(GameAction::CastSpell {
+                object_id: clarion,
+                card_id,
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::Auto,
+            })
+            .expect("reach: Deafening Clarion's cast begins");
+        let state = runner.state();
+        let WaitingFor::ModeChoice {
+            player,
+            pending_cast,
+            ..
+        } = &state.waiting_for
+        else {
+            panic!("reach: expected the mode prompt: {:?}", state.waiting_for);
+        };
+        assert_eq!(*player, P0);
+        assert_eq!(pending_cast.object_id, clarion);
+
+        let candidates = build_decision_context(state).candidates;
+        [vec![0], vec![1], vec![0, 1]].map(|indices| {
+            let candidate = candidates
+                .iter()
+                .find(|c| {
+                    c.action
+                        == GameAction::SelectModes {
+                            indices: indices.clone(),
+                        }
+                })
+                .unwrap_or_else(|| panic!("reach: SelectModes {indices:?} must be offered"));
+            timing_delta(state, candidate)
+        })
+    }
+
+    /// CR 601.2b + CR 700.2a: a spell's modes are chosen while it is being cast, so the mode
+    /// prompt reads the pending cast's object. Deafening Clarion's lifelink mode (CR 611.2a +
+    /// CR 514.2) has its last window in the precombat main and reads as its damage mode; a
+    /// postcombat main keeps the penalty, and so does a Leyline's permission, read mid-cast.
+    #[test]
+    fn mode_prompt_of_a_sorcery_confined_spell_prices_its_pump_mode_neutral() {
+        let [damage, lifelink, _] = clarion_mode_deltas(Phase::PostCombatMain, false);
+        assert!(
+            lifelink < damage - 1.5,
+            "reach: the trick term fires on this path, {lifelink} vs {damage}"
+        );
+
+        let [damage, lifelink, both] = clarion_mode_deltas(Phase::PreCombatMain, false);
+        assert_eq!(damage, 0.0, "the damage mode carries no timing term");
+        assert_eq!(lifelink, 0.0, "the lifelink mode is in its last window");
+        assert_eq!(both, 0.0, "both modes together are in their last window");
+
+        let [damage, lifelink, _] = clarion_mode_deltas(Phase::PreCombatMain, true);
+        // Decided residual: the card reads [1] = [0] (cast committed); a prompt fix flips this.
+        assert!(
+            lifelink < damage - 1.5,
+            "the prompt reads the engine query under Leyline, {lifelink} vs {damage}"
         );
     }
 }
