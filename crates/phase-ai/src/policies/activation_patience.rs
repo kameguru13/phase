@@ -23,9 +23,10 @@
 //! activated in the precombat main phase, and the mana and untapped creatures it
 //! would spend now are still free for the sorcery-speed plays only the main phase
 //! allows (CR 307.1). The same holds in an upkeep whose triggers have already
-//! resolved. It fails only when the main phase opens with something an earlier
+//! resolved. It fails when the main phase opens with something an earlier
 //! activation could still change (CR 505.3-505.5 turn-based actions, CR 117.3a
-//! triggers), so those boards are not gated.
+//! triggers) or, from the upkeep, when a trigger reaches the draw step (see
+//! "What a hold rests on"), so those boards are not gated.
 //! The untap step is excluded because CR 502.4 means no player ever receives
 //! priority in it at all, so `WaitingFor::Priority` cannot occur there to gate on.
 //!
