@@ -1617,6 +1617,14 @@ pub(crate) fn drain_pending_batch_deliveries(state: &mut GameState, events: &mut
                 .collect()
         };
         if let Some(ref paused_current) = paused_current {
+            // CR 603.6d + CR 603.2c: the batch resumes only after the paused
+            // member's as-enters continuation completed; custody takes its
+            // parked entry (and runs its delayed half) so the segment below
+            // collects it once, against the realized entrant.
+            crate::game::engine_replacement::take_entry_continuation_custody(
+                state,
+                &paused_current.delivery_events,
+            );
             crate::game::triggers::append_and_collect_logical_zone_trigger_segment(
                 state,
                 &mut logical_zone_change_group,

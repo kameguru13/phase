@@ -3473,6 +3473,286 @@ pub(crate) fn flush_deferred_entry_events_into_priority_scan(
     events.extend(deferred);
 }
 
+/// The three entry shapes a park holds for `source_id`: its battlefield
+/// `ZoneChanged`, its `LandPlayed` (CR 305.1), and its attach resolution. The
+/// single filter shared by the mid-entry choice capture and the as-enters
+/// continuation bracket.
+fn is_entry_event_of(event: &GameEvent, source_id: ObjectId) -> bool {
+    match event {
+        GameEvent::ZoneChanged {
+            object_id,
+            to: Zone::Battlefield,
+            ..
+        }
+        | GameEvent::LandPlayed { object_id, .. } => *object_id == source_id,
+        GameEvent::EffectResolved {
+            kind: EffectKind::Attach,
+            source_id: attach_source_id,
+            ..
+        } => *attach_source_id == source_id,
+        _ => false,
+    }
+}
+
+/// Does the parked event `parked` hold `event`? A battlefield `ZoneChanged` is
+/// matched by its per-turn ledger key (the key
+/// `zones::settle_battlefield_entry_observations` uses), so later record
+/// stamping of the action's copy cannot unpark it; `LandPlayed` and the attach
+/// resolution by equality. No other shape is ever parked.
+fn parked_event_holds(parked: &GameEvent, event: &GameEvent) -> bool {
+    match event {
+        GameEvent::ZoneChanged {
+            to: Zone::Battlefield,
+            record,
+            ..
+        } => matches!(
+            parked,
+            GameEvent::ZoneChanged { record: parked_record, .. }
+                if parked_record.recorded_turn_number == record.recorded_turn_number
+                    && parked_record.turn_zone_change_index == record.turn_zone_change_index
+        ),
+        GameEvent::LandPlayed { .. }
+        | GameEvent::EffectResolved {
+            kind: EffectKind::Attach,
+            ..
+        } => parked == event,
+        _ => false,
+    }
+}
+
+/// CR 614.12a + CR 603.6d + CR 603.2c: the single hold predicate. True when
+/// `event` is an entry whose as-enters continuation (or mid-entry choice) has not
+/// completed, so it is parked in `deferred_entry_events`. Such an entry is
+/// collected only by its replay, its settled release or its logical owner's
+/// custody, never by a collector running at the pause.
+pub(crate) fn entry_event_is_parked(state: &GameState, event: &GameEvent) -> bool {
+    if state.deferred_entry_events.is_empty() {
+        return false;
+    }
+    state
+        .deferred_entry_events
+        .iter()
+        .any(|parked| parked_event_holds(parked, event))
+}
+
+/// CR 603.6d + CR 614.1c: the entrant whose own as-enters continuation is
+/// about to run: a `Moved` continuation for an object that is, right now, the
+/// exact entered incarnation (CR 400.7) of a battlefield entry in `events`
+/// whose key is not already parked. A "would die / would be exiled … instead"
+/// `Moved` continuation for an object that entered earlier in the same buffer
+/// fails the live-zone test.
+fn as_enters_continuation_entrant(
+    state: &GameState,
+    event: Option<&ReplacementEvent>,
+    source: Option<ObjectId>,
+    events: &[GameEvent],
+) -> Option<ObjectId> {
+    if event != Some(&ReplacementEvent::Moved) {
+        return None;
+    }
+    let source = source?;
+    let live = state
+        .objects
+        .get(&source)
+        .filter(|obj| obj.zone == Zone::Battlefield)?;
+    events
+        .iter()
+        .any(|entry| {
+            matches!(
+                entry,
+                GameEvent::ZoneChanged {
+                    object_id,
+                    to: Zone::Battlefield,
+                    record,
+                    ..
+                } if *object_id == source
+                    && record
+                        .entered_incarnation
+                        .is_none_or(|incarnation| incarnation == live.incarnation)
+                    && !entry_event_is_parked(state, entry)
+            )
+        })
+        .then_some(source)
+}
+
+/// The bracket that makes an as-enters continuation part of its entrant's entry
+/// (CR 603.6d + CR 614.1c). `open` parks the entrant's entry events before the
+/// continuation runs; `close` unparks them when it completed inline and keeps
+/// them when it paused.
+struct EntryContinuationParking {
+    parked: Vec<GameEvent>,
+}
+
+impl EntryContinuationParking {
+    /// CR 603.6d + CR 614.1c: the continuation's work is part of the entry, so
+    /// the entry is neither observed nor collected while it runs. The parked-key
+    /// skip in `zones::settle_battlefield_entry_observations` then refuses to
+    /// observe this entrant at every instruction boundary inside the
+    /// continuation; other entries of the same buffer still settle.
+    fn open(
+        state: &mut GameState,
+        event: Option<&ReplacementEvent>,
+        source: Option<ObjectId>,
+        events: &[GameEvent],
+    ) -> Self {
+        let parked: Vec<GameEvent> = as_enters_continuation_entrant(state, event, source, events)
+            .map(|entrant| {
+                events
+                    .iter()
+                    .filter(|entry| is_entry_event_of(entry, entrant))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        state.deferred_entry_events.extend(parked.iter().cloned());
+        Self { parked }
+    }
+
+    /// CR 614.12a + CR 603.6d: a continuation that completed inline leaves its
+    /// entry unparked; the entry's `ZoneChanged` is still in the action's events,
+    /// so its owning collector collects it against the realized entrant. A
+    /// paused continuation keeps the park for its release or owner custody.
+    fn close(self, state: &mut GameState, waiting_for: Option<&WaitingFor>) {
+        if self.parked.is_empty() || waiting_for.is_some() {
+            return;
+        }
+        state
+            .deferred_entry_events
+            .retain(|event| !self.parked.contains(event));
+    }
+}
+
+/// CR 603.6d + CR 603.2c: a logical zone-change owner resuming its paused
+/// member takes custody of that member's parked entry: every parked event that
+/// holds an event of `delivery_events` leaves the park. The owner's segment
+/// collection that follows is the ordinary half; this runs the delayed half.
+///
+/// CR 603.2 + CR 603.7: a delayed triggered ability whose trigger event is the
+/// entry triggers on the realized entry, once, like a printed one.
+pub(crate) fn take_entry_continuation_custody(
+    state: &mut GameState,
+    delivery_events: &[GameEvent],
+) {
+    if state.deferred_entry_events.is_empty() {
+        return;
+    }
+    let (taken, kept): (Vec<GameEvent>, Vec<GameEvent>) =
+        std::mem::take(&mut state.deferred_entry_events)
+            .into_iter()
+            .partition(|parked| {
+                delivery_events
+                    .iter()
+                    .any(|event| parked_event_holds(parked, event))
+            });
+    state.deferred_entry_events = kept;
+    if !taken.is_empty() {
+        super::triggers::collect_delayed_trigger_contexts_into_deferred(state, &taken);
+    }
+}
+
+/// CR 800.4a: has the entrant this parked event describes left the game with
+/// its owner or controller of record? A `ZoneChanged` reads its record; a
+/// `LandPlayed` / attach event follows the parked `ZoneChanged` for the same
+/// object, else the object in `state.objects`.
+fn parked_entrant_left_the_game(state: &GameState, event: &GameEvent, park: &[GameEvent]) -> bool {
+    let entrant_record = |object_id: ObjectId| {
+        park.iter().find_map(|parked| match parked {
+            GameEvent::ZoneChanged {
+                object_id: parked_id,
+                to: Zone::Battlefield,
+                record,
+                ..
+            } if *parked_id == object_id => Some((record.owner, record.arrival.controller)),
+            _ => None,
+        })
+    };
+    let identity = match event {
+        GameEvent::ZoneChanged { record, .. } => Some((record.owner, record.arrival.controller)),
+        GameEvent::LandPlayed { object_id, .. }
+        | GameEvent::EffectResolved {
+            source_id: object_id,
+            ..
+        } => entrant_record(*object_id).or_else(|| {
+            state
+                .objects
+                .get(object_id)
+                .map(|obj| (obj.owner, obj.controller))
+        }),
+        _ => None,
+    };
+    identity.is_some_and(|(owner, controller)| {
+        !super::players::is_alive(state, owner) || !super::players::is_alive(state, controller)
+    })
+}
+
+/// CR 603.2 + CR 603.6a + CR 603.10 + CR 800.4a: take the parked entries whose
+/// as-enters continuations are settled. The gate is the complement of any pause
+/// (`WaitingFor::Priority`, as in `realize_settled_token_battlefield_entry`), no
+/// inline dispatch live on this thread, and the drain authority's own readiness
+/// predicate (`resolution_completion_can_settle`: no live resolution frame,
+/// replacement pause, payment or trigger construction). A take therefore means
+/// the entrant's continuation, and every frame above it, is no longer live.
+///
+/// Completion decides collection, not presence: an entry whose continuation
+/// completed happened (CR 603.2), and a later departure of the entrant does not
+/// untrigger its enters abilities (CR 603.10). The one drop is an entrant whose
+/// owner or controller of record has left the game (CR 800.4a): the teardowns
+/// that abandon its paused continuation keep the park, and that entry never
+/// finished. The kept events pass the consumed-ledger and queued-witness
+/// authority, so a release never re-collects an occurrence another collector
+/// claimed or queued.
+fn take_settled_entry_continuation_events(state: &mut GameState) -> Vec<GameEvent> {
+    if state.deferred_entry_events.is_empty()
+        || !matches!(state.waiting_for, WaitingFor::Priority { .. })
+        || post_replacement_dispatch_is_live()
+        || !super::triggers::resolution_completion_can_settle(state)
+    {
+        return Vec::new();
+    }
+    // CR 603.2c: a paused logical owner is a live frame, so it always fails the
+    // gate above and its member stays parked for its custody.
+    debug_assert!(super::engine_priority::retained_logical_zone_events(state).is_empty());
+    let park = std::mem::take(&mut state.deferred_entry_events);
+    let kept: Vec<GameEvent> = park
+        .iter()
+        .filter(|event| !parked_entrant_left_the_game(state, event, &park))
+        .cloned()
+        .collect();
+    super::triggers::filter_already_collected_trigger_events_from(
+        state,
+        &kept,
+        0,
+        &state.consumed_before_priority_trigger_events,
+    )
+}
+
+/// CR 603.2 + CR 603.7: the settled-entry release authority. Takes the settled
+/// park and runs its delayed half here — a delayed triggered ability whose
+/// trigger event is the entry triggers on the realized entry, once, like a
+/// printed one — then returns the events for the caller's ordinary half. The
+/// queued (no-claim) delayed collector fits because the released events belong
+/// to no action buffer: taking the park is their claim. This is the queued form
+/// of the replays' `process_triggers` + `check_delayed_triggers` pair.
+pub(crate) fn release_settled_entry_continuation(state: &mut GameState) -> Vec<GameEvent> {
+    let released = take_settled_entry_continuation_events(state);
+    if !released.is_empty() {
+        super::triggers::collect_delayed_trigger_contexts_into_deferred(state, &released);
+    }
+    released
+}
+
+/// CR 603.3 + CR 603.3b: the release for a point that queues — the settled
+/// entry's ordinary half joins `deferred_triggers` beside its delayed half, and
+/// the caller's drain places them. Returns whether anything was released.
+pub(crate) fn collect_settled_entry_continuation_triggers(state: &mut GameState) -> bool {
+    let released = release_settled_entry_continuation(state);
+    if released.is_empty() {
+        return false;
+    }
+    super::triggers::collect_triggers_into_deferred(state, &released);
+    true
+}
+
 fn copy_effect_for_source(state: &GameState, source_id: ObjectId) -> Option<&AbilityDefinition> {
     if let Some(entry) = state.liminal_entries.get(&source_id) {
         return entry
@@ -3925,6 +4205,9 @@ pub(crate) fn apply_pending_post_replacement_effect(
     // (on unwind profiles) a panic. While it is held, the priority-boundary
     // sweeper must not treat a `Dispatching` resident as ownerless.
     let _live_dispatch = LiveDispatchGuard::enter();
+    // CR 603.6d + CR 614.1c: an as-enters continuation is part of its entrant's
+    // entry; park that entry while the continuation runs.
+    let entry_parking = EntryContinuationParking::open(state, event.as_ref(), source, events);
     let waiting_for = match continuation {
         PostReplacementContinuation::Resolved(resolved) => {
             apply_post_replacement_resolved_effect(state, &resolved, replacement_applied, events)
@@ -4005,6 +4288,9 @@ pub(crate) fn apply_pending_post_replacement_effect(
     // copy replacements) and the `handle_replacement_choice` path (optional
     // "you may have this enter as a copy" replacements) defer uniformly.
     capture_deferred_entry_events_if_mid_entry_choice(state, waiting_for.as_ref(), events);
+    // CR 614.12a + CR 603.6d: a paused continuation keeps its entrant's entry
+    // parked until the continuation completes; an inline one unparks it.
+    entry_parking.close(state, waiting_for.as_ref());
     waiting_for
 }
 
@@ -4014,7 +4300,7 @@ pub(crate) fn apply_pending_post_replacement_effect(
 /// pre-entry counter fold and the entering object's `ZoneChanged` event must be
 /// deferred until after the branch is chosen, so ETB observers see the chosen
 /// counter (CR 614.12a). Exhaustive — no wildcard accept.
-fn is_enters_counter_choice(branches: &[AbilityDefinition]) -> bool {
+pub(crate) fn is_enters_counter_choice(branches: &[AbilityDefinition]) -> bool {
     branches.len() >= 2
         && branches.iter().all(|b| {
             matches!(
@@ -4110,22 +4396,7 @@ fn capture_deferred_entry_events_if_mid_entry_choice(
     // the clear is a write that happens either way.
     state.deferred_entry_events.clear();
     for event in events.iter() {
-        if matches!(
-            event,
-            GameEvent::ZoneChanged { object_id, to, .. }
-                if *object_id == source_id && *to == Zone::Battlefield
-        ) || matches!(
-            event,
-            GameEvent::LandPlayed { object_id, .. }
-                if *object_id == source_id
-        ) || matches!(
-            event,
-            GameEvent::EffectResolved {
-                kind: EffectKind::Attach,
-                source_id: attach_source_id,
-                ..
-            } if *attach_source_id == source_id
-        ) {
+        if is_entry_event_of(event, source_id) {
             state.deferred_entry_events.push(event.clone());
         }
     }
@@ -9859,5 +10130,274 @@ mod tests {
             }
             other => panic!("expected a RevealChoice prompt, got {:?}", other),
         }
+    }
+}
+
+#[cfg(test)]
+mod entry_continuation_release_tests {
+    //! U4-T2 / U4-T6: the settled-entry release — its gate, completion over
+    //! presence, the CR 800.4a drop (owner or controller of record), the
+    //! owner-frame refusal, the ledger filter and the delayed half — and the
+    //! as-enters entrant predicate (CR 603.2 + CR 603.6a + CR 603.6d +
+    //! CR 603.7 + CR 603.10 + CR 614.12a + CR 800.4a).
+    use super::*;
+    use crate::game::scenario::{GameRunner, GameScenario, P0, P1};
+    use crate::game::zones::{create_object, record_and_emit_entry_from_no_zone};
+    use crate::types::actions::GameAction;
+    use crate::types::card_type::CoreType;
+    use crate::types::game_state::{
+        PendingBatchDeliveries, PendingCounterAdditionQueue, PendingZoneChangeDelivery,
+        ZoneDeliveryExileTracking,
+    };
+    use crate::types::identifiers::CardId;
+    use crate::types::phase::Phase;
+    use crate::types::resolution::ResolutionFrame;
+    use crate::types::zones::EtbTapState;
+
+    const SOUL_WARDEN: &str = "Whenever another creature enters, you gain 1 life.";
+    const BECK: &str = "Whenever a creature enters this turn, you may draw a card.";
+
+    fn scenario(players: u8) -> GameScenario {
+        let mut scenario = GameScenario::new_n_player(players, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.add_creature_from_oracle(P0, "Soul Warden", 1, 1, SOUL_WARDEN);
+        scenario
+    }
+
+    /// A creature owned by `owner` and controlled by `controller` that has just
+    /// entered the battlefield; its entry event, parked.
+    fn parked_entry(
+        state: &mut GameState,
+        card: u64,
+        owner: PlayerId,
+        controller: PlayerId,
+    ) -> (ObjectId, GameEvent) {
+        let id = create_object(
+            state,
+            CardId(card),
+            owner,
+            format!("Entrant {card}"),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&id).expect("entrant");
+        obj.controller = controller;
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.base_card_types = obj.card_types.clone();
+        obj.power = Some(1);
+        obj.toughness = Some(1);
+        obj.base_power = Some(1);
+        obj.base_toughness = Some(1);
+        let mut events = Vec::new();
+        record_and_emit_entry_from_no_zone(state, id, &mut events).expect("entered");
+        let entry = events
+            .into_iter()
+            .find(|event| matches!(event, GameEvent::ZoneChanged { .. }))
+            .expect("entry event");
+        state.deferred_entry_events = vec![entry.clone()];
+        (id, entry)
+    }
+
+    fn settled_state(players: u8) -> GameState {
+        scenario(players).build().state().clone()
+    }
+
+    /// U4-T2. The gate, completion over presence, the CR 800.4a drop, the
+    /// owner-frame refusal, the ledger filter, and the delayed half.
+    #[test]
+    fn the_settled_release_gate_and_completion_rule() {
+        // Positive: Priority, entrant live, un-owned → its events.
+        let mut state = settled_state(2);
+        let (_, entry) = parked_entry(&mut state, 900, P0, P0);
+        assert_eq!(release_settled_entry_continuation(&mut state), vec![entry]);
+        assert!(state.deferred_entry_events.is_empty());
+
+        // Not Priority → empty, park kept.
+        let mut state = settled_state(2);
+        let (id, entry) = parked_entry(&mut state, 900, P0, P0);
+        state.waiting_for = WaitingFor::ScryChoice {
+            player: P0,
+            cards: vec![id],
+        };
+        assert!(release_settled_entry_continuation(&mut state).is_empty());
+        assert_eq!(state.deferred_entry_events, vec![entry]);
+
+        // Priority with a live resolution frame → empty, park kept.
+        let mut state = settled_state(2);
+        let (_, entry) = parked_entry(&mut state, 900, P0, P0);
+        state.push_counter_additions(PendingCounterAdditionQueue {
+            remaining: Vec::new(),
+            completion: None,
+        });
+        assert!(release_settled_entry_continuation(&mut state).is_empty());
+        assert_eq!(state.deferred_entry_events, vec![entry]);
+
+        // Owner-frame gate case: the entry is the paused member of a logical
+        // owner whose frame is on top → refused by the readiness predicate.
+        let mut state = settled_state(2);
+        let (id, entry) = parked_entry(&mut state, 900, P0, P0);
+        let mut paused = PendingZoneChangeDelivery::new(
+            crate::types::identifiers::ObjectIncarnationRef {
+                object_id: id,
+                incarnation: state.objects[&id].incarnation,
+            },
+            crate::types::proposed_event::ProposedEvent::zone_change(
+                id,
+                Zone::Graveyard,
+                Zone::Battlefield,
+                None,
+            ),
+        );
+        paused.delivery_events = vec![entry.clone()];
+        let logical_zone_change_group = state.allocate_logical_zone_change_group(&[]);
+        state
+            .resolution_stack
+            .push_inner(ResolutionFrame::BatchDelivery(Box::new(
+                PendingBatchDeliveries {
+                    logical_zone_change_group,
+                    paused_current: Some(paused),
+                    remaining: Vec::new(),
+                    destination: Zone::Battlefield,
+                    source_id: None,
+                    enter_tapped: EtbTapState::Unspecified,
+                    exile_tracking: ZoneDeliveryExileTracking::None,
+                    library_placement: None,
+                    completion: None,
+                    replacement_applied: HashSet::new(),
+                    requests: Vec::new(),
+                    attempted: Vec::new(),
+                    zone_change_record_start: 0,
+                    deferred_events: Vec::new(),
+                },
+            )));
+        assert!(!crate::game::engine_priority::retained_logical_zone_events(&state).is_empty());
+        assert!(release_settled_entry_continuation(&mut state).is_empty());
+        assert_eq!(state.deferred_entry_events, vec![entry]);
+
+        // An equal occurrence already queued → empty (the queued-witness filter),
+        // and the park is taken.
+        let mut state = settled_state(2);
+        let (_, entry) = parked_entry(&mut state, 900, P0, P0);
+        state.deferred_entry_events.clear();
+        crate::game::triggers::collect_triggers_into_deferred(
+            &mut state,
+            std::slice::from_ref(&entry),
+        );
+        assert!(!state.deferred_triggers.is_empty(), "reach guard: queued");
+        state.deferred_entry_events = vec![entry];
+        assert!(release_settled_entry_continuation(&mut state).is_empty());
+        assert!(state.deferred_entry_events.is_empty());
+
+        // The entrant left the battlefield after its entry completed → still
+        // returned (CR 603.2 + CR 603.10).
+        let mut state = settled_state(2);
+        let (id, entry) = parked_entry(&mut state, 900, P0, P0);
+        let mut events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, id, Zone::Graveyard, &mut events);
+        assert_eq!(state.objects[&id].zone, Zone::Graveyard);
+        assert_eq!(release_settled_entry_continuation(&mut state), vec![entry]);
+
+        // The entrant's owner left the game → dropped (CR 800.4a).
+        let mut state = settled_state(3);
+        let (_, _) = parked_entry(&mut state, 900, P1, P1);
+        let mut events = Vec::new();
+        crate::game::elimination::eliminate_player(&mut state, P1, &mut events);
+        assert!(
+            !state.deferred_entry_events.is_empty(),
+            "reach guard: park kept"
+        );
+        assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+        assert!(release_settled_entry_continuation(&mut state).is_empty());
+        assert!(state.deferred_entry_events.is_empty());
+
+        // Predicate: a `Moved` continuation for an object no longer on the
+        // battlefield has no as-enters entrant; on the battlefield it does.
+        let mut state = settled_state(2);
+        let (id, entry) = parked_entry(&mut state, 900, P0, P0);
+        state.deferred_entry_events.clear();
+        let events = vec![entry];
+        assert_eq!(
+            as_enters_continuation_entrant(
+                &state,
+                Some(&ReplacementEvent::Moved),
+                Some(id),
+                &events
+            ),
+            Some(id)
+        );
+        assert_eq!(
+            as_enters_continuation_entrant(&state, None, Some(id), &events),
+            None
+        );
+        let mut moved = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, id, Zone::Graveyard, &mut moved);
+        assert_eq!(
+            as_enters_continuation_entrant(
+                &state,
+                Some(&ReplacementEvent::Moved),
+                Some(id),
+                &events
+            ),
+            None
+        );
+    }
+
+    /// U4-T2, the delayed half: a matching "whenever a creature enters this
+    /// turn" delayed trigger is queued exactly once by the release itself.
+    #[test]
+    fn the_settled_release_runs_the_delayed_half() {
+        let mut scenario = scenario(2);
+        let beck = scenario
+            .add_spell_to_hand_from_oracle(P0, "Beck", false, BECK)
+            .with_mana_cost(crate::types::mana::ManaCost::generic(0))
+            .id();
+        let mut runner: GameRunner = scenario.build();
+        runner.cast(beck).resolve();
+        runner.advance_until_stack_empty();
+        assert!(!runner.state().delayed_triggers.is_empty(), "reach guard");
+        let state = runner.state_mut();
+        let (_, entry) = parked_entry(state, 900, P0, P0);
+        let released = release_settled_entry_continuation(state);
+        assert_eq!(released, vec![entry]);
+        let delayed = state
+            .deferred_triggers
+            .iter()
+            .filter(|context| context.pending.source_id == beck)
+            .count();
+        assert_eq!(delayed, 1, "{:?}", state.deferred_triggers);
+        let _ = GameAction::PassPriority;
+    }
+
+    /// U4-T6. 3 players: the CR 800.4a drop also fires on the entrant's
+    /// controller of record, not only on its owner.
+    #[test]
+    fn the_player_left_drop_reads_owner_or_controller_of_record() {
+        // P0 controls the entrant P1 owns; P0 leaves → dropped, P1 still in.
+        let mut state = settled_state(3);
+        parked_entry(&mut state, 900, P1, P0);
+        let mut events = Vec::new();
+        crate::game::elimination::eliminate_player(&mut state, P0, &mut events);
+        assert!(
+            !state.deferred_entry_events.is_empty(),
+            "reach guard: park kept"
+        );
+        assert!(crate::game::players::is_alive(&state, P1));
+        assert!(release_settled_entry_continuation(&mut state).is_empty());
+        assert!(state.deferred_entry_events.is_empty());
+
+        // A bystander's departure does not drop it.
+        let mut state = settled_state(3);
+        let (_, entry) = parked_entry(&mut state, 900, P1, P0);
+        let mut events = Vec::new();
+        crate::game::elimination::eliminate_player(&mut state, PlayerId(2), &mut events);
+        assert_eq!(release_settled_entry_continuation(&mut state), vec![entry]);
+        assert!(state.deferred_entry_events.is_empty());
+
+        // The owner leg.
+        let mut state = settled_state(3);
+        parked_entry(&mut state, 900, P1, P0);
+        let mut events = Vec::new();
+        crate::game::elimination::eliminate_player(&mut state, P1, &mut events);
+        assert!(release_settled_entry_continuation(&mut state).is_empty());
+        assert!(state.deferred_entry_events.is_empty());
     }
 }

@@ -2153,7 +2153,8 @@ pub(crate) fn record_and_emit_entry_from_no_zone(
 /// Layers are flushed first (CR 613.1), so static continuous effects and the counters it
 /// entered with (CR 614.1c) are part of the observation. An entry whose `ZoneChanged` is parked
 /// in `deferred_entry_events` is still mid-entry (CR 614.12a / CR 707.5: its choice is made
-/// before it enters) and is skipped; its replay collects against the realized object.
+/// before it enters), or whose as-enters continuation is still running (CR 603.6d + CR 614.1c),
+/// and is skipped; its replay collects against the realized object.
 /// Idempotent. An entrant that is no longer the exact entered incarnation on the battlefield is
 /// not observed.
 pub(crate) fn settle_battlefield_entry_observations(state: &mut GameState, events: &[GameEvent]) {

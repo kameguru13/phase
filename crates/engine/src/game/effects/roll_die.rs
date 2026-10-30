@@ -206,6 +206,24 @@ pub(crate) fn resolve_step(
     // independently with the same sides/modifier/results table.
     let count = resolve_quantity_with_targets(state, count_expr, ability).max(0) as u32;
 
+    // CR 706.1: an instruction to roll zero dice names no dice, so nothing is
+    // proposed (`roll_dice_matcher` refuses a zero-count roll anyway) and the
+    // RNG is untouched. CR 706.4: the text says how to use the results; with
+    // no dice rolled the total of those results is 0 (Hydradoodle's ruling:
+    // "you won't roll any dice as it enters and it will be a 0/0"). Unlike a
+    // replacement-prevented roll (CR 614.6, which keeps `None`), the
+    // instruction's result is a determined zero, so a later "equal to the
+    // total of those results" reader cannot fall through to another channel.
+    if count == 0 {
+        state.die_result_this_resolution = Some(0);
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::RollDie,
+            source_id: ability.source_id,
+            subject: None,
+        });
+        return Ok(ResolutionProgress::Complete);
+    }
+
     let instruction = PendingDieRollInstruction {
         source_id: ability.source_id,
         controller: ability.controller,
@@ -1447,8 +1465,9 @@ mod tests {
         );
     }
 
-    /// CR 706.1: If the requested number of dice resolves to 0, no die result
-    /// exists for an inline `EventContextAmount` consumer.
+    /// CR 706.1 + CR 706.4: If the requested number of dice resolves to 0, no
+    /// die is rolled and the total of those (zero) results is 0, so an inline
+    /// `EventContextAmount` consumer reads 0 — never the stale die result.
     #[test]
     fn roll_die_count_zero_clears_stale_die_result() {
         use crate::types::ability::{QuantityRef, TargetFilter};
@@ -1494,7 +1513,7 @@ mod tests {
                 .all(|event| !matches!(event, GameEvent::DieRolled { .. })),
             "count 0 must not emit a die roll"
         );
-        assert_eq!(state.die_result_this_resolution, None);
+        assert_eq!(state.die_result_this_resolution, Some(0));
         assert_eq!(
             state.players[0].hand.len(),
             0,

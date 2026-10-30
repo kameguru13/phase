@@ -35699,3 +35699,332 @@ fn risky_move_gain_side_control_trigger_parses_but_card_stays_unsupported() {
         }
     );
 }
+
+// ---------------------------------------------------------------------------
+// CR 614.1c + CR 603.6d + CR 706.4: "As this creature enters, roll <dice>.
+// It enters with <counters> equal to the result / the total of those results."
+// Oracle text verbatim (Scryfall / card-data).
+// ---------------------------------------------------------------------------
+
+const NEVERWINTER_HYDRA: &str = "As this creature enters, roll X d6. It enters with a number of +1/+1 counters on it equal to the total of those results.\nTrample\nWard {4} (Whenever this creature becomes the target of a spell or ability an opponent controls, counter it unless that player pays {4}.)";
+const HYDRADOODLE: &str = "As this creature enters, roll X six-sided dice. This creature enters with a number of +1/+1 counters on it equal to the total of those results.\nReach, trample";
+const HAMMER_JAMMER: &str = "As this creature enters, roll a six-sided die. This creature enters with a number of +1/+1 counters on it equal to the result.\nWhenever you roll a die, remove all +1/+1 counters from this creature, then put a number of +1/+1 counters on it equal to the result.";
+const JUMBO_IMP: &str = "Flying\nAs this creature enters, roll a six-sided die. This creature enters with a number of +1/+1 counters on it equal to the result.\nAt the beginning of your upkeep, roll a six-sided die and put a number of +1/+1 counters on this creature equal to the result.\nAt the beginning of your end step, roll a six-sided die and remove a number of +1/+1 counters from this creature equal to the result.";
+const TEMP_OF_THE_DAMNED: &str = "As this creature enters, roll a six-sided die. This creature enters with a number of funk counters on it equal to the result.\nAt the beginning of your upkeep, remove a funk counter from this creature. If you can't, sacrifice it.";
+
+fn face_of(
+    name: &str,
+    parsed: &ParsedAbilities,
+    keywords: Vec<Keyword>,
+) -> crate::types::card::CardFace {
+    crate::types::card::CardFace {
+        name: name.to_string(),
+        keywords,
+        abilities: parsed.abilities.clone(),
+        triggers: parsed.triggers.clone(),
+        static_abilities: parsed.statics.clone(),
+        replacements: parsed.replacements.clone(),
+        ..crate::types::card::CardFace::default()
+    }
+}
+
+/// R2. Every class line is one `Moved` + `SelfRef` replacement: the roll heads
+/// the execute chain (CR 603.6d: it happens as part of the entry) and the
+/// counter placement it determines follows it (CR 614.1c + CR 122.6). X is the
+/// X paid for the spell (CR 107.3m); the count is the die-result channel
+/// (CR 706.4). No gap remains on any face.
+#[test]
+fn as_enters_roll_lines_compose_one_counter_replacement() {
+    let cost_x = QuantityExpr::Ref {
+        qty: QuantityRef::CostXPaid,
+    };
+    let one = QuantityExpr::Fixed { value: 1 };
+    for (name, oracle, keyword_names, count, counter, line) in [
+        (
+            "Neverwinter Hydra",
+            NEVERWINTER_HYDRA,
+            vec!["Trample", "Ward"],
+            cost_x.clone(),
+            CounterType::Plus1Plus1,
+            "As this creature enters, roll X d6. It enters with a number of +1/+1 counters on it equal to the total of those results.",
+        ),
+        (
+            "Hydradoodle",
+            HYDRADOODLE,
+            vec!["Reach", "Trample"],
+            cost_x.clone(),
+            CounterType::Plus1Plus1,
+            "As this creature enters, roll X six-sided dice. This creature enters with a number of +1/+1 counters on it equal to the total of those results.",
+        ),
+        (
+            "Hammer Jammer",
+            HAMMER_JAMMER,
+            vec![],
+            one.clone(),
+            CounterType::Plus1Plus1,
+            "As this creature enters, roll a six-sided die. This creature enters with a number of +1/+1 counters on it equal to the result.",
+        ),
+        (
+            "Jumbo Imp",
+            JUMBO_IMP,
+            vec!["Flying"],
+            one.clone(),
+            CounterType::Plus1Plus1,
+            "As this creature enters, roll a six-sided die. This creature enters with a number of +1/+1 counters on it equal to the result.",
+        ),
+        (
+            "Temp of the Damned",
+            TEMP_OF_THE_DAMNED,
+            vec![],
+            one.clone(),
+            crate::types::counter::parse_counter_type("funk"),
+            "As this creature enters, roll a six-sided die. This creature enters with a number of funk counters on it equal to the result.",
+        ),
+    ] {
+        let keyword_names: Vec<String> = keyword_names.iter().map(|k| k.to_string()).collect();
+        let parsed = parse_oracle_text(
+            oracle,
+            name,
+            &keyword_names,
+            &["Creature".to_string()],
+            &[],
+        );
+        let moved: Vec<_> = parsed
+            .replacements
+            .iter()
+            .filter(|repl| repl.event == ReplacementEvent::Moved)
+            .collect();
+        assert_eq!(moved.len(), 1, "{name}: {:#?}", parsed.replacements);
+        let repl = moved[0];
+        assert_eq!(repl.valid_card, Some(TargetFilter::SelfRef), "{name}");
+        assert_eq!(repl.destination_zone, Some(Zone::Battlefield), "{name}");
+        assert!(repl.condition.is_none(), "{name}");
+        let execute = repl.execute.as_deref().expect("execute");
+        assert_eq!(
+            *execute.effect,
+            Effect::RollDie {
+                count: count.clone(),
+                sides: 6,
+                results: vec![],
+                modifier: None,
+            },
+            "{name}"
+        );
+        let put = execute.sub_ability.as_deref().expect("counter placement");
+        assert_eq!(
+            *put.effect,
+            Effect::PutCounter {
+                counter_type: counter.clone(),
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                },
+                target: TargetFilter::SelfRef,
+            },
+            "{name}"
+        );
+        assert!(put.sub_ability.is_none(), "{name}");
+        // Coverage honesty: no gap on the face, and the gap authority agrees.
+        let face = face_of(name, &parsed, parsed.extracted_keywords.clone());
+        let gaps = crate::game::coverage::card_face_gaps(&face);
+        assert!(
+            gaps.iter().all(|gap| gap != "Effect:enters_with_clause"),
+            "{name}: {gaps:?}"
+        );
+        // Jumbo Imp's end-step line ("remove a number of +1/+1 counters … equal
+        // to the result") is a separate, pre-existing `unparsed_quantity` gap.
+        let expected_gaps: Vec<String> = match name {
+            "Jumbo Imp" => vec!["Effect:unparsed_quantity".to_string()],
+            _ => vec![],
+        };
+        assert_eq!(gaps, expected_gaps, "{name}");
+        assert!(
+            parsed.abilities.iter().all(|a| !matches!(
+                &*a.effect,
+                Effect::Unimplemented { name, .. } if name == "enters_with_clause"
+            )),
+            "{name}: {:?}",
+            parsed.abilities
+        );
+        // Reach guard: the keyword lines still parse.
+        let expected_keywords: &[fn(&Keyword) -> bool] = match name {
+            "Neverwinter Hydra" => &[
+                |k| matches!(k, Keyword::Trample),
+                |k| matches!(k, Keyword::Ward(_)),
+            ],
+            "Hydradoodle" => &[
+                |k| matches!(k, Keyword::Reach),
+                |k| matches!(k, Keyword::Trample),
+            ],
+            "Jumbo Imp" => &[|k| matches!(k, Keyword::Flying)],
+            _ => &[],
+        };
+        assert_eq!(
+            parsed.extracted_keywords.len(),
+            expected_keywords.len(),
+            "{name}: {:?}",
+            parsed.extracted_keywords
+        );
+        for expected in expected_keywords {
+            assert!(
+                parsed.extracted_keywords.iter().any(expected),
+                "{name}: {:?}",
+                parsed.extracted_keywords
+            );
+        }
+        assert_eq!(enters_with_fails_closed(line, name), None, "{name}");
+        // Reach guard: the card's other lines still parse as before.
+        match name {
+            "Hammer Jammer" => assert_eq!(parsed.triggers.len(), 1, "{name}"),
+            "Jumbo Imp" => assert_eq!(parsed.triggers.len(), 2, "{name}"),
+            "Temp of the Damned" => assert_eq!(parsed.triggers.len(), 1, "{name}"),
+            _ => assert!(parsed.triggers.is_empty(), "{name}: {:?}", parsed.triggers),
+        }
+    }
+}
+
+/// R3. Lines the composition does not claim keep their verdict: one
+/// `enters_with_clause` gap, the whole line, and the gap authority reports
+/// `Clause` (CR 614.1c + CR 608.2c). The helper-level reach guards
+/// (`split_as_enters_roll_prefix` admitted the frame) live beside the
+/// composition in `oracle_replacement.rs`'s tests.
+#[test]
+fn as_enters_roll_lines_the_composition_declines_stay_one_clause_gap() {
+    for line in [
+        // (a) a gate on the counter sentence would also gate the roll.
+        "As this creature enters, roll a six-sided die. If this creature was kicked, it enters with a number of +1/+1 counters on it equal to the result.",
+        "As this creature enters, roll a six-sided die. If you cast it, it enters with a number of +1/+1 counters on it equal to the result.",
+        // (b) a distributive subject.
+        "As this creature enters, roll a six-sided die. Each other creature you control enters with a number of +1/+1 counters on it equal to the result.",
+        // (c) a non-modifier instruction (a keyword grant) beside the counters.
+        "As this creature enters, roll a six-sided die. This creature enters with flying and with a number of +1/+1 counters on it equal to the result.",
+        // (c') a quoted granted ability: the split itself declines.
+        "As this creature enters, roll a six-sided die. This creature enters with a number of +1/+1 counters on it equal to the result and with \"{T}: Add {G}.\"",
+        // (e) frame + roll + two enters-with sentences: three units.
+        "As this creature enters, roll a six-sided die. This creature enters with a number of +1/+1 counters on it equal to the result. This creature enters with a number of charge counters on it equal to the result.",
+    ] {
+        let name = "Roll Witness";
+        let parsed = parse_oracle_text(line, name, &[], &["Creature".to_string()], &[]);
+        assert!(
+            parsed
+                .replacements
+                .iter()
+                .all(|repl| repl.event != ReplacementEvent::Moved),
+            "{line}: no replacement may carry half of the line, got {:?}",
+            parsed.replacements
+        );
+        assert_eq!(
+            parsed
+                .abilities
+                .iter()
+                .filter(|a| matches!(
+                    &*a.effect,
+                    Effect::Unimplemented { name, .. } if name == "enters_with_clause"
+                ))
+                .count(),
+            1,
+            "{line}: {:?}",
+            parsed.abilities
+        );
+        assert_eq!(
+            enters_with_fails_closed(line, name),
+            Some(EntersWithGap::Clause),
+            "{line}"
+        );
+    }
+}
+
+/// Every JSON object under `value` whose `"type"` tag is `effect_type`.
+fn effects_of_type<'a>(
+    value: &'a serde_json::Value,
+    effect_type: &str,
+    out: &mut Vec<&'a serde_json::Value>,
+) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.get("type").and_then(serde_json::Value::as_str) == Some(effect_type) {
+                out.push(value);
+            }
+            for child in map.values() {
+                effects_of_type(child, effect_type, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                effects_of_type(child, effect_type, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn die_roll_trigger_effects(oracle: &str, name: &str, effect_type: &str) -> Vec<serde_json::Value> {
+    let parsed = parse_oracle_text(oracle, name, &[], &["Creature".to_string()], &[]);
+    let trigger = parsed
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::RolledDieOnce)
+        .unwrap_or_else(|| panic!("{name}: a RolledDieOnce trigger, got {:?}", parsed.triggers));
+    let json = serde_json::to_value(&trigger.execute).expect("serializable trigger body");
+    let mut found = Vec::new();
+    effects_of_type(&json, effect_type, &mut found);
+    found.into_iter().cloned().collect()
+}
+
+/// R11. CR 608.2k + CR 706.1: a die-roll trigger condition names a player's
+/// roll and no object, so a bare "it" in the body is the ability's own source
+/// (`SelfRef`), never `TriggeringSource` (which resolves to no object for a
+/// `DieRolled` event). Explicit referents and other condition shapes are
+/// untouched.
+#[test]
+fn die_roll_trigger_bodies_bind_a_bare_it_to_the_source() {
+    let self_ref = serde_json::json!({ "type": "SelfRef" });
+    let triggering = serde_json::json!({ "type": "TriggeringSource" });
+
+    // Hammer Jammer: "remove all +1/+1 counters from this creature, then put …
+    // on it" — both halves name the source.
+    let puts = die_roll_trigger_effects(HAMMER_JAMMER, "Hammer Jammer", "PutCounter");
+    assert_eq!(puts.len(), 1, "{puts:?}");
+    assert_eq!(puts[0]["target"], self_ref);
+    let removes = die_roll_trigger_effects(HAMMER_JAMMER, "Hammer Jammer", "RemoveCounter");
+    assert_eq!(removes.len(), 1, "{removes:?}");
+    assert_eq!(removes[0]["target"], self_ref);
+
+    // Monoxa: "Monoxa gains first strike … it gains menace … it gains lifelink".
+    const MONOXA: &str = "Whenever you roll a 3 or higher, Monoxa gains first strike until end of turn. If the roll was 4 or higher, it gains menace until end of turn. If the roll was 5 or higher, it gains lifelink until end of turn.\n{6}: Roll a six-sided die.";
+    let grants = die_roll_trigger_effects(MONOXA, "Monoxa, Midway Manager", "GenericEffect");
+    assert_eq!(grants.len(), 3, "{grants:?}");
+    for grant in &grants {
+        let statics = grant["static_abilities"].as_array().expect("statics");
+        assert!(!statics.is_empty(), "{grant:?}");
+        for stat in statics {
+            assert_eq!(stat["affected"], self_ref, "{grant:?}");
+        }
+    }
+
+    // Siblings that keep `TriggeringSource`.
+    const BLASTRONAUTS: &str = "When this creature enters, open an Attraction.\nWhenever you roll a 6, you may copy the spell, ability, or Attraction visit that caused you to roll that die. You may choose new targets for the copy.";
+    let copies = die_roll_trigger_effects(BLASTRONAUTS, "Goblin Blastronauts", "CopySpell");
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    assert_eq!(copies[0]["target"], triggering);
+    const PRIORITY_BOARDING: &str = "Whenever you roll a die, you may reveal the top card of your library. Do this only once each turn. Whenever you reveal a card with mana value less than the result this way, you may exile it. If you do, you may play it this turn.";
+    let exiles = die_roll_trigger_effects(PRIORITY_BOARDING, "Priority Boarding", "ChangeZone");
+    assert_eq!(exiles.len(), 1, "{exiles:?}");
+    assert_eq!(exiles[0]["target"], triggering);
+    let parsed = parse_oracle_text(
+        "Whenever you cast a spell, put a +1/+1 counter on it.",
+        "Spell Witness",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+    let trigger = parsed
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::SpellCast)
+        .expect("spell-cast trigger");
+    let json = serde_json::to_value(&trigger.execute).expect("serializable trigger body");
+    let mut spell_puts = Vec::new();
+    effects_of_type(&json, "PutCounter", &mut spell_puts);
+    assert_eq!(spell_puts.len(), 1);
+    assert_eq!(spell_puts[0]["target"], triggering);
+}
