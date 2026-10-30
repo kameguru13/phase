@@ -1264,7 +1264,10 @@ impl AcceptedOptionalMove {
 /// The result is read only from this producer's event slice (`producer_events`),
 /// restricted to the occurrences it selected and its requested destination. A
 /// completed instruction that moved nothing consumes its immediate dependent
-/// return locally with `NoOp` and clears that node's forwarded context; an
+/// return locally with `NoOp` and clears that node's forwarded context (a
+/// defensive fallback: a `SelfRef` move whose source can no longer move is
+/// declined before it is offered, CR 608.2d + CR 400.7, so no current fixture
+/// reaches this arm); an
 /// independent later sibling still resolves. An ineligible delivery (a
 /// replacement, or no completion witness) keeps its pre-existing route.
 ///
