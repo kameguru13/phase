@@ -11076,7 +11076,8 @@ mod entry_continuation_release_tests {
     /// entrant's entries, in either state, and leaves the others unchanged.
     #[test]
     fn a_removal_leaves_the_entries_it_does_not_own() {
-        let removals: [(&str, fn(&mut GameState, ObjectId, &[GameEvent])); 6] = [
+        type Removal = fn(&mut GameState, ObjectId, &[GameEvent]);
+        let removals: [(&str, Removal); 6] = [
             ("replay", |state, entrant, _| {
                 // A prompt keeps the settled take out of the replay's own drain.
                 state.waiting_for = WaitingFor::ScryChoice {

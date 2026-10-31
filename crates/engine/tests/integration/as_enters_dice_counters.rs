@@ -3538,7 +3538,8 @@ fn no_roll_observer_shape_sees_its_entrants_roll() {
     let per_instruction = |_: &[u32]| 1;
     let three_or_higher = |rolls: &[u32]| rolls.iter().filter(|&&r| r >= 3).count();
     let each_die = |rolls: &[u32]| rolls.len();
-    let shapes: [(&str, &dyn Fn(&[u32]) -> usize); 3] = [
+    type Expected<'a> = &'a dyn Fn(&[u32]) -> usize;
+    let shapes: [(&str, Expected); 3] = [
         (BRAZEN_DWARF, &per_instruction),
         (oracle_line(MONOXA, 0), &three_or_higher),
         (oracle_line(HAMMER_JAMMER, 1), &each_die),
