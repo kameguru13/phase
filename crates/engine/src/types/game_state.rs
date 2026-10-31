@@ -7620,8 +7620,9 @@ pub struct PendingTokenBattlefieldEntry {
 }
 
 /// CR 603.2 + CR 614.12a: whether a parked entry happened. Each producer records
-/// this; the settled take and the whole-carrier abandonment read it, and every
-/// other reader of the park keeps its membership reading.
+/// this; the settled take, the whole-carrier abandonment and
+/// `entrant_entry_is_pending` read it, and every other reader of the park keeps
+/// its membership reading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum ParkedEntryState {
@@ -22712,9 +22713,9 @@ declare_game_state! {
     ///
     /// Each entry carries a [`ParkedEntryState`]: `Pending` until its producer
     /// records that the entry happened, then `Completed` until its collector
-    /// takes it. Only the settled take and the whole-carrier abandonment read
-    /// the state. Every other reader holds a parked entry the same in either
-    /// state.
+    /// takes it. Only the settled take, the whole-carrier abandonment and
+    /// `entrant_entry_is_pending` read the state. Every other reader holds a
+    /// parked entry the same in either state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deferred_entry_events: Vec<ParkedEntry>,
 

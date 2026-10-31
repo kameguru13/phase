@@ -4876,18 +4876,16 @@ pub(crate) fn apply_pending_spell_resolution(
 }
 
 /// CR 614.1c + CR 122.6 + CR 603.6d: an as-enters roll and its counters are
-/// part of the event that puts the permanent onto the battlefield, so when every
-/// counter the entrant is given as it enters is of the kind the roll places, they
-/// join that placement as one number, which a counter replacement affects once
-/// (CR 614.5). Called where the entry's contributions are first all known.
-/// Returns what delivery still places: nothing once the roll has taken them, and
-/// `counters` unchanged otherwise.
+/// part of the event that puts the permanent onto the battlefield, so the counters
+/// the entrant is given as it enters of the kind the roll places join that
+/// placement as one number, which a counter replacement affects once (CR 614.5).
+/// Called where the entry's contributions are first all known. Returns what
+/// delivery still places: the contributions of every other kind, in their order,
+/// and `counters` unchanged when the roll takes nothing.
 ///
-/// Any contribution of another kind refuses the whole hand-on, leaving delivery's
-/// own counter step ahead of the roll, because a prompt of that kind behind the
-/// roll would hide the roll from its observers. A contribution of the roll's kind
-/// in such a list stays its own placement, so a counter replacement then applies
-/// to it and to the rolled counters separately.
+/// Contributions of another kind stay on delivery's own counter step, so a prompt
+/// of another kind stays ahead of the roll, because behind the roll it would hide
+/// the roll from its observers.
 pub(crate) fn hand_entry_counters_to_as_enters_roll(
     state: &mut GameState,
     entrant: ObjectId,
@@ -4898,17 +4896,21 @@ pub(crate) fn hand_entry_counters_to_as_enters_roll(
     else {
         return counters;
     };
-    match effects::counters::coalesce_entry_counters(counters.iter().cloned()).as_slice() {
-        [(counter_type, count)] if counter_type == kind => {
-            let inner = std::mem::replace(placed, QuantityExpr::Fixed { value: 0 });
-            *placed = QuantityExpr::Offset {
-                inner: Box::new(inner),
-                offset: u32_to_i32_saturating(*count),
-            };
-            Vec::new()
-        }
-        _ => counters,
-    }
+    let Some((_, taken)) = effects::counters::coalesce_entry_counters(counters.iter().cloned())
+        .into_iter()
+        .find(|(counter_type, _)| counter_type == kind)
+    else {
+        return counters;
+    };
+    let inner = std::mem::replace(placed, QuantityExpr::Fixed { value: 0 });
+    *placed = QuantityExpr::Offset {
+        inner: Box::new(inner),
+        offset: u32_to_i32_saturating(taken),
+    };
+    counters
+        .into_iter()
+        .filter(|(counter_type, _)| counter_type != kind)
+        .collect()
 }
 
 /// The not-yet-run as-enters roll of `entrant`: the resident drain the dispatch
@@ -10733,18 +10735,45 @@ mod entry_continuation_release_tests {
         assert_eq!(resident_chain(&state), roll_chain());
     }
 
-    /// CR 122.1: a contribution of another kind refuses the whole hand-on. The list
-    /// comes back as built for delivery to place, and the chain stays as printed.
+    /// CR 122.1: each kind is its own placement. The chain takes the roll's kind and
+    /// the list keeps only the other kinds, in their order. A list with nothing of
+    /// the roll's kind is refused: it comes back as built for delivery to place, and
+    /// the chain stays as printed.
     #[test]
-    fn the_hand_on_refuses_any_contribution_of_another_kind() {
+    fn the_hand_on_keeps_only_other_kinds_and_refuses_a_list_of_only_those() {
+        let funk = CounterType::Generic("funk".to_string());
+
+        let (mut state, entrant) = with_drain(None, ready_chain(roll_chain()));
+        let left = hand_entry_counters_to_as_enters_roll(
+            &mut state,
+            entrant,
+            vec![
+                (vigilance(), 1),
+                (CounterType::Plus1Plus1, 1),
+                (funk.clone(), 1),
+                (CounterType::Plus1Plus1, 2),
+                (vigilance(), 2),
+            ],
+        );
+        assert_eq!(
+            left,
+            vec![(vigilance(), 1), (funk.clone(), 1), (vigilance(), 2)]
+        );
+        let chain = resident_chain(&state);
+        let placement = chain.sub_ability.as_deref().expect("the placement");
+        assert_eq!(
+            placed_count(placement),
+            &QuantityExpr::Offset {
+                inner: Box::new(rolled_amount()),
+                offset: 3,
+            }
+        );
+        assert!(placement.sub_ability.is_none(), "no link of its own");
+
         for counters in [
             vec![(vigilance(), 1)],
-            // Neither kind is handed on, and the contributions stay apart.
-            vec![
-                (CounterType::Plus1Plus1, 1),
-                (vigilance(), 1),
-                (CounterType::Plus1Plus1, 2),
-            ],
+            // The contributions stay apart.
+            vec![(vigilance(), 1), (funk.clone(), 1), (vigilance(), 2)],
         ] {
             let (mut state, entrant) = with_drain(None, ready_chain(roll_chain()));
             let left = hand_entry_counters_to_as_enters_roll(&mut state, entrant, counters.clone());

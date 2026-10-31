@@ -4248,7 +4248,7 @@ pub(crate) fn deliver_replaced_zone_change(
             counters_to_apply.extend(pending);
             // CR 603.6d + CR 614.1c + CR 122.6: an as-enters roll is part of this entry,
             // so counters of the kind it places are one placement with the roll's, and
-            // no counter choice comes before the roll. Any other kind refuses that.
+            // no counter choice comes before the roll. Counters of any other kind stay here.
             // CR 508.4: an attacking entry keeps its counter step: only that pause
             // records `enters_attacking` for the resume, so the entrant is still placed
             // in combat after a chain that pauses.

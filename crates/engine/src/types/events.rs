@@ -1709,7 +1709,7 @@ pub enum GameEvent {
         /// function yet, so it alone is not an observer of this event. `None` for
         /// every other roll, and for the as-enters roll of an entry that paused on
         /// its counters first: an entry put onto the battlefield attacking, or one
-        /// with counters of another kind (filed residuals).
+        /// whose counter step for counters of another kind paused (filed residuals).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pre_entry_source: Option<ObjectId>,
     },

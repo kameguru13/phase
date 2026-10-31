@@ -4042,7 +4042,7 @@ fn an_entry_with_no_roll_is_not_parked_at_a_counter_pause() {
 }
 
 /// V25. CR 122.1 + CR 614.5: each kind is its own placement, and Scales and
-/// Evolution read only +1/+1 counters. A fold of another kind refuses the hand-on and
+/// Evolution read only +1/+1 counters. A fold of another kind is not handed on and
 /// keeps its counter step ahead of the roll. On Temp's board the roll's own action
 /// then ends at Priority, so the roll stays where its observers see it.
 #[test]
@@ -4287,4 +4287,60 @@ fn an_attacking_entry_is_refused_the_hand_on_and_attacks() {
         .find(|attacker| attacker.object_id == jammer)
         .expect("Hammer Jammer attacks");
     assert_eq!(attacker.defending_player, P1);
+}
+
+/// V33. CR 122.1 + CR 122.6 + CR 614.5: an entry given counters of both kinds splits
+/// them by kind. Tayam's vigilance counter stays on the counter step, which places it
+/// with nothing to choose. Grumgully's +1/+1 counter joins the rolled counters as one
+/// number, so the roll comes first, and Scales and Evolution modify that number once.
+#[test]
+fn a_fold_of_both_kinds_splits_by_kind() {
+    // (a) Each replacement order: Scales first makes r + 1 into r + 2, then 2r + 4.
+    // Evolution first makes it 2r + 2, then 2r + 3.
+    for pick in FirstPick::BOTH {
+        reset_triggers_seen();
+        let mut scenario = board(7);
+        scenario.add_creature_from_oracle(P0, "Tayam, Luminous Enigma", 3, 3, TAYAM);
+        add_grumgully(&mut scenario);
+        add_counter_replacements(&mut scenario);
+        let jammer = free_jammer(&mut scenario);
+        let mut runner = scenario.build();
+        let mut events = Vec::new();
+        cast_and_pass(&mut runner, jammer, None, None, &mut events);
+        order_entry(&mut runner, "Hammer Jammer", &mut events);
+        assert_counter_prompt(runner.state());
+        assert_eq!(die_results(&events).len(), 1, "{pick:?}");
+        assert_eq!(counters_of(runner.state(), jammer, &vigilance_counter()), 1);
+        assert_eq!(plus_counters(runner.state(), jammer), 0, "{pick:?}");
+        let settled = settle_picking(&mut runner, &mut events, pick);
+        let rolls = die_results(&events);
+        assert_eq!(rolls.len(), 1, "{pick:?}");
+        let r = rolls[0];
+        assert_eq!(settled.counter_prompts, 1, "{pick:?}");
+        let expected = match pick {
+            FirstPick::Scales => 2 * r + 4,
+            FirstPick::Evolution => 2 * r + 3,
+        };
+        assert_eq!(plus_counters(runner.state(), jammer), expected, "{pick:?}");
+        assert_eq!(counters_of(runner.state(), jammer, &vigilance_counter()), 1);
+        assert_eq!(triggers_seen_from(jammer), 0, "{pick:?}");
+    }
+
+    // (b) Neverwinter Hydra, X = 2: the total plus Grumgully's counter is one number,
+    // and Scales adds one to it.
+    let mut scenario = board(7);
+    scenario.add_creature_from_oracle(P0, "Tayam, Luminous Enigma", 3, 3, TAYAM);
+    add_grumgully(&mut scenario);
+    scenario.add_enchantment_from_oracle(P0, "Hardened Scales", HARDENED_SCALES);
+    let hydra = x_creature(&mut scenario, "Neverwinter Hydra", NEVERWINTER_HYDRA, 2);
+    let mut runner = scenario.build();
+    let mut events = Vec::new();
+    cast_and_pass(&mut runner, hydra, Some(2), None, &mut events);
+    order_entry(&mut runner, "Neverwinter Hydra", &mut events);
+    settle(&mut runner, &mut events, DEFAULT_ANSWERS);
+    let rolls = die_results(&events);
+    assert_eq!(rolls.len(), 2, "{rolls:?}");
+    let total: u32 = rolls.iter().sum();
+    assert_eq!(plus_counters(runner.state(), hydra), total + 1 + 1);
+    assert_eq!(counters_of(runner.state(), hydra, &vigilance_counter()), 1);
 }
