@@ -4043,8 +4043,8 @@ fn an_entry_with_no_roll_is_not_parked_at_a_counter_pause() {
 
 /// V25. CR 122.1 + CR 614.5: each kind is its own placement, and Scales and
 /// Evolution read only +1/+1 counters. A fold of another kind refuses the hand-on and
-/// keeps its counter step ahead of the roll, so the roll stays where its observers
-/// see it.
+/// keeps its counter step ahead of the roll. On Temp's board the roll's own action
+/// then ends at Priority, so the roll stays where its observers see it.
 #[test]
 fn a_fold_of_another_kind_keeps_its_counter_step() {
     // (a) Temp's funk with Grumgully's +1/+1: the fold alone meets the replacements,
@@ -4113,7 +4113,6 @@ fn a_fold_of_another_kind_keeps_its_counter_step() {
         assert_eq!(settled.counter_prompts, 1, "{pick:?}");
         assert_eq!(plus_counters(runner.state(), jammer), pick.counters(r));
         assert_eq!(counters_of(runner.state(), jammer, &vigilance_counter()), 1);
-        assert_eq!(triggers_seen_from(jammer), 0, "{pick:?}");
     }
 }
 

@@ -4884,11 +4884,10 @@ pub(crate) fn apply_pending_spell_resolution(
 /// `counters` unchanged otherwise.
 ///
 /// Any contribution of another kind refuses the whole hand-on, leaving delivery's
-/// own counter step ahead of the roll. Counters of another kind are a separate
-/// placement anyway, and a prompt of theirs behind the roll would hide the roll
-/// from its observers. Temp of the Damned, the one as-enters roll whose kind no
-/// printed fold shares, has no roll observer of its own, so it loses nothing it
-/// needs.
+/// own counter step ahead of the roll, because a prompt of that kind behind the
+/// roll would hide the roll from its observers. A contribution of the roll's kind
+/// in such a list stays its own placement, so a counter replacement then applies
+/// to it and to the rolled counters separately.
 pub(crate) fn hand_entry_counters_to_as_enters_roll(
     state: &mut GameState,
     entrant: ObjectId,
