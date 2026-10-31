@@ -4246,6 +4246,19 @@ pub(crate) fn deliver_replaced_zone_change(
                 Some(object_id)
             };
             counters_to_apply.extend(pending);
+            // CR 603.6d + CR 614.1c + CR 122.6: an as-enters roll is part of this entry,
+            // so its counters are one placement with the rest, and no counter choice
+            // comes before the roll.
+            // CR 508.4: an attacking entry keeps its counter step, whose pause alone
+            // carries the seat past a chain that pauses.
+            if entered_battlefield && !enters_attacking {
+                counters_to_apply =
+                    crate::game::engine_replacement::hand_entry_counters_to_as_enters_roll(
+                        state,
+                        object_id,
+                        counters_to_apply,
+                    );
+            }
             if !counters_to_apply.is_empty()
                 && !crate::game::engine_replacement::apply_etb_counters(
                     state,

@@ -4,16 +4,18 @@ use crate::ai_support::copy_target_mana_value_ceiling;
 use crate::game::game_object::ObjectIncarnationRefExt;
 use crate::types::ability::{
     AbilityDefinition, AttachCardinality, AttachSelection, ChosenAttribute, CopyTargetPurpose,
-    Effect, EffectKind, PostReplacementContinuation, ResolvedAbility, TargetFilter, TargetRef,
+    Effect, EffectKind, PostReplacementContinuation, QuantityExpr, ResolvedAbility, TargetFilter,
+    TargetRef,
 };
 #[cfg(test)]
 use crate::types::ability::{EffectScope, TapStateChange};
 use crate::types::counter::CounterType;
 use crate::types::events::{GameEvent, ManaTapState};
 use crate::types::game_state::{
-    CounterCostRootSubtree, DeferredLifeCostResume, GameState, ParkedEntry, ParkedEntryState,
-    PendingCostMoveResume, PendingCounterPostAction, PendingReplacement, PostReplacementDrain,
-    PostReplacementDrainStack, TokenEntryEventEmission, UnrepresentablePolicy, WaitingFor,
+    CounterCostRootSubtree, DeferredLifeCostResume, DrainStatus, GameState, ParkedEntry,
+    ParkedEntryState, PendingCostMoveResume, PendingCounterPostAction, PendingReplacement,
+    PostReplacementDrain, PostReplacementDrainStack, TokenEntryEventEmission,
+    UnrepresentablePolicy, WaitingFor,
 };
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::keywords::Keyword;
@@ -25,6 +27,7 @@ use crate::types::replacements::ReplacementEvent;
 use crate::types::zones::Zone;
 
 use super::ability_utils::build_resolved_from_def_with_targets;
+use super::arithmetic::u32_to_i32_saturating;
 use super::effects;
 use super::effects::deal_damage::{apply_damage_after_replacement, DamageContext};
 use super::effects::destroy::apply_destroy_after_replacement;
@@ -102,6 +105,29 @@ fn finish_spell_resolution_exposed_by_child(
         .take_active_spell_resolution()
         .expect("matching spell-resolution frame was checked above");
     apply_pending_spell_resolution(state, &ctx, events);
+}
+
+/// CR 608.3a + CR 616.1f: a post-replacement drain raised while the spell's
+/// entry replacements were being ordered sits above the spell's parked frame.
+/// Retiring it exposes that frame with the entry already delivered, and no
+/// answering action remains to finish it.
+pub(crate) fn finish_spell_resolution_exposed_by_retired_drain(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) {
+    if state.pending_replacement.is_some() {
+        return;
+    }
+    let subject = state
+        .active_spell_resolution()
+        .map(|ctx| ctx.object_id)
+        .filter(|id| {
+            state
+                .objects
+                .get(id)
+                .is_some_and(|object| object.zone == Zone::Battlefield)
+        });
+    finish_spell_resolution_exposed_by_child(state, subject, events);
 }
 
 /// CR 614.13a + CR 702.82a/c: matches the broad as-enters shape of a Devour
@@ -3592,6 +3618,28 @@ pub(crate) fn entry_park_holds_entrant(state: &GameState, entrant: ObjectId) -> 
         .any(|parked| is_entry_event_of(parked, entrant))
 }
 
+/// CR 614.12a + CR 113.6: has `entrant`'s entry not happened yet? True while
+/// this incarnation's parked entry is pending. A completed entry has happened,
+/// so that entrant is an ordinary observer (CR 603.2), even though its entry
+/// waits for collection. The one park reader of the state outside the take and
+/// the carrier abandonment.
+pub(crate) fn entrant_entry_is_pending(state: &GameState, entrant: ObjectId) -> bool {
+    if state.deferred_entry_events.is_empty() {
+        return false;
+    }
+    let Some(object) = state.objects.get(&entrant) else {
+        return false;
+    };
+    let reference = ObjectIncarnationRef::from_object(object);
+    state.deferred_entry_events.iter().any(|parked| {
+        parked_entry_is_of_incarnation(&parked.event, reference)
+            && match parked.state {
+                ParkedEntryState::Pending { .. } => true,
+                ParkedEntryState::Completed => false,
+            }
+    })
+}
+
 /// CR 400.7: is `record` an entry of exactly `incarnation`? A record stamped
 /// with no incarnation cannot name a different one.
 fn entry_record_is_of_incarnation(
@@ -4821,6 +4869,89 @@ pub(crate) fn apply_pending_spell_resolution(
                 crate::types::ability::CastVariantPaid::Evoke,
                 state.turn_number,
             ));
+        }
+    }
+}
+
+/// CR 614.1c + CR 122.6 + CR 603.6d: an as-enters roll and its counters are
+/// part of the event that puts the permanent onto the battlefield, so every
+/// counter the entrant is given as it enters joins the roll's chain, and each
+/// kind is one placement, which a counter replacement affects once (CR 614.5).
+/// Called where the entry's contributions are first all known. Returns what
+/// delivery still places: nothing once the roll has taken them, and `counters`
+/// unchanged when no as-enters roll is waiting.
+pub(crate) fn hand_entry_counters_to_as_enters_roll(
+    state: &mut GameState,
+    entrant: ObjectId,
+    counters: Vec<(CounterType, u32)>,
+) -> Vec<(CounterType, u32)> {
+    let Some(chain) = as_enters_roll_chain_mut(state, entrant) else {
+        return counters;
+    };
+    for (counter_type, count) in effects::counters::coalesce_entry_counters(counters) {
+        add_entry_counters_to_chain(chain, counter_type, count);
+    }
+    Vec::new()
+}
+
+/// The not-yet-run as-enters roll of `entrant`: the resident drain the dispatch
+/// will run, when it is that entrant's and has `RollDie` at its head.
+fn as_enters_roll_chain_mut(
+    state: &mut GameState,
+    entrant: ObjectId,
+) -> Option<&mut AbilityDefinition> {
+    let drain = state.active_post_replacement_drains_mut()?.resident_mut()?;
+    if drain.source != Some(entrant) {
+        return None;
+    }
+    match &mut drain.status {
+        DrainStatus::Ready(PostReplacementContinuation::Template(chain)) => {
+            matches!(*chain.effect, Effect::RollDie { .. }).then_some(&mut **chain)
+        }
+        DrainStatus::Ready(PostReplacementContinuation::Resolved(_))
+        | DrainStatus::Dispatching
+        | DrainStatus::Paused => None,
+    }
+}
+
+/// CR 122.6 + CR 614.5: `count` counters of one kind join the chain's
+/// unconditional placement of that kind on the entrant, so a counter replacement
+/// meets one number. A kind the chain does not place is its own placement, last.
+fn add_entry_counters_to_chain(
+    link: &mut AbilityDefinition,
+    counter_type: CounterType,
+    count: u32,
+) {
+    if link.condition.is_none() {
+        if let Effect::PutCounter {
+            counter_type: kind,
+            count: placed,
+            target: TargetFilter::SelfRef,
+        } = link.effect.as_mut()
+        {
+            if *kind == counter_type {
+                let inner = std::mem::replace(placed, QuantityExpr::Fixed { value: 0 });
+                *placed = QuantityExpr::Offset {
+                    inner: Box::new(inner),
+                    offset: u32_to_i32_saturating(count),
+                };
+                return;
+            }
+        }
+    }
+    match &mut link.sub_ability {
+        Some(next) => add_entry_counters_to_chain(next, counter_type, count),
+        None => {
+            link.sub_ability = Some(Box::new(AbilityDefinition::new(
+                link.kind,
+                Effect::PutCounter {
+                    counter_type,
+                    count: QuantityExpr::Fixed {
+                        value: u32_to_i32_saturating(count),
+                    },
+                    target: TargetFilter::SelfRef,
+                },
+            )));
         }
     }
 }
@@ -10374,11 +10505,12 @@ mod entry_continuation_release_tests {
     use super::*;
     use crate::game::scenario::{GameRunner, GameScenario, P0, P1};
     use crate::game::zones::{create_object, record_and_emit_entry_from_no_zone};
+    use crate::types::ability::{AbilityCondition, AbilityKind, QuantityRef};
     use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
     use crate::types::game_state::{
-        DrainStatus, PendingBatchDeliveries, PendingCounterAdditionQueue,
-        PendingZoneChangeDelivery, ResidentDrainPolicy, ZoneDeliveryExileTracking,
+        PendingBatchDeliveries, PendingCounterAdditionQueue, PendingZoneChangeDelivery,
+        ResidentDrainPolicy, ZoneDeliveryExileTracking,
     };
     use crate::types::identifiers::CardId;
     use crate::types::phase::Phase;
@@ -10449,6 +10581,243 @@ mod entry_continuation_release_tests {
 
     fn settled_state(players: u8) -> GameState {
         scenario(players).build().state().clone()
+    }
+
+    /// CR 614.12a + CR 113.6 + CR 400.7: an entrant is mid-entry while this
+    /// incarnation's parked entry is pending, and at no other time. A completed
+    /// entry happened, though it still waits for its collector.
+    #[test]
+    fn only_a_pending_entry_of_this_incarnation_is_mid_entry() {
+        let mut state = settled_state(2);
+        let (id, _) = parked_entry(&mut state, 900, P0, P0, PENDING);
+        assert!(entrant_entry_is_pending(&state, id));
+
+        let (other, _) = entered(&mut state, 901, P0, P0);
+        assert!(!entrant_entry_is_pending(&state, other), "another entrant");
+
+        // CR 400.7: the entry the park holds was of an earlier incarnation.
+        state.objects.get_mut(&id).expect("entrant").incarnation += 1;
+        assert!(!entrant_entry_is_pending(&state, id), "earlier incarnation");
+
+        let mut state = settled_state(2);
+        let (id, _) = parked_entry(&mut state, 900, P0, P0, COMPLETED);
+        assert!(entry_park_holds_entrant(&state, id), "still parked");
+        assert!(!entrant_entry_is_pending(&state, id), "completed");
+
+        let mut state = settled_state(2);
+        let (id, _) = entered(&mut state, 900, P0, P0);
+        assert!(!entrant_entry_is_pending(&state, id), "an empty park");
+
+        let mut state = settled_state(2);
+        parked_entry(&mut state, 900, P0, P0, PENDING);
+        assert!(
+            !entrant_entry_is_pending(&state, ObjectId(9_999)),
+            "a missing object"
+        );
+    }
+
+    /// The printed chain's shape: the roll, then its counters on the entrant.
+    fn roll_chain() -> AbilityDefinition {
+        AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 1 },
+                sides: 6,
+                results: Vec::new(),
+                modifier: None,
+            },
+        )
+        .sub_ability(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::PutCounter {
+                counter_type: CounterType::Plus1Plus1,
+                count: rolled_amount(),
+                target: TargetFilter::SelfRef,
+            },
+        ))
+    }
+
+    fn rolled_amount() -> QuantityExpr {
+        QuantityExpr::Ref {
+            qty: QuantityRef::EventContextAmount,
+        }
+    }
+
+    fn with_drain(entrant_source: Option<ObjectId>, status: DrainStatus) -> (GameState, ObjectId) {
+        let mut state = settled_state(2);
+        let (entrant, _) = entered(&mut state, 900, P0, P0);
+        let mut drain = PostReplacementDrain::ready(PostReplacementContinuation::Template(
+            Box::new(roll_chain()),
+        ));
+        drain.source = Some(entrant_source.unwrap_or(entrant));
+        drain.status = status;
+        state.install_post_replacement_drain(drain, ResidentDrainPolicy::Replace);
+        (state, entrant)
+    }
+
+    fn ready_chain(chain: AbilityDefinition) -> DrainStatus {
+        DrainStatus::Ready(PostReplacementContinuation::Template(Box::new(chain)))
+    }
+
+    fn resident_status(state: &GameState) -> DrainStatus {
+        state
+            .active_post_replacement_drains()
+            .and_then(PostReplacementDrainStack::resident)
+            .expect("the seeded drain")
+            .status
+            .clone()
+    }
+
+    fn resident_chain(state: &GameState) -> AbilityDefinition {
+        match resident_status(state) {
+            DrainStatus::Ready(PostReplacementContinuation::Template(chain)) => *chain,
+            other => panic!("expected a ready template, got {other:?}"),
+        }
+    }
+
+    fn put_counter(link: &AbilityDefinition) -> (&CounterType, &QuantityExpr, &TargetFilter) {
+        match link.effect.as_ref() {
+            Effect::PutCounter {
+                counter_type,
+                count,
+                target,
+            } => (counter_type, count, target),
+            other => panic!("expected PutCounter, got {other:?}"),
+        }
+    }
+
+    fn vigilance() -> CounterType {
+        CounterType::Keyword(crate::types::keywords::KeywordKind::Vigilance)
+    }
+
+    /// CR 614.1c + CR 122.6 + CR 614.5: one number per kind, in the roll's chain.
+    #[test]
+    fn the_roll_takes_the_entry_counters_one_placement_per_kind() {
+        // Same kind: the printed placement carries them.
+        let (mut state, entrant) = with_drain(None, ready_chain(roll_chain()));
+        let left = hand_entry_counters_to_as_enters_roll(
+            &mut state,
+            entrant,
+            vec![(CounterType::Plus1Plus1, 2)],
+        );
+        assert!(left.is_empty());
+        let chain = resident_chain(&state);
+        let placement = chain.sub_ability.as_deref().expect("the placement");
+        assert_eq!(
+            put_counter(placement).1,
+            &QuantityExpr::Offset {
+                inner: Box::new(rolled_amount()),
+                offset: 2,
+            }
+        );
+        assert!(placement.sub_ability.is_none(), "no link of its own");
+
+        // Two contributions of a kind: one offset of their sum.
+        let (mut state, entrant) = with_drain(None, ready_chain(roll_chain()));
+        let left = hand_entry_counters_to_as_enters_roll(
+            &mut state,
+            entrant,
+            vec![(CounterType::Plus1Plus1, 1), (CounterType::Plus1Plus1, 2)],
+        );
+        assert!(left.is_empty());
+        let chain = resident_chain(&state);
+        let placement = chain.sub_ability.as_deref().expect("the placement");
+        assert_eq!(
+            put_counter(placement).1,
+            &QuantityExpr::Offset {
+                inner: Box::new(rolled_amount()),
+                offset: 3,
+            }
+        );
+
+        // Another kind: one tail link, after the printed placement.
+        let (mut state, entrant) = with_drain(None, ready_chain(roll_chain()));
+        let left =
+            hand_entry_counters_to_as_enters_roll(&mut state, entrant, vec![(vigilance(), 1)]);
+        assert!(left.is_empty());
+        let chain = resident_chain(&state);
+        let placement = chain.sub_ability.as_deref().expect("the placement");
+        assert_eq!(put_counter(placement).1, &rolled_amount());
+        let tail = placement.sub_ability.as_deref().expect("the tail link");
+        assert_eq!(
+            put_counter(tail),
+            (
+                &vigilance(),
+                &QuantityExpr::Fixed { value: 1 },
+                &TargetFilter::SelfRef
+            )
+        );
+
+        // A conditional placement of that kind is not this entry's: a tail link.
+        let mut conditional = roll_chain();
+        conditional
+            .sub_ability
+            .as_deref_mut()
+            .expect("the placement")
+            .condition = Some(AbilityCondition::TriggerEventTargetExploitedBySource);
+        let (mut state, entrant) = with_drain(None, ready_chain(conditional));
+        let left = hand_entry_counters_to_as_enters_roll(
+            &mut state,
+            entrant,
+            vec![(CounterType::Plus1Plus1, 1)],
+        );
+        assert!(left.is_empty());
+        let chain = resident_chain(&state);
+        let placement = chain.sub_ability.as_deref().expect("the placement");
+        assert_eq!(put_counter(placement).1, &rolled_amount());
+        let tail = placement.sub_ability.as_deref().expect("the tail link");
+        assert_eq!(put_counter(tail).1, &QuantityExpr::Fixed { value: 1 });
+
+        // Nothing to hand on: the chain stays as printed.
+        let (mut state, entrant) = with_drain(None, ready_chain(roll_chain()));
+        let left = hand_entry_counters_to_as_enters_roll(&mut state, entrant, Vec::new());
+        assert!(left.is_empty());
+        assert_eq!(resident_chain(&state), roll_chain());
+    }
+
+    /// The gate: every other drain is refused, and the list comes back whole for
+    /// delivery to place.
+    #[test]
+    fn the_hand_on_refuses_every_other_drain() {
+        let counters = vec![(CounterType::Plus1Plus1, 2), (vigilance(), 1)];
+        let non_roll = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+        );
+        let resolved = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            Vec::new(),
+            ObjectId(1),
+            P0,
+        );
+        for (source, status) in [
+            // Another source with a roll at its head: Barbarian Class's shape.
+            (Some(ObjectId(9_999)), ready_chain(roll_chain())),
+            (None, ready_chain(non_roll)),
+            (
+                None,
+                DrainStatus::Ready(PostReplacementContinuation::Resolved(Box::new(resolved))),
+            ),
+            (None, DrainStatus::Dispatching),
+            (None, DrainStatus::Paused),
+        ] {
+            let (mut state, entrant) = with_drain(source, status.clone());
+            let left = hand_entry_counters_to_as_enters_roll(&mut state, entrant, counters.clone());
+            assert_eq!(left, counters, "{status:?}");
+            assert_eq!(resident_status(&state), status);
+        }
+
+        // No drain at all.
+        let mut state = settled_state(2);
+        let (entrant, _) = entered(&mut state, 900, P0, P0);
+        let left = hand_entry_counters_to_as_enters_roll(&mut state, entrant, counters.clone());
+        assert_eq!(left, counters);
     }
 
     /// V6, U4-T2. The gate, the recorded state deciding collection, the

@@ -8544,6 +8544,7 @@ mod tests {
             player_id: PlayerId(0),
             sides: 8,
             result: Some(7),
+            pre_entry_source: None,
         };
         assert_eq!(extract_amount_from_event(&event), Some(7));
     }
@@ -8557,6 +8558,7 @@ mod tests {
             player_id: PlayerId(0),
             sides: 6,
             result: None,
+            pre_entry_source: None,
         };
         assert_eq!(extract_amount_from_event(&event), None);
     }

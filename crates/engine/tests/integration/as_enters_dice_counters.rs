@@ -6,23 +6,35 @@
 //! collected for triggers once, after the continuation completes, by whichever
 //! collector owns it (CR 603.2 + CR 603.2c + CR 603.6a + CR 614.12a).
 //!
+//! The roll is made before the permanent is on the battlefield (CR 614.1c,
+//! CR 614.12), so its abilities do not function yet (CR 113.6) and it is not among
+//! the objects checked after that event (CR 603.10). Hammer Jammer therefore
+//! enters with counters equal to its roll and does not trigger on it. A later roll
+//! by its controller triggers it (CR 603.2), once per surviving die (CR 603.2c).
+//!
 //! Oracle text is verbatim (Scryfall / card-data). Barbarian Class and First Day
 //! of Class carry only the line under test (the Class level-1 line; First Day of
 //! Class's first sentence, without its Learn rider). Beck carries Beck's half.
 //! Dice-dependent rows choose their RNG seed by search and assert against the
 //! emitted `DieRolled` results, never a hard-coded total.
 
+use engine::game::combat::AttackTarget;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::ability::{ChoiceType, Effect, TargetRef};
+use engine::types::ability::{
+    AbilityDefinition, ChoiceType, Effect, PostReplacementContinuation, TargetRef,
+};
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
-use engine::types::game_state::{GameState, ParkedEntryState, StackEntryKind, WaitingFor};
+use engine::types::game_state::{
+    CastPaymentMode, DrainStatus, GameState, ParkedEntryState, StackEntryKind, WaitingFor,
+};
 use engine::types::identifiers::ObjectId;
-use engine::types::keywords::Keyword;
+use engine::types::keywords::{Keyword, KeywordKind};
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
+use engine::types::replacements::ReplacementEvent;
 use engine::types::resolution::{FrameKind, ResolutionFrame};
 use engine::types::zones::Zone;
 
@@ -67,6 +79,23 @@ const ANOINTED_PEACEKEEPER: &str = "Vigilance\nAs this creature enters, look at 
 const TRISKELION: &str = "This creature enters with three +1/+1 counters on it.\nRemove a +1/+1 counter from this creature: It deals 1 damage to any target.";
 const CITY_OF_TRAITORS: &str = "When you play another land, sacrifice this land.\n{T}: Add {C}{C}.";
 const LOTUS_VALE: &str = "If this land would enter, sacrifice two untapped lands instead. If you do, put this land onto the battlefield. If you don't, put it into its owner's graveyard.\n{T}: Add three mana of any one color.";
+const TEMP_OF_THE_DAMNED: &str = "As this creature enters, roll a six-sided die. This creature enters with a number of funk counters on it equal to the result.\nAt the beginning of your upkeep, remove a funk counter from this creature. If you can't, sacrifice it.";
+const MONOXA: &str = "Whenever you roll a 3 or higher, Monoxa gains first strike until end of turn.\n{6}: Roll a six-sided die.";
+const PIXIE_GUIDE: &str = "Grant an Advantage — If you would roll one or more dice, instead roll that many dice plus one and ignore the lowest roll.";
+const STORM_THE_FESTIVAL: &str = "Look at the top five cards of your library. You may put up to two permanent cards with mana value 5 or less from among them onto the battlefield. Put the rest on the bottom of your library in a random order.";
+const STOLEN_IDENTITY: &str = "Create a token that's a copy of target artifact or creature.";
+const GRUMGULLY: &str =
+    "Each other non-Human creature you control enters with an additional +1/+1 counter on it.";
+const VELOCIPEDE: &str = "Trample\nEach other Vehicle and creature you control enters with an additional +1/+1 counter on it if its mana value is 4 or less. Otherwise, it enters with three additional +1/+1 counters on it.\nCrew 3";
+const TAYAM: &str =
+    "Each other creature you control enters with an additional vigilance counter on it.";
+const EVIL_REAWAKENED: &str = "Return target creature card from your graveyard to the battlefield with two additional +1/+1 counters on it.";
+const RHYTHM_OF_THE_WILD: &str =
+    "Nontoken creatures you control have riot. (They enter with your choice of a +1/+1 counter or haste.)";
+const FATHOM_MAGE: &str = "Whenever a +1/+1 counter is put on this creature, you may draw a card.";
+const BREEDING_POOL: &str =
+    "({T}: Add {G} or {U}.)\nAs this land enters, you may pay 2 life. If you don't, it enters tapped.";
+const YORE_TILLER_NEPHILIM: &str = "Whenever this creature attacks, return target creature card from your graveyard to the battlefield tapped and attacking.";
 
 /// The scenario module exports only `P0` and `P1`.
 const P2: PlayerId = PlayerId(2);
@@ -249,6 +278,9 @@ const DEFAULT_ANSWERS: Answers = Answers {
 #[derive(Default)]
 struct Settled {
     optional_offers: Vec<ObjectId>,
+    /// Counter-ordering prompts answered on the way, when the run was given a
+    /// first pick.
+    counter_prompts: usize,
 }
 
 thread_local! {
@@ -277,6 +309,17 @@ fn reset_triggers_seen() {
 }
 
 /// Triggered abilities from `source` the drivers have seen on the stack since
+/// the last reset.
+fn triggers_seen_from(source: ObjectId) -> usize {
+    TRIGGERS_SEEN.with(|seen| {
+        seen.borrow()
+            .iter()
+            .filter(|(_, from)| *from == source)
+            .count()
+    })
+}
+
+/// Triggered abilities from `source` the drivers have seen on the stack since
 /// the last call, then forget them.
 fn take_triggers_seen_from(source: ObjectId) -> usize {
     TRIGGERS_SEEN.with(|seen| {
@@ -288,11 +331,41 @@ fn take_triggers_seen_from(source: ObjectId) -> usize {
 /// Drive to Priority on an empty stack, answering every prompt with the
 /// default policy, and assert the settled postcondition.
 fn settle(runner: &mut GameRunner, events: &mut Vec<GameEvent>, answers: Answers) -> Settled {
+    drive_to_settled(runner, events, answers, None)
+}
+
+/// `settle`, answering every counter-ordering prompt with `pick`, and counting
+/// those prompts.
+fn settle_picking(
+    runner: &mut GameRunner,
+    events: &mut Vec<GameEvent>,
+    pick: FirstPick,
+) -> Settled {
+    drive_to_settled(runner, events, DEFAULT_ANSWERS, Some(pick))
+}
+
+fn drive_to_settled(
+    runner: &mut GameRunner,
+    events: &mut Vec<GameEvent>,
+    answers: Answers,
+    pick: Option<FirstPick>,
+) -> Settled {
     let mut settled = Settled::default();
     for _ in 0..120 {
         record_stack(runner.state());
         let action = match &runner.state().waiting_for {
             WaitingFor::Priority { .. } if resolution_is_settled(runner.state()) => break,
+            WaitingFor::ReplacementChoice { .. }
+                if pick.is_some() && is_counter_prompt(runner.state()) =>
+            {
+                settled.counter_prompts += 1;
+                GameAction::ChooseReplacement {
+                    index: replacement_index(
+                        runner.state(),
+                        pick.expect("checked by the guard").source_name(),
+                    ),
+                }
+            }
             WaitingFor::Priority { .. } => GameAction::PassPriority,
             WaitingFor::OrderTriggers { .. } => {
                 engine::game::triggers::drain_order_triggers_with_identity(runner.state_mut());
@@ -881,12 +954,13 @@ fn a_pause_on_the_counters_also_defers_the_entry() {
     }
 }
 
-/// R9. CR 603.10 + CR 603.6a + CR 608.2k: Hammer Jammer exists immediately
-/// after the entry that contains its roll, so its "whenever you roll a die"
-/// triggers once; its bare "it" is Hammer Jammer, so the counters end equal to
-/// the as-enters result.
+/// R9 / V1. CR 614.1c + CR 614.12 + CR 113.6 + CR 603.10: Hammer Jammer rolls
+/// before it is on the battlefield, so its die-roll ability does not function yet
+/// and it is not among the objects checked after that roll. It enters with
+/// counters equal to the result and triggers on nothing.
 #[test]
-fn hammer_jammer_sees_its_own_as_enters_roll() {
+fn hammer_jammer_does_not_see_its_own_as_enters_roll() {
+    reset_triggers_seen();
     let mut scenario = board(7);
     let jammer = free_creature(&mut scenario, "Hammer Jammer", 0, 0, HAMMER_JAMMER);
     let mut runner = scenario.build();
@@ -904,16 +978,15 @@ fn hammer_jammer_sees_its_own_as_enters_roll() {
     }
     let rolls = die_results(&events);
     assert_eq!(rolls.len(), 1, "{rolls:?}");
-    let from_jammer = runner
-        .state()
-        .stack
-        .iter()
-        .filter(|entry| entry.source_id == jammer)
-        .count();
-    assert_eq!(from_jammer, 1, "its die-roll trigger, once");
+    assert_eq!(
+        queued_or_stacked_from(runner.state(), jammer),
+        0,
+        "no Hammer Jammer trigger on entry"
+    );
     settle(&mut runner, &mut events, DEFAULT_ANSWERS);
     assert_eq!(zone(runner.state(), jammer), Zone::Battlefield);
     assert_eq!(plus_counters(runner.state(), jammer), rolls[0]);
+    assert_eq!(take_triggers_seen_from(jammer), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -2806,7 +2879,6 @@ fn a_refused_drain_keeps_the_released_entry_beside_the_dies_context() {
 /// pre-existing `unparsed_quantity` gap.
 #[test]
 fn as_enters_roll_faces_carry_no_enters_with_gap() {
-    const TEMP_OF_THE_DAMNED: &str = "As this creature enters, roll a six-sided die. This creature enters with a number of funk counters on it equal to the result.\nAt the beginning of your upkeep, remove a funk counter from this creature. If you can't, sacrifice it.";
     for (name, oracle, keyword_names, expected_gaps) in [
         (
             "Neverwinter Hydra",
@@ -2864,4 +2936,1318 @@ fn as_enters_roll_faces_carry_no_enters_with_gap() {
         let expected: Vec<String> = expected_gaps.iter().map(|g| g.to_string()).collect();
         assert_eq!(gaps, expected, "{name}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// An entrant does not observe its own as-enters roll
+// ---------------------------------------------------------------------------
+
+/// Which of Hardened Scales and Branching Evolution a counter prompt picks first.
+#[derive(Clone, Copy, Debug)]
+enum FirstPick {
+    Scales,
+    Evolution,
+}
+
+impl FirstPick {
+    const BOTH: [FirstPick; 2] = [FirstPick::Scales, FirstPick::Evolution];
+
+    fn source_name(self) -> &'static str {
+        match self {
+            FirstPick::Scales => "Hardened Scales",
+            FirstPick::Evolution => "Branching Evolution",
+        }
+    }
+
+    /// CR 614.5 + CR 616.1: `n` +1/+1 counters are one number, which each
+    /// replacement modifies once, in the order chosen once (the two cards'
+    /// rulings on entering with counters).
+    fn counters(self, n: u32) -> u32 {
+        match self {
+            FirstPick::Scales => (n + 1) * 2,
+            FirstPick::Evolution => n * 2 + 1,
+        }
+    }
+}
+
+/// Is this `ReplacementChoice` the +1/+1 counter ordering, not an entry's?
+fn is_counter_prompt(state: &GameState) -> bool {
+    matches!(
+        &state.waiting_for,
+        WaitingFor::ReplacementChoice { candidates, .. }
+            if candidates.iter().any(|c| c.source_name == "Hardened Scales")
+    )
+}
+
+fn assert_counter_prompt(state: &GameState) {
+    assert!(
+        is_counter_prompt(state),
+        "expected the counter prompt, got {:?} on {:?}",
+        state.waiting_for,
+        stack_frames(state)
+    );
+}
+
+fn counters_of(state: &GameState, id: ObjectId, kind: &CounterType) -> u32 {
+    state.objects[&id].counters.get(kind).copied().unwrap_or(0)
+}
+
+fn vigilance_counter() -> CounterType {
+    CounterType::Keyword(KeywordKind::Vigilance)
+}
+
+fn funk_counter() -> CounterType {
+    CounterType::Generic("funk".to_string())
+}
+
+/// The `index`th line of a card's Oracle text, for a composed fixture face.
+fn oracle_line(oracle: &str, index: usize) -> &str {
+    oracle.lines().nth(index).expect("the card has that line")
+}
+
+fn free_jammer(scenario: &mut GameScenario) -> ObjectId {
+    free_creature(scenario, "Hammer Jammer", 0, 0, HAMMER_JAMMER)
+}
+
+/// A Hammer Jammer already on the battlefield. Printed 0/0, so it carries a
+/// +1/+1 counter to survive the first SBA check (CR 704.5f).
+fn resident_jammer(scenario: &mut GameScenario, player: PlayerId) -> ObjectId {
+    let id = scenario
+        .add_creature_from_oracle(player, "Hammer Jammer", 0, 0, HAMMER_JAMMER)
+        .id();
+    scenario.with_counter(id, CounterType::Plus1Plus1, 1);
+    id
+}
+
+fn add_dwarf(scenario: &mut GameScenario) -> ObjectId {
+    scenario
+        .add_creature_from_oracle(P0, "Brazen Dwarf", 1, 3, BRAZEN_DWARF)
+        .id()
+}
+
+fn add_counter_replacements(scenario: &mut GameScenario) {
+    scenario.add_enchantment_from_oracle(P0, "Hardened Scales", HARDENED_SCALES);
+    scenario.add_enchantment_from_oracle(P0, "Branching Evolution", BRANCHING_EVOLUTION);
+}
+
+fn add_velocipede(scenario: &mut GameScenario) {
+    scenario.add_artifact_from_oracle(P0, "Thunderous Velocipede", VELOCIPEDE);
+}
+
+fn add_grumgully(scenario: &mut GameScenario) {
+    scenario.add_creature_from_oracle(P0, "Grumgully, the Generous", 3, 3, GRUMGULLY);
+}
+
+fn add_warden_p0(scenario: &mut GameScenario) -> ObjectId {
+    scenario
+        .add_creature_from_oracle(P0, "Soul Warden", 1, 1, SOUL_WARDEN)
+        .id()
+}
+
+/// Seat `id`, staged in P0's hand, on top of P0's library. The scenario has no
+/// library builder that keeps a card's printed power and toughness.
+fn seat_on_library_top(runner: &mut GameRunner, id: ObjectId) {
+    let state = runner.state_mut();
+    state.players[0].hand.retain(|card| *card != id);
+    state.players[0].library.insert(0, id);
+    state.objects.get_mut(&id).expect("staged card").zone = Zone::Library;
+}
+
+/// A {3}{R} Hammer Jammer in P0's hand, for `seat_on_library_top`.
+fn jammer_card(scenario: &mut GameScenario) -> ObjectId {
+    scenario
+        .add_creature_to_hand_from_oracle(P0, "Hammer Jammer", 0, 0, HAMMER_JAMMER)
+        .with_mana_cost(ManaCost::Cost {
+            generic: 3,
+            shards: vec![ManaCostShard::Red],
+        })
+        .id()
+}
+
+fn assert_dig_choice(state: &GameState) {
+    assert!(
+        matches!(state.waiting_for, WaitingFor::DigChoice { .. }),
+        "{:?}",
+        state.waiting_for
+    );
+}
+
+fn the_token_copy(state: &GameState, name: &str) -> ObjectId {
+    state
+        .objects
+        .values()
+        .find(|object| object.is_token && object.name == name && object.zone == Zone::Battlefield)
+        .map(|object| object.id)
+        .expect("the token copy is on the battlefield")
+}
+
+/// Answer an entry's replacement ordering prompt, applying `source_name` first.
+fn order_entry(runner: &mut GameRunner, source_name: &str, events: &mut Vec<GameEvent>) {
+    assert!(
+        !is_counter_prompt(runner.state()),
+        "{:?}",
+        runner.state().waiting_for
+    );
+    let index = replacement_index(runner.state(), source_name);
+    act(runner, GameAction::ChooseReplacement { index }, events);
+}
+
+/// V2. CR 603.2 + CR 706.2: once Hammer Jammer is on the battlefield, a later roll
+/// by its controller triggers it: all counters off, then that result.
+#[test]
+fn hammer_jammer_sees_a_later_roll() {
+    fn later_roll_board(seed: u64) -> (GameRunner, ObjectId, ObjectId) {
+        let mut scenario = board(seed);
+        let jammer = free_jammer(&mut scenario);
+        let box_of_goblins = free_spell(
+            &mut scenario,
+            "Box of Free-Range Goblins",
+            false,
+            BOX_OF_FREE_RANGE_GOBLINS,
+        );
+        (scenario.build(), jammer, box_of_goblins)
+    }
+    fn drive(runner: &mut GameRunner, jammer: ObjectId, spell: ObjectId) -> Vec<GameEvent> {
+        let mut events = Vec::new();
+        cast_and_pass(runner, jammer, None, None, &mut events);
+        settle(runner, &mut events, DEFAULT_ANSWERS);
+        reset_triggers_seen();
+        cast_and_pass(runner, spell, None, None, &mut events);
+        settle(runner, &mut events, DEFAULT_ANSWERS);
+        events
+    }
+    // Two different results, so the reset is visible.
+    let seed = find_seed("a later roll with another result", |seed| {
+        let (mut runner, jammer, spell) = later_roll_board(seed);
+        let rolls = die_results(&drive(&mut runner, jammer, spell));
+        rolls.len() == 2 && rolls[0] != rolls[1]
+    });
+    let (mut runner, jammer, spell) = later_roll_board(seed);
+    let rolls = die_results(&drive(&mut runner, jammer, spell));
+    assert_eq!(take_triggers_seen_from(jammer), 1, "the later roll only");
+    assert_eq!(plus_counters(runner.state(), jammer), rolls[1]);
+    let goblins = runner
+        .battlefield_names()
+        .iter()
+        .filter(|name| name.contains("Goblin"))
+        .count();
+    assert_eq!(goblins as u32, rolls[1]);
+}
+
+/// V3. CR 603.2 + CR 706.2: the stamp is for an entry. A permanent's own activated
+/// roll is an ordinary roll, and the permanent that made it observes it.
+#[test]
+fn a_source_sees_a_roll_it_makes_outside_its_entry() {
+    fn monoxa_board(seed: u64) -> (GameRunner, ObjectId) {
+        let mut scenario = board(seed);
+        let monoxa = scenario
+            .add_creature_from_oracle(P0, "Monoxa, Midway Manager", 3, 3, MONOXA)
+            .id();
+        scenario.with_mana_pool(P0, green(6));
+        (scenario.build(), monoxa)
+    }
+    fn activate(runner: &mut GameRunner, monoxa: ObjectId) -> Vec<GameEvent> {
+        let mut events = Vec::new();
+        act(
+            runner,
+            GameAction::ActivateAbility {
+                source_id: monoxa,
+                ability_index: 0,
+                payment_mode: CastPaymentMode::Auto,
+            },
+            &mut events,
+        );
+        settle(runner, &mut events, DEFAULT_ANSWERS);
+        events
+    }
+    let seed = find_seed("a result of 3 or higher", |seed| {
+        let (mut runner, monoxa) = monoxa_board(seed);
+        die_results(&activate(&mut runner, monoxa))
+            .first()
+            .is_some_and(|&r| r >= 3)
+    });
+    reset_triggers_seen();
+    let (mut runner, monoxa) = monoxa_board(seed);
+    let rolls = die_results(&activate(&mut runner, monoxa));
+    assert!(rolls.len() == 1 && rolls[0] >= 3, "{rolls:?}");
+    assert_eq!(take_triggers_seen_from(monoxa), 1);
+    assert!(runner.state().objects[&monoxa].has_keyword(&Keyword::FirstStrike));
+}
+
+/// V4. CR 706.6 + CR 603.10: the keep route. The ignored roll never happened, and
+/// the kept one is seen by the resident Hammer Jammer and Brazen Dwarf, and not by
+/// the entrant. With no tie the ignore is forced and inline, with the same counts.
+#[test]
+fn a_kept_as_enters_roll_is_seen_by_others_only() {
+    fn keep_board(seed: u64) -> (GameRunner, ObjectId, ObjectId) {
+        let mut scenario = board(seed);
+        scenario.add_enchantment_from_oracle(P0, "Barbarian Class", BARBARIAN_CLASS_L1);
+        let resident = resident_jammer(&mut scenario, P0);
+        add_dwarf(&mut scenario);
+        let entrant = free_jammer(&mut scenario);
+        (scenario.build(), resident, entrant)
+    }
+    for tie in [true, false] {
+        let seed = find_seed("a keep-route roll", |seed| {
+            let (mut runner, _, entrant) = keep_board(seed);
+            let mut events = Vec::new();
+            cast_and_pass(&mut runner, entrant, None, None, &mut events);
+            tie_prompt_results(runner.state()).is_some() == tie
+        });
+        reset_triggers_seen();
+        let (mut runner, resident, entrant) = keep_board(seed);
+        let before = life(runner.state(), P1);
+        let mut events = Vec::new();
+        cast_and_pass(&mut runner, entrant, None, None, &mut events);
+        if tie {
+            assert!(
+                matches!(
+                    runner.state().waiting_for,
+                    WaitingFor::DieKeepChoice { player, .. } if player == P0
+                ),
+                "{:?}",
+                runner.state().waiting_for
+            );
+            assert!(is_pending(runner.state(), entrant));
+        }
+        settle(&mut runner, &mut events, DEFAULT_ANSWERS);
+        let rolls = die_results(&events);
+        assert_eq!(rolls.len(), 1, "tie = {tie}: {rolls:?}");
+        assert_eq!(ignored_rolls(&events), 1, "tie = {tie}");
+        assert_eq!(triggers_seen_from(entrant), 0, "tie = {tie}");
+        assert_eq!(triggers_seen_from(resident), 1, "tie = {tie}");
+        assert_eq!(before - life(runner.state(), P1), 1, "tie = {tie}");
+        assert_eq!(plus_counters(runner.state(), entrant), rolls[0]);
+        assert_eq!(plus_counters(runner.state(), resident), rolls[0]);
+    }
+}
+
+/// V5. CR 614.12 + CR 113.6: the counter `ReplacementChoice`. The roll precedes the
+/// pause, in the entry, so the entrant is not an observer of it.
+#[test]
+fn a_counter_pause_does_not_show_the_roll_to_its_roller() {
+    for pick in FirstPick::BOTH {
+        reset_triggers_seen();
+        let mut scenario = board(7);
+        add_counter_replacements(&mut scenario);
+        add_dwarf(&mut scenario);
+        let jammer = free_jammer(&mut scenario);
+        let mut runner = scenario.build();
+        let before = life(runner.state(), P1);
+        let mut events = Vec::new();
+        cast_and_pass(&mut runner, jammer, None, None, &mut events);
+        assert_counter_prompt(runner.state());
+        assert!(is_pending(runner.state(), jammer));
+        assert_eq!(queued_or_stacked_from(runner.state(), jammer), 0);
+        let r = die_results(&events)[0];
+        settle_picking(&mut runner, &mut events, pick);
+        assert_eq!(triggers_seen_from(jammer), 0, "{pick:?}");
+        assert_eq!(before - life(runner.state(), P1), 1, "{pick:?}");
+        assert_eq!(plus_counters(runner.state(), jammer), pick.counters(r));
+    }
+}
+
+/// V6. CR 614.12 + CR 113.6: under a logical owner, inline and through custody. The
+/// owner collects the entry, and the entrant still does not see its roll.
+#[test]
+fn a_reanimated_entrant_does_not_see_its_own_roll() {
+    fn zombify_board(seed: u64, barbarian: bool) -> (GameRunner, ObjectId, ObjectId) {
+        let mut scenario = board(seed);
+        add_dwarf(&mut scenario);
+        if barbarian {
+            scenario.add_enchantment_from_oracle(P0, "Barbarian Class", BARBARIAN_CLASS_L1);
+        }
+        let jammer = graveyard_creature(&mut scenario, "Hammer Jammer", HAMMER_JAMMER);
+        let zombify = free_spell(&mut scenario, "Zombify", false, ZOMBIFY);
+        (scenario.build(), jammer, zombify)
+    }
+    // (a) inline.
+    reset_triggers_seen();
+    let (mut runner, jammer, zombify) = zombify_board(7, false);
+    let before = life(runner.state(), P1);
+    let mut events = Vec::new();
+    cast_and_pass(&mut runner, zombify, None, Some(jammer), &mut events);
+    settle(&mut runner, &mut events, DEFAULT_ANSWERS);
+    let rolls = die_results(&events);
+    assert_eq!(rolls.len(), 1, "{rolls:?}");
+    assert_eq!(take_triggers_seen_from(jammer), 0);
+    assert_eq!(before - life(runner.state(), P1), 1);
+    assert_eq!(plus_counters(runner.state(), jammer), rolls[0]);
+
+    // (b) custody, after a tie.
+    let seed = find_seed("a reanimated tie", |seed| {
+        let (mut runner, jammer, zombify) = zombify_board(seed, true);
+        let mut events = Vec::new();
+        cast_and_pass(&mut runner, zombify, None, Some(jammer), &mut events);
+        tie_prompt_results(runner.state()).is_some()
+    });
+    reset_triggers_seen();
+    let (mut runner, jammer, zombify) = zombify_board(seed, true);
+    let before = life(runner.state(), P1);
+    let mut events = Vec::new();
+    cast_and_pass(&mut runner, zombify, None, Some(jammer), &mut events);
+    let naturals = answer_tie(&mut runner, &mut events);
+    assert!(
+        runner.state().active_change_zone_frame().is_none(),
+        "the owner completed in the answering action"
+    );
+    settle(&mut runner, &mut events, DEFAULT_ANSWERS);
+    assert_eq!(take_triggers_seen_from(jammer), 0);
+    assert_eq!(before - life(runner.state(), P1), 1);
+    assert_eq!(
+        plus_counters(runner.state(), jammer),
+        survivors_total(&naturals)
+    );
+}
+
+/// V8. CR 616.1 + CR 706.6: the roll's own `ReplacementChoice`. Two replacements of
+/// the roll are ordered, three dice roll, and two never happened.
+#[test]
+fn an_ordered_as_enters_roll_is_seen_by_others_only() {
+    reset_triggers_seen();
+    let mut scenario = board(7);
+    scenario.add_enchantment_from_oracle(P0, "Barbarian Class", BARBARIAN_CLASS_L1);
+    scenario.add_enchantment_from_oracle(P0, "Pixie Guide", PIXIE_GUIDE);
+    add_dwarf(&mut scenario);
+    let jammer = free_jammer(&mut scenario);
+    let mut runner = scenario.build();
+    let before = life(runner.state(), P1);
+    let mut events = Vec::new();
+    cast_and_pass(&mut runner, jammer, None, None, &mut events);
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ),
+        "{:?}",
+        runner.state().waiting_for
+    );
+    assert!(die_results(&events).is_empty());
+    assert!(is_pending(runner.state(), jammer));
+    let index = replacement_index(runner.state(), "Barbarian Class");
+    act(
+        &mut runner,
+        GameAction::ChooseReplacement { index },
+        &mut events,
+    );
+    settle(&mut runner, &mut events, DEFAULT_ANSWERS);
+    let rolls = die_results(&events);
+    assert_eq!(rolls.len(), 1, "{rolls:?}");
+    assert_eq!(ignored_rolls(&events), 2);
+    assert_eq!(take_triggers_seen_from(jammer), 0);
+    assert_eq!(before - life(runner.state(), P1), 1);
+    assert_eq!(plus_counters(runner.state(), jammer), rolls[0]);
+}
+
+/// V9. CR 603.2 + CR 603.2c + CR 603.10: every other observer keeps the roll,
+/// once per surviving die for "a die" and once per instruction for "one or more
+/// dice". P1's Hammer Jammer does not see P0's roll: "you".
+#[test]
+fn other_observers_see_the_as_enters_roll() {
+    for hydra_entrant in [false, true] {
+        reset_triggers_seen();
+        let mut scenario = board(7);
+        let resident = resident_jammer(&mut scenario, P0);
+        add_dwarf(&mut scenario);
+        let bystander = resident_jammer(&mut scenario, P1);
+        let entrant = if hydra_entrant {
+            x_creature(&mut scenario, "Neverwinter Hydra", NEVERWINTER_HYDRA, 2)
+        } else {
+            free_jammer(&mut scenario)
+        };
+        let mut runner = scenario.build();
+        let before = life(runner.state(), P1);
+        let mut events = Vec::new();
+        let x = hydra_entrant.then_some(2);
+        cast_and_pass(&mut runner, entrant, x, None, &mut events);
+        settle(&mut runner, &mut events, DEFAULT_ANSWERS);
+        let rolls = die_results(&events);
+        assert_eq!(rolls.len(), if hydra_entrant { 2 } else { 1 });
+        assert_eq!(triggers_seen_from(entrant), 0);
+        assert_eq!(triggers_seen_from(resident), rolls.len());
+        assert_eq!(triggers_seen_from(bystander), 0);
+        assert_eq!(before - life(runner.state(), P1), 1);
+        assert!(rolls.contains(&plus_counters(runner.state(), resident)));
+    }
+}
+
+/// V10. CR 603.3b: the roll's observer and the entry's observer are placed in one
+/// batch, the active player's first.
+#[test]
+fn the_roll_and_the_entry_trigger_in_one_batch() {
+    let mut scenario = board(7);
+    let dwarf = add_dwarf(&mut scenario);
+    let warden = scenario
+        .add_creature_from_oracle(P1, "Soul Warden", 1, 1, SOUL_WARDEN)
+        .id();
+    let hydra = x_creature(&mut scenario, "Neverwinter Hydra", NEVERWINTER_HYDRA, 1);
+    let mut runner = scenario.build();
+    let (p1_before, mut events) = (life(runner.state(), P1), Vec::new());
+    {
+        let commit = runner.cast(hydra).x(1).commit();
+        events.extend(commit.events().iter().cloned());
+    }
+    while zone(runner.state(), hydra) == Zone::Stack {
+        act(&mut runner, GameAction::PassPriority, &mut events);
+    }
+    let state = runner.state();
+    let position = |source| {
+        state
+            .stack
+            .iter()
+            .position(|entry| entry.source_id == source)
+            .expect("the trigger is on the stack")
+    };
+    assert!(
+        position(dwarf) < position(warden),
+        "the active player's trigger is placed first"
+    );
+    assert!(state.deferred_triggers.is_empty());
+    settle(&mut runner, &mut events, DEFAULT_ANSWERS);
+    assert_eq!(life(runner.state(), P1), p1_before, "-1, then +1");
+}
+
+/// V11. CR 603.3 + CR 117.5: a spell beneath the entrant does not hold the roll's
+/// observers back. They are on the stack before anyone receives priority.
+#[test]
+fn a_spell_beneath_does_not_hold_the_roll_observers() {
+    let mut scenario = board(7);
+    let dwarf = add_dwarf(&mut scenario);
+    let opt = free_spell(&mut scenario, "Opt", true, OPT);
+    let jammer = free_keyword_creature(
+        &mut scenario,
+        "Hammer Jammer",
+        (0, 0),
+        &["flash"],
+        HAMMER_JAMMER,
+    );
+    let mut runner = scenario.build();
+    let mut events = Vec::new();
+    for spell in [opt, jammer] {
+        let commit = runner.cast(spell).commit();
+        events.extend(commit.events().iter().cloned());
+    }
+    while zone(runner.state(), jammer) == Zone::Stack {
+        act(&mut runner, GameAction::PassPriority, &mut events);
+    }
+    if matches!(runner.state().waiting_for, WaitingFor::OrderTriggers { .. }) {
+        engine::game::triggers::drain_order_triggers_with_identity(runner.state_mut());
+    }
+    let state = runner.state();
+    assert!(
+        matches!(state.waiting_for, WaitingFor::Priority { .. }),
+        "{:?}",
+        state.waiting_for
+    );
+    assert_eq!(state.stack[0].id, opt, "Opt still on the stack");
+    assert!(
+        state
+            .stack
+            .iter()
+            .skip(1)
+            .any(|entry| entry.source_id == dwarf),
+        "Brazen Dwarf's trigger is above Opt"
+    );
+    assert!(state.deferred_triggers.is_empty());
+}
+
+/// V12. CR 603.2c + CR 113.6: the roll is seen in a later action, when a later
+/// member of the batch pauses, and its record travels with it.
+#[test]
+fn a_batch_member_does_not_see_its_roll_after_a_later_member_pauses() {
+    reset_triggers_seen();
+    let mut scenario = board(7);
+    let resident = resident_jammer(&mut scenario, P0);
+    add_dwarf(&mut scenario);
+    let jammer = jammer_card(&mut scenario);
+    let pool = {
+        let mut builder = scenario.add_land_to_library_top(P0, "Breeding Pool");
+        builder.from_oracle_text(BREEDING_POOL);
+        builder.id()
+    };
+    let festival = free_spell(
+        &mut scenario,
+        "Storm the Festival",
+        false,
+        STORM_THE_FESTIVAL,
+    );
+    let mut runner = scenario.build();
+    seat_on_library_top(&mut runner, jammer);
+    let before = life(runner.state(), P1);
+    let mut events = Vec::new();
+    cast_and_pass(&mut runner, festival, None, None, &mut events);
+    assert_dig_choice(runner.state());
+
+    let mut delivered = Vec::new();
+    act(
+        &mut runner,
+        GameAction::SelectCards {
+            cards: vec![jammer, pool],
+        },
+        &mut delivered,
+    );
+    assert_eq!(
+        replacement_index(runner.state(), "Breeding Pool"),
+        0,
+        "Breeding Pool's prompt"
+    );
+    assert!(
+        die_results(&delivered).is_empty(),
+        "reach: the roll sits in the batch's deferred events"
+    );
+    events.extend(delivered);
+    let decline = replacement_decline_index(runner.state());
+    act(
+        &mut runner,
+        GameAction::ChooseReplacement { index: decline },
+        &mut events,
+    );
+    settle(&mut runner, &mut events, DEFAULT_ANSWERS);
+
+    let rolls = die_results(&events);
+    assert_eq!(rolls.len(), 1, "{rolls:?}");
+    assert_eq!(triggers_seen_from(jammer), 0);
+    assert_eq!(triggers_seen_from(resident), 1);
+    assert_eq!(plus_counters(runner.state(), jammer), rolls[0]);
+    assert_eq!(plus_counters(runner.state(), resident), rolls[0]);
+    assert_eq!(before - life(runner.state(), P1), 1);
+    assert_eq!(zone(runner.state(), pool), Zone::Battlefield);
+    assert!(runner.state().objects[&pool].tapped);
+}
+
+/// V16. CR 113.6: the refusal is at observer presence, so every roll observer shape
+/// is covered: batched, a result filter, and each die. Composed faces, not printed
+/// cards: each is the Hydra's as-enters line plus one verbatim observer line. A
+/// resident with the same line sees the roll, so each face can trigger.
+#[test]
+fn no_roll_observer_shape_sees_its_entrants_roll() {
+    const NAME: &str = "Monoxa, Midway Manager";
+    fn composed_board(seed: u64, observer: &str) -> (GameRunner, ObjectId, ObjectId) {
+        let mut scenario = board(seed);
+        let resident = scenario
+            .add_creature_from_oracle(P0, NAME, 1, 3, observer)
+            .id();
+        let face = format!("{}\n{observer}", oracle_line(NEVERWINTER_HYDRA, 0));
+        let entrant = x_creature(&mut scenario, NAME, &face, 2);
+        (scenario.build(), resident, entrant)
+    }
+    let per_instruction = |_: &[u32]| 1;
+    let three_or_higher = |rolls: &[u32]| rolls.iter().filter(|&&r| r >= 3).count();
+    let each_die = |rolls: &[u32]| rolls.len();
+    let shapes: [(&str, &dyn Fn(&[u32]) -> usize); 3] = [
+        (BRAZEN_DWARF, &per_instruction),
+        (oracle_line(MONOXA, 0), &three_or_higher),
+        (oracle_line(HAMMER_JAMMER, 1), &each_die),
+    ];
+    for (observer, expected) in shapes {
+        let seed = find_seed("a result of 3 or higher", |seed| {
+            let (mut runner, _, entrant) = composed_board(seed, observer);
+            let mut events = Vec::new();
+            cast_and_pass(&mut runner, entrant, Some(2), None, &mut events);
+            die_results(&events).iter().any(|&r| r >= 3)
+        });
+        reset_triggers_seen();
+        let (mut runner, resident, entrant) = composed_board(seed, observer);
+        let mut events = Vec::new();
+        cast_and_pass(&mut runner, entrant, Some(2), None, &mut events);
+        settle(&mut runner, &mut events, DEFAULT_ANSWERS);
+        let rolls = die_results(&events);
+        assert_eq!(triggers_seen_from(entrant), 0, "{observer}");
+        assert_eq!(triggers_seen_from(resident), expected(&rolls), "{observer}");
+        assert!(expected(&rolls) >= 1, "{observer}");
+    }
+}
+
+/// V17. CR 122.6 (Fathom Mage's ruling): the counters it enters with are part of
+/// entering, so its own counter observer sees them. Only the roll is refused. A
+/// composed face: Hammer Jammer's as-enters line and Fathom Mage's last line.
+#[test]
+fn an_entrants_counter_observer_still_sees_its_counters() {
+    let mut scenario = board(7);
+    let face = format!("{}\n{FATHOM_MAGE}", oracle_line(HAMMER_JAMMER, 0));
+    let entrant = free_creature(&mut scenario, "Fathom Mage", 0, 0, &face);
+    let mut runner = scenario.build();
+    let mut events = Vec::new();
+    cast_and_pass(&mut runner, entrant, None, None, &mut events);
+    let settled = settle(&mut runner, &mut events, DEFAULT_ANSWERS);
+    let rolls = die_results(&events);
+    assert_eq!(rolls.len(), 1, "{rolls:?}");
+    assert_eq!(plus_counters(runner.state(), entrant), rolls[0]);
+    let offers = settled
+        .optional_offers
+        .iter()
+        .filter(|source| **source == entrant)
+        .count();
+    assert_eq!(offers as u32, rolls[0]);
+}
+
+fn stolen_identity_board(seed: u64) -> (GameRunner, ObjectId, ObjectId) {
+    let mut scenario = board(seed);
+    let resident = resident_jammer(&mut scenario, P0);
+    let spell = free_spell(&mut scenario, "Stolen Identity", false, STOLEN_IDENTITY);
+    (scenario.build(), resident, spell)
+}
+
+/// V18. Stolen Identity's ruling + CR 614.12: a token copy rolls too, and it is not
+/// on the battlefield at the roll, so it is no candidate at all.
+#[test]
+fn a_token_copy_does_not_see_its_own_roll() {
+    reset_triggers_seen();
+    let (mut runner, resident, spell) = stolen_identity_board(7);
+    let mut events = Vec::new();
+    cast_and_pass(&mut runner, spell, None, Some(resident), &mut events);
+    settle(&mut runner, &mut events, DEFAULT_ANSWERS);
+    let rolls = die_results(&events);
+    assert_eq!(rolls.len(), 1, "{rolls:?}");
+    let token = the_token_copy(runner.state(), "Hammer Jammer");
+    assert_eq!(triggers_seen_from(token), 0);
+    assert_eq!(triggers_seen_from(resident), 1);
+    assert_eq!(plus_counters(runner.state(), token), rolls[0]);
+}
+
+/// What gives the entrant a fold in V20's rows.
+#[derive(Clone, Copy, Debug)]
+enum Fold {
+    Velocipede,
+    /// Grumgully, with the named replacement ordered first.
+    Grumgully(&'static str),
+    /// Rhythm of the Wild, riot ordered first and accepted.
+    Riot,
+}
+
+struct FoldBoard {
+    runner: GameRunner,
+    jammer: ObjectId,
+    warden: ObjectId,
+    /// Zombify, when the fold's route is the owner's.
+    zombify: Option<ObjectId>,
+}
+
+fn fold_board(seed: u64, fold: Fold, reanimated: bool) -> FoldBoard {
+    let mut scenario = board(seed);
+    add_counter_replacements(&mut scenario);
+    add_dwarf(&mut scenario);
+    let warden = add_warden_p0(&mut scenario);
+    match fold {
+        Fold::Velocipede => add_velocipede(&mut scenario),
+        Fold::Grumgully(_) => add_grumgully(&mut scenario),
+        Fold::Riot => {
+            scenario.add_enchantment_from_oracle(P0, "Rhythm of the Wild", RHYTHM_OF_THE_WILD);
+        }
+    }
+    let (jammer, zombify) = if reanimated {
+        let jammer = graveyard_creature(&mut scenario, "Hammer Jammer", HAMMER_JAMMER);
+        let zombify = free_spell(&mut scenario, "Zombify", false, ZOMBIFY);
+        (jammer, Some(zombify))
+    } else {
+        (free_jammer(&mut scenario), None)
+    };
+    FoldBoard {
+        runner: scenario.build(),
+        jammer,
+        warden,
+        zombify,
+    }
+}
+
+/// Cast the board's spell, and answer any entry ordering, to its counter prompt.
+fn to_counter_prompt(board: &mut FoldBoard, fold: Fold, events: &mut Vec<GameEvent>) {
+    let (spell, target) = match board.zombify {
+        Some(zombify) => (zombify, Some(board.jammer)),
+        None => (board.jammer, None),
+    };
+    cast_and_pass(&mut board.runner, spell, None, target, events);
+    match fold {
+        Fold::Velocipede => {}
+        Fold::Grumgully(first) => order_entry(&mut board.runner, first, events),
+        Fold::Riot => {
+            order_entry(&mut board.runner, "Rhythm of the Wild", events);
+            accept_replacement(&mut board.runner, events);
+        }
+    }
+}
+
+fn printed_chain(state: &GameState, id: ObjectId) -> Option<AbilityDefinition> {
+    state.objects[&id]
+        .replacement_definitions
+        .iter_unchecked()
+        .find(|def| def.event == ReplacementEvent::Moved)
+        .and_then(|def| def.execute.as_deref().cloned())
+}
+
+/// One row of V20: `fold` on the route, through the counter prompt, to settled.
+fn run_fold_row(fold: Fold, reanimated: bool, pick: FirstPick) {
+    let what = format!("{fold:?}, reanimated = {reanimated}, {pick:?}");
+    reset_triggers_seen();
+    let mut board = fold_board(7, fold, reanimated);
+    let printed = printed_chain(board.runner.state(), board.jammer);
+    let before = life(board.runner.state(), P1);
+    let warden_life = life(board.runner.state(), P0);
+    let mut events = Vec::new();
+    to_counter_prompt(&mut board, fold, &mut events);
+
+    let FoldBoard {
+        mut runner,
+        jammer,
+        warden,
+        ..
+    } = board;
+    assert_counter_prompt(runner.state());
+    assert_eq!(die_results(&events).len(), 1, "{what}");
+    assert!(is_pending(runner.state(), jammer), "{what}");
+    assert_eq!(plus_counters(runner.state(), jammer), 0, "{what}");
+    assert_eq!(queued_or_stacked_from(runner.state(), warden), 0, "{what}");
+
+    let settled = settle_picking(&mut runner, &mut events, pick);
+    let r = die_results(&events)[0];
+    assert_eq!(settled.counter_prompts, 1, "{what}");
+    assert_eq!(
+        plus_counters(runner.state(), jammer),
+        pick.counters(r + 1),
+        "{what}, r = {r}"
+    );
+    assert_eq!(triggers_seen_from(jammer), 0, "{what}");
+    // Known gap: behind an ordering prompt, the other observer's trigger on this route.
+    if matches!(fold, Fold::Velocipede) {
+        assert_eq!(before - life(runner.state(), P1), 1, "{what}: Dwarf once");
+    }
+    assert_eq!(
+        life(runner.state(), P0),
+        warden_life + 1,
+        "{what}: Warden once"
+    );
+    assert_eq!(
+        printed_chain(runner.state(), jammer),
+        printed,
+        "{what}: the card's own chain is untouched, so a later entry starts clean"
+    );
+}
+
+/// V20. CR 603.6d + CR 614.1c + CR 122.6 + CR 614.5: the roll and every counter the
+/// entrant is given are inside the entry. No counter choice comes ahead of the
+/// roll, they are one number, Scales and Evolution modify it once, and the entry is
+/// observed after all of it. The frame shapes with no ordering prompt.
+#[test]
+fn a_fold_lands_with_the_roll_and_no_counter_prompt_precedes_it() {
+    for reanimated in [false, true] {
+        for pick in FirstPick::BOTH {
+            run_fold_row(Fold::Velocipede, reanimated, pick);
+        }
+    }
+}
+
+/// V20's frame shapes behind an entry ordering prompt.
+#[test]
+fn a_fold_behind_an_ordering_prompt_lands_with_the_roll() {
+    for (fold, reanimated) in [
+        (Fold::Grumgully("Hammer Jammer"), false),
+        (Fold::Grumgully("Grumgully, the Generous"), false),
+        (Fold::Grumgully("Hammer Jammer"), true),
+        (Fold::Riot, false),
+    ] {
+        for pick in FirstPick::BOTH {
+            run_fold_row(fold, reanimated, pick);
+        }
+    }
+}
+
+/// V21. CR 603.6d + CR 603.10 (Kiora's ruling): with a fold the entry is observed
+/// with its counters. Soul Warden cannot show this: a 0/0 and a 5/5 both enter.
+#[test]
+fn an_as_enters_roll_with_a_fold_is_observed_with_its_counters() {
+    for pick in FirstPick::BOTH {
+        let mut scenario = board(7);
+        kiora(&mut scenario);
+        add_counter_replacements(&mut scenario);
+        add_velocipede(&mut scenario);
+        let hydra = x_creature(&mut scenario, "Neverwinter Hydra", NEVERWINTER_HYDRA, 1);
+        let mut runner = scenario.build();
+        let hand_before = hand(runner.state(), P0);
+        let mut events = Vec::new();
+        cast_and_pass(&mut runner, hydra, Some(1), None, &mut events);
+        assert_counter_prompt(runner.state());
+        settle_picking(&mut runner, &mut events, pick);
+        let r = die_results(&events)[0];
+        assert_eq!(plus_counters(runner.state(), hydra), pick.counters(r + 1));
+        assert_eq!(hand(runner.state(), P0) + 1 - hand_before, 1, "{pick:?}");
+    }
+}
+
+fn barbarian_grumgully_hydra(seed: u64) -> (GameRunner, ObjectId) {
+    let mut scenario = board(seed);
+    scenario.add_enchantment_from_oracle(P0, "Barbarian Class", BARBARIAN_CLASS_L1);
+    add_grumgully(&mut scenario);
+    let hydra = x_creature(&mut scenario, "Neverwinter Hydra", NEVERWINTER_HYDRA, 1);
+    (scenario.build(), hydra)
+}
+
+/// V22. CR 608.3a + CR 616.1f: a tie behind an ordering prompt finishes its spell.
+/// The fold waits with the `PutCounter`, and the aggregate is the kept roll.
+#[test]
+fn a_tied_roll_behind_an_ordering_prompt_finishes_its_spell() {
+    let to_prompt = |runner: &mut GameRunner, hydra, events: &mut Vec<GameEvent>| {
+        cast_and_pass(runner, hydra, Some(1), None, events);
+        order_entry(runner, "Neverwinter Hydra", events);
+    };
+    let seed = find_seed("a tie", |seed| {
+        let (mut runner, hydra) = barbarian_grumgully_hydra(seed);
+        to_prompt(&mut runner, hydra, &mut Vec::new());
+        tie_prompt_results(runner.state()).is_some()
+    });
+    let (mut runner, hydra) = barbarian_grumgully_hydra(seed);
+    let mut events = Vec::new();
+    to_prompt(&mut runner, hydra, &mut events);
+    let naturals = answer_tie(&mut runner, &mut events);
+    assert!(
+        runner.state().resolution_stack.is_empty(),
+        "the answer finished the spell: {:?}",
+        stack_frames(runner.state())
+    );
+    settle(&mut runner, &mut events, DEFAULT_ANSWERS);
+    assert_eq!(zone(runner.state(), hydra), Zone::Battlefield);
+    assert_eq!(
+        plus_counters(runner.state(), hydra),
+        survivors_total(&naturals) + 1
+    );
+}
+
+fn free_fanatic(scenario: &mut GameScenario) -> ObjectId {
+    free_keyword_creature(
+        scenario,
+        "Fanatic of Xenagos",
+        (3, 3),
+        &["trample", "tribute:1"],
+        FANATIC_OF_XENAGOS,
+    )
+}
+
+/// Answer Tribute's opponent choice, when one is asked, and decline the tribute.
+fn decline_tribute(runner: &mut GameRunner, events: &mut Vec<GameEvent>) {
+    if matches!(runner.state().waiting_for, WaitingFor::NamedChoice { .. }) {
+        answer_named_choice(runner, events);
+    }
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::TributeChoice { .. }),
+        "{:?}",
+        runner.state().waiting_for
+    );
+    act(
+        runner,
+        GameAction::DecideOptionalEffect { accept: false },
+        events,
+    );
+}
+
+/// V22b. CR 608.3a + CR 616.1f: the spell frame's finish is not roll-shaped. A
+/// Tribute behind an ordering prompt finishes its spell too.
+#[test]
+fn a_tribute_behind_an_ordering_prompt_finishes_its_spell() {
+    let mut scenario = board(7);
+    add_grumgully(&mut scenario);
+    let fanatic = free_fanatic(&mut scenario);
+    let mut runner = scenario.build();
+    let mut events = Vec::new();
+    cast_and_pass(&mut runner, fanatic, None, None, &mut events);
+    order_entry(&mut runner, "Fanatic of Xenagos", &mut events);
+    decline_tribute(&mut runner, &mut events);
+    assert!(
+        runner.state().resolution_stack.is_empty(),
+        "the answer finished the spell: {:?}",
+        stack_frames(runner.state())
+    );
+    settle(&mut runner, &mut events, DEFAULT_ANSWERS);
+    assert_eq!(zone(runner.state(), fanatic), Zone::Battlefield);
+}
+
+/// Storm the Festival over Hammer Jammer and a Forest, with a fold, Scales,
+/// Evolution, Brazen Dwarf and Soul Warden.
+struct FestivalBoard {
+    runner: GameRunner,
+    jammer: ObjectId,
+    forest: ObjectId,
+    warden: ObjectId,
+    festival: ObjectId,
+}
+
+fn festival_board(seed: u64, add_fold: fn(&mut GameScenario)) -> FestivalBoard {
+    let mut scenario = board(seed);
+    add_fold(&mut scenario);
+    add_counter_replacements(&mut scenario);
+    add_dwarf(&mut scenario);
+    let warden = add_warden_p0(&mut scenario);
+    let jammer = jammer_card(&mut scenario);
+    let forest = scenario.add_land_to_library_top(P0, "Forest").id();
+    let festival = free_spell(
+        &mut scenario,
+        "Storm the Festival",
+        false,
+        STORM_THE_FESTIVAL,
+    );
+    let mut runner = scenario.build();
+    seat_on_library_top(&mut runner, jammer);
+    FestivalBoard {
+        runner,
+        jammer,
+        forest,
+        warden,
+        festival,
+    }
+}
+
+/// Every die the action has rolled, whether returned or held in the batch's
+/// deferred events.
+fn rolled_so_far(state: &GameState, events: &[GameEvent]) -> Vec<u32> {
+    let mut rolls = die_results(events);
+    if let Some(batch) = state.active_batch_delivery() {
+        rolls.extend(die_results(&batch.deferred_events));
+    }
+    rolls
+}
+
+fn run_festival(mut board: FestivalBoard, pick: FirstPick, ordering_prompt: bool) {
+    reset_triggers_seen();
+    let before = life(board.runner.state(), P1);
+    let warden_life = life(board.runner.state(), P0);
+    let mut events = Vec::new();
+    let runner = &mut board.runner;
+    cast_and_pass(runner, board.festival, None, None, &mut events);
+    assert_dig_choice(runner.state());
+    act(
+        runner,
+        GameAction::SelectCards {
+            cards: vec![board.jammer, board.forest],
+        },
+        &mut events,
+    );
+    if ordering_prompt {
+        order_entry(runner, "Hammer Jammer", &mut events);
+    }
+    assert_counter_prompt(runner.state());
+    let rolled = rolled_so_far(runner.state(), &events);
+    assert_eq!(rolled.len(), 1, "{pick:?}");
+    assert!(is_pending(runner.state(), board.jammer), "{pick:?}");
+    assert_eq!(queued_or_stacked_from(runner.state(), board.warden), 0);
+
+    settle_picking(runner, &mut events, pick);
+    let r = rolled[0];
+    assert_eq!(triggers_seen_from(board.jammer), 0, "{pick:?}");
+    assert_eq!(
+        plus_counters(runner.state(), board.jammer),
+        pick.counters(r + 1),
+        "{pick:?}, r = {r}"
+    );
+    assert_eq!(zone(runner.state(), board.forest), Zone::Battlefield);
+    // Known gap: behind an ordering prompt, the other observer's trigger on this route.
+    if !ordering_prompt {
+        assert_eq!(before - life(runner.state(), P1), 1, "Dwarf once");
+    }
+    assert_eq!(life(runner.state(), P0), warden_life + 1, "Warden once");
+    assert!(runner.state().resolution_stack.is_empty());
+}
+
+/// V23. CR 603.6d + CR 603.2c: a mass member with a fold rolls before its counter
+/// prompt, and the batch's custody takes its entry after the answer placed the
+/// counters. The second member is a land, so one member pauses.
+#[test]
+fn a_mass_member_with_a_fold_rolls_before_its_counter_prompt() {
+    for pick in FirstPick::BOTH {
+        run_festival(festival_board(7, add_velocipede), pick, false);
+    }
+}
+
+/// V23b. The same behind the entry's ordering prompt.
+#[test]
+fn a_mass_member_behind_an_ordering_prompt_rolls_before_its_counter_prompt() {
+    for pick in FirstPick::BOTH {
+        run_festival(festival_board(7, add_grumgully), pick, true);
+    }
+}
+
+/// V24. The hand-on is the roll's alone: an entry with no roll keeps its counter
+/// step. Not the card's reading for Tribute, whose counters are part of entering:
+/// this pins the gate, and a fix for that class rewrites it.
+#[test]
+fn an_entry_with_no_roll_is_not_parked_at_a_counter_pause() {
+    fn gate_board() -> (GameScenario, ObjectId) {
+        let mut scenario = board(7);
+        add_velocipede(&mut scenario);
+        add_counter_replacements(&mut scenario);
+        let warden = add_warden_p0(&mut scenario);
+        (scenario, warden)
+    }
+    // (a) Triskelion.
+    let (mut scenario, _) = gate_board();
+    let triskelion = free_creature(&mut scenario, "Triskelion", 1, 1, TRISKELION);
+    let mut runner = scenario.build();
+    let warden_life = life(runner.state(), P0);
+    let mut events = Vec::new();
+    cast_and_pass(&mut runner, triskelion, None, None, &mut events);
+    assert_counter_prompt(runner.state());
+    assert_eq!(parked_state_of(runner.state(), triskelion), None);
+    settle_picking(&mut runner, &mut events, FirstPick::Scales);
+    assert_eq!(life(runner.state(), P0), warden_life + 1, "Warden once");
+
+    // (b) Fanatic of Xenagos: the prompt comes ahead of the Tribute's, and the
+    // chain under it is the card's own.
+    let (mut scenario, _) = gate_board();
+    let fanatic = free_fanatic(&mut scenario);
+    let mut runner = scenario.build();
+    let mut events = Vec::new();
+    cast_and_pass(&mut runner, fanatic, None, None, &mut events);
+    assert_counter_prompt(runner.state());
+    assert_eq!(parked_state_of(runner.state(), fanatic), None);
+    let printed = runner.state().objects[&fanatic]
+        .replacement_definitions
+        .iter_unchecked()
+        .find(|def| def.event == ReplacementEvent::Moved)
+        .and_then(|def| def.execute.clone())
+        .expect("Tribute's replacement");
+    let chain = stack_frames(runner.state())
+        .iter()
+        .position(|kind| *kind == FrameKind::PostReplacement)
+        .and_then(|slot| runner.state().resolution_stack.iter().nth(slot))
+        .and_then(|frame| match frame {
+            ResolutionFrame::PostReplacement(drains) => drains.resident(),
+            _ => None,
+        })
+        .map(|drain| drain.status.clone())
+        .expect("a resident drain");
+    assert_eq!(
+        chain,
+        DrainStatus::Ready(PostReplacementContinuation::Template(printed))
+    );
+}
+
+/// V25. CR 122.1 + CR 614.5: each kind is its own placement, and Scales and
+/// Evolution read only +1/+1 counters.
+#[test]
+fn a_fold_of_another_kind_lands_with_the_roll() {
+    // (a) Temp's funk with Grumgully's +1/+1: the link alone meets the replacements.
+    for pick in FirstPick::BOTH {
+        let mut scenario = board(7);
+        add_grumgully(&mut scenario);
+        add_counter_replacements(&mut scenario);
+        let temp = free_creature(
+            &mut scenario,
+            "Temp of the Damned",
+            0,
+            0,
+            TEMP_OF_THE_DAMNED,
+        );
+        let mut runner = scenario.build();
+        let mut events = Vec::new();
+        cast_and_pass(&mut runner, temp, None, None, &mut events);
+        order_entry(&mut runner, "Temp of the Damned", &mut events);
+        assert_counter_prompt(runner.state());
+        let settled = settle_picking(&mut runner, &mut events, pick);
+        let r = die_results(&events)[0];
+        assert_eq!(settled.counter_prompts, 1, "{pick:?}");
+        assert_eq!(counters_of(runner.state(), temp, &funk_counter()), r);
+        assert_eq!(plus_counters(runner.state(), temp), pick.counters(1));
+    }
+
+    // (b) Hammer Jammer with Tayam's vigilance, and nothing to pick.
+    let mut scenario = board(7);
+    scenario.add_creature_from_oracle(P0, "Tayam, Luminous Enigma", 3, 3, TAYAM);
+    let jammer = free_jammer(&mut scenario);
+    let mut runner = scenario.build();
+    let mut events = Vec::new();
+    cast_and_pass(&mut runner, jammer, None, None, &mut events);
+    order_entry(&mut runner, "Hammer Jammer", &mut events);
+    settle(&mut runner, &mut events, DEFAULT_ANSWERS);
+    let r = die_results(&events)[0];
+    assert_eq!(plus_counters(runner.state(), jammer), r);
+    assert_eq!(counters_of(runner.state(), jammer, &vigilance_counter()), 1);
+
+    // (c) The rolled kind pauses, and the link waits behind it.
+    for pick in FirstPick::BOTH {
+        let mut scenario = board(7);
+        scenario.add_creature_from_oracle(P0, "Tayam, Luminous Enigma", 3, 3, TAYAM);
+        add_counter_replacements(&mut scenario);
+        let jammer = free_jammer(&mut scenario);
+        let mut runner = scenario.build();
+        let mut events = Vec::new();
+        cast_and_pass(&mut runner, jammer, None, None, &mut events);
+        order_entry(&mut runner, "Hammer Jammer", &mut events);
+        assert_counter_prompt(runner.state());
+        assert_eq!(counters_of(runner.state(), jammer, &vigilance_counter()), 0);
+        let settled = settle_picking(&mut runner, &mut events, pick);
+        let r = die_results(&events)[0];
+        assert_eq!(settled.counter_prompts, 1, "{pick:?}");
+        assert_eq!(plus_counters(runner.state(), jammer), pick.counters(r));
+        assert_eq!(counters_of(runner.state(), jammer, &vigilance_counter()), 1);
+    }
+}
+
+/// V26. CR 706.1 (Hydradoodle's ruling): X = 0 rolls no dice, and the fold still
+/// lands, on the number zero plus the fold.
+#[test]
+fn an_x_of_zero_roll_still_lands_its_fold() {
+    // (a) The fold alone.
+    let mut scenario = board(7);
+    add_velocipede(&mut scenario);
+    let doodle = x_creature(&mut scenario, "Hydradoodle", HYDRADOODLE, 0);
+    let mut runner = scenario.build();
+    let mut events = Vec::new();
+    cast_and_pass(&mut runner, doodle, Some(0), None, &mut events);
+    settle(&mut runner, &mut events, DEFAULT_ANSWERS);
+    assert_eq!(roll_resolved_for(&events, doodle), 1);
+    assert!(die_results(&events).is_empty());
+    assert_eq!(zone(runner.state(), doodle), Zone::Battlefield);
+    assert_eq!(plus_counters(runner.state(), doodle), 1);
+
+    // (b) Under Scales and Evolution.
+    for pick in FirstPick::BOTH {
+        let mut scenario = board(7);
+        add_velocipede(&mut scenario);
+        add_counter_replacements(&mut scenario);
+        let doodle = x_creature(&mut scenario, "Hydradoodle", HYDRADOODLE, 0);
+        let mut runner = scenario.build();
+        let mut events = Vec::new();
+        cast_and_pass(&mut runner, doodle, Some(0), None, &mut events);
+        settle_picking(&mut runner, &mut events, pick);
+        assert_eq!(roll_resolved_for(&events, doodle), 1);
+        assert!(die_results(&events).is_empty());
+        assert_eq!(plus_counters(runner.state(), doodle), pick.counters(1));
+    }
+}
+
+/// V27. CR 122.6 + CR 614.5: three contributions reach three lists, and they are one
+/// number. Grumgully's and Velocipede's reach delivery apart, an effect's rides the
+/// event, and a delayed one is pending for the object.
+#[test]
+fn every_entry_counter_of_one_kind_is_one_placement() {
+    for pick in FirstPick::BOTH {
+        // (a) The event's and the static's.
+        let mut scenario = board(7);
+        add_grumgully(&mut scenario);
+        add_velocipede(&mut scenario);
+        add_counter_replacements(&mut scenario);
+        let jammer = free_jammer(&mut scenario);
+        let mut runner = scenario.build();
+        let mut events = Vec::new();
+        cast_and_pass(&mut runner, jammer, None, None, &mut events);
+        order_entry(&mut runner, "Hammer Jammer", &mut events);
+        let settled = settle_picking(&mut runner, &mut events, pick);
+        let r = die_results(&events)[0];
+        assert_eq!(settled.counter_prompts, 1, "(a) {pick:?}");
+        assert_eq!(plus_counters(runner.state(), jammer), pick.counters(r + 2));
+
+        // (b) An effect's.
+        let mut scenario = board(7);
+        add_counter_replacements(&mut scenario);
+        let jammer = graveyard_creature(&mut scenario, "Hammer Jammer", HAMMER_JAMMER);
+        let spell = free_spell(&mut scenario, "Evil Reawakened", false, EVIL_REAWAKENED);
+        let mut runner = scenario.build();
+        let mut events = Vec::new();
+        cast_and_pass(&mut runner, spell, None, Some(jammer), &mut events);
+        let settled = settle_picking(&mut runner, &mut events, pick);
+        let r = die_results(&events)[0];
+        assert_eq!(settled.counter_prompts, 1, "(b) {pick:?}");
+        assert_eq!(plus_counters(runner.state(), jammer), pick.counters(r + 2));
+
+        // (c) A delayed one, which the success branch still clears.
+        let mut scenario = board(7);
+        add_counter_replacements(&mut scenario);
+        let jammer = free_jammer(&mut scenario);
+        let mut runner = scenario.build();
+        runner
+            .state_mut()
+            .pending_etb_counters
+            .push((jammer, CounterType::Plus1Plus1, 1));
+        let mut events = Vec::new();
+        cast_and_pass(&mut runner, jammer, None, None, &mut events);
+        let settled = settle_picking(&mut runner, &mut events, pick);
+        let r = die_results(&events)[0];
+        assert_eq!(settled.counter_prompts, 1, "(c) {pick:?}");
+        assert_eq!(plus_counters(runner.state(), jammer), pick.counters(r + 1));
+        assert!(runner.state().pending_etb_counters.is_empty());
+    }
+}
+
+/// V29. CR 616.1 + CR 706.6: behind the entry's ordering prompt and the roll's, the
+/// entrant still gets the survivor plus the fold, and the spell finishes.
+#[test]
+fn a_fold_behind_an_ordered_roll_lands_with_the_survivor() {
+    reset_triggers_seen();
+    let mut scenario = board(7);
+    scenario.add_enchantment_from_oracle(P0, "Barbarian Class", BARBARIAN_CLASS_L1);
+    scenario.add_enchantment_from_oracle(P0, "Pixie Guide", PIXIE_GUIDE);
+    add_grumgully(&mut scenario);
+    add_dwarf(&mut scenario);
+    let jammer = free_jammer(&mut scenario);
+    let mut runner = scenario.build();
+    let before = life(runner.state(), P1);
+    let mut events = Vec::new();
+    cast_and_pass(&mut runner, jammer, None, None, &mut events);
+    order_entry(&mut runner, "Hammer Jammer", &mut events);
+    assert!(die_results(&events).is_empty());
+    let index = replacement_index(runner.state(), "Barbarian Class");
+    act(
+        &mut runner,
+        GameAction::ChooseReplacement { index },
+        &mut events,
+    );
+    settle(&mut runner, &mut events, DEFAULT_ANSWERS);
+    let rolls = die_results(&events);
+    assert_eq!(rolls.len(), 1, "{rolls:?}");
+    assert_eq!(ignored_rolls(&events), 2);
+    assert_eq!(triggers_seen_from(jammer), 0);
+    assert_eq!(plus_counters(runner.state(), jammer), rolls[0] + 1);
+    assert_eq!(before - life(runner.state(), P1), 1);
+    assert!(runner.state().resolution_stack.is_empty());
+}
+
+/// V32. Yore-Tiller Nephilim + CR 508.4: an entrant put in attacking keeps its
+/// counter step, whose pause alone carries the seat past a chain that pauses, so
+/// the hand-on is refused and Hammer Jammer attacks. Not the card's reading for the
+/// count, which stays split on this class: the row pins the refusal and asserts no
+/// count.
+#[test]
+fn an_attacking_entry_is_refused_the_hand_on_and_attacks() {
+    let mut scenario = board(7);
+    let nephilim = scenario
+        .add_creature_from_oracle(P0, "Yore-Tiller Nephilim", 2, 2, YORE_TILLER_NEPHILIM)
+        .id();
+    add_velocipede(&mut scenario);
+    add_counter_replacements(&mut scenario);
+    let jammer = graveyard_creature(&mut scenario, "Hammer Jammer", HAMMER_JAMMER);
+    let mut runner = scenario.build();
+    runner.advance_to_combat();
+    let attacked = runner
+        .declare_attackers(&[(nephilim, AttackTarget::Player(P1))])
+        .expect("Nephilim attacks");
+    let mut events = attacked.events;
+    for _ in 0..40 {
+        if is_counter_prompt(runner.state()) {
+            break;
+        }
+        match &runner.state().waiting_for {
+            WaitingFor::TriggerTargetSelection { .. } => act(
+                &mut runner,
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(jammer)),
+                },
+                &mut events,
+            ),
+            WaitingFor::Priority { .. } => {
+                act(&mut runner, GameAction::PassPriority, &mut events);
+            }
+            other => panic!("unhandled prompt: {other:?}"),
+        }
+    }
+    assert_counter_prompt(runner.state());
+    assert!(
+        die_results(&events).is_empty(),
+        "a counter step ran ahead of the roll, which only a refused hand-on does"
+    );
+    settle_picking(&mut runner, &mut events, FirstPick::Scales);
+    assert_eq!(die_results(&events).len(), 1);
+    let combat = runner.state().combat.as_ref().expect("combat");
+    let attacker = combat
+        .attackers
+        .iter()
+        .find(|attacker| attacker.object_id == jammer)
+        .expect("Hammer Jammer attacks");
+    assert_eq!(attacker.defending_player, P1);
 }

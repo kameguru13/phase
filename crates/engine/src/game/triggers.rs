@@ -3766,12 +3766,21 @@ pub(crate) fn departure_observer_provably_excludes(
 /// self-departure check: for a source that leaves and later re-enters within
 /// the same batch, its own departure index is always strictly less than its
 /// last-entry index, so it is correctly excluded.
+///
+/// CR 614.1c + CR 614.12 + CR 113.6 + CR 603.10: an entrant's as-enters roll
+/// was made before its entry happened, so its abilities did not function yet,
+/// and that one entrant is not an observer of that event, wherever the event
+/// sits in this batch and in whichever action collects it.
 fn live_battlefield_source_was_present_at_event(
+    event: &GameEvent,
     event_idx: usize,
     source_id: ObjectId,
     battlefield_entry_index: &std::collections::HashMap<ObjectId, usize>,
 ) -> bool {
-    battlefield_entry_index
+    !matches!(
+        event,
+        GameEvent::DieRolled { pre_entry_source: Some(entrant), .. } if *entrant == source_id
+    ) && battlefield_entry_index
         .get(&source_id)
         .is_none_or(|&entry_idx| event_idx >= entry_idx)
 }
@@ -5283,6 +5292,7 @@ fn collect_pending_triggers_with_collection(
         // Scan candidate permanents for matching triggers
         for obj_id in candidates.iter().copied() {
             if !live_battlefield_source_was_present_at_event(
+                event,
                 event_idx,
                 obj_id,
                 &battlefield_entry_index,
@@ -5770,6 +5780,7 @@ fn collect_pending_triggers_with_collection(
                     .collect();
                 for obj_id in shadow_population {
                     if !live_battlefield_source_was_present_at_event(
+                        event,
                         event_idx,
                         obj_id,
                         &battlefield_entry_index,
@@ -18737,17 +18748,87 @@ pub mod tests {
         let boundaries = battlefield_entry_observation_indices(&events);
 
         assert!(
-            !live_battlefield_source_was_present_at_event(0, saga, &boundaries),
+            !live_battlefield_source_was_present_at_event(&events[0], 0, saga, &boundaries),
             "the entering Saga must not observe an unrelated pre-entry sacrifice"
         );
         assert!(
-            live_battlefield_source_was_present_at_event(1, saga, &boundaries),
+            live_battlefield_source_was_present_at_event(&events[1], 1, saga, &boundaries),
             "the Saga's intrinsic lore counter belongs to its entry lifetime"
         );
         assert!(live_battlefield_source_was_present_at_event(
+            &events[2],
             2,
             saga,
             &boundaries
+        ));
+    }
+
+    /// CR 614.1c + CR 113.6 + CR 603.10: a stamped roll refuses its entrant and
+    /// no one else; an unstamped roll and any other event fall to the entry index.
+    #[test]
+    fn a_stamped_roll_refuses_only_its_entrant() {
+        let (entrant, other) = (ObjectId(1), ObjectId(2));
+        let roll = |pre_entry_source| GameEvent::DieRolled {
+            player_id: PlayerId(0),
+            sides: 6,
+            result: Some(3),
+            pre_entry_source,
+        };
+        let no_entries = std::collections::HashMap::new();
+        let stamped = roll(Some(entrant));
+        assert!(!live_battlefield_source_was_present_at_event(
+            &stamped,
+            0,
+            entrant,
+            &no_entries
+        ));
+        assert!(live_battlefield_source_was_present_at_event(
+            &stamped,
+            0,
+            other,
+            &no_entries
+        ));
+
+        // The record refuses at a position the index alone would admit.
+        let entered_at_zero = std::collections::HashMap::from([(entrant, 0)]);
+        assert!(!live_battlefield_source_was_present_at_event(
+            &stamped,
+            5,
+            entrant,
+            &entered_at_zero
+        ));
+
+        // No record: the index decides, on either side of the boundary.
+        let unstamped = roll(None);
+        let entered_at_two = std::collections::HashMap::from([(entrant, 2)]);
+        assert!(!live_battlefield_source_was_present_at_event(
+            &unstamped,
+            1,
+            entrant,
+            &entered_at_two
+        ));
+        assert!(live_battlefield_source_was_present_at_event(
+            &unstamped,
+            2,
+            entrant,
+            &entered_at_two
+        ));
+
+        // Another kind of event: the same.
+        let other_event = GameEvent::MonarchChanged {
+            player_id: PlayerId(0),
+        };
+        assert!(!live_battlefield_source_was_present_at_event(
+            &other_event,
+            1,
+            entrant,
+            &entered_at_two
+        ));
+        assert!(live_battlefield_source_was_present_at_event(
+            &other_event,
+            2,
+            entrant,
+            &entered_at_two
         ));
     }
 
@@ -42518,6 +42599,7 @@ pub mod tests {
                 player_id: PlayerId(0),
                 sides: 6,
                 result: Some(rolled),
+                pre_entry_source: None,
             }];
             process_triggers(&mut state, &events);
 
