@@ -60,9 +60,11 @@ fn maybe_drain_each_player_copy_chosen(state: &mut GameState, events: &mut Vec<G
 /// parked resolution frame once the child stack its own entry raised has retired.
 ///
 /// The parked frame is that child's structural PARENT, so it becomes the active
-/// frame only here — after this resume's drain stages have settled. `subject` is
-/// the object whose replacement this resume answered; the frame completes only
-/// when it is that same object's, so an unrelated parked spell is never touched.
+/// frame only here — after this resume's drain stages have settled. `subject`
+/// names the object whose frame may complete: the object whose replacement this
+/// resume answered or, from `finish_spell_resolution_exposed_by_retired_drain`,
+/// the exposed frame's own object once it is on the battlefield. An answering
+/// resume never completes another object's frame.
 /// `active_spell_resolution` stays top-only: this reads the frame the drain just
 /// exposed and never reaches through a live child. This function is the SINGLE
 /// settle authority for that completion — call sites add no `Priority` guard of
@@ -4874,24 +4876,40 @@ pub(crate) fn apply_pending_spell_resolution(
 }
 
 /// CR 614.1c + CR 122.6 + CR 603.6d: an as-enters roll and its counters are
-/// part of the event that puts the permanent onto the battlefield, so every
-/// counter the entrant is given as it enters joins the roll's chain, and each
-/// kind is one placement, which a counter replacement affects once (CR 614.5).
-/// Called where the entry's contributions are first all known. Returns what
-/// delivery still places: nothing once the roll has taken them, and `counters`
-/// unchanged when no as-enters roll is waiting.
+/// part of the event that puts the permanent onto the battlefield, so when every
+/// counter the entrant is given as it enters is of the kind the roll places, they
+/// join that placement as one number, which a counter replacement affects once
+/// (CR 614.5). Called where the entry's contributions are first all known.
+/// Returns what delivery still places: nothing once the roll has taken them, and
+/// `counters` unchanged otherwise.
+///
+/// Any contribution of another kind refuses the whole hand-on, leaving delivery's
+/// own counter step ahead of the roll. Counters of another kind are a separate
+/// placement anyway, and a prompt of theirs behind the roll would hide the roll
+/// from its observers. Temp of the Damned, the one as-enters roll whose kind no
+/// printed fold shares, has no roll observer of its own, so it loses nothing it
+/// needs.
 pub(crate) fn hand_entry_counters_to_as_enters_roll(
     state: &mut GameState,
     entrant: ObjectId,
     counters: Vec<(CounterType, u32)>,
 ) -> Vec<(CounterType, u32)> {
-    let Some(chain) = as_enters_roll_chain_mut(state, entrant) else {
+    let Some((kind, placed)) =
+        as_enters_roll_chain_mut(state, entrant).and_then(unconditional_self_placement_mut)
+    else {
         return counters;
     };
-    for (counter_type, count) in effects::counters::coalesce_entry_counters(counters) {
-        add_entry_counters_to_chain(chain, counter_type, count);
+    match effects::counters::coalesce_entry_counters(counters.iter().cloned()).as_slice() {
+        [(counter_type, count)] if counter_type == kind => {
+            let inner = std::mem::replace(placed, QuantityExpr::Fixed { value: 0 });
+            *placed = QuantityExpr::Offset {
+                inner: Box::new(inner),
+                offset: u32_to_i32_saturating(*count),
+            };
+            Vec::new()
+        }
+        _ => counters,
     }
-    Vec::new()
 }
 
 /// The not-yet-run as-enters roll of `entrant`: the resident drain the dispatch
@@ -4914,46 +4932,24 @@ fn as_enters_roll_chain_mut(
     }
 }
 
-/// CR 122.6 + CR 614.5: `count` counters of one kind join the chain's
-/// unconditional placement of that kind on the entrant, so a counter replacement
-/// meets one number. A kind the chain does not place is its own placement, last.
-fn add_entry_counters_to_chain(
+/// The chain's first unconditional `PutCounter` on the entrant itself: the
+/// placement an entry's counters of its kind join.
+fn unconditional_self_placement_mut(
     link: &mut AbilityDefinition,
-    counter_type: CounterType,
-    count: u32,
-) {
+) -> Option<(&CounterType, &mut QuantityExpr)> {
     if link.condition.is_none() {
         if let Effect::PutCounter {
-            counter_type: kind,
-            count: placed,
+            counter_type,
+            count,
             target: TargetFilter::SelfRef,
         } = link.effect.as_mut()
         {
-            if *kind == counter_type {
-                let inner = std::mem::replace(placed, QuantityExpr::Fixed { value: 0 });
-                *placed = QuantityExpr::Offset {
-                    inner: Box::new(inner),
-                    offset: u32_to_i32_saturating(count),
-                };
-                return;
-            }
+            return Some((&*counter_type, count));
         }
     }
-    match &mut link.sub_ability {
-        Some(next) => add_entry_counters_to_chain(next, counter_type, count),
-        None => {
-            link.sub_ability = Some(Box::new(AbilityDefinition::new(
-                link.kind,
-                Effect::PutCounter {
-                    counter_type,
-                    count: QuantityExpr::Fixed {
-                        value: u32_to_i32_saturating(count),
-                    },
-                    target: TargetFilter::SelfRef,
-                },
-            )));
-        }
-    }
+    link.sub_ability
+        .as_deref_mut()
+        .and_then(unconditional_self_placement_mut)
 }
 
 /// CR 614.1c: Apply counters accumulated on a `ProposedEvent::ZoneChange` to
@@ -10627,14 +10623,18 @@ mod entry_continuation_release_tests {
                 modifier: None,
             },
         )
-        .sub_ability(AbilityDefinition::new(
+        .sub_ability(rolled_placement())
+    }
+
+    fn rolled_placement() -> AbilityDefinition {
+        AbilityDefinition::new(
             AbilityKind::Spell,
             Effect::PutCounter {
                 counter_type: CounterType::Plus1Plus1,
                 count: rolled_amount(),
                 target: TargetFilter::SelfRef,
             },
-        ))
+        )
     }
 
     fn rolled_amount() -> QuantityExpr {
@@ -10675,13 +10675,9 @@ mod entry_continuation_release_tests {
         }
     }
 
-    fn put_counter(link: &AbilityDefinition) -> (&CounterType, &QuantityExpr, &TargetFilter) {
+    fn placed_count(link: &AbilityDefinition) -> &QuantityExpr {
         match link.effect.as_ref() {
-            Effect::PutCounter {
-                counter_type,
-                count,
-                target,
-            } => (counter_type, count, target),
+            Effect::PutCounter { count, .. } => count,
             other => panic!("expected PutCounter, got {other:?}"),
         }
     }
@@ -10690,9 +10686,10 @@ mod entry_continuation_release_tests {
         CounterType::Keyword(crate::types::keywords::KeywordKind::Vigilance)
     }
 
-    /// CR 614.1c + CR 122.6 + CR 614.5: one number per kind, in the roll's chain.
+    /// CR 614.1c + CR 122.6 + CR 614.5: the roll's kind is one number, in the
+    /// roll's own placement.
     #[test]
-    fn the_roll_takes_the_entry_counters_one_placement_per_kind() {
+    fn the_roll_takes_entry_counters_of_its_kind_as_one_placement() {
         // Same kind: the printed placement carries them.
         let (mut state, entrant) = with_drain(None, ready_chain(roll_chain()));
         let left = hand_entry_counters_to_as_enters_roll(
@@ -10704,7 +10701,7 @@ mod entry_continuation_release_tests {
         let chain = resident_chain(&state);
         let placement = chain.sub_ability.as_deref().expect("the placement");
         assert_eq!(
-            put_counter(placement).1,
+            placed_count(placement),
             &QuantityExpr::Offset {
                 inner: Box::new(rolled_amount()),
                 offset: 2,
@@ -10723,50 +10720,12 @@ mod entry_continuation_release_tests {
         let chain = resident_chain(&state);
         let placement = chain.sub_ability.as_deref().expect("the placement");
         assert_eq!(
-            put_counter(placement).1,
+            placed_count(placement),
             &QuantityExpr::Offset {
                 inner: Box::new(rolled_amount()),
                 offset: 3,
             }
         );
-
-        // Another kind: one tail link, after the printed placement.
-        let (mut state, entrant) = with_drain(None, ready_chain(roll_chain()));
-        let left =
-            hand_entry_counters_to_as_enters_roll(&mut state, entrant, vec![(vigilance(), 1)]);
-        assert!(left.is_empty());
-        let chain = resident_chain(&state);
-        let placement = chain.sub_ability.as_deref().expect("the placement");
-        assert_eq!(put_counter(placement).1, &rolled_amount());
-        let tail = placement.sub_ability.as_deref().expect("the tail link");
-        assert_eq!(
-            put_counter(tail),
-            (
-                &vigilance(),
-                &QuantityExpr::Fixed { value: 1 },
-                &TargetFilter::SelfRef
-            )
-        );
-
-        // A conditional placement of that kind is not this entry's: a tail link.
-        let mut conditional = roll_chain();
-        conditional
-            .sub_ability
-            .as_deref_mut()
-            .expect("the placement")
-            .condition = Some(AbilityCondition::TriggerEventTargetExploitedBySource);
-        let (mut state, entrant) = with_drain(None, ready_chain(conditional));
-        let left = hand_entry_counters_to_as_enters_roll(
-            &mut state,
-            entrant,
-            vec![(CounterType::Plus1Plus1, 1)],
-        );
-        assert!(left.is_empty());
-        let chain = resident_chain(&state);
-        let placement = chain.sub_ability.as_deref().expect("the placement");
-        assert_eq!(put_counter(placement).1, &rolled_amount());
-        let tail = placement.sub_ability.as_deref().expect("the tail link");
-        assert_eq!(put_counter(tail).1, &QuantityExpr::Fixed { value: 1 });
 
         // Nothing to hand on: the chain stays as printed.
         let (mut state, entrant) = with_drain(None, ready_chain(roll_chain()));
@@ -10775,18 +10734,61 @@ mod entry_continuation_release_tests {
         assert_eq!(resident_chain(&state), roll_chain());
     }
 
+    /// CR 122.1: a contribution of another kind refuses the whole hand-on. The list
+    /// comes back as built for delivery to place, and the chain stays as printed.
+    #[test]
+    fn the_hand_on_refuses_any_contribution_of_another_kind() {
+        for counters in [
+            vec![(vigilance(), 1)],
+            // Neither kind is handed on, and the contributions stay apart.
+            vec![
+                (CounterType::Plus1Plus1, 1),
+                (vigilance(), 1),
+                (CounterType::Plus1Plus1, 2),
+            ],
+        ] {
+            let (mut state, entrant) = with_drain(None, ready_chain(roll_chain()));
+            let left = hand_entry_counters_to_as_enters_roll(&mut state, entrant, counters.clone());
+            assert_eq!(left, counters);
+            assert_eq!(resident_chain(&state), roll_chain());
+        }
+    }
+
+    /// A chain with no unconditional placement on the entrant has nothing for the
+    /// entry's counters to join. A conditional placement is not this entry's.
+    #[test]
+    fn the_hand_on_refuses_a_roll_with_no_unconditional_placement() {
+        let mut conditional = roll_chain();
+        conditional
+            .sub_ability
+            .as_deref_mut()
+            .expect("the placement")
+            .condition = Some(AbilityCondition::TriggerEventTargetExploitedBySource);
+        let mut unplaced = roll_chain();
+        unplaced.sub_ability = None;
+        let counters = vec![(CounterType::Plus1Plus1, 1)];
+        for chain in [conditional, unplaced] {
+            let (mut state, entrant) = with_drain(None, ready_chain(chain.clone()));
+            let left = hand_entry_counters_to_as_enters_roll(&mut state, entrant, counters.clone());
+            assert_eq!(left, counters);
+            assert_eq!(resident_chain(&state), chain);
+        }
+    }
+
     /// The gate: every other drain is refused, and the list comes back whole for
-    /// delivery to place.
+    /// delivery to place. The list and each chain below would be taken but for the
+    /// gate.
     #[test]
     fn the_hand_on_refuses_every_other_drain() {
-        let counters = vec![(CounterType::Plus1Plus1, 2), (vigilance(), 1)];
+        let counters = vec![(CounterType::Plus1Plus1, 2)];
         let non_roll = AbilityDefinition::new(
             AbilityKind::Spell,
             Effect::Draw {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Controller,
             },
-        );
+        )
+        .sub_ability(rolled_placement());
         let resolved = ResolvedAbility::new(
             Effect::Draw {
                 count: QuantityExpr::Fixed { value: 1 },

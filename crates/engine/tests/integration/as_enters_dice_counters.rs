@@ -15,6 +15,8 @@
 //! Oracle text is verbatim (Scryfall / card-data). Barbarian Class and First Day
 //! of Class carry only the line under test (the Class level-1 line; First Day of
 //! Class's first sentence, without its Learn rider). Beck carries Beck's half.
+//! Monoxa, Pixie Guide, Tayam, Rhythm of the Wild, Stolen Identity, Fathom Mage and
+//! Storm the Festival carry only the lines under test.
 //! Dice-dependent rows choose their RNG seed by search and assert against the
 //! emitted `DieRolled` results, never a hard-coded total.
 
@@ -87,6 +89,7 @@ const STOLEN_IDENTITY: &str = "Create a token that's a copy of target artifact o
 const GRUMGULLY: &str =
     "Each other non-Human creature you control enters with an additional +1/+1 counter on it.";
 const VELOCIPEDE: &str = "Trample\nEach other Vehicle and creature you control enters with an additional +1/+1 counter on it if its mana value is 4 or less. Otherwise, it enters with three additional +1/+1 counters on it.\nCrew 3";
+const KAVU_TITAN: &str = "Kicker {2}{G} (You may pay an additional {2}{G} as you cast this spell.)\nIf this creature was kicked, it enters with three +1/+1 counters on it and with trample.";
 const TAYAM: &str =
     "Each other creature you control enters with an additional vigilance counter on it.";
 const EVIL_REAWAKENED: &str = "Return target creature card from your graveyard to the battlefield with two additional +1/+1 counters on it.";
@@ -3517,8 +3520,9 @@ fn a_batch_member_does_not_see_its_roll_after_a_later_member_pauses() {
 
 /// V16. CR 113.6: the refusal is at observer presence, so every roll observer shape
 /// is covered: batched, a result filter, and each die. Composed faces, not printed
-/// cards: each is the Hydra's as-enters line plus one verbatim observer line. A
-/// resident with the same line sees the roll, so each face can trigger.
+/// cards: each is the Hydra's as-enters line plus one observer line, cut to the
+/// sentence under test for Monoxa. A resident with the same line sees the roll, so
+/// each face can trigger.
 #[test]
 fn no_roll_observer_shape_sees_its_entrants_roll() {
     const NAME: &str = "Monoxa, Midway Manager";
@@ -3975,6 +3979,29 @@ fn an_entry_with_no_roll_is_not_parked_at_a_counter_pause() {
         let warden = add_warden_p0(&mut scenario);
         (scenario, warden)
     }
+    /// The entrant's own drain still holds its printed chain.
+    fn assert_printed_chain(state: &GameState, entrant: ObjectId) {
+        let printed = state.objects[&entrant]
+            .replacement_definitions
+            .iter_unchecked()
+            .find(|def| def.event == ReplacementEvent::Moved)
+            .and_then(|def| def.execute.clone())
+            .expect("the entry replacement");
+        let chain = stack_frames(state)
+            .iter()
+            .position(|kind| *kind == FrameKind::PostReplacement)
+            .and_then(|slot| state.resolution_stack.iter().nth(slot))
+            .and_then(|frame| match frame {
+                ResolutionFrame::PostReplacement(drains) => drains.resident(),
+                _ => None,
+            })
+            .map(|drain| drain.status.clone())
+            .expect("a resident drain");
+        assert_eq!(
+            chain,
+            DrainStatus::Ready(PostReplacementContinuation::Template(printed))
+        );
+    }
     // (a) Triskelion.
     let (mut scenario, _) = gate_board();
     let triskelion = free_creature(&mut scenario, "Triskelion", 1, 1, TRISKELION);
@@ -3996,37 +4023,37 @@ fn an_entry_with_no_roll_is_not_parked_at_a_counter_pause() {
     cast_and_pass(&mut runner, fanatic, None, None, &mut events);
     assert_counter_prompt(runner.state());
     assert_eq!(parked_state_of(runner.state(), fanatic), None);
-    let printed = runner.state().objects[&fanatic]
-        .replacement_definitions
-        .iter_unchecked()
-        .find(|def| def.event == ReplacementEvent::Moved)
-        .and_then(|def| def.execute.clone())
-        .expect("Tribute's replacement");
-    let chain = stack_frames(runner.state())
-        .iter()
-        .position(|kind| *kind == FrameKind::PostReplacement)
-        .and_then(|slot| runner.state().resolution_stack.iter().nth(slot))
-        .and_then(|frame| match frame {
-            ResolutionFrame::PostReplacement(drains) => drains.resident(),
-            _ => None,
-        })
-        .map(|drain| drain.status.clone())
-        .expect("a resident drain");
-    assert_eq!(
-        chain,
-        DrainStatus::Ready(PostReplacementContinuation::Template(printed))
-    );
+    assert_printed_chain(runner.state(), fanatic);
+
+    // (c) Kavu Titan, kicked: its chain places +1/+1 counters on itself, behind a
+    // head that is no roll, and the fold stays out of that placement.
+    let (mut scenario, _) = gate_board();
+    let titan = free_creature(&mut scenario, "Kavu Titan", 2, 2, KAVU_TITAN);
+    scenario.with_mana_pool(P0, green(3));
+    let mut runner = scenario.build();
+    let mut events = Vec::new();
+    let commit = runner.cast(titan).accept_optional().commit();
+    events.extend(commit.events().iter().cloned());
+    drop(commit);
+    pass_until_prompt(&mut runner, &mut events);
+    assert_counter_prompt(runner.state());
+    assert_eq!(parked_state_of(runner.state(), titan), None);
+    assert_printed_chain(runner.state(), titan);
 }
 
 /// V25. CR 122.1 + CR 614.5: each kind is its own placement, and Scales and
-/// Evolution read only +1/+1 counters.
+/// Evolution read only +1/+1 counters. A fold of another kind refuses the hand-on and
+/// keeps its counter step ahead of the roll, so the roll stays where its observers
+/// see it.
 #[test]
-fn a_fold_of_another_kind_lands_with_the_roll() {
-    // (a) Temp's funk with Grumgully's +1/+1: the link alone meets the replacements.
+fn a_fold_of_another_kind_keeps_its_counter_step() {
+    // (a) Temp's funk with Grumgully's +1/+1: the fold alone meets the replacements,
+    // and the answer rolls, which Brazen Dwarf sees.
     for pick in FirstPick::BOTH {
         let mut scenario = board(7);
         add_grumgully(&mut scenario);
         add_counter_replacements(&mut scenario);
+        add_dwarf(&mut scenario);
         let temp = free_creature(
             &mut scenario,
             "Temp of the Damned",
@@ -4035,18 +4062,25 @@ fn a_fold_of_another_kind_lands_with_the_roll() {
             TEMP_OF_THE_DAMNED,
         );
         let mut runner = scenario.build();
+        let before = life(runner.state(), P1);
         let mut events = Vec::new();
         cast_and_pass(&mut runner, temp, None, None, &mut events);
         order_entry(&mut runner, "Temp of the Damned", &mut events);
         assert_counter_prompt(runner.state());
+        let rolled_at_prompt = die_results(&events).len();
         let settled = settle_picking(&mut runner, &mut events, pick);
-        let r = die_results(&events)[0];
+        let rolls = die_results(&events);
+        assert_eq!(rolls.len(), 1, "{pick:?}");
+        let r = rolls[0];
         assert_eq!(settled.counter_prompts, 1, "{pick:?}");
         assert_eq!(counters_of(runner.state(), temp, &funk_counter()), r);
         assert_eq!(plus_counters(runner.state(), temp), pick.counters(1));
+        assert_eq!(before - life(runner.state(), P1), 1, "Dwarf {pick:?}");
+        assert_eq!(rolled_at_prompt, 0, "the counter step comes first");
     }
 
     // (b) Hammer Jammer with Tayam's vigilance, and nothing to pick.
+    reset_triggers_seen();
     let mut scenario = board(7);
     scenario.add_creature_from_oracle(P0, "Tayam, Luminous Enigma", 3, 3, TAYAM);
     let jammer = free_jammer(&mut scenario);
@@ -4058,9 +4092,11 @@ fn a_fold_of_another_kind_lands_with_the_roll() {
     let r = die_results(&events)[0];
     assert_eq!(plus_counters(runner.state(), jammer), r);
     assert_eq!(counters_of(runner.state(), jammer, &vigilance_counter()), 1);
+    assert_eq!(triggers_seen_from(jammer), 0);
 
-    // (c) The rolled kind pauses, and the link waits behind it.
+    // (c) The rolled kind pauses, with the fold placed ahead of it.
     for pick in FirstPick::BOTH {
+        reset_triggers_seen();
         let mut scenario = board(7);
         scenario.add_creature_from_oracle(P0, "Tayam, Luminous Enigma", 3, 3, TAYAM);
         add_counter_replacements(&mut scenario);
@@ -4070,12 +4106,14 @@ fn a_fold_of_another_kind_lands_with_the_roll() {
         cast_and_pass(&mut runner, jammer, None, None, &mut events);
         order_entry(&mut runner, "Hammer Jammer", &mut events);
         assert_counter_prompt(runner.state());
-        assert_eq!(counters_of(runner.state(), jammer, &vigilance_counter()), 0);
+        assert_eq!(die_results(&events).len(), 1, "{pick:?}");
+        assert_eq!(counters_of(runner.state(), jammer, &vigilance_counter()), 1);
         let settled = settle_picking(&mut runner, &mut events, pick);
         let r = die_results(&events)[0];
         assert_eq!(settled.counter_prompts, 1, "{pick:?}");
         assert_eq!(plus_counters(runner.state(), jammer), pick.counters(r));
         assert_eq!(counters_of(runner.state(), jammer, &vigilance_counter()), 1);
+        assert_eq!(triggers_seen_from(jammer), 0, "{pick:?}");
     }
 }
 
@@ -4198,11 +4236,11 @@ fn a_fold_behind_an_ordered_roll_lands_with_the_survivor() {
     assert!(runner.state().resolution_stack.is_empty());
 }
 
-/// V32. Yore-Tiller Nephilim + CR 508.4: an entrant put in attacking keeps its
-/// counter step, whose pause alone carries the seat past a chain that pauses, so
-/// the hand-on is refused and Hammer Jammer attacks. Not the card's reading for the
-/// count, which stays split on this class: the row pins the refusal and asserts no
-/// count.
+/// V32. Yore-Tiller Nephilim + CR 508.4: an attacking entry keeps its counter step:
+/// only that pause records `enters_attacking` for the resume, so the entrant is still
+/// placed in combat after a chain that pauses. The hand-on is refused and Hammer
+/// Jammer attacks. Not the card's reading for the count, which stays split on this
+/// class: the row pins the refusal and asserts no count.
 #[test]
 fn an_attacking_entry_is_refused_the_hand_on_and_attacks() {
     let mut scenario = board(7);

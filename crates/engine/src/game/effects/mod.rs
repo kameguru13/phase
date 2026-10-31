@@ -2121,8 +2121,10 @@ pub(crate) fn resume_resolution_frames(state: &mut GameState, events: &mut Vec<G
             // A permanent spell's entry is resumed only by the exact parked
             // replacement action. This frame remains its parent while any
             // replacement-produced child work resolves; Priority does not
-            // authorize a synthetic entry completion. The one exception is a
-            // retiring drain that exposes it, in the PostReplacement arm below.
+            // authorize a synthetic entry completion. The exception is a
+            // retiring drain that exposes it:
+            // `finish_spell_resolution_exposed_by_retired_drain`, called from the
+            // PostReplacement arm below and from `drain_pending_continuation`.
         }
         ResolutionFrame::PostReplacement(drains) => {
             let retired_paused_dispatch = matches!(
