@@ -4326,7 +4326,7 @@ pub(crate) fn deliver_replaced_zone_change(
             // CR 508.4: an attacking entry keeps its counter step: only that pause
             // records `enters_attacking` for the resume, so the entrant is still placed
             // in combat after a chain that pauses.
-            if entered_battlefield && !enters_attacking {
+            if !enters_attacking {
                 counters_to_apply =
                     crate::game::engine_replacement::hand_entry_counters_to_as_enters_roll(
                         state,
