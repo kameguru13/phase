@@ -900,8 +900,8 @@ fn a_delayed_trigger_with_a_chosen_land_targets_only_the_land() {
 /// one declared target makes it a single-target ability for Bolt Bend, and the
 /// retarget checks that slot against the land filter, at the land's own
 /// address: P0's creature isn't offered, and with a second Swamp the change
-/// takes, so the earthbend animates that Swamp. With one Swamp, chosen without
-/// a prompt, that Swamp is the only legal choice and stays the target.
+/// takes, so the earthbend animates that Swamp. With one Swamp, there is no
+/// alternative and Bolt Bend completes without a retarget prompt.
 #[test]
 fn bolt_bend_changes_only_the_delayed_earthbends_land() {
     for lands in [1, 2] {
@@ -939,6 +939,15 @@ fn bolt_bend_changes_only_the_delayed_earthbends_land() {
         runner
             .act(GameAction::PassPriority)
             .expect("Bolt Bend resolves");
+        if lands == 1 {
+            assert!(
+                matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+                "CR 115.7a: no alternative means no prompt"
+            );
+            runner.advance_until_stack_empty();
+            assert_earthbend_finished(runner, fissure.swamps[0]);
+            continue;
+        }
         let WaitingFor::RetargetChoice {
             scope,
             current_targets,
@@ -965,16 +974,46 @@ fn bolt_bend_changes_only_the_delayed_earthbends_land() {
             "the land filter, not a legacy pool"
         );
         let animated = fissure.swamps[lands - 1];
+        assert!(legal_new_targets.contains(&TargetRef::Object(animated)));
         assert!(
-            legal_new_targets.contains(&TargetRef::Object(animated)),
-            "lands {lands}: the land to keep or change to is offered"
+            !legal_new_targets.contains(&TargetRef::Object(fissure.swamps[0])),
+            "CR 115.7a: unchanged target is absent from the projection union"
         );
+        let candidates = engine::ai_support::candidate_actions(runner.state());
+        assert!(
+            candidates.iter().any(|candidate| {
+                matches!(&candidate.action, GameAction::RetargetSpell { new_targets }
+                if new_targets == &vec![Some(TargetRef::Object(animated))])
+            }),
+            "reach guard: the AI proposes the replacement land"
+        );
+        assert!(
+            !candidates.iter().any(|candidate| {
+                matches!(&candidate.action, GameAction::RetargetSpell { new_targets }
+                if new_targets == &vec![Some(TargetRef::Object(fissure.swamps[0]))])
+            }),
+            "the AI cannot propose the unchanged target"
+        );
+        for action in [
+            GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(fissure.swamps[0])),
+            },
+            GameAction::RetargetSpell {
+                new_targets: vec![Some(TargetRef::Object(fissure.swamps[0]))],
+            },
+        ] {
+            assert!(
+                runner.act(action).is_err(),
+                "CR 115.7a: both action forms reject keeping"
+            );
+        }
         runner
             .act(GameAction::ChooseTarget {
                 target: Some(TargetRef::Object(animated)),
             })
-            .expect("change the land, or keep the only one");
+            .expect("change the land");
         runner.advance_until_stack_empty();
+        assert_earthbend_finished(runner, animated);
         assert!(
             runner.state().objects[&animated]
                 .card_types
@@ -989,6 +1028,345 @@ fn bolt_bend_changes_only_the_delayed_earthbends_land() {
                 .contains(&engine::types::card_type::CoreType::Creature));
         }
     }
+}
+
+/// CR 701.66a: earthbend 4 animates the chosen land and adds four counters.
+fn assert_earthbend_finished(runner: &GameRunner, land: ObjectId) {
+    assert!(runner.state().stack.is_empty());
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { .. }
+    ));
+    let object = &runner.state().objects[&land];
+    assert!(object
+        .card_types
+        .core_types
+        .contains(&engine::types::card_type::CoreType::Creature));
+    assert_eq!(
+        object
+            .counters
+            .get(&engine::types::counter::CounterType::Plus1Plus1),
+        Some(&4)
+    );
+}
+
+const DEFLECTING_SWAT: &str = "If you control a commander, you may cast this spell without paying its mana cost.\nYou may choose new targets for target spell or ability.";
+
+/// Produce a real parked choice through casting and priority actions.
+fn fissure_retarget_prompt(scope: RetargetScope) -> (FissureTrigger, ObjectId) {
+    let (name, text) = match scope {
+        RetargetScope::Single => ("Bolt Bend", BOLT_BEND),
+        RetargetScope::All => ("Deflecting Swat", DEFLECTING_SWAT),
+        RetargetScope::ForcedTo(_) => panic!("interactive fixture"),
+    };
+    let (mut fissure, spell) = fissure_trigger_with(2, |scenario| {
+        scenario
+            .add_spell_to_hand_from_oracle(P0, name, true, text)
+            .with_mana_cost(ManaCost::generic(0))
+            .id()
+    });
+    fissure
+        .runner
+        .cast(spell)
+        .target_object(fissure.entry)
+        .commit();
+    pass_until(&mut fissure.runner, |state| {
+        matches!(
+            state.waiting_for,
+            WaitingFor::OptionalEffectChoice { .. } | WaitingFor::RetargetChoice { .. }
+        )
+    });
+    // Deflecting Swat's "You may choose new targets" asks first.
+    if matches!(
+        fissure.runner.state().waiting_for,
+        WaitingFor::OptionalEffectChoice { .. }
+    ) {
+        fissure
+            .runner
+            .act(GameAction::DecideOptionalEffect { accept: true })
+            .expect("choose new targets");
+    }
+    assert!(matches!(
+        fissure.runner.state().waiting_for,
+        WaitingFor::RetargetChoice { .. }
+    ));
+    (fissure, spell)
+}
+
+/// Reconstruct the release projection, which addressed the held creature as
+/// well as the declared land, without modifying the live targeted ability.
+fn release_fissure_prompt(state: &mut GameState, entry: ObjectId) {
+    let ability = state
+        .stack
+        .iter()
+        .find(|e| e.id == entry)
+        .unwrap()
+        .ability()
+        .unwrap();
+    let held = ability.targets.clone();
+    assert_eq!(held.len(), 2, "release fixture holds creature and land");
+    if let WaitingFor::RetargetChoice {
+        current_targets,
+        slots,
+        slot_pools,
+        keep_is_distinct,
+        legal_new_targets,
+        ..
+    } = &mut state.waiting_for
+    {
+        *current_targets = held.clone();
+        *slots = (0..held.len())
+            .map(|slot| engine::types::game_state::RetargetSlotAddress { path: vec![], slot })
+            .collect();
+        *slot_pools = vec![legal_new_targets.clone(); held.len()];
+        *keep_is_distinct = vec![false; held.len()];
+    } else {
+        panic!("parked prompt");
+    }
+}
+
+fn restore_retarget_state(state: &GameState, trusted: bool) -> GameState {
+    let envelope = if trusted {
+        PersistedGameState::capture(state.clone())
+    } else {
+        PersistedGameState::Raw(Box::new(state.clone()))
+    };
+    let value = serde_json::to_value(envelope).expect("save");
+    serde_json::from_value::<PersistedGameState>(value)
+        .expect("decode")
+        .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+        .expect("admit")
+        .finalize_after_rehydration(|_| Ok(()))
+        .expect("restore")
+}
+
+#[test]
+fn restored_release_retarget_rebuilds_land_slots_for_keep_and_replace() {
+    for trusted in [false, true] {
+        for replace in [false, true] {
+            let (mut fissure, swat) = fissure_retarget_prompt(RetargetScope::All);
+            let pre = fissure.runner.state().stack[0].ability().unwrap().clone();
+            release_fissure_prompt(fissure.runner.state_mut(), fissure.entry);
+            let restored = restore_retarget_state(fissure.runner.state(), trusted);
+            let WaitingFor::RetargetChoice {
+                current_targets,
+                slots,
+                slot_pools,
+                keep_is_distinct,
+                legal_new_targets,
+                ..
+            } = &restored.waiting_for
+            else {
+                panic!("rebuilt prompt");
+            };
+            assert_eq!(
+                current_targets,
+                &vec![TargetRef::Object(fissure.swamps[0])],
+                "restore discards held creature address"
+            );
+            assert_eq!(slots.len(), 1);
+            assert_eq!(slot_pools.len(), 1);
+            assert_eq!(keep_is_distinct, &vec![false]);
+            assert!(!legal_new_targets.contains(&TargetRef::Object(fissure.bear)));
+            assert_eq!(
+                serde_json::to_value(restored.stack[0].ability().unwrap()).expect("ability"),
+                serde_json::to_value(&pre).expect("ability"),
+                "restore never elects targets"
+            );
+            let mut runner = GameRunner::from_state(restored);
+            runner
+                .act(GameAction::RetargetSpell {
+                    new_targets: vec![replace.then_some(TargetRef::Object(fissure.swamps[1]))],
+                })
+                .expect("answer rebuilt prompt");
+            assert_eq!(
+                runner.state().objects[&swat].zone,
+                Zone::Graveyard,
+                "owning spell finishes"
+            );
+            runner.advance_until_stack_empty();
+            assert_earthbend_finished(&runner, fissure.swamps[usize::from(replace)]);
+            assert!(
+                !runner.state().objects[&fissure.swamps[usize::from(!replace)]]
+                    .card_types
+                    .core_types
+                    .contains(&engine::types::card_type::CoreType::Creature)
+            );
+        }
+    }
+}
+
+#[test]
+fn restored_retarget_without_declared_targets_completes_owning_spell() {
+    for trusted in [false, true] {
+        let (mut fissure, swat) = fissure_retarget_prompt(RetargetScope::All);
+        // Hostile save: the live entry no longer declares a target. Leave its
+        // effect and held values intact; restore must retire Swat without
+        // electing a target on this entry.
+        fissure.runner.state_mut().stack[0]
+            .ability_mut()
+            .unwrap()
+            .chosen_target_slots = ChosenTargetSlots::Recorded(vec![]);
+        let restored = restore_retarget_state(fissure.runner.state(), trusted);
+        assert!(
+            matches!(restored.waiting_for, WaitingFor::Priority { .. }),
+            "no zero-position prompt"
+        );
+        assert_eq!(
+            restored.objects[&swat].zone,
+            Zone::Graveyard,
+            "parked owning continuation delivered"
+        );
+        // Completion must be settled before publishing the restored state;
+        // a second restore must not discover an unfinished resolution carrier.
+        let restored = restore_retarget_state(&restored, trusted);
+        assert_eq!(restored.objects[&swat].zone, Zone::Graveyard);
+        assert!(matches!(restored.waiting_for, WaitingFor::Priority { .. }));
+        let mut runner = GameRunner::from_state(restored);
+        runner.advance_until_stack_empty();
+        assert!(runner.state().stack.is_empty());
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+    }
+}
+
+#[test]
+fn restored_single_retarget_without_an_alternative_completes_owning_spell() {
+    for trusted in [false, true] {
+        let (mut fissure, bend) = fissure_retarget_prompt(RetargetScope::Single);
+        let mut events = Vec::new();
+        engine::game::zones::move_to_zone(
+            fissure.runner.state_mut(),
+            fissure.swamps[1],
+            Zone::Exile,
+            &mut events,
+        );
+        let restored = restore_retarget_state(fissure.runner.state(), trusted);
+        assert!(
+            matches!(restored.waiting_for, WaitingFor::Priority { .. }),
+            "no answer means unchanged completion"
+        );
+        assert_eq!(restored.objects[&bend].zone, Zone::Graveyard);
+        let restored = restore_retarget_state(&restored, trusted);
+        assert_eq!(restored.objects[&bend].zone, Zone::Graveyard);
+        assert!(matches!(restored.waiting_for, WaitingFor::Priority { .. }));
+        let mut runner = GameRunner::from_state(restored);
+        runner.advance_until_stack_empty();
+        assert_earthbend_finished(&runner, fissure.swamps[0]);
+    }
+}
+
+#[test]
+fn single_retarget_outer_empty_pools_still_requires_a_change() {
+    let (mut fissure, _) = fissure_retarget_prompt(RetargetScope::Single);
+    if let WaitingFor::RetargetChoice {
+        slot_pools,
+        legal_new_targets,
+        ..
+    } = &mut fissure.runner.state_mut().waiting_for
+    {
+        slot_pools.clear();
+        *legal_new_targets = fissure
+            .swamps
+            .iter()
+            .map(|id| TargetRef::Object(*id))
+            .collect();
+    }
+    assert!(fissure
+        .runner
+        .act(GameAction::RetargetSpell {
+            new_targets: vec![Some(TargetRef::Object(fissure.swamps[0]))]
+        })
+        .is_err());
+    let mut empty_inner = GameRunner::from_state(fissure.runner.state().clone());
+    if let WaitingFor::RetargetChoice { slot_pools, .. } = &mut empty_inner.state_mut().waiting_for
+    {
+        *slot_pools = vec![vec![]];
+    }
+    assert!(
+        empty_inner
+            .act(GameAction::RetargetSpell {
+                new_targets: vec![Some(TargetRef::Object(fissure.swamps[1]))]
+            })
+            .is_err(),
+        "empty inner never falls back"
+    );
+    fissure
+        .runner
+        .act(GameAction::RetargetSpell {
+            new_targets: vec![Some(TargetRef::Object(fissure.swamps[1]))],
+        })
+        .expect("different legal land");
+    fissure.runner.advance_until_stack_empty();
+    assert_earthbend_finished(&fissure.runner, fissure.swamps[1]);
+}
+
+#[test]
+fn single_retarget_offers_the_returned_incarnation_of_its_target() {
+    let (mut fissure, _) = fissure_retarget_prompt(RetargetScope::Single);
+    let land = fissure.swamps[0];
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(fissure.runner.state_mut(), land, Zone::Exile, &mut events);
+    engine::game::zones::move_to_zone(
+        fissure.runner.state_mut(),
+        land,
+        Zone::Battlefield,
+        &mut events,
+    );
+    let restored = restore_retarget_state(fissure.runner.state(), true);
+    let WaitingFor::RetargetChoice {
+        slot_pools,
+        keep_is_distinct,
+        ..
+    } = &restored.waiting_for
+    else {
+        panic!("returned land is a change");
+    };
+    assert!(
+        slot_pools[0].contains(&TargetRef::Object(land)),
+        "CR 400.7: returned incarnation is offered"
+    );
+    assert_eq!(keep_is_distinct, &vec![true]);
+    let mut runner = GameRunner::from_state(restored);
+    runner
+        .act(GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(land)),
+        })
+        .expect("returned incarnation changes the target");
+    runner.advance_until_stack_empty();
+    assert_earthbend_finished(&runner, land);
+}
+
+#[test]
+fn all_retarget_still_allows_keeping_an_illegal_target() {
+    let (mut fissure, _) = fissure_retarget_prompt(RetargetScope::All);
+    let land = fissure.swamps[0];
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(fissure.runner.state_mut(), land, Zone::Exile, &mut events);
+    let restored = restore_retarget_state(fissure.runner.state(), true);
+    assert!(matches!(
+        restored.waiting_for,
+        WaitingFor::RetargetChoice { .. }
+    ));
+    let mut runner = GameRunner::from_state(restored);
+    runner
+        .act(GameAction::RetargetSpell {
+            new_targets: vec![None],
+        })
+        .expect("CR 115.7d: illegal target may be kept");
+    runner.advance_until_stack_empty();
+    assert!(runner.state().stack.is_empty());
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { .. }
+    ));
+    assert_eq!(runner.state().objects[&land].zone, Zone::Exile);
+    assert!(!runner.state().objects[&fissure.swamps[1]]
+        .card_types
+        .core_types
+        .contains(&engine::types::card_type::CoreType::Creature));
 }
 
 const GIFT_OF_IMMORTALITY: &str = "Enchant creature\nWhen enchanted creature dies, return that card to the battlefield under its owner's control. Return this card to the battlefield attached to that creature at the beginning of the next end step.";
