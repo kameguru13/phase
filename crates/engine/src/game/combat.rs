@@ -1073,6 +1073,53 @@ fn record_block_history(
     state.creature_blocked_attackers_this_turn.insert(pair);
 }
 
+/// CR 509.4: entering blocking never counts as having blocked. Repair saves
+/// written before entering blockers stopped contributing to declaration history.
+/// Receipts identify the blocker incarnation but only the attacker's storage id.
+/// Consequently a later genuine declaration of the same pair is also removed:
+/// the persisted representation cannot distinguish those contributions.
+pub(crate) fn migrate_restored_entering_block_history(state: &mut GameState) {
+    use crate::types::resolved_commands::ResolvedRulesCommand;
+
+    let entering: HashSet<_> = state
+        .resolved_rules_journal
+        .entries()
+        .iter()
+        .filter_map(|entry| {
+            let Some(ResolvedRulesCommand::CombatMembership(command)) = entry.command.as_ref()
+            else {
+                return None;
+            };
+            match command.edit {
+                ResolvedCombatMembershipEdit::Block {
+                    resulting_attacker, ..
+                } => Some((command.object, resulting_attacker)),
+                ResolvedCombatMembershipEdit::Attack { .. }
+                | ResolvedCombatMembershipEdit::MarkBlocked
+                | ResolvedCombatMembershipEdit::Remove { .. }
+                | ResolvedCombatMembershipEdit::RetireAttacked { .. } => None,
+            }
+        })
+        .collect();
+    let keep =
+        |pair: &BlockHistoryPair| !entering.contains(&(pair.blocker, pair.attacker.object_id));
+    state.creature_blocked_attackers_this_turn.retain(keep);
+    if let Some(combat) = state.combat.as_mut() {
+        combat.creature_blocked_attackers_this_combat.retain(keep);
+    }
+    state.creatures_blocked_this_turn.retain(|id| {
+        let entering_live = state.objects.get(id).is_some_and(|object| {
+            let live = ObjectIncarnationRef::from_object(object);
+            entering.iter().any(|(blocker, _)| *blocker == live)
+        });
+        !entering_live
+            || state
+                .creature_blocked_attackers_this_turn
+                .iter()
+                .any(|pair| pair.blocker.object_id == *id)
+    });
+}
+
 /// CR 509.1g + CR 400.7: every current block pairing `object_id` is in, in both
 /// orientations (as the blocker, and as an attacker some blocker is blocking),
 /// each side pinned to its live incarnation; sorted and deduplicated. Empty

@@ -1,7 +1,8 @@
 //! Look-back block history bound to an earlier instruction's target, and the
 //! referent an instruction leaves for the next one when it emits no event naming it.
 //!
-//! Every card is built from its verbatim Oracle text and driven through production
+//! Except for the explicitly labelled synthetic mass-untap discriminator, every
+//! card is built from its verbatim Oracle text and driven through production
 //! actions (`cast`, `activate`, `DeclareAttackers`, `DeclareBlockers`,
 //! `PassPriority`, `OrderTriggers`, `ChooseTarget`, `DecideOptionalEffect`,
 //! `RetargetSpell`). Creatures are textless unless a row names a card. A row that
@@ -16,7 +17,7 @@
 //!   toughness." after an instruction that leaves no event naming its target
 //!   (CR 608.2c).
 
-use engine::game::combat::AttackTarget;
+use engine::game::combat::{AttackTarget, BlockHistoryPair};
 use engine::game::keywords::has_keyword;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
@@ -26,7 +27,9 @@ use engine::types::ability::{
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
-use engine::types::game_state::{GameState, WaitingFor};
+use engine::types::game_state::{
+    GameState, PersistedGameState, PersistedRestoreFinalization, WaitingFor,
+};
 use engine::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaColor, ManaCost, ManaType, ManaUnit};
@@ -47,6 +50,7 @@ const EPHEMERATE: &str =
     "Exile target creature you control, then return it to the battlefield under its owner's control.";
 const REDIRECT: &str = "You may choose new targets for target spell.";
 const MIRROR_MATCH: &str = "Cast this spell only during the declare blockers step.\nFor each creature attacking you or a planeswalker you control, create a token that's a copy of that creature and that's blocking that creature. Exile those tokens at end of combat.";
+const ICY: &str = "{1}, {T}: Tap target artifact, creature, or land.";
 const FULL_THROTTLE: &str = "After this main phase, there are two additional combat phases.\nAt the beginning of each combat this turn, untap all creatures that attacked this turn.";
 const PALACE_GUARD: &str = "This creature can block any number of creatures.";
 
@@ -970,6 +974,307 @@ fn ride_down_on_a_token_put_onto_the_battlefield_blocking_grants_nothing() {
     assert_eq!(life(&runner, P1), p1_before);
 }
 
+fn restore_block_history(state: &GameState, trusted: bool) -> GameState {
+    let envelope = if trusted {
+        PersistedGameState::capture(state.clone())
+    } else {
+        PersistedGameState::Raw(Box::new(state.clone()))
+    };
+    let value = serde_json::to_value(envelope).expect("save");
+    serde_json::from_value::<PersistedGameState>(value)
+        .expect("decode")
+        .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+        .expect("admit")
+        .finalize_after_rehydration(|_| Ok(()))
+        .expect("restore")
+}
+
+fn history_pair(state: &GameState, blocker: ObjectId, attacker: ObjectId) -> BlockHistoryPair {
+    let reference = |id| ObjectIncarnationRef::of(id, state.objects[&id].incarnation);
+    BlockHistoryPair {
+        blocker: reference(blocker),
+        attacker: reference(attacker),
+    }
+}
+
+/// Reconstruct only the release writer's erroneous history contributions;
+/// Mirror Match itself produces the receipt and live blocking assignments.
+#[test]
+fn release_entering_block_history_is_repaired_for_raw_and_trusted_saves() {
+    for trusted in [false, true] {
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        let a = s.add_creature(P0, "Attacker", 0, 6).id();
+        let b = s.add_creature(P1, "Declared blocker", 0, 6).id();
+        let mirror = free_spell(&mut s, P1, "Mirror Match", MIRROR_MATCH);
+        let barrage = free_spell(
+            &mut s,
+            P0,
+            "Sizzling Barrage",
+            "Sizzling Barrage deals 4 damage to target creature that blocked this turn.",
+        );
+        let mut runner = s.build();
+        attack_block(&mut runner, &[a], &[(b, a)]);
+        pass_priority_to(&mut runner, P1);
+        runner.cast(mirror).resolve();
+        drain(&mut runner);
+        let token = mirror_token(&runner, a);
+        let declared = history_pair(runner.state(), b, a);
+        let entrant = history_pair(runner.state(), token, a);
+        let clean = restore_block_history(runner.state(), trusted);
+        assert_eq!(
+            clean.creature_blocked_attackers_this_turn,
+            runner.state().creature_blocked_attackers_this_turn,
+            "a clean current save preserves declarations"
+        );
+        let mut legacy = runner.state().clone();
+        legacy.creature_blocked_attackers_this_turn.insert(entrant);
+        legacy
+            .combat
+            .as_mut()
+            .unwrap()
+            .creature_blocked_attackers_this_combat
+            .insert(entrant);
+        legacy.creatures_blocked_this_turn.insert(token);
+        let restored = restore_block_history(&legacy, trusted);
+        assert_eq!(
+            restored.creature_blocked_attackers_this_turn,
+            clean.creature_blocked_attackers_this_turn,
+            "release entrant removed from the turn window"
+        );
+        assert!(restored
+            .creature_blocked_attackers_this_turn
+            .contains(&declared));
+        let combat = restored.combat.as_ref().unwrap();
+        assert!(!combat
+            .creature_blocked_attackers_this_combat
+            .contains(&entrant));
+        assert!(combat
+            .creature_blocked_attackers_this_combat
+            .contains(&declared));
+        assert!(!restored.creatures_blocked_this_turn.contains(&token));
+        assert!(restored.creatures_blocked_this_turn.contains(&b));
+        let before = legacy.combat.as_ref().unwrap();
+        assert_eq!(combat.blocker_assignments, before.blocker_assignments);
+        assert_eq!(combat.blocker_to_attacker, before.blocker_to_attacker);
+        assert_eq!(combat.attackers, before.attackers);
+        assert_eq!(
+            restored.resolved_rules_journal,
+            legacy.resolved_rules_journal
+        );
+        let repeated = restore_block_history(&restored, trusted);
+        assert_eq!(
+            repeated.creature_blocked_attackers_this_turn,
+            restored.creature_blocked_attackers_this_turn
+        );
+        assert_eq!(
+            repeated.creatures_blocked_this_turn,
+            restored.creatures_blocked_this_turn
+        );
+        assert_eq!(
+            repeated
+                .combat
+                .as_ref()
+                .unwrap()
+                .creature_blocked_attackers_this_combat,
+            combat.creature_blocked_attackers_this_combat
+        );
+        let mut runner = GameRunner::from_state(repeated);
+        if !matches!(runner.state().waiting_for, WaitingFor::Priority { player } if player == P0) {
+            pass_priority_to(&mut runner, P0);
+        }
+        let card_id = runner.state().objects[&barrage].card_id;
+        runner
+            .act(GameAction::CastSpell {
+                object_id: barrage,
+                card_id,
+                targets: vec![],
+                payment_mode: Default::default(),
+            })
+            .expect("cast Barrage");
+        // CR 509.4: the entrant never blocked, so the declared blocker is
+        // Barrage's only legal target and the engine announces it without a
+        // prompt. A repaired entrant would be a second candidate and open one.
+        assert!(
+            !matches!(
+                runner.state().waiting_for,
+                WaitingFor::TargetSelection { .. }
+            ),
+            "only the declared blocker is a legal target: {:?}",
+            runner.state().waiting_for
+        );
+        let announced = runner
+            .state()
+            .stack
+            .iter()
+            .find(|entry| entry.id == barrage)
+            .and_then(|entry| entry.ability())
+            .map(|ability| ability.targets.clone())
+            .expect("Barrage is on the stack");
+        assert_eq!(announced, vec![TargetRef::Object(b)]);
+        drain(&mut runner);
+        assert_eq!(
+            runner.state().objects[&b].damage_marked,
+            4,
+            "Barrage resolved on the declared blocker"
+        );
+    }
+}
+
+/// Keep Mirror Match's token past end of combat using the printed Stifle,
+/// then actually declare it as a blocker in Full Throttle's second combat.
+/// Different-attacker contributions survive; the identical pair documents the
+/// deliberately lossy compatibility contract, even for a current-format save.
+fn check_restored_entering_receipt(same_attacker: bool, check_returned_incarnation: bool) {
+    for trusted in [false, true] {
+        let mut s = GameScenario::new();
+        s.at_phase(Phase::PreCombatMain);
+        let a = s.add_creature(P0, "First attacker", 0, 6).id();
+        let a2 = s.add_creature(P0, "Second attacker", 0, 6).id();
+        let mirror = free_spell(&mut s, P1, "Mirror Match", MIRROR_MATCH);
+        let throttle = s
+            .add_spell_to_hand_from_oracle(P0, "Full Throttle", false, FULL_THROTTLE)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let stifle = free_spell(
+            &mut s,
+            P0,
+            "Stifle",
+            "Counter target activated or triggered ability. (Mana abilities can't be targeted.)",
+        );
+        let mut runner = s.build();
+        runner.cast(throttle).resolve();
+        drain(&mut runner);
+        // P1 controls no creature yet, so no block declaration is offered.
+        runner.advance_to_combat();
+        attack(&mut runner, &[a]);
+        pass_until(&mut runner, "declare blockers priority", |s| {
+            s.phase == Phase::DeclareBlockers
+                && matches!(s.waiting_for, WaitingFor::Priority { player } if player == P0)
+        });
+        pass_priority_to(&mut runner, P1);
+        runner.cast(mirror).resolve();
+        drain(&mut runner);
+        let token = mirror_token(&runner, a);
+        let entered_pair = history_pair(runner.state(), token, a);
+        pass_until(&mut runner, "Mirror Match exile trigger", |state| {
+            state.phase == Phase::EndCombat
+                && !state.stack.is_empty()
+                && matches!(state.waiting_for, WaitingFor::Priority { player } if player == P0)
+        });
+        let exile = runner.state().stack.back().expect("exile trigger").id;
+        runner.cast(stifle).target_objects(&[exile]).resolve();
+        drain(&mut runner);
+        assert_eq!(
+            zone(&runner, token),
+            Zone::Battlefield,
+            "Stifle preserved the entrant"
+        );
+        pass_until(&mut runner, "second combat", |state| {
+            matches!(state.waiting_for, WaitingFor::DeclareAttackers { .. })
+        });
+        let next = if same_attacker { a } else { a2 };
+        attack(&mut runner, &[next]);
+        to_block_prompt(&mut runner);
+        block(&mut runner, &[(token, next)]);
+        let declared_pair = history_pair(runner.state(), token, next);
+        assert!(
+            runner
+                .state()
+                .creature_blocked_attackers_this_turn
+                .contains(&declared_pair),
+            "reach: a genuine second-combat declaration"
+        );
+        let mut saved = runner.state().clone();
+        if !same_attacker {
+            // Release contribution from combat one; combat two must be
+            // repaired independently rather than copied from the turn set.
+            saved
+                .creature_blocked_attackers_this_turn
+                .insert(entered_pair);
+        }
+        let restored = restore_block_history(&saved, trusted);
+        assert!(!restored
+            .creature_blocked_attackers_this_turn
+            .contains(&entered_pair));
+        assert_eq!(
+            restored
+                .creature_blocked_attackers_this_turn
+                .contains(&declared_pair),
+            !same_attacker
+        );
+        assert_eq!(
+            restored
+                .combat
+                .as_ref()
+                .unwrap()
+                .creature_blocked_attackers_this_combat
+                .contains(&declared_pair),
+            !same_attacker
+        );
+        assert_eq!(
+            restored.creatures_blocked_this_turn.contains(&token),
+            !same_attacker
+        );
+        assert_eq!(
+            restored.combat.as_ref().unwrap().blocker_to_attacker,
+            saved.combat.as_ref().unwrap().blocker_to_attacker,
+            "live assignments survive even a collision"
+        );
+
+        if check_returned_incarnation {
+            // Persistence compatibility fixture: the old receipt must not
+            // erase a declaration by a later incarnation of the same id.
+            // Keep the attacker's id equal to the receipt's so only the
+            // blocker's incarnation distinguishes the surviving pair.
+            // Change only the live incarnation and its declaration keys;
+            // leave the original entering receipt intact.
+            let mut returned = saved.clone();
+            returned.objects.get_mut(&token).unwrap().incarnation += 1;
+            let new_pair = history_pair(&returned, token, next);
+            returned
+                .creature_blocked_attackers_this_turn
+                .remove(&declared_pair);
+            returned
+                .creature_blocked_attackers_this_turn
+                .insert(new_pair);
+            let combat = returned.combat.as_mut().unwrap();
+            combat
+                .creature_blocked_attackers_this_combat
+                .remove(&declared_pair);
+            combat
+                .creature_blocked_attackers_this_combat
+                .insert(new_pair);
+            let restored = restore_block_history(&returned, trusted);
+            assert!(restored
+                .creature_blocked_attackers_this_turn
+                .contains(&new_pair));
+            assert!(restored
+                .combat
+                .as_ref()
+                .unwrap()
+                .creature_blocked_attackers_this_combat
+                .contains(&new_pair));
+            assert!(restored.creatures_blocked_this_turn.contains(&token));
+        }
+    }
+}
+
+#[test]
+fn restored_entering_receipts_preserve_independent_declarations() {
+    check_restored_entering_receipt(false, false);
+}
+
+#[test]
+fn restored_entering_receipts_preserve_later_blocker_incarnations() {
+    check_restored_entering_receipt(true, true);
+}
+
+#[test]
+fn restored_entering_receipts_remove_later_same_pair_declarations() {
+    check_restored_entering_receipt(true, false);
+}
+
 /// CR 702.12b: an indestructible target survives, and Ride Down's grant still
 /// happens.
 #[test]
@@ -1219,9 +1524,10 @@ fn ferrets_restrict_already_tapped_and_untapped_blockers_next_untap() {
     let already = s.add_creature(P1, "Already tapped blocker", 0, 6).id();
     let untapped = s.add_creature(P1, "Untapped blocker", 0, 6).id();
     let other = s.add_creature(P1, "Nonmatching creature", 0, 6).id();
-    // Named apart from their text, which would otherwise read "Tap" as the card's name.
-    let tap = free_spell(&mut s, P0, "Frost Breath One", "Tap target creature.");
-    let tap_other = free_spell(&mut s, P0, "Frost Breath Two", "Tap target creature.");
+    let tap = s.add_artifact_from_oracle(P0, "Icy Manipulator", ICY).id();
+    let tap_other = s.add_artifact_from_oracle(P0, "Icy Manipulator", ICY).id();
+    let mana = s.add_basic_land(P0, ManaColor::Green);
+    let mana_other = s.add_basic_land(P0, ManaColor::Green);
     s.with_library_top(P0, &["Forest", "Forest", "Forest"]);
     s.with_library_top(P1, &["Forest", "Forest", "Forest"]);
     let mut runner = s.build();
@@ -1230,8 +1536,31 @@ fn ferrets_restrict_already_tapped_and_untapped_blockers_next_untap() {
         &[ferrets],
         &[(already, ferrets), (untapped, ferrets)],
     );
-    runner.cast(tap).target_objects(&[already]).resolve();
-    runner.cast(tap_other).target_objects(&[other]).resolve();
+    for source_id in [mana, mana_other] {
+        runner
+            .act(GameAction::ActivateAbility {
+                source_id,
+                ability_index: 0,
+                payment_mode: Default::default(),
+            })
+            .expect("produce mana in the declare blockers step");
+    }
+    assert_eq!(
+        runner
+            .state()
+            .players
+            .iter()
+            .find(|player| player.id == P0)
+            .unwrap()
+            .mana_pool
+            .total(),
+        2
+    );
+    runner.activate(tap, 0).target_objects(&[already]).resolve();
+    runner
+        .activate(tap_other, 0)
+        .target_objects(&[other])
+        .resolve();
     assert!(tapped(&runner, already));
     assert!(
         !tapped(&runner, untapped),
@@ -1282,28 +1611,52 @@ fn kill_switch_does_not_restrict_an_artifact_that_enters_after_the_tap() {
             "Shimmer Myr",
             2,
             2,
-            "You may cast artifact spells as though they had flash.",
+            "Flash\nYou may cast artifact spells as though they had flash.",
         )
         .as_artifact_creature()
-        .flash()
-        .with_mana_cost(ManaCost::zero())
+        .with_mana_cost(ManaCost::generic(3))
         .id();
-    let tap_before = free_spell(&mut s, P0, "Tap artifact", "Tap target artifact.");
-    // Named apart from its text, which would otherwise read "Tap" as the card's name.
-    let tap = free_spell(&mut s, P0, "Frost Breath", "Tap target creature.");
+    let tap_before = s.add_artifact_from_oracle(P0, "Icy Manipulator", ICY).id();
+    let late_tap = s
+        .add_artifact_to_hand_from_oracle(P1, "Icy Manipulator", ICY)
+        .with_mana_cost(ManaCost::generic(4))
+        .id();
     s.with_mana_pool(
         P0,
-        vec![ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]); 2],
+        vec![ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]); 3],
+    );
+    s.with_mana_pool(
+        P1,
+        vec![ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]); 8],
     );
     s.with_library_top(P0, &["Forest", "Forest", "Forest"]);
     s.with_library_top(P1, &["Forest", "Forest", "Forest"]);
     let mut runner = s.build();
-    runner.cast(tap_before).target_objects(&[already]).resolve();
+    runner
+        .activate(tap_before, 0)
+        .target_objects(&[already])
+        .resolve();
     assert!(
         tapped(&runner, already),
         "reach: an artifact was already tapped"
     );
     runner.activate(switch, 0).resolve();
+    assert!(
+        tapped(&runner, tap_before),
+        "the mass tap includes the setup Manipulator"
+    );
+    assert_eq!(
+        runner
+            .state()
+            .players
+            .iter()
+            .find(|player| player.id == P0)
+            .unwrap()
+            .mana_pool
+            .total(),
+        0,
+        "all three setup mana were spent"
+    );
     assert!(
         tapped(&runner, switch),
         "reach: the activation cost was paid"
@@ -1317,8 +1670,35 @@ fn kill_switch_does_not_restrict_an_artifact_that_enters_after_the_tap() {
         Zone::Battlefield,
         "reach: the later artifact entered"
     );
-    runner.cast(tap).target_objects(&[late]).resolve();
+    pass_priority_to(&mut runner, P1);
+    runner.cast(late_tap).resolve();
+    assert_eq!(
+        zone(&runner, late_tap),
+        Zone::Battlefield,
+        "Myr grants flash to the artifact"
+    );
+    pass_priority_to(&mut runner, P1);
+    runner
+        .activate(late_tap, 0)
+        .target_objects(&[late])
+        .resolve();
     assert!(tapped(&runner, late), "reach: the later artifact is tapped");
+    assert!(
+        tapped(&runner, late_tap),
+        "the late activation paid its tap cost"
+    );
+    assert_eq!(
+        runner
+            .state()
+            .players
+            .iter()
+            .find(|player| player.id == P1)
+            .unwrap()
+            .mana_pool
+            .total(),
+        0,
+        "all eight late-route mana were spent"
+    );
     pass_until(
         &mut runner,
         "artifacts' controller's next upkeep",
@@ -1334,6 +1714,10 @@ fn kill_switch_does_not_restrict_an_artifact_that_enters_after_the_tap() {
         "the newly-tapped selected artifact stays tapped"
     );
     assert!(!tapped(&runner, late), "the later artifact untaps normally");
+    assert!(
+        !tapped(&runner, late_tap),
+        "the later Manipulator untaps normally"
+    );
 }
 
 /// CR 608.2c + CR 122.1d: "They" names the creatures the mass untap selected
@@ -1349,6 +1733,10 @@ fn mass_untap_they_keeps_a_member_that_lost_its_only_stun_counter() {
     let plain = s.add_creature(P0, "Plain creature", 2, 2).id();
     s.with_counter(stunned, CounterType::Stun, 1);
     s.with_counter(countered, CounterType::Plus1Plus1, 1);
+    // Synthetic discriminator, based on Flying Crane Technique: "Untap all
+    // creatures you control. They gain flying and double strike until end of turn."
+    // The counter filter is necessary: without it, rescanning after the untap
+    // selects the same creatures and cannot distinguish a frozen selection.
     let spell = free_spell(
         &mut s,
         P0,

@@ -17348,14 +17348,16 @@ impl PersistedGameState {
         // the repair — a legacy save restored through either one would
         // otherwise present an optional or search-found prompt as an ordering.
         state.migrate_restored_replacement_choice_kind();
+        crate::game::combat::migrate_restored_entering_block_history(&mut state);
         // The recovery checkpoint nested in a staged payment is restored state
-        // too; its parked replacement prompt gets the same repair.
+        // too; its parked replacement prompt and block history get the same repairs.
         if let Some(checkpoint) = state
             .payment_transaction
             .as_deref_mut()
             .and_then(|transaction| transaction.recovered.as_deref_mut())
         {
             checkpoint.state.migrate_restored_replacement_choice_kind();
+            crate::game::combat::migrate_restored_entering_block_history(&mut checkpoint.state);
         }
         // `pending_trigger_event_batch` is a construction carrier for the
         // corresponding `pending_trigger`. A historical save can retain the
