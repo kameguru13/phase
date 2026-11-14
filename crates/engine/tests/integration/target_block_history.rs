@@ -980,13 +980,66 @@ fn restore_block_history(state: &GameState, trusted: bool) -> GameState {
     } else {
         PersistedGameState::Raw(Box::new(state.clone()))
     };
-    let value = serde_json::to_value(envelope).expect("save");
-    serde_json::from_value::<PersistedGameState>(value)
-        .expect("decode")
+    let mut value = serde_json::to_value(envelope).expect("save");
+    if trusted {
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("block_history_format");
+    }
+    let decoded = serde_json::from_value::<PersistedGameState>(value).expect("decode");
+    let resaved = serde_json::to_value(decoded).expect("resave before migration");
+    assert!(resaved.get("block_history_format").is_none());
+    serde_json::from_value::<PersistedGameState>(resaved)
+        .expect("decode legacy resave")
         .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
         .expect("admit")
         .finalize_after_rehydration(|_| Ok(()))
         .expect("restore")
+}
+
+#[test]
+fn block_history_persistence_marker_is_validated_and_legacy_is_not_upgraded_on_decode() {
+    let state = GameScenario::new().build().state().clone();
+    let current = serde_json::to_value(PersistedGameState::capture(state.clone())).unwrap();
+    assert_eq!(current["block_history_format"], 1);
+    assert!(serde_json::to_value(&state)
+        .unwrap()
+        .get("block_history_format")
+        .is_none());
+    let mut legacy = current.clone();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("block_history_format");
+    let decoded: PersistedGameState = serde_json::from_value(legacy).unwrap();
+    assert!(serde_json::to_value(&decoded)
+        .unwrap()
+        .get("block_history_format")
+        .is_none());
+    let restored = decoded
+        .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+        .unwrap()
+        .finalize_after_rehydration(|_| Ok(()))
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(PersistedGameState::capture(restored)).unwrap()
+            ["block_history_format"],
+        1
+    );
+    for malformed in [
+        serde_json::json!(null),
+        serde_json::json!(0),
+        serde_json::json!(2),
+        serde_json::json!("1"),
+        serde_json::json!(true),
+        serde_json::json!({}),
+        serde_json::json!(1.0),
+    ] {
+        let mut invalid = current.clone();
+        invalid["block_history_format"] = malformed;
+        assert!(serde_json::from_value::<PersistedGameState>(invalid).is_err());
+    }
 }
 
 fn history_pair(state: &GameState, blocker: ObjectId, attacker: ObjectId) -> BlockHistoryPair {
@@ -1123,8 +1176,8 @@ fn release_entering_block_history_is_repaired_for_raw_and_trusted_saves() {
 
 /// Keep Mirror Match's token past end of combat using the printed Stifle,
 /// then actually declare it as a blocker in Full Throttle's second combat.
-/// Different-attacker contributions survive; the identical pair documents the
-/// deliberately lossy compatibility contract, even for a current-format save.
+/// Different-attacker contributions survive. Current trusted saves preserve the
+/// identical pair too; only legacy saves retain the lossy compatibility contract.
 fn check_restored_entering_receipt(same_attacker: bool, check_returned_incarnation: bool) {
     for trusted in [false, true] {
         let mut s = GameScenario::new();
@@ -1141,6 +1194,12 @@ fn check_restored_entering_receipt(same_attacker: bool, check_returned_incarnati
             P0,
             "Stifle",
             "Counter target activated or triggered ability. (Mana abilities can't be targeted.)",
+        );
+        let barrage = free_spell(
+            &mut s,
+            P0,
+            "Sizzling Barrage",
+            "Sizzling Barrage deals 4 damage to target creature that blocked this turn.",
         );
         let mut runner = s.build();
         runner.cast(throttle).resolve();
@@ -1185,6 +1244,43 @@ fn check_restored_entering_receipt(same_attacker: bool, check_returned_incarnati
                 .contains(&declared_pair),
             "reach: a genuine second-combat declaration"
         );
+        if same_attacker {
+            let current = serde_json::to_value(PersistedGameState::capture(runner.state().clone()))
+                .expect("capture current");
+            assert_eq!(current["block_history_format"], 1);
+            let restored = serde_json::from_value::<PersistedGameState>(current)
+                .expect("decode current")
+                .prepare_for_restore(PersistedRestoreFinalization::DeferUntilRehydrated)
+                .expect("admit current")
+                .finalize_after_rehydration(|_| Ok(()))
+                .expect("restore current");
+            assert!(restored
+                .creature_blocked_attackers_this_turn
+                .contains(&declared_pair));
+            assert!(restored
+                .combat
+                .as_ref()
+                .unwrap()
+                .creature_blocked_attackers_this_combat
+                .contains(&declared_pair));
+            assert!(restored.creatures_blocked_this_turn.contains(&token));
+            let mut current_runner = GameRunner::from_state(restored);
+            if !matches!(current_runner.state().waiting_for, WaitingFor::Priority { player } if player == P0)
+            {
+                pass_priority_to(&mut current_runner, P0);
+            }
+            current_runner
+                .cast(barrage)
+                .target_objects(&[token])
+                .resolve();
+            drain(&mut current_runner);
+            assert_eq!(current_runner.state().objects[&token].damage_marked, 4);
+            assert!(current_runner.state().stack.is_empty());
+            assert!(matches!(
+                current_runner.state().waiting_for,
+                WaitingFor::Priority { .. }
+            ));
+        }
         let mut saved = runner.state().clone();
         if !same_attacker {
             // Release contribution from combat one; combat two must be
@@ -1271,7 +1367,7 @@ fn restored_entering_receipts_preserve_later_blocker_incarnations() {
 }
 
 #[test]
-fn restored_entering_receipts_remove_later_same_pair_declarations() {
+fn current_saves_preserve_same_pair_declarations_while_legacy_saves_lose_them() {
     check_restored_entering_receipt(true, false);
 }
 

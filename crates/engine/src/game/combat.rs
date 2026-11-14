@@ -1074,10 +1074,11 @@ fn record_block_history(
 }
 
 /// CR 509.4: entering blocking never counts as having blocked. Repair saves
-/// written before entering blockers stopped contributing to declaration history.
+/// in the legacy release/pre-marker format, before declaration history was versioned.
 /// Receipts identify the blocker incarnation but only the attacker's storage id.
-/// Consequently a later genuine declaration of the same pair is also removed:
-/// the persisted representation cannot distinguish those contributions.
+/// Consequently a later genuine declaration of the same pair is also removed
+/// from legacy saves: that representation cannot distinguish those contributions.
+/// Current trusted saves bypass this repair and preserve genuine declarations.
 pub(crate) fn migrate_restored_entering_block_history(state: &mut GameState) {
     use crate::types::resolved_commands::ResolvedRulesCommand;
 
