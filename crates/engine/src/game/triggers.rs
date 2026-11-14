@@ -9555,7 +9555,7 @@ pub(crate) fn park_observer_triggers_if_paused(
     // CR 601.2h + CR 602.2b + CR 603.3: under a live announcement these events
     // wait in its carrier; only the span it does not own is parked here.
     let owned = super::announcement_triggers::take_inline_trigger_span(state, events, slice_start);
-    collect_unclaimed_ordinary_observers(state, &events[..owned.end], slice_start);
+    collect_unclaimed_ordinary_observers(state, &events[..owned.end], slice_start, |_| true);
 }
 
 /// CR 603.2c + CR 603.3b: the paused-exit collector. An action that ends at a
@@ -9568,7 +9568,18 @@ pub(crate) fn collect_paused_exit_triggers(
     events: &[GameEvent],
     event_start: usize,
 ) {
-    collect_unclaimed_ordinary_observers(state, events, event_start);
+    collect_paused_exit_triggers_matching(state, events, event_start, |_| true);
+}
+
+/// CR 603.2c: collect only the occurrences selected by an exit's owner, keeping
+/// their full-buffer positions so a later scan honors the same claims.
+pub(crate) fn collect_paused_exit_triggers_matching(
+    state: &mut GameState,
+    events: &[GameEvent],
+    event_start: usize,
+    matches: impl Fn(&GameEvent) -> bool,
+) {
+    collect_unclaimed_ordinary_observers(state, events, event_start, &matches);
     let retained = paused_exit_retained_events(state);
     let mut delayed = unclaimed_trigger_events_from(
         events,
@@ -9576,7 +9587,7 @@ pub(crate) fn collect_paused_exit_triggers(
         TriggerCollectionRequester::Delayed,
         &state.consumed_before_priority_trigger_events,
     );
-    delayed.retain(|event| !retained.contains(event));
+    delayed.retain(|event| matches(event) && !retained.contains(event));
     collect_unclaimed_delayed_triggers_into_deferred(state, events, &delayed);
 }
 
@@ -9598,6 +9609,7 @@ fn collect_unclaimed_ordinary_observers(
     state: &mut GameState,
     events: &[GameEvent],
     event_start: usize,
+    matches: impl Fn(&GameEvent) -> bool,
 ) {
     let retained = paused_exit_retained_events(state);
     let mut zone_change_witnesses: Vec<GameEvent> = state
@@ -9614,6 +9626,9 @@ fn collect_unclaimed_ordinary_observers(
         &state.consumed_before_priority_trigger_events,
     );
     ordinary.retain(|event| {
+        if !matches(event) {
+            return false;
+        }
         // CR 707.10: `copy_spell` collects `SpellCopied` observers at
         // announcement and drains them after CopyRetarget finalization.
         if matches!(
