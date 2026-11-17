@@ -16,14 +16,10 @@
 //! when a simultaneous batch opens (CR 510.2, CR 608.2f), and every portion of the batch meets that
 //! reading.
 //!
-//! A rider's pause inside a combat damage batch is settled before the batch moves on, at the
-//! per-portion drain and at the aggregate drain after it (CR 510.2). Combat damage can't pause for
-//! a player's answer yet (Command Zone #140), so the engine answers in the player's place: an
-//! order the rider's event meets takes its first candidate (CR 616.1, CR 616.1f), a "may" on it is
-//! declined, and the rider's own choice is cleared. None of these is the player's answer, so those
-//! rows are strict failures, not readings of the cards. A card whose own replacement asks such a
-//! choice reports unsupported (`ResolverFeature:structural:damage_replacement_choice_unasked_in_combat`).
-//! The last section holds those rows; the Ironscale Hydra rows are in
+//! A rider's pause inside a combat damage batch is asked of the player it belongs to, at the
+//! per-portion drain and at the aggregate drain after the batch's damage (CR 615.5, CR 616.1,
+//! CR 608.2d), and the answer completes the batch in the same action: CR 510.2 rules out a priority
+//! window, not the choice. The last section holds those rows; the Ironscale Hydra rows are in
 //! `ironscale_hydra_combat_prevention`.
 
 use engine::game::combat::AttackTarget;
@@ -1607,6 +1603,105 @@ fn the_batch_reading_survives_serialization_at_the_pause() {
     assert_eq!(prevented(&events), 2);
 }
 
+/// CR 608.2f + CR 700.1: a combat batch that parks keeps the guard reading it opened with, in
+/// memory and through a save and load at the second prompt. Undergrowth Champion with no counter
+/// attacks and two Grizzly Bears block it; it assigns its 2 to the first (CR 510.1c). P0 cast
+/// Temper at X = 1 ("Prevent the next X damage that would be dealt to target creature this turn.
+/// For each 1 damage prevented this way, put a +1/+1 counter on that creature.") at the Champion,
+/// and controls two Hardened Scales and Doubling Season.
+///
+/// The batch opens with the Champion's guard ("while it has a +1/+1 counter on it") false, so its
+/// shield applies to none of the 4 damage (its ruling: "its prevention effect will apply once to
+/// all that damage"). Temper prevents 1, and its counter meets the three effects: P0 orders them,
+/// two prompts (CR 616.1, CR 616.1f). Hardened Scales twice gives ((1+1)+1)×2 = 6; Hardened
+/// Scales then Doubling Season (1+1)×2+1 = 5. The Bears' other 3 is dealt to the Champion even
+/// though it has counters by then, because the batch read the guard before they were put.
+#[test]
+fn undergrowth_champion_keeps_its_batch_reading_across_a_combat_park() {
+    for round_trip in [false, true] {
+        for (second_scales, expected) in [(true, 6), (false, 5)] {
+            let mut scenario = main_phase();
+            let champion = undergrowth_champion(&mut scenario, P0, 0);
+            let first_bear = scenario.add_creature(P1, "Grizzly Bears", 2, 2).id();
+            let second_bear = scenario.add_creature(P1, "Grizzly Bears", 2, 2).id();
+            let scales_a = scenario
+                .add_enchantment_from_oracle(P0, "Hardened Scales", HARDENED_SCALES)
+                .id();
+            let scales_b = scenario
+                .add_enchantment_from_oracle(P0, "Hardened Scales", HARDENED_SCALES)
+                .id();
+            let season = scenario
+                .add_enchantment_from_oracle(P0, "Doubling Season", DOUBLING_SEASON)
+                .id();
+            let temper = super::damage_substitution_replacements::temper(&mut scenario);
+            let mut runner = scenario.build();
+            super::damage_substitution_replacements::cast_temper_at_one(
+                &mut runner,
+                temper,
+                champion,
+            );
+            let mut answer = preferring(vec![
+                scales_a,
+                if second_scales { scales_b } else { season },
+            ]);
+            let mut asked = 0;
+
+            let combat = fight_driving(
+                &mut runner,
+                &[champion],
+                &[(first_bear, champion), (second_bear, champion)],
+                |runner| {
+                    asked += 1;
+                    if round_trip && asked == 2 {
+                        // The second prompt is answered on a reloaded game: the parked record
+                        // carries the batch's reading.
+                        assert!(runner
+                            .state()
+                            .pending_combat_lifelink
+                            .as_ref()
+                            .is_some_and(|record| record.replacement.is_some()));
+                        let json =
+                            serde_json::to_string(runner.state()).expect("serialize at the pause");
+                        *runner.state_mut() =
+                            serde_json::from_str::<GameState>(&json).expect("deserialize");
+                    }
+                    answer(runner.state())
+                },
+            );
+
+            let label = format!("round trip {round_trip}, second Scales {second_scales}");
+            assert_batch_settled(&runner);
+            assert_eq!(combat.prompts.len(), 2, "{label}: {:?}", combat.prompts);
+            assert_eq!(combat.choosers, vec![P0, P0], "{label}");
+            assert_eq!(
+                offered(&combat.prompts[0]),
+                offered(&[scales_a, scales_b, season]),
+                "{label}"
+            );
+            assert!(
+                combat
+                    .prompts
+                    .iter()
+                    .all(|prompt| !prompt.contains(&champion)),
+                "{label}: the Champion's shield is never offered"
+            );
+            // Reach guard: Temper applied, and its counters made the live guard true.
+            assert_eq!(prevented(&combat.events), 1, "{label}");
+            assert_eq!(plus_counters(&runner, champion), expected, "{label}");
+            assert_eq!(
+                runner.state().objects[&champion].damage_marked,
+                3,
+                "{label}"
+            );
+            assert_eq!(
+                runner.state().objects[&champion].zone,
+                Zone::Battlefield,
+                "{label}"
+            );
+        }
+    }
+}
+
 /// CR 608.2f: one dealer's two damage clauses in one sentence are one action. Chandra's Outrage:
 /// "deals 4 damage to target creature and 2 damage to that creature's controller." Pariah brings
 /// the second clause's damage to the Champion, and its one counter covers both.
@@ -2216,7 +2311,7 @@ fn a_cast_outfitted_jouster_is_shielded_by_its_conjured_equipment() {
 }
 
 // ---------------------------------------------------------------------------
-// Rider pauses inside a combat batch (CR 510.2, CR 616.1; Command Zone #140)
+// Rider pauses inside a combat batch, asked (CR 510.2, CR 616.1)
 // ---------------------------------------------------------------------------
 
 const HARDENED_SCALES: &str = "If one or more +1/+1 counters would be put on a creature you control, that many plus one +1/+1 counters are put on it instead.";
@@ -2328,10 +2423,11 @@ pub(super) fn faithmender_and_leyline(scenario: &mut GameScenario) -> ObjectId {
 }
 
 /// What one combat showed: its events, and the candidate sources of each CR 616.1 prompt it
-/// answered.
+/// answered, with the player each was asked of.
 pub(super) struct Combat {
     pub(super) events: Vec<GameEvent>,
     pub(super) prompts: Vec<Vec<ObjectId>>,
+    pub(super) choosers: Vec<PlayerId>,
 }
 
 /// Drive one combat from the precombat main phase to the end of combat: P0 attacks P1 with
@@ -2367,9 +2463,26 @@ pub(super) fn fight_answering(
     blocks: &[(ObjectId, ObjectId)],
     mut answer: impl FnMut(&GameState) -> GameAction,
 ) -> Combat {
+    fight_driving(runner, attackers, blocks, |runner| answer(runner.state()))
+}
+
+/// [`fight_answering`], with `answer` given the runner itself, so a row can inspect or replace
+/// the state at a prompt (a save and load) before it answers.
+///
+/// CR 510.2 + CR 615.5: every prompt the combat raises is answered inside the batch, and the
+/// answer finishes it: an answer that leaves a priority window must leave no combat damage batch
+/// parked, since no player gets priority between combat damage being assigned and dealt, and the
+/// prevention's additional effects happen with it.
+pub(super) fn fight_driving(
+    runner: &mut GameRunner,
+    attackers: &[ObjectId],
+    blocks: &[(ObjectId, ObjectId)],
+    mut answer: impl FnMut(&mut GameRunner) -> GameAction,
+) -> Combat {
     let mut combat = Combat {
         events: Vec::new(),
         prompts: Vec::new(),
+        choosers: Vec::new(),
     };
     let (mut attacked, mut blocked) = (false, false);
     for _ in 0..400 {
@@ -2379,11 +2492,11 @@ pub(super) fn fight_answering(
         {
             return combat;
         }
-        let action = match &state.waiting_for {
-            WaitingFor::Priority { .. } => GameAction::PassPriority,
-            WaitingFor::OrderTriggers { triggers, .. } => GameAction::OrderTriggers {
+        let turn_action = match &state.waiting_for {
+            WaitingFor::Priority { .. } => Some(GameAction::PassPriority),
+            WaitingFor::OrderTriggers { triggers, .. } => Some(GameAction::OrderTriggers {
                 order: (0..triggers.len()).collect(),
-            },
+            }),
             WaitingFor::DeclareAttackers { .. } => {
                 let attacks = if attacked {
                     Vec::new()
@@ -2394,15 +2507,15 @@ pub(super) fn fight_answering(
                         .collect()
                 };
                 attacked = true;
-                GameAction::DeclareAttackers {
+                Some(GameAction::DeclareAttackers {
                     attacks,
                     bands: vec![],
-                }
+                })
             }
             WaitingFor::DeclareBlockers { .. } => {
                 let assignments = if blocked { Vec::new() } else { blocks.to_vec() };
                 blocked = true;
-                GameAction::DeclareBlockers { assignments }
+                Some(GameAction::DeclareBlockers { assignments })
             }
             WaitingFor::AssignCombatDamage {
                 blockers,
@@ -2424,25 +2537,36 @@ pub(super) fn fight_answering(
                 if let Some(last) = assignments.last_mut() {
                     last.1 += remaining;
                 }
-                GameAction::AssignCombatDamage {
+                Some(GameAction::AssignCombatDamage {
                     mode: CombatDamageAssignmentMode::Normal,
                     assignments,
                     trample_damage: 0,
                     controller_damage: 0,
-                }
+                })
             }
-            WaitingFor::ReplacementChoice { candidates, .. } => {
+            WaitingFor::ReplacementChoice {
+                player, candidates, ..
+            } => {
                 combat
                     .prompts
                     .push(candidates.iter().map(|c| c.source_id).collect());
-                answer(state)
+                combat.choosers.push(*player);
+                None
             }
             // Any other prompt the combat raises (a zone choice, a named choice) is `answer`'s.
-            _ => answer(state),
+            _ => None,
         };
+        let answered = turn_action.is_none();
+        let action = turn_action.unwrap_or_else(|| answer(runner));
         combat
             .events
             .extend(runner.act(action).expect("combat action").events);
+        if answered && matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
+            assert!(
+                runner.state().pending_combat_lifelink.is_none(),
+                "CR 510.2 + CR 615.5: a parked combat batch outlived its answer"
+            );
+        }
     }
     panic!("combat did not end");
 }
@@ -2564,56 +2688,61 @@ fn phytohydras_counter_order_is_asked_inside_the_batch() {
     }
 }
 
-/// CR 616.1 at the aggregate drain. Gatta and Luzzu: "If damage would be dealt to that creature
-/// this turn, prevent that damage and put that many +1/+1 counters on it." Its chosen Grizzly
-/// Bears, blocked by a 2/2 under its controller's Hardened Scales and Doubling Season.
+/// CR 616.1 at the aggregate drain, asked. Gatta and Luzzu: "If damage would be dealt to that
+/// creature this turn, prevent that damage and put that many +1/+1 counters on it." Its chosen
+/// Grizzly Bears is blocked by an Eager Cadet (1/1): 1 damage is prevented, and its one counter
+/// meets P0's Hardened Scales and Doubling Season, an order P0 chooses after the batch's damage
+/// (CR 615.5, CR 616.1; Hardened Scales' ruling: "you choose the order to apply those effects").
+/// Hardened Scales first (1+1)×2 = 4, Doubling Season first 1×2+1 = 3. Without them 1 counter and
+/// no prompt. The answer finishes the batch, and the state-based actions after it run (Lightning
+/// Bolt kills a 3/3).
 #[test]
-fn gatta_and_luzzus_counter_order_is_settled_after_the_batch() {
-    for scales in [true, false] {
+fn gatta_and_luzzus_counter_order_is_asked_after_the_batch() {
+    for (scales, scales_first, expected) in [(true, true, 4), (true, false, 3), (false, true, 1)] {
         let mut scenario = rider_board();
         let bears = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
-        let blocker = scenario.add_creature(P1, "Grizzly Bears", 2, 2).id();
+        let cadet = scenario.add_creature(P1, "Eager Cadet", 1, 1).id();
         let courser = scenario.add_creature(P1, "Centaur Courser", 3, 3).id();
         let gatta = gatta_and_luzzu(&mut scenario);
-        if scales {
-            scales_and_season(&mut scenario, P0);
-        }
+        let counter_sources = scales.then(|| scales_and_season(&mut scenario, P0));
         let bolt = spell(&mut scenario, "Lightning Bolt", BOLT, true);
         let mut runner = scenario.build();
         cast(&mut runner, gatta, vec![TargetRef::Object(bears)]);
+        let prefer = counter_sources
+            .map(|(scales, season)| vec![if scales_first { scales } else { season }])
+            .unwrap_or_default();
 
-        let combat = fight(&mut runner, &[bears], &[(blocker, bears)], None);
+        let combat = fight_answering(&mut runner, &[bears], &[(cadet, bears)], preferring(prefer));
 
         assert_batch_settled(&runner);
-        assert!(combat.prompts.is_empty());
-        assert_eq!(prevented(&combat.events), 1);
-        assert_eq!(runner.state().objects[&bears].damage_marked, 0);
-        assert_eq!(runner.state().objects[&blocker].zone, Zone::Graveyard);
-        let counters = plus_counters(&runner, bears);
-        if scales {
-            // strict-failure: the card reads one event of 2 counters, 5 or 6 by its controller's
-            // order (CR 616.1, CR 616.1f; Hardened Scales' ruling: "you choose the order to apply
-            // those effects"). "Put that many +1/+1 counters on it" parses as one counter repeated
-            // per damage (Command Zone #174, with Brace for Impact, Temper and Test of Faith), so
-            // each counter meets its own order, 3 or 4, and combat can't ask it (Command Zone
-            // #140): the engine takes the first candidate each time, not P0's pick.
-            assert!([6, 7, 8].contains(&counters), "got {counters} counters");
-        } else {
-            assert_eq!(counters, 2);
+        match counter_sources {
+            Some((scales, season)) => {
+                assert_eq!(combat.prompts.len(), 1, "prompts: {:?}", combat.prompts);
+                assert_eq!(combat.choosers, vec![P0]);
+                assert_eq!(offered(&combat.prompts[0]), offered(&[scales, season]));
+            }
+            None => assert!(combat.prompts.is_empty()),
         }
+        assert_eq!(prevented(&combat.events), 1);
+        assert_eq!(plus_counters(&runner, bears), expected);
+        assert_eq!(runner.state().objects[&bears].damage_marked, 0);
+        assert_eq!(runner.state().objects[&cadet].zone, Zone::Graveyard);
 
         bolt_at(&mut runner, bolt, courser);
         assert_eq!(runner.state().objects[&courser].zone, Zone::Graveyard);
     }
 }
 
-/// A lifelink gain answered in combat, then Gatta and Luzzu's rider at the aggregate drain. Child
-/// of Night is the chosen creature; P0's Rhox Faithmender and Leyline of Hope meet the lifelink
-/// gain (CR 702.15b), and P0 answers Rhox Faithmender first: 2 doubled, plus 1. That is the one
-/// prompt: the rider's counter order is settled inside the batch.
+/// A lifelink answer in combat, then Gatta and Luzzu's rider at the aggregate drain. Child of
+/// Night is the chosen creature, blocked by an Eager Cadet (1/1). P0's Rhox Faithmender and
+/// Leyline of Hope meet the lifelink gain of 2 (CR 702.15b), and P0 answers Rhox Faithmender
+/// first: 2×2+1 = 5. The Cadet's 1 is prevented, and its one counter meets P0's Hardened Scales
+/// and Doubling Season, a second order P0 is asked (CR 616.1): Hardened Scales first 4, Doubling
+/// Season first 3. Without them 1 counter, and the gain's order is the one prompt. The gain is
+/// asked first: the batch's gains come before its prevention riders.
 #[test]
 fn a_lifelink_answer_then_gatta_and_luzzus_rider() {
-    for scales in [true, false] {
+    for (scales, scales_first, expected) in [(true, true, 4), (true, false, 3), (false, true, 1)] {
         let mut scenario = rider_board();
         let child = creature_with_keywords(
             &mut scenario,
@@ -2624,49 +2753,55 @@ fn a_lifelink_answer_then_gatta_and_luzzus_rider() {
             CHILD_OF_NIGHT,
         );
         let rhox = faithmender_and_leyline(&mut scenario);
-        if scales {
-            scales_and_season(&mut scenario, P0);
-        }
-        let blocker = scenario.add_creature(P1, "Grizzly Bears", 2, 2).id();
+        let counter_sources = scales.then(|| scales_and_season(&mut scenario, P0));
+        let cadet = scenario.add_creature(P1, "Eager Cadet", 1, 1).id();
         let courser = scenario.add_creature(P1, "Centaur Courser", 3, 3).id();
         let gatta = gatta_and_luzzu(&mut scenario);
         let bolt = spell(&mut scenario, "Lightning Bolt", BOLT, true);
         let mut runner = scenario.build();
         cast(&mut runner, gatta, vec![TargetRef::Object(child)]);
         let life_before = life(&runner, P0);
+        let mut prefer = vec![rhox];
+        if let Some((scales, season)) = counter_sources {
+            prefer.push(if scales_first { scales } else { season });
+        }
 
-        let combat = fight(&mut runner, &[child], &[(blocker, child)], Some(rhox));
+        let combat = fight_answering(&mut runner, &[child], &[(cadet, child)], preferring(prefer));
 
         assert_batch_settled(&runner);
-        assert_eq!(combat.prompts.len(), 1, "prompts: {:?}", combat.prompts);
         assert!(combat.prompts[0].contains(&rhox));
+        match counter_sources {
+            Some((scales, season)) => {
+                assert_eq!(combat.prompts.len(), 2, "prompts: {:?}", combat.prompts);
+                assert_eq!(offered(&combat.prompts[1]), offered(&[scales, season]));
+                assert_eq!(combat.choosers, vec![P0, P0]);
+            }
+            None => {
+                assert_eq!(combat.prompts.len(), 1, "prompts: {:?}", combat.prompts);
+                assert_eq!(combat.choosers, vec![P0]);
+            }
+        }
         assert_eq!(life(&runner, P0) - life_before, 5);
         assert_eq!(prevented(&combat.events), 1);
+        assert_eq!(plus_counters(&runner, child), expected);
         assert_eq!(runner.state().objects[&child].damage_marked, 0);
-        assert_eq!(runner.state().objects[&blocker].zone, Zone::Graveyard);
-        let counters = plus_counters(&runner, child);
-        if scales {
-            // strict-failure: the card reads one event of 2 counters, 5 or 6 by its controller's
-            // order (CR 616.1, CR 616.1f; Hardened Scales' ruling); the per-counter parse (Command
-            // Zone #174) gives each counter its own order, 3 or 4, which the engine answers with the
-            // first candidate, not P0's pick (Command Zone #140).
-            assert!([6, 7, 8].contains(&counters), "got {counters} counters");
-        } else {
-            assert_eq!(counters, 2);
-        }
+        assert_eq!(runner.state().objects[&cadet].zone, Zone::Graveyard);
 
         bolt_at(&mut runner, bolt, courser);
         assert_eq!(runner.state().objects[&courser].zone, Zone::Graveyard);
     }
 }
 
-/// The rider's own prompt at the aggregate drain. Channel Harm: "If damage is prevented this way,
-/// you may have Channel Harm deal that much damage to target creature." Blocked, the Hill Giant's
-/// 3 to the Bears is prevented and P0 may have Channel Harm deal 3 to the Giant. Unblocked, nothing
-/// is prevented and P1 takes 2. The card reports unsupported for the unasked "may".
+/// The rider's own prompt at the aggregate drain, asked. Channel Harm: "If damage is prevented
+/// this way, you may have Channel Harm deal that much damage to target creature." Blocked, the
+/// Hill Giant's 3 to the Bears is prevented, and after the batch's damage P0 chooses whether
+/// Channel Harm deals that 3 to the Giant (CR 615.5, CR 608.2d). Accepting, the Giant is dealt the
+/// 3, which is not combat damage (Channel Harm's ruling: "The new damage is not combat damage, even
+/// if the prevented damage was."), on top of the Bears' 2, and dies; declining, it keeps the
+/// Bears' 2. Unblocked, nothing is prevented, nothing is asked, and P1 takes 2.
 #[test]
-fn channel_harms_may_is_settled_after_the_batch() {
-    for block in [true, false] {
+fn channel_harms_may_is_asked_after_the_batch() {
+    for (block, accept) in [(true, false), (false, true), (true, true)] {
         let mut scenario = rider_board();
         let bears = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
         let giant = scenario.add_creature(P1, "Hill Giant", 3, 3).id();
@@ -2676,24 +2811,54 @@ fn channel_harms_may_is_settled_after_the_batch() {
         let mut runner = scenario.build();
         cast(&mut runner, channel_harm, vec![TargetRef::Object(giant)]);
         let blocks = if block { vec![(giant, bears)] } else { vec![] };
+        let mut asked = Vec::new();
 
-        let combat = fight(&mut runner, &[bears], &blocks, None);
+        let combat = fight_answering(&mut runner, &[bears], &blocks, |state| {
+            match &state.waiting_for {
+                WaitingFor::OptionalEffectChoice { player, .. } => {
+                    asked.push(*player);
+                    GameAction::DecideOptionalEffect { accept }
+                }
+                other => panic!("an unexpected prompt: {other:?}"),
+            }
+        });
 
-        // strict-failure: CR 608.2d: whether Channel Harm deals the 3 is P0's choice, and combat
-        // can't ask it yet (Command Zone #140). The engine clears the "may" unasked, so the Hill
-        // Giant is never dealt the 3; that is not P0's answer.
         assert_batch_settled(&runner);
         assert!(combat.prompts.is_empty());
         assert_eq!(runner.state().objects[&bears].zone, Zone::Battlefield);
         assert_eq!(runner.state().objects[&bears].damage_marked, 0);
-        if block {
-            assert_eq!(prevented(&combat.events), 1);
-            assert_eq!(runner.state().objects[&giant].damage_marked, 2);
-            assert_eq!(life(&runner, P1), 20);
-        } else {
+        let harm_damage: Vec<(u32, bool)> = combat
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                GameEvent::DamageDealt {
+                    source_id,
+                    amount,
+                    is_combat,
+                    ..
+                } if *source_id == channel_harm => Some((*amount, *is_combat)),
+                _ => None,
+            })
+            .collect();
+        if !block {
+            assert!(asked.is_empty());
             assert_eq!(prevented(&combat.events), 0);
+            assert!(harm_damage.is_empty());
             assert_eq!(runner.state().objects[&giant].damage_marked, 0);
             assert_eq!(life(&runner, P1), 18);
+        } else {
+            // Reach guard: the Giant's 3 was prevented, and P0 was asked once.
+            assert_eq!(prevented(&combat.events), 1);
+            assert_eq!(asked, vec![P0]);
+            assert_eq!(life(&runner, P1), 20);
+            if accept {
+                assert_eq!(harm_damage, vec![(3, false)]);
+                assert_eq!(runner.state().objects[&giant].zone, Zone::Graveyard);
+            } else {
+                assert!(harm_damage.is_empty());
+                assert_eq!(runner.state().objects[&giant].zone, Zone::Battlefield);
+                assert_eq!(runner.state().objects[&giant].damage_marked, 2);
+            }
         }
 
         bolt_at(&mut runner, bolt, p1_bears);
@@ -2731,15 +2896,30 @@ fn cards_drawn(events: &[GameEvent], player: PlayerId) -> usize {
         .count()
 }
 
-/// Both drains pause in one batch. Swans of Bryn Argoll blocks one of P0's Grizzly Bears: "The
-/// source's controller draws cards equal to the damage prevented this way", each draw meeting
-/// P0's Abundance, whose "may" the combat batch asks P0 (CR 616.1): two draws, two prompts.
+/// A prompt a combat answers in [`a_may_park_and_a_riders_own_prompt_are_both_asked`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Asked {
+    /// Abundance's "may" on one draw (a `ReplacementChoice`).
+    Abundance(PlayerId),
+    /// Channel Harm's "you may have Channel Harm deal that much damage".
+    ChannelHarm(PlayerId),
+}
+
+/// Both drains ask in one batch. Swans of Bryn Argoll blocks one of P0's Grizzly Bears: "The
+/// source's controller draws cards equal to the damage prevented this way", each draw meeting P0's
+/// Abundance, whose "may" P0 is asked at the per-portion drain (CR 616.1): two draws, two prompts.
 /// Declining both draws 2 cards; accepting both and choosing nonland puts the two nonland cards
-/// revealed into P0's hand instead, with no draw. P0's Channel Harm, cast at the Hill Giant
-/// blocking the other Bears, prevents the blockers' damage and asks its "may" after the batch.
+/// revealed into P0's hand instead, with no draw. P0's Channel Harm, cast at the Hill Giant blocking
+/// the other Bears, prevents both blockers' damage, 3 and 4, and after the batch's damage asks P0
+/// whether it deals that 7 to the Giant (CR 615.5, CR 608.2d): accepted, the Giant is dealt 7, not
+/// combat damage, and dies; declined, it keeps the Bears' 2.
 #[test]
-fn a_may_park_and_a_riders_own_prompt_asks_abundance_and_settles_channel_harm() {
-    for (abundance, accept) in [(true, false), (true, true), (false, false)] {
+fn a_may_park_and_a_riders_own_prompt_are_both_asked() {
+    for (abundance, accept_abundance, accept_harm) in [
+        (true, true, false),
+        (true, false, true),
+        (false, false, true),
+    ] {
         let mut scenario = rider_board();
         let first = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
         let second = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
@@ -2754,27 +2934,63 @@ fn a_may_park_and_a_riders_own_prompt_asks_abundance_and_settles_channel_harm() 
         let mut runner = scenario.build();
         cast(&mut runner, channel_harm, vec![TargetRef::Object(giant)]);
         let hand_before = hand_size(&runner, P0);
+        let mut asked = Vec::new();
+        let mut abundance_answer = answering_abundance(accept_abundance);
 
         let combat = fight_answering(
             &mut runner,
             &[first, second],
             &[(giant, first), (swans, second)],
-            answering_abundance(accept),
+            |state| match &state.waiting_for {
+                WaitingFor::OptionalEffectChoice { player, .. } => {
+                    asked.push(Asked::ChannelHarm(*player));
+                    GameAction::DecideOptionalEffect {
+                        accept: accept_harm,
+                    }
+                }
+                WaitingFor::ReplacementChoice { player, .. } => {
+                    asked.push(Asked::Abundance(*player));
+                    abundance_answer(state)
+                }
+                _ => abundance_answer(state),
+            },
         );
 
         assert_batch_settled(&runner);
-        assert_eq!(combat.prompts.len(), if abundance { 2 } else { 0 });
+        let mut expected_asks = Vec::new();
+        if abundance {
+            expected_asks.extend([Asked::Abundance(P0), Asked::Abundance(P0)]);
+        }
+        expected_asks.push(Asked::ChannelHarm(P0));
+        assert_eq!(asked, expected_asks);
         assert_eq!(prevented(&combat.events), 2);
         // CR 121.2: the Swans' 2 is two draws, so 2 cards either way.
         assert_eq!(hand_size(&runner, P0) - hand_before, 2);
         assert_eq!(
             cards_drawn(&combat.events, P0),
-            if abundance && accept { 0 } else { 2 }
+            if abundance && accept_abundance { 0 } else { 2 }
         );
-        // strict-failure: CR 510.2 + CR 616.1: Channel Harm's "you may have Channel Harm deal
-        // that much damage" is P0's to answer, and the aggregate drain can't ask it yet (Command
-        // Zone #140); it is cleared unasked, so the Giant takes only the Bears' 2.
-        assert_eq!(runner.state().objects[&giant].damage_marked, 2);
+        let harm_damage: Vec<(u32, bool)> = combat
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                GameEvent::DamageDealt {
+                    source_id,
+                    amount,
+                    is_combat,
+                    ..
+                } if *source_id == channel_harm => Some((*amount, *is_combat)),
+                _ => None,
+            })
+            .collect();
+        if accept_harm {
+            assert_eq!(harm_damage, vec![(7, false)]);
+            assert_eq!(runner.state().objects[&giant].zone, Zone::Graveyard);
+        } else {
+            assert!(harm_damage.is_empty());
+            assert_eq!(runner.state().objects[&giant].zone, Zone::Battlefield);
+            assert_eq!(runner.state().objects[&giant].damage_marked, 2);
+        }
         for bears in [first, second] {
             assert_eq!(runner.state().objects[&bears].zone, Zone::Battlefield);
             assert_eq!(runner.state().objects[&bears].damage_marked, 0);
@@ -2876,12 +3092,21 @@ fn double_strike_asks_abundance_for_the_swans_draw_in_each_damage_step() {
     }
 }
 
-/// A "may" park at the aggregate drain. P1's New Way Forward: "When damage is prevented this way,
-/// New Way Forward deals that much damage to that source's controller and you draw that many
-/// cards." Its chosen source is P0's unblocked Grizzly Bears, and P1's draws meet P1's Abundance.
+/// A "may" park at the aggregate drain, asked. P1's New Way Forward: "When damage is prevented
+/// this way, New Way Forward deals that much damage to that source's controller and you draw that
+/// many cards." Its chosen source is P0's unblocked Grizzly Bears: the 2 is prevented, P0 is dealt
+/// 2, and P1 draws 2 (CR 121.2), each draw meeting P1's Abundance, whose "may" P1 is asked
+/// (CR 616.1). Declining both draws 2 cards; accepting both and choosing nonland puts 2 nonland
+/// cards into P1's hand with no draw. Without Abundance, 2 draws and no prompt.
+///
+/// strict-failure: "When damage is prevented this way, …" is a triggered ability (CR 603.2,
+/// CR 615.13), put on the stack the next time a player would receive priority, after the combat
+/// damage step's other triggers (CR 603.3, CR 510.3a). The engine runs it as a rider inside the
+/// combat damage batch instead. Who is asked, how many cards and how much damage are the card's;
+/// the timing is not.
 #[test]
-fn new_way_forwards_draws_are_kept_under_abundance() {
-    for abundance in [true, false] {
+fn new_way_forwards_draws_ask_abundance() {
+    for (abundance, accept) in [(true, false), (true, true), (false, false)] {
         let mut scenario = rider_board();
         let bears = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
         if abundance {
@@ -2928,16 +3153,23 @@ fn new_way_forwards_draws_are_kept_under_abundance() {
         let (p0_before, p1_before, hand_before) =
             (life(&runner, P0), life(&runner, P1), hand_size(&runner, P1));
 
-        let combat = fight(&mut runner, &[bears], &[], None);
+        let combat = fight_answering(&mut runner, &[bears], &[], answering_abundance(accept));
 
-        // strict-failure: CR 510.2 + CR 616.1: Abundance's "may" on each draw is P1's to answer,
-        // and combat can't ask it yet (Command Zone #140); each is declined, which keeps the
-        // draw. CR 121.2: "you draw that many cards" is 2 draws, so 2 cards.
         assert_batch_settled(&runner);
-        assert!(combat.prompts.is_empty());
+        if abundance {
+            assert_eq!(combat.prompts.len(), 2, "prompts: {:?}", combat.prompts);
+            assert_eq!(combat.choosers, vec![P1, P1]);
+        } else {
+            assert!(combat.prompts.is_empty());
+        }
+        // Reach guard: the Bears' 2 was prevented, and New Way Forward dealt it to P0 once.
         assert_eq!(life(&runner, P0) - p0_before, -2);
         assert_eq!(life(&runner, P1), p1_before);
         assert_eq!(hand_size(&runner, P1) - hand_before, 2);
+        assert_eq!(
+            cards_drawn(&combat.events, P1),
+            if abundance && accept { 0 } else { 2 }
+        );
 
         bolt_at(&mut runner, bolt, courser);
         assert_eq!(runner.state().objects[&courser].zone, Zone::Graveyard);
@@ -3278,6 +3510,204 @@ fn a_prevention_rider_that_ends_the_game_ends_the_batchs_riders() {
         "{:?}",
         &combat.events[over + 1..]
     );
+}
+
+/// Rhox Faithmender and Leyline of Hope under P1: a life gain of P1's meets both (CR 616.1).
+/// Returns (Rhox Faithmender, Leyline of Hope).
+fn p1_faithmender_and_leyline(scenario: &mut GameScenario) -> (ObjectId, ObjectId) {
+    let rhox = creature_with_keywords(
+        scenario,
+        P1,
+        "Rhox Faithmender",
+        (1, 5),
+        &["Lifelink"],
+        RHOX_FAITHMENDER,
+    );
+    let leyline = scenario
+        .add_enchantment_from_oracle(P1, "Leyline of Hope", LEYLINE_OF_HOPE)
+        .id();
+    (rhox, leyline)
+}
+
+/// P1 casts Awe Strike at `target` and it resolves.
+fn awe_strike_by_p1(runner: &mut GameRunner, awe_strike: ObjectId, target: ObjectId) {
+    let mut events = cast_by_p1(runner, awe_strike);
+    drive(runner, &mut vec![TargetRef::Object(target)], &mut events);
+    assert_settled(runner);
+}
+
+/// CR 615.5 + CR 616.1 at the aggregate drain, one shield at a time. P1 cast Awe Strike ("The next
+/// time target creature would deal damage this turn, prevent that damage. You gain life equal to
+/// the damage prevented this way.") at P0's Grizzly Bears, then a second at P0's Hill Giant; both
+/// attack P1 unblocked, and both are prevented. Each rider's life gain meets P1's Rhox Faithmender
+/// ("If you would gain life, you gain twice that much life instead.") and Leyline of Hope ("If you
+/// would gain life, you gain that much life plus 1 instead."), an order P1 chooses, so P1 is asked
+/// twice, once per shield, and the second shield's rider runs once, after the first one's answer.
+/// The shields fire in the order the engine keeps them, the order they were created; that order
+/// is not the cards' (both riders are P1's, and either order gives the same totals).
+///
+/// The Bears' 2: Rhox first 2×2+1 = 5, Leyline first (2+1)×2 = 6. The Giant's 3: Rhox first 7,
+/// Leyline first 8. P1 is at 20 at the first prompt, 25 or 26 at the second, and ends at 32, 33
+/// or 34. The batch is saved and loaded at each prompt: parked with the Giant's shield still to
+/// fire at the first, and with none at the second.
+#[test]
+fn two_aggregate_riders_are_asked_one_after_the_other() {
+    for (first_rhox, second_rhox, at_second, total) in [
+        (true, true, 25, 32),
+        (true, false, 25, 33),
+        (false, true, 26, 33),
+        (false, false, 26, 34),
+    ] {
+        let mut scenario = rider_board();
+        let bears = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+        let giant = scenario.add_creature(P0, "Hill Giant", 3, 3).id();
+        let (rhox, leyline) = p1_faithmender_and_leyline(&mut scenario);
+        let awe_strikes: Vec<ObjectId> = (0..2)
+            .map(|_| {
+                scenario
+                    .add_spell_to_hand_from_oracle(P1, "Awe Strike", true, AWE_STRIKE)
+                    .id()
+            })
+            .collect();
+        let mut runner = scenario.build();
+        awe_strike_by_p1(&mut runner, awe_strikes[0], bears);
+        awe_strike_by_p1(&mut runner, awe_strikes[1], giant);
+        let pick = |rhox_first: bool| if rhox_first { rhox } else { leyline };
+        let picks = [pick(first_rhox), pick(second_rhox)];
+        let mut life_at_prompts = Vec::new();
+
+        let combat = fight_driving(&mut runner, &[bears, giant], &[], |runner| {
+            let asked = life_at_prompts.len();
+            life_at_prompts.push(life(runner, P1));
+            // The batch is parked in its aggregate drain, after all its damage, and each shield
+            // leaves the record before its rider runs: at the first prompt the Giant's shield is
+            // still to fire, at the second none is. A save and load keeps the park.
+            let record = runner
+                .state()
+                .pending_combat_lifelink
+                .as_ref()
+                .expect("the batch is parked at a rider");
+            assert!(record.replacement.is_none());
+            assert_eq!(record.prevention_tally.len(), 1 - asked);
+            let json = serde_json::to_string(runner.state()).expect("serialize at the pause");
+            *runner.state_mut() = serde_json::from_str::<GameState>(&json).expect("deserialize");
+            preferring(vec![picks[asked]])(runner.state())
+        });
+
+        let label = format!("Rhox first: {first_rhox}, {second_rhox}");
+        assert_batch_settled(&runner);
+        assert_eq!(life_at_prompts, vec![20, at_second], "{label}");
+        assert_eq!(combat.choosers, vec![P1, P1], "{label}");
+        for prompt in &combat.prompts {
+            assert_eq!(offered(prompt), offered(&[rhox, leyline]), "{label}");
+        }
+        assert_eq!(life(&runner, P1), total, "{label}");
+        // Reach guard: both portions were prevented, and P1 was dealt no combat damage.
+        assert_eq!(prevented(&combat.events), 2, "{label}");
+        assert!(
+            damage_dealt_to_player(&combat.events, P1).is_empty(),
+            "{label}"
+        );
+    }
+}
+
+/// CR 800.4a: a player asked at the aggregate drain leaves the game, and the batch still finishes.
+/// Three players; P1 controls Rhox Faithmender and Leyline of Hope and cast Awe Strike at P0's
+/// Grizzly Bears, which attack P1 unblocked. The Bears' 2 is prevented, and Awe Strike's gain
+/// meets both, so P1 is asked the order after the batch's damage. P1 concedes there: P1 gains
+/// nothing, no further prompt is P1's, and the parked batch finishes for the players left.
+#[test]
+fn a_phase_d_rider_prompt_whose_player_leaves_lets_the_batch_finish() {
+    let p2 = PlayerId(2);
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    for player in [P0, P1, p2] {
+        for index in 0..8 {
+            scenario.add_spell_to_library_top(player, &format!("Library Filler {index}"), true);
+        }
+    }
+    let bears = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+    p1_faithmender_and_leyline(&mut scenario);
+    let awe_strike = scenario
+        .add_spell_to_hand_from_oracle(P1, "Awe Strike", true, AWE_STRIKE)
+        .id();
+    let mut runner = scenario.build();
+    awe_strike_by_p1(&mut runner, awe_strike, bears);
+
+    let mut events = Vec::new();
+    let mut attacked = false;
+    let mut asked = false;
+    for _ in 0..400 {
+        let state = runner.state();
+        let action = match &state.waiting_for {
+            WaitingFor::Priority { .. } => GameAction::PassPriority,
+            WaitingFor::OrderTriggers { triggers, .. } => GameAction::OrderTriggers {
+                order: (0..triggers.len()).collect(),
+            },
+            WaitingFor::DeclareAttackers { .. } => {
+                let attacks = if attacked {
+                    Vec::new()
+                } else {
+                    vec![(bears, AttackTarget::Player(P1))]
+                };
+                attacked = true;
+                GameAction::DeclareAttackers {
+                    attacks,
+                    bands: vec![],
+                }
+            }
+            WaitingFor::DeclareBlockers { .. } => GameAction::DeclareBlockers {
+                assignments: Vec::new(),
+            },
+            WaitingFor::ReplacementChoice { player, .. } => {
+                assert_eq!(*player, P1);
+                let record = state
+                    .pending_combat_lifelink
+                    .as_ref()
+                    .expect("the batch is parked at Awe Strike's rider");
+                assert!(record.replacement.is_none());
+                asked = true;
+                break;
+            }
+            other => panic!("combat stopped at {other:?}"),
+        };
+        events.extend(runner.act(action).expect("combat action").events);
+    }
+    assert!(asked, "P1 was asked the order of its gain");
+
+    events.extend(
+        runner
+            .act(GameAction::Concede { player_id: P1 })
+            .expect("P1 concedes")
+            .events,
+    );
+    for _ in 0..16 {
+        if runner.state().pending_combat_lifelink.is_none() {
+            break;
+        }
+        let action = match &runner.state().waiting_for {
+            WaitingFor::Priority { .. } => GameAction::PassPriority,
+            WaitingFor::OrderTriggers { triggers, .. } => GameAction::OrderTriggers {
+                order: (0..triggers.len()).collect(),
+            },
+            other => panic!("the departed player's batch stopped at {other:?}"),
+        };
+        events.extend(runner.act(action).expect("finish the batch").events);
+    }
+
+    let state = runner.state();
+    assert!(state.pending_combat_lifelink.is_none(), "the batch drained");
+    assert!(state
+        .combat
+        .as_ref()
+        .is_some_and(|combat| combat.regular_damage_done));
+    assert!(state.players[1].is_eliminated);
+    assert!(state.pending_replacement.is_none());
+    // The departed P1 gains nothing; the Bears' 2 was prevented.
+    assert_eq!(state.players[1].life, 20);
+    assert!(damage_dealt_to_player(&events, P1).is_empty());
+    assert_eq!(state.players[0].life, 20);
+    assert_eq!(state.players[2].life, 20);
 }
 
 /// P0 passes priority, and P1 casts `spell`; the caller answers its prompts.

@@ -1541,8 +1541,9 @@ const PREVENTION_SHIELD: &str =
 ///
 /// This covers the seam this change actually modified:
 /// `fire_combat_prevention_riders`' parameter became
-/// `&[(AppliedReplacementKey, i32)]` and its call site now reads
-/// `&record.prevention_tally` / `&mut record.batch_events` — i.e. the tally is
+/// `&mut Vec<(AppliedReplacementKey, i32)>`, popped one shield at a time, and its
+/// call site now reads `&mut record.prevention_tally` /
+/// `&mut record.batch_events` — i.e. the tally is
 /// carried across the park inside `PendingCombatLifelink` instead of living in
 /// two locals that never crossed a pause. A zero-damage fixture cannot reach it:
 /// nothing is prevented, so the tally is empty and Phase D has nothing to fire.

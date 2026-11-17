@@ -22677,7 +22677,9 @@ pub struct PendingCombatPhaseCRemnant {
 /// byte-identical to the un-paused one: per-source gains, then the per-player
 /// `CombatDamageDealtToPlayer` aggregate, then Phase D's prevention riders. Deferring Phase D
 /// rather than hoisting it makes it impossible for a rider's own continuation (CR 615.5) to run
-/// while the CR 616.1 prompt is open.
+/// while the CR 616.1 prompt is open. A Phase D rider that asks its player a choice (CR 608.2d:
+/// Channel Harm's "you may"; CR 616.1: the order its event meets) parks the record the same way,
+/// with the shields not yet fired still in `prevention_tally`.
 /// `Eq` is absent because the Phase C remnant holds `ProposedEvent`
 /// survivors (see `PendingCombatLeg`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -22704,7 +22706,9 @@ pub struct PendingCombatLifelink {
     /// CR 615.5 + CR 615.13: each shield's aggregate prevented amount, so the
     /// completion tail can fire every rider exactly once against the amount THIS
     /// batch prevented. A `Vec` rather than the producer's `HashMap`: an enum key
-    /// is not a JSON map key, and the record is serialized.
+    /// is not a JSON map key, and the record is serialized. Phase D takes each
+    /// shield out before its rider runs, so a record parked on a rider's prompt
+    /// holds only the shields still to fire, and the resume fires each once.
     pub prevention_tally: Vec<(AppliedReplacementKey, i32)>,
     /// CR 510.4: which sub-step owns this batch. Snapshotted because
     /// `combat.first_strike_done` mutates during the resume.
@@ -22747,6 +22751,13 @@ pub struct PendingCombatDamageReplacement {
     /// existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub one_shot_applications: Vec<(AppliedReplacementKey, ObjectId)>,
+    /// CR 608.2f + CR 700.1: what the printed "while" guards read when the
+    /// batch opened. Every portion of the batch meets that one reading,
+    /// including the portions proposed after the pause (Undergrowth Champion
+    /// ruling: "its prevention effect will apply once to all that damage").
+    /// Absent from saves written before it existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settled_guards: Vec<crate::types::ability::SettledDamageGuard>,
 }
 
 /// CR 616.1 + CR 616.1g + CR 101.4: where one proposed damage leg of a parked
@@ -32971,12 +32982,10 @@ pub(crate) struct DamageBatchLedger {
     /// A printed guard reads once for the whole batch (Undergrowth Champion ruling: "its
     /// prevention effect will apply once to all that damage").
     pub(crate) settled_guards: Vec<crate::types::ability::SettledDamageGuard>,
-    /// CR 615.5 + CR 608.2c: the frame of the first noncombat rider in this batch that left its
-    /// prompt standing. The batch's later riders queue behind it
-    /// (`replacement::damage_rider_placement`). In combat a settled leg's own continuation parks
-    /// the pass (`replacement::drain_combat_damage_continuation`), and only the in-leg
-    /// earlier-rider and aggregate drains settle their pauses (`drain_combat_damage_rider`), so
-    /// it is never set there.
+    /// CR 615.5 + CR 608.2c: the frame of the first rider in this batch that left its prompt
+    /// standing (`replacement::drain_damage_rider`). The batch's later riders queue behind it
+    /// (`replacement::damage_rider_placement`). In combat the leg it paused in parks on it
+    /// (`replacement::settle_combat_damage_replacement`).
     pub(crate) paused_rider: Option<PostReplacementFrameId>,
     /// CR 614.6 + CR 615.5 + CR 616.1: `Some` while a two-phase noncombat batch is settling its
     /// original replacement choices. A damage replacement's action or rider is held here

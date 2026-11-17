@@ -12220,6 +12220,9 @@ fn apply_non_priority_pass_action(
     // `PendingCast` exists.
     let answers_a_cast_step = state.waiting_for.has_pending_cast()
         || matches!(state.waiting_for, WaitingFor::ModalFaceChoice { .. });
+    // Where THIS action's events begin, for a parked combat-damage batch the
+    // answer finishes below (`resume_parked_combat_damage_after_answer`).
+    let action_event_start = events.len();
     // Validate and process action against current WaitingFor
     let waiting_for = match (&state.waiting_for.clone(), action) {
         (
@@ -17135,6 +17138,17 @@ fn apply_non_priority_pass_action(
     let waiting_for =
         resume_parked_counter_cost_root_at_action_boundary(state, &waiting_for, &mut events)?
             .unwrap_or(waiting_for);
+
+    // CR 510.2 + CR 615.5: an answer that settled the prompt a parked combat-damage
+    // batch waited on (a rider's zone choice, its "may") finishes the batch here,
+    // before the pipeline below: no priority window opens inside combat damage.
+    let waiting_for = super::combat_damage::resume_parked_combat_damage_after_answer(
+        state,
+        &waiting_for,
+        action_event_start,
+        &mut events,
+    )
+    .unwrap_or(waiting_for);
 
     // Run post-action pipeline (SBAs, triggers, layers) and check for terminal states.
     // When triggers were already processed inline (e.g., DeclareAttackers, combat damage),

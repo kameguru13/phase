@@ -12,10 +12,9 @@
 //! - A rider that picks from a population acts on what the player picks, and the spell's next
 //!   instruction follows all of it (CR 608.2c, CR 608.2d): Lightning Helix's "and you gain 3
 //!   life" under Nefarious Lich.
-//! - Combat damage can't pause for a CR 616.1 order choice yet (Command Zone #140), so the engine
-//!   answers each order park inside a batch with its first candidate instead of dropping the
-//!   damage (CR 510.2). That is not the player's pick, so those rows are strict failures; candidate
-//!   order is scan order, so they assert the set the player could reach, never one member.
+//! - Combat damage asks every CR 616.1 order inside its batch, and every prompt a substitute or a
+//!   rider raises there, of the player it belongs to (CR 510.2 rules out a priority window, not the
+//!   choice); the answer completes the batch.
 //! - A spell's later instruction runs once, behind its remaining recipients, whichever
 //!   replacement answer reaches it.
 
@@ -2780,10 +2779,9 @@ fn a_paused_rider_keeps_the_batchs_later_riders_behind_it() {
         // strict-failure: the order between Dralnu's substitution and the Bear's counters is not
         // asserted: by CR 614.6 + CR 615.5 the substitution comes first, which the engine doesn't
         // yet do in every creation order (Command Zone #172). That order decides what P1 can
-        // sacrifice (Hardened Scales before or after the Bear's counters). Dralnu's sacrifice is a
-        // choice, so the card reports unsupported
-        // (`ResolverFeature:structural:damage_replacement_choice_unasked_in_combat`), which keeps
-        // this order outside the claimed coverage.
+        // sacrifice (Hardened Scales before or after the Bear's counters). Dralnu's substitution
+        // reports unsupported (`ResolverFeature:structural:damage_substitution_choice_incomplete`),
+        // which keeps this order outside the claimed coverage.
         assert!(sacrificed_at.is_some());
         assert_eq!(plus_counters(&runner, bear), 8);
         assert_eq!(zone(&runner, id), Zone::Battlefield);
@@ -3400,7 +3398,7 @@ fn a_rider_draw_with_a_declined_replacement_finishes_before_the_spell_does() {
 }
 
 /// Temper with its printed {X}{1}{W}, and the mana to pay for it.
-fn temper(scenario: &mut GameScenario) -> ObjectId {
+pub(super) fn temper(scenario: &mut GameScenario) -> ObjectId {
     let id = scenario
         .add_spell_to_hand_from_oracle(P0, "Temper", true, TEMPER)
         .with_mana_cost(ManaCost::Cost {
@@ -3417,7 +3415,7 @@ fn temper(scenario: &mut GameScenario) -> ObjectId {
     id
 }
 
-fn cast_temper_at_one(runner: &mut GameRunner, temper: ObjectId, target: ObjectId) {
+pub(super) fn cast_temper_at_one(runner: &mut GameRunner, temper: ObjectId, target: ObjectId) {
     let action = cast_action(runner, temper);
     runner.act(action).expect("cast Temper");
     let mut target = Some(object_target(target));
@@ -3485,6 +3483,161 @@ fn a_resident_rider_from_another_recipient_is_not_lost() {
         assert_eq!(damage(&runner, hydra), 0);
         assert!(!runner.state().has_post_replacement_drain());
     }
+}
+
+/// The player and candidate sources of the `ReplacementChoice` that must be up.
+#[track_caller]
+fn replacement_prompt(runner: &GameRunner) -> (PlayerId, BTreeSet<ObjectId>) {
+    match &runner.state().waiting_for {
+        WaitingFor::ReplacementChoice {
+            player, candidates, ..
+        } => (*player, candidates.iter().map(|c| c.source_id).collect()),
+        other => panic!("expected ReplacementChoice, got {other:?}"),
+    }
+}
+
+/// CR 615.5 + CR 608.2c + CR 616.1f: an earlier rider's prompt inside a combat leg is asked, and
+/// the substitution's actions wait behind it. P1's Phytohydra ("If damage would be dealt to this
+/// creature, put that many +1/+1 counters on it instead.") blocks P0's Rumbling Baloth (4), under
+/// P0's Temper at X = 1 ("Prevent the next X damage that would be dealt to target creature this
+/// turn. For each 1 damage prevented this way, put a +1/+1 counter on that creature."). P1 controls
+/// Hardened Scales and Doubling Season.
+///
+/// P1 orders Temper and Phytohydra (CR 616.1) and picks Temper: it prevents 1, and its additional
+/// effect happens immediately afterward (CR 615.5), so its one counter meets Hardened Scales and
+/// Doubling Season and P1 orders those; then Phytohydra replaces what is left, 3 (CR 616.1f), and
+/// its 3 counters meet the same two, a third order. Temper's counter becomes 4 (Hardened Scales
+/// first, (1+1)×2) or 3 (Doubling Season first, 1×2+1); Phytohydra's 3 become 8 ((3+1)×2) or 7
+/// (3×2+1). Phytohydra is dealt no damage, and the last answer finishes the batch.
+///
+/// Phytohydra picked first replaces all 4 and leaves Temper unused: one counter order, 10 or 9.
+/// With Doubling Season alone nothing pauses: 1×2 + 3×2 = 8, one prompt.
+#[test]
+fn an_earlier_riders_pause_inside_a_combat_leg_is_asked() {
+    for (temper_scales_first, hydra_scales_first, after_temper, total) in [
+        (true, true, 4, 12),
+        (true, false, 4, 11),
+        (false, true, 3, 11),
+        (false, false, 3, 10),
+    ] {
+        let mut scenario = scenario();
+        let hydra = phytohydra(&mut scenario, P1);
+        let scales = scenario
+            .add_enchantment_from_oracle(P1, "Hardened Scales", HARDENED_SCALES)
+            .id();
+        let season = scenario
+            .add_enchantment_from_oracle(P1, "Doubling Season", DOUBLING_SEASON)
+            .id();
+        let baloth = scenario.add_creature(P0, "Rumbling Baloth", 4, 4).id();
+        let temper = temper(&mut scenario);
+        let mut runner = scenario.build();
+        cast_temper_at_one(&mut runner, temper, hydra);
+        let mut events = combat_events(&mut runner, vec![baloth], vec![(hydra, baloth)]);
+        let pick = |scales_first: bool| if scales_first { scales } else { season };
+
+        // Prompt 1: Temper's shield and Phytohydra, P1's order (CR 616.1).
+        let WaitingFor::ReplacementChoice {
+            player, candidates, ..
+        } = runner.state().waiting_for.clone()
+        else {
+            panic!(
+                "expected the order prompt, got {:?}",
+                runner.state().waiting_for
+            );
+        };
+        assert_eq!(player, P1);
+        assert_eq!(candidates.len(), 2, "{candidates:?}");
+        assert!(candidates.iter().any(|c| c.description == SHIELD));
+        assert!(candidates.iter().any(|c| c.source_id == hydra));
+        choose_shield(&mut runner, &mut events);
+
+        // Prompt 2: Temper's counter, asked inside the leg while the batch is parked.
+        assert_eq!(
+            replacement_prompt(&runner),
+            (P1, BTreeSet::from([scales, season]))
+        );
+        assert!(runner
+            .state()
+            .pending_combat_lifelink
+            .as_ref()
+            .is_some_and(|record| record.replacement.is_some()));
+        assert_eq!(plus_counters(&runner, hydra), 0);
+        choose_source(&mut runner, &mut events, pick(temper_scales_first));
+
+        // Prompt 3: Phytohydra's 3 counters, after Temper's (CR 616.1f).
+        assert_eq!(
+            replacement_prompt(&runner),
+            (P1, BTreeSet::from([scales, season]))
+        );
+        assert_eq!(plus_counters(&runner, hydra), after_temper);
+        choose_source(&mut runner, &mut events, pick(hydra_scales_first));
+
+        assert_eq!(plus_counters(&runner, hydra), total);
+        assert_eq!(damage(&runner, hydra), 0);
+        assert!(!runner.state().has_post_replacement_drain());
+        assert!(runner.state().pending_combat_lifelink.is_none());
+        assert!(runner
+            .state()
+            .combat
+            .as_ref()
+            .is_some_and(|combat| combat.regular_damage_done));
+        assert_at_rest(&runner);
+    }
+
+    // Phytohydra first: it replaces all 4, Temper's shield is unused, and its 4 counters are the
+    // one counter order.
+    for (scales_first, total) in [(true, 10), (false, 9)] {
+        let mut scenario = scenario();
+        let hydra = phytohydra(&mut scenario, P1);
+        let scales = scenario
+            .add_enchantment_from_oracle(P1, "Hardened Scales", HARDENED_SCALES)
+            .id();
+        let season = scenario
+            .add_enchantment_from_oracle(P1, "Doubling Season", DOUBLING_SEASON)
+            .id();
+        let baloth = scenario.add_creature(P0, "Rumbling Baloth", 4, 4).id();
+        let temper = temper(&mut scenario);
+        let mut runner = scenario.build();
+        cast_temper_at_one(&mut runner, temper, hydra);
+        let mut events = combat_events(&mut runner, vec![baloth], vec![(hydra, baloth)]);
+        assert_prompt_is_replacement_choice(&runner);
+        choose_source(&mut runner, &mut events, hydra);
+        assert_eq!(
+            replacement_prompt(&runner),
+            (P1, BTreeSet::from([scales, season]))
+        );
+        choose_source(
+            &mut runner,
+            &mut events,
+            if scales_first { scales } else { season },
+        );
+
+        assert_eq!(plus_counters(&runner, hydra), total);
+        assert_eq!(damage(&runner, hydra), 0);
+        assert!(runner.state().pending_combat_lifelink.is_none());
+        assert_at_rest(&runner);
+    }
+
+    // Doubling Season alone: Temper's rider completes without a prompt, and nothing parks.
+    let mut scenario = scenario();
+    let hydra = phytohydra(&mut scenario, P1);
+    scenario.add_enchantment_from_oracle(P1, "Doubling Season", DOUBLING_SEASON);
+    let baloth = scenario.add_creature(P0, "Rumbling Baloth", 4, 4).id();
+    let temper = temper(&mut scenario);
+    let mut runner = scenario.build();
+    cast_temper_at_one(&mut runner, temper, hydra);
+    let mut events = combat_events(&mut runner, vec![baloth], vec![(hydra, baloth)]);
+    assert_prompt_is_replacement_choice(&runner);
+    choose_shield(&mut runner, &mut events);
+
+    assert!(!matches!(
+        runner.state().waiting_for,
+        WaitingFor::ReplacementChoice { .. }
+    ));
+    assert_eq!(plus_counters(&runner, hydra), 8);
+    assert_eq!(damage(&runner, hydra), 0);
+    assert!(runner.state().pending_combat_lifelink.is_none());
+    assert_at_rest(&runner);
 }
 
 /// Force Bubble: "The effect does not prevent damage, it replaces it so the damage is neither
@@ -3827,6 +3980,14 @@ fn combat_answering(
             .unwrap_or_else(|| panic!("an unexpected replacement prompt: {sources:?}"));
         prompts.push((*player, sources));
         choose_source(runner, &mut events, pick);
+        // CR 510.2 + CR 615.5: the answer finishes the batch it was asked inside; no priority
+        // window opens with combat damage still to be dealt.
+        if matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
+            assert!(
+                runner.state().pending_combat_lifelink.is_none(),
+                "CR 510.2 + CR 615.5: a parked combat batch outlived its answer"
+            );
+        }
     }
     (events, prompts)
 }

@@ -361,8 +361,10 @@ pub(super) fn resume_active_draw_sequences(
 /// action that can be parked waiting on it.
 ///
 /// A simultaneous combat-damage batch (CR 510.2) parks in `state.pending_combat_lifelink`
-/// when a lifelink life gain meets two or more co-applicable replacements. This is the only
-/// boundary that knows where THIS action's events begin, and the resumed `LifeChanged` must
+/// when a lifelink life gain meets two or more co-applicable replacements. This is the
+/// `ChooseReplacement` boundary that knows where THIS action's events begin (any other answer's
+/// is `engine::apply_non_priority_pass_action`, through
+/// `combat_damage::resume_parked_combat_damage_after_answer`), and the resumed `LifeChanged` must
 /// join the batch's own CR 603.3b trigger batch — so the anchor is a LOCAL captured here, and
 /// the drain lives here rather than in `engine::resume_pending_continuation_if_priority`,
 /// which has no such anchor. Stored on the record it would be a persisted index into a

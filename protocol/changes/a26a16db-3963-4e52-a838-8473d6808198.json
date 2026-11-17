@@ -1,0 +1,7 @@
+{
+  "surfaces": [
+    "full",
+    "wire"
+  ],
+  "reason": "A combat damage batch parked in its replacement pass carries the guard reading it opened with (PendingCombatDamageReplacement.settled_guards), which an older reader drops and re-reads at its next entry; a combat batch can park in its aggregate prevention riders (PendingCombatLifelink with no replacement and an empty remaining tail) with the shields not yet fired in prevention_tally"
+}
