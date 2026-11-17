@@ -2339,6 +2339,8 @@ const LABORATORY_MANIAC: &str =
     "If you would draw a card while your library has no cards in it, you win the game instead.";
 const VAMPIRE_OF_THE_DIRE_MOON: &str = "Deathtouch (Any amount of damage this deals to a creature is enough to destroy it.)\nLifelink (Damage dealt by this creature also causes you to gain that much life.)";
 const PSYCHOSIS_CRAWLER: &str = "Psychosis Crawler's power and toughness are each equal to the number of cards in your hand.\nWhenever you draw a card, each opponent loses 1 life.";
+const SUNTAIL_HAWK: &str = "Flying";
+const ZURS_WEIRDING: &str = "Players play with their hands revealed.\nIf a player would draw a card, they reveal it instead. Then any other player may pay 2 life. If a player does, put that card into its owner's graveyard. Otherwise, that player draws a card.";
 const VAMPIRE_NIGHTHAWK: &str = "Flying\nDeathtouch (Any amount of damage this deals to a creature is enough to destroy it.)\nLifelink (Damage dealt by this creature also causes you to gain that much life.)";
 
 /// A main-phase board with eight library cards for each player, so a rider's draws and a later
@@ -3082,6 +3084,97 @@ fn swans_of_bryn_argolls_draws_ask_abundance() {
         assert_eq!(life(&runner, P1) - p1_before, -draws);
         assert_eq!(runner.state().objects[&swans].damage_marked, 0);
         assert_eq!(runner.state().objects[&bears].zone, Zone::Graveyard);
+
+        bolt_at(&mut runner, bolt, courser);
+        assert_eq!(runner.state().objects[&courser].zone, Zone::Graveyard);
+    }
+}
+
+/// An any-other-player "may" inside the combat damage batch. Suntail Hawk (Flying, 1/1) attacks
+/// and Swans of Bryn Argoll blocks it: "The source's controller draws cards equal to the damage
+/// prevented this way", so P0 draws 1. Zur's Weirding replaces that draw: "If a player would draw
+/// a card, they reveal it instead. Then any other player may pay 2 life. If a player does, put
+/// that card into its owner's graveyard. Otherwise, that player draws a card." The offer is made
+/// to P1, the only other player (CR 608.2d). Declined, P0 draws the revealed card; accepted, P1
+/// pays 2 life and the card goes to P0's graveyard, with no draw.
+///
+/// Either answer completes combat damage in its own action, so no player receives priority while
+/// the batch is parked (CR 510.2), and the step's triggers go on the stack before the active
+/// player gets priority (CR 510.3a). P0's Psychosis Crawler ("Whenever you draw a card, each
+/// opponent loses 1 life.") triggers on the declined draw exactly once, in the combat damage
+/// step's trigger batch (CR 603.2, CR 603.3).
+#[test]
+fn zurs_weirding_offer_inside_the_combat_batch_completes_it() {
+    for accept in [false, true] {
+        let label = format!("accept {accept}");
+        let mut scenario = rider_board();
+        let hawk = creature_with_keywords(
+            &mut scenario,
+            P0,
+            "Suntail Hawk",
+            (1, 1),
+            &["Flying"],
+            SUNTAIL_HAWK,
+        );
+        let swans = swans_of_bryn_argoll(&mut scenario);
+        scenario.add_enchantment_from_oracle(P1, "Zur's Weirding", ZURS_WEIRDING);
+        let crawler = scenario
+            .add_creature_from_oracle(P0, "Psychosis Crawler", 0, 0, PSYCHOSIS_CRAWLER)
+            .id();
+        // A card in P0's hand keeps the Crawler alive.
+        scenario.add_card_to_hand(P0, "Hand Filler");
+        let courser = scenario.add_creature(P1, "Centaur Courser", 3, 3).id();
+        let bolt = spell(&mut scenario, "Lightning Bolt", BOLT, true);
+        let mut runner = scenario.build();
+        let revealed = runner.state().players[0].library[0];
+        let (p0_hand_before, p1_before) = (hand_size(&runner, P0), life(&runner, P1));
+        let mut offered = Vec::new();
+
+        let combat = fight_answering(&mut runner, &[hawk], &[(swans, hawk)], |state| match &state
+            .waiting_for
+        {
+            WaitingFor::OpponentMayChoice { player, .. } => {
+                offered.push(*player);
+                GameAction::DecideOptionalEffect { accept }
+            }
+            other => panic!("an unexpected prompt: {other:?}"),
+        });
+
+        assert_batch_settled(&runner);
+        // Reach guard: the Hawk's 1 was prevented, and the Weirding's offer was made to P1 once.
+        assert_eq!(prevented(&combat.events), 1, "{label}");
+        assert_eq!(offered, vec![P1], "{label}");
+        let [answer] = combat.answers.as_slice() else {
+            panic!("{label}: one answer, got {}", combat.answers.len());
+        };
+        let draws = usize::from(!accept);
+        assert_eq!(cards_drawn(&answer.events, P0), draws, "{label}");
+        // The answer completed combat damage: nothing parked, and the Crawler's trigger on the
+        // declined draw is on the stack once, with the step's other triggers.
+        assert!(!answer.batch_parked, "{label}: left {:?}", answer.left);
+        assert_eq!(
+            answer
+                .stack_sources
+                .iter()
+                .filter(|&&source| source == crawler)
+                .count(),
+            draws,
+            "{label}: left {:?}",
+            answer.left
+        );
+        assert_eq!(cards_drawn(&combat.events, P0), draws, "{label}");
+        assert_eq!(hand_size(&runner, P0) - p0_hand_before, draws, "{label}");
+        let in_graveyard = runner.state().players[0].graveyard.contains(&revealed);
+        assert_eq!(in_graveyard, accept, "{label}");
+        // Declined: the Crawler's trigger resolved once. Accepted: P1 paid 2 life.
+        let p1_loss = if accept { -2 } else { -1 };
+        assert_eq!(life(&runner, P1) - p1_before, p1_loss, "{label}");
+        assert_eq!(runner.state().objects[&swans].damage_marked, 0, "{label}");
+        assert_eq!(
+            runner.state().objects[&hawk].zone,
+            Zone::Graveyard,
+            "{label}"
+        );
 
         bolt_at(&mut runner, bolt, courser);
         assert_eq!(runner.state().objects[&courser].zone, Zone::Graveyard);
