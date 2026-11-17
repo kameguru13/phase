@@ -22697,7 +22697,9 @@ pub struct PendingCombatLifelink {
     /// lifelink `LifeChanged` and the combat-damage events reach
     /// `process_combat_damage_triggers` as ONE batch — CR 702.15b makes the gain
     /// simultaneous with the damage, and no player received priority for the
-    /// CR 616.1 choice.
+    /// CR 616.1 choice. An answer that leaves the batch parked on another prompt
+    /// appends its events too (CR 603.2 + CR 603.3: a rider's draw triggers once,
+    /// with the batch), so a saved game at that prompt keeps them here.
     pub batch_events: Vec<GameEvent>,
     /// CR 510.2: the per-player `CombatDamageDealtToPlayer` aggregate, built in
     /// Phase C and emitted AFTER the lifelink gains — the position it occupies

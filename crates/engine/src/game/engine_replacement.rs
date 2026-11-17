@@ -418,6 +418,9 @@ pub(super) fn handle_replacement_choice(
     // CR 616.1f: a second ordering choice, or any nested prompt, leaves the record
     // parked for the next answer; only a settled round trip may close the batch.
     // Nothing is left behind on this path — the anchor is a local that dies here.
+    // CR 603.2 + CR 603.3: this answer's events (a draw it let happen) go to the
+    // still-parked batch at the answer's exit, through
+    // `combat_damage::resume_parked_combat_damage_after_answer`.
     // CR 616.1g: this is also how a batch parked on its substitute's prompt
     // (counters, mill) resumes — once that prompt's round trip has settled.
     let WaitingFor::Priority { player } = waiting_for else {

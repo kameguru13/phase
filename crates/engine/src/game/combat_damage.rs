@@ -386,13 +386,15 @@ fn finish_combat_damage_sub_step(
 ///
 /// `action_event_start` is the index at which the ANSWERING action's events
 /// begin. It is a parameter, never stored: `handle_replacement_choice` captures
-/// it as a local before the answer is applied, and the re-entry guard passes
+/// it as a local before the answer is applied ([`ParkedCombatDamageAnswer`]
+/// carries it for any other answer), and the re-entry guard passes
 /// `events.len()` when no answer is in flight. Both are `<= events.len()` by
 /// construction, so the slice below cannot be out of range.
 ///
 /// The answering action's events — the resumed `LifeChanged` among them — are
-/// folded into the parked batch, so "whenever you gain life" observers
-/// (CR 119.9) join the SAME CR 603.3b batch as the combat-damage observers.
+/// folded into the parked batch ([`take_answer_events_into_batch`]), so
+/// "whenever you gain life" observers (CR 119.9) join the SAME CR 603.3b batch
+/// as the combat-damage observers.
 /// CR 702.15b makes the gain simultaneous with the damage, and no player
 /// received priority for the CR 616.1 choice, so splitting them would be a rules
 /// regression.
@@ -414,9 +416,7 @@ pub(crate) fn resume_pending_combat_lifelink(
     events: &mut Vec<GameEvent>,
 ) -> Option<WaitingFor> {
     let mut record = *state.pending_combat_lifelink.take()?;
-    record
-        .batch_events
-        .extend_from_slice(&events[action_event_start..]);
+    take_answer_events_into_batch(state, &mut record, events, action_event_start);
     let owed_from = record.batch_events.len();
     let sub_step = record.sub_step;
     // CR 510.2 + CR 616.1: a batch parked on a LEG's life-loss pause completes
@@ -482,33 +482,98 @@ pub(crate) fn resume_pending_combat_lifelink(
     }
 }
 
-/// CR 510.2 + CR 510.3 + CR 510.3a + CR 615.5 + CR 616.1g: an answer other than
-/// a `ChooseReplacement` (a rider's zone choice, its "may", its sacrifice) that
-/// settles the prompt a parked combat-damage batch was waiting on finishes the
-/// batch in the answering action. No player receives priority between combat
-/// damage being assigned and dealt, a prevention's additional effects happen
-/// with it, and the step's triggers go on the stack before the active player
-/// gets priority; a priority window opened over the parked record would break
-/// all three.
+/// CR 510.2: an action that answers a prompt a parked combat-damage batch is
+/// waiting on. Taken as the action begins, so `action_event_start` is where the
+/// answer's own events start in the action's buffer, and only an action that
+/// found the batch already parked is one: a batch that parks during the action
+/// publishes and claims its own events as it parks, and the action's earlier
+/// events (declared blockers, the step's start) are not the batch's.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParkedCombatDamageAnswer {
+    action_event_start: usize,
+}
+
+impl ParkedCombatDamageAnswer {
+    /// `None` when no combat-damage batch is parked as the action begins.
+    pub(crate) fn begin(state: &GameState, action_event_start: usize) -> Option<Self> {
+        state
+            .pending_combat_lifelink
+            .is_some()
+            .then_some(Self { action_event_start })
+    }
+}
+
+/// CR 510.2 + CR 510.3 + CR 510.3a + CR 615.5 + CR 616.1g: an answer (a rider's
+/// replacement choice, zone choice, "may" or sacrifice) that settles the prompt
+/// a parked combat-damage batch was waiting on finishes the batch in the
+/// answering action. No player receives priority between combat damage being
+/// assigned and dealt, a prevention's additional effects happen with it, and
+/// the step's triggers go on the stack before the active player gets priority;
+/// a priority window opened over the parked record would break all three.
+/// `engine_replacement::handle_replacement_choice` resumes the batch after a
+/// `ChooseReplacement` itself, so the resume is a no-op after one.
 ///
-/// `waiting_for` is what the answer settled to, and `action_event_start` the
-/// index at which the answering action's events begin, a local of the caller,
-/// as in `engine_replacement::handle_replacement_choice` (which resumes the
-/// `ChooseReplacement` answers itself, so this is a no-op after one). `None`
-/// when the answer left another prompt, or nothing is parked.
+/// CR 603.2 + CR 603.3 + CR 510.3a: an answer that leaves the batch parked on
+/// another prompt (the first of two draws a rider's Abundance asks about) hands
+/// the batch what it emitted, so the abilities those events trigger ("whenever
+/// you draw a card") join the step's trigger batch once, when the batch
+/// completes. The events would otherwise leave with this action's buffer, which
+/// no collector scans at a prompt.
+///
+/// `waiting_for` is what the answer settled to. `None` when the answer left
+/// another prompt, or nothing is parked any longer.
 pub(crate) fn resume_parked_combat_damage_after_answer(
     state: &mut GameState,
+    answer: ParkedCombatDamageAnswer,
     waiting_for: &WaitingFor,
-    action_event_start: usize,
     events: &mut Vec<GameEvent>,
 ) -> Option<WaitingFor> {
-    if !matches!(waiting_for, WaitingFor::Priority { .. })
-        || state.pending_combat_lifelink.is_none()
-    {
+    let action_event_start = answer.action_event_start;
+    if !matches!(waiting_for, WaitingFor::Priority { .. }) {
+        let mut record = state.pending_combat_lifelink.take()?;
+        take_answer_events_into_batch(state, &mut record, events, action_event_start);
+        state.pending_combat_lifelink = Some(record);
+        claim_combat_lifelink_batch_events_for_ordinary_collection(
+            state,
+            events,
+            action_event_start,
+        );
+        return None;
+    }
+    if state.pending_combat_lifelink.is_none() {
         return None;
     }
     state.waiting_for = waiting_for.clone();
     resume_pending_combat_lifelink(state, action_event_start, None, events)
+}
+
+/// CR 510.2 + CR 603.2 + CR 603.2c + CR 603.3b: the parked batch takes custody of
+/// what an answering action emitted from `action_event_start` on, the single
+/// authority for both a resume and an answer that leaves the batch parked. The
+/// batch collects the triggers of everything in `batch_events` once, when it
+/// completes, so it leaves out every occurrence another collector owns: one a
+/// collector already claimed (the batch's own events, published as it
+/// re-parked, among them) or queued (a zone change whose observers a
+/// `ChangeZone` queued), an entry whose mid-entry choice holds it for its
+/// replay, and one a paused zone-change or cost owner still retains for its
+/// own settlement.
+fn take_answer_events_into_batch(
+    state: &GameState,
+    record: &mut PendingCombatLifelink,
+    events: &[GameEvent],
+    action_event_start: usize,
+) {
+    let mut answer = triggers::uncollected_trigger_events_from(
+        state,
+        events,
+        action_event_start,
+        &state.consumed_before_priority_trigger_events,
+    );
+    let mut retained = crate::game::engine_priority::retained_logical_zone_events(state);
+    retained.extend(crate::game::engine_priority::retained_cost_events(state));
+    answer
+        .retain(|event| !state.deferred_entry_events.contains(event) && !retained.contains(event));
+    record.batch_events.extend(answer.events);
 }
 
 /// CR 510.2 + CR 603.2c: a combat-damage batch parked for a CR 616.1 choice

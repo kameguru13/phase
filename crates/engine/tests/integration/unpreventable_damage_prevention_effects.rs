@@ -2338,6 +2338,7 @@ const BOROS_SWIFTBLADE: &str = "Double strike";
 const LABORATORY_MANIAC: &str =
     "If you would draw a card while your library has no cards in it, you win the game instead.";
 const VAMPIRE_OF_THE_DIRE_MOON: &str = "Deathtouch (Any amount of damage this deals to a creature is enough to destroy it.)\nLifelink (Damage dealt by this creature also causes you to gain that much life.)";
+const PSYCHOSIS_CRAWLER: &str = "Psychosis Crawler's power and toughness are each equal to the number of cards in your hand.\nWhenever you draw a card, each opponent loses 1 life.";
 const VAMPIRE_NIGHTHAWK: &str = "Flying\nDeathtouch (Any amount of damage this deals to a creature is enough to destroy it.)\nLifelink (Damage dealt by this creature also causes you to gain that much life.)";
 
 /// A main-phase board with eight library cards for each player, so a rider's draws and a later
@@ -2423,11 +2424,21 @@ pub(super) fn faithmender_and_leyline(scenario: &mut GameScenario) -> ObjectId {
 }
 
 /// What one combat showed: its events, and the candidate sources of each CR 616.1 prompt it
-/// answered, with the player each was asked of.
+/// answered, with the player each was asked of, and what each answer's own action did.
 pub(super) struct Combat {
     pub(super) events: Vec<GameEvent>,
     pub(super) prompts: Vec<Vec<ObjectId>>,
     pub(super) choosers: Vec<PlayerId>,
+    pub(super) answers: Vec<Answered>,
+}
+
+/// One answered prompt of a [`Combat`]: the answering action's events, the wait it left, the
+/// sources of the stack's entries after it, and whether a combat damage batch was still parked.
+pub(super) struct Answered {
+    pub(super) events: Vec<GameEvent>,
+    pub(super) left: WaitingFor,
+    pub(super) stack_sources: Vec<ObjectId>,
+    pub(super) batch_parked: bool,
 }
 
 /// Drive one combat from the precombat main phase to the end of combat: P0 attacks P1 with
@@ -2483,6 +2494,7 @@ pub(super) fn fight_driving(
         events: Vec::new(),
         prompts: Vec::new(),
         choosers: Vec::new(),
+        answers: Vec::new(),
     };
     let (mut attacked, mut blocked) = (false, false);
     for _ in 0..400 {
@@ -2558,9 +2570,17 @@ pub(super) fn fight_driving(
         };
         let answered = turn_action.is_none();
         let action = turn_action.unwrap_or_else(|| answer(runner));
-        combat
-            .events
-            .extend(runner.act(action).expect("combat action").events);
+        let events = runner.act(action).expect("combat action").events;
+        if answered {
+            let state = runner.state();
+            combat.answers.push(Answered {
+                events: events.clone(),
+                left: state.waiting_for.clone(),
+                stack_sources: state.stack.iter().map(|entry| entry.source_id).collect(),
+                batch_parked: state.pending_combat_lifelink.is_some(),
+            });
+        }
+        combat.events.extend(events);
         if answered && matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
             assert!(
                 runner.state().pending_combat_lifelink.is_none(),
@@ -3006,6 +3026,10 @@ fn a_may_park_and_a_riders_own_prompt_are_both_asked() {
 /// draws each meet P0's Abundance ("If you would draw a card, you may instead …"), and the combat
 /// batch asks each (CR 616.1). Declining both draws 2 cards; accepting both and choosing nonland
 /// puts 2 nonland cards into P0's hand with no draw. Without Abundance, 2 draws and no prompt.
+/// P0's Psychosis Crawler ("Whenever you draw a card, each opponent loses 1 life.") triggers once
+/// for each draw, with the combat damage step's triggers (CR 510.3a, CR 603.2, CR 603.3): the
+/// first decline's draw stays with the parked batch, and the second decline puts both triggers
+/// on the stack.
 #[test]
 fn swans_of_bryn_argolls_draws_ask_abundance() {
     for (abundance, accept) in [(true, false), (true, true), (false, false)] {
@@ -3015,10 +3039,13 @@ fn swans_of_bryn_argolls_draws_ask_abundance() {
         if abundance {
             scenario.add_enchantment_from_oracle(P0, "Abundance", ABUNDANCE);
         }
+        let crawler = scenario
+            .add_creature_from_oracle(P0, "Psychosis Crawler", 0, 0, PSYCHOSIS_CRAWLER)
+            .id();
         let courser = scenario.add_creature(P1, "Centaur Courser", 3, 3).id();
         let bolt = spell(&mut scenario, "Lightning Bolt", BOLT, true);
         let mut runner = scenario.build();
-        let hand_before = hand_size(&runner, P0);
+        let (hand_before, p1_before) = (hand_size(&runner, P0), life(&runner, P1));
 
         let combat = fight_answering(
             &mut runner,
@@ -3031,10 +3058,28 @@ fn swans_of_bryn_argolls_draws_ask_abundance() {
         assert_eq!(combat.prompts.len(), if abundance { 2 } else { 0 });
         assert_eq!(prevented(&combat.events), 1);
         assert_eq!(hand_size(&runner, P0) - hand_before, 2);
-        assert_eq!(
-            cards_drawn(&combat.events, P0),
-            if abundance && accept { 0 } else { 2 }
-        );
+        let draws = if abundance && accept { 0 } else { 2 };
+        assert_eq!(cards_drawn(&combat.events, P0), draws as usize);
+        if abundance && !accept {
+            let [first, second] = combat.answers.as_slice() else {
+                panic!("two answers, got {}", combat.answers.len());
+            };
+            assert_eq!(cards_drawn(&first.events, P0), 1);
+            assert!(first.batch_parked && first.stack_sources.is_empty());
+            assert!(!second.batch_parked);
+            assert_eq!(
+                second
+                    .stack_sources
+                    .iter()
+                    .filter(|&&source| source == crawler)
+                    .count(),
+                2,
+                "left {:?}",
+                second.left
+            );
+        }
+        // Each draw's Psychosis Crawler trigger resolved once: P1 loses 1 for each.
+        assert_eq!(life(&runner, P1) - p1_before, -draws);
         assert_eq!(runner.state().objects[&swans].damage_marked, 0);
         assert_eq!(runner.state().objects[&bears].zone, Zone::Graveyard);
 
@@ -3099,20 +3144,40 @@ fn double_strike_asks_abundance_for_the_swans_draw_in_each_damage_step() {
 /// (CR 616.1). Declining both draws 2 cards; accepting both and choosing nonland puts 2 nonland
 /// cards into P1's hand with no draw. Without Abundance, 2 draws and no prompt.
 ///
+/// P1 also controls Psychosis Crawler ("Whenever you draw a card, each opponent loses 1 life."),
+/// so each draw triggers it once, and its triggers join the combat damage step's own trigger batch
+/// whichever action drew the card (CR 510.2, CR 510.3a, CR 603.2, CR 603.3). Declining, the
+/// first decline draws one card and leaves the second offer open with the batch still parked,
+/// which keeps that draw; the second decline completes combat damage in its own action, with both
+/// triggers on the stack, and P0 loses 1 for each. A save and load at the second offer keeps the
+/// first draw with the batch.
+///
 /// strict-failure: "When damage is prevented this way, …" is a triggered ability (CR 603.2,
-/// CR 615.13), put on the stack the next time a player would receive priority, after the combat
-/// damage step's other triggers (CR 603.3, CR 510.3a). The engine runs it as a rider inside the
+/// CR 615.13), put on the stack the next time a player would receive priority, in the same
+/// before-priority trigger batch as the combat damage step's other triggers, ordered under
+/// CR 603.3b (CR 603.3, CR 510.3a). The engine runs it as a rider inside the
 /// combat damage batch instead. Who is asked, how many cards and how much damage are the card's;
 /// the timing is not.
 #[test]
 fn new_way_forwards_draws_ask_abundance() {
-    for (abundance, accept) in [(true, false), (true, true), (false, false)] {
+    for (abundance, accept, round_trip) in [
+        (true, false, false),
+        (true, false, true),
+        (true, true, false),
+        (false, false, false),
+    ] {
+        let label = format!("Abundance {abundance}, accept {accept}, round trip {round_trip}");
         let mut scenario = rider_board();
         let bears = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
         if abundance {
             scenario.add_enchantment_from_oracle(P1, "Abundance", ABUNDANCE);
         }
         let courser = scenario.add_creature(P1, "Centaur Courser", 3, 3).id();
+        let crawler = scenario
+            .add_creature_from_oracle(P1, "Psychosis Crawler", 0, 0, PSYCHOSIS_CRAWLER)
+            .id();
+        // A card in P1's hand keeps the Crawler alive once New Way Forward is cast.
+        scenario.add_card_to_hand(P1, "Hand Filler");
         let new_way_forward = scenario
             .add_spell_to_hand_from_oracle(P1, "New Way Forward", true, NEW_WAY_FORWARD)
             .id();
@@ -3150,26 +3215,89 @@ fn new_way_forwards_draws_ask_abundance() {
         }
         assert_eq!(source_choices, 1);
         assert_settled(&runner);
+        assert_eq!(runner.state().objects[&crawler].zone, Zone::Battlefield);
         let (p0_before, p1_before, hand_before) =
             (life(&runner, P0), life(&runner, P1), hand_size(&runner, P1));
+        let declining = abundance && !accept;
+        let mut answer = answering_abundance(accept);
+        let mut offers = 0;
 
-        let combat = fight_answering(&mut runner, &[bears], &[], answering_abundance(accept));
+        let combat = fight_driving(&mut runner, &[bears], &[], |runner| {
+            if matches!(
+                runner.state().waiting_for,
+                WaitingFor::ReplacementChoice { .. }
+            ) {
+                offers += 1;
+            }
+            if declining && offers == 2 {
+                // The batch is parked at the second offer and holds the first decline's draw, so
+                // the Crawler's trigger on it waits for the batch's end; a save and load keeps it.
+                let parked_draws = |runner: &GameRunner| {
+                    runner
+                        .state()
+                        .pending_combat_lifelink
+                        .as_ref()
+                        .map(|record| cards_drawn(&record.batch_events, P1))
+                };
+                assert_eq!(parked_draws(runner), Some(1), "{label}");
+                if round_trip {
+                    let json =
+                        serde_json::to_string(runner.state()).expect("serialize at the offer");
+                    *runner.state_mut() =
+                        serde_json::from_str::<GameState>(&json).expect("deserialize");
+                    assert_eq!(parked_draws(runner), Some(1), "{label}: reloaded");
+                }
+            }
+            answer(runner.state())
+        });
 
         assert_batch_settled(&runner);
         if abundance {
-            assert_eq!(combat.prompts.len(), 2, "prompts: {:?}", combat.prompts);
-            assert_eq!(combat.choosers, vec![P1, P1]);
+            assert_eq!(combat.prompts.len(), 2, "{label}: {:?}", combat.prompts);
+            assert_eq!(combat.choosers, vec![P1, P1], "{label}");
         } else {
-            assert!(combat.prompts.is_empty());
+            assert!(combat.prompts.is_empty(), "{label}");
         }
+        if declining {
+            let [first, second] = combat.answers.as_slice() else {
+                panic!("{label}: two answers, got {}", combat.answers.len());
+            };
+            // The first decline draws one card and leaves the second offer open, parked.
+            assert_eq!(cards_drawn(&first.events, P1), 1, "{label}");
+            assert!(
+                matches!(first.left, WaitingFor::ReplacementChoice { player, .. } if player == P1),
+                "{label}: got {:?}",
+                first.left
+            );
+            assert!(first.batch_parked, "{label}");
+            assert!(first.stack_sources.is_empty(), "{label}");
+            // The second decline draws the other card and completes combat damage in its own
+            // action: both draws' triggers are on the stack, each once.
+            assert_eq!(cards_drawn(&second.events, P1), 1, "{label}");
+            assert!(!second.batch_parked, "{label}");
+            assert_eq!(
+                second
+                    .stack_sources
+                    .iter()
+                    .filter(|&&source| source == crawler)
+                    .count(),
+                2,
+                "{label}: left {:?}",
+                second.left
+            );
+        }
+        let draws = if abundance && accept { 0 } else { 2 };
         // Reach guard: the Bears' 2 was prevented, and New Way Forward dealt it to P0 once.
-        assert_eq!(life(&runner, P0) - p0_before, -2);
-        assert_eq!(life(&runner, P1), p1_before);
-        assert_eq!(hand_size(&runner, P1) - hand_before, 2);
         assert_eq!(
-            cards_drawn(&combat.events, P1),
-            if abundance && accept { 0 } else { 2 }
+            damage_dealt_to_player(&combat.events, P0),
+            vec![2],
+            "{label}"
         );
+        // Each draw's Psychosis Crawler trigger resolved once: P0 loses 1 for each.
+        assert_eq!(life(&runner, P0) - p0_before, -2 - draws, "{label}");
+        assert_eq!(life(&runner, P1), p1_before, "{label}");
+        assert_eq!(hand_size(&runner, P1) - hand_before, 2, "{label}");
+        assert_eq!(cards_drawn(&combat.events, P1), draws as usize, "{label}");
 
         bolt_at(&mut runner, bolt, courser);
         assert_eq!(runner.state().objects[&courser].zone, Zone::Graveyard);

@@ -16016,8 +16016,8 @@ fn settle_combat_damage_replacement(
 }
 
 /// CR 615.5 + CR 608.2c + CR 616.1g: take the paused earlier rider the combat batch's ledger
-/// recorded for the leg being settled (`drain_damage_rider`). The leg parks on its prompt, so
-/// the batch's other legs never wait behind it.
+/// recorded for the leg being settled (`drain_damage_rider`). The leg parks the batch on its
+/// prompt. The pass resumes this leg's continuation before advancing other legs.
 fn take_combat_leg_paused_rider(state: &mut GameState) -> bool {
     state
         .damage_batch_ledger
