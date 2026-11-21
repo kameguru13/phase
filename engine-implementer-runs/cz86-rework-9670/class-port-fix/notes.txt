@@ -1,0 +1,23 @@
+Port fix round (maintainer review pr-review-port-r1.md). MTGJSON 5.3.0+20261021, jq-1.8.1, query = ../class/query.sh.
+
+F1 class: guarded_prevention_class.json
+  regex 'If (combat )?damage would be dealt to [^.]*? while [^.]*?, prevent'  kw ''  add [] drop []
+  count 8, 39 distinct rulings, sha256(jq -cS .) 98a1b51465ce5a91db8fbd70019523ed12966ca7a3229c9c036b1a4d8ac5f5a6
+  Broadened regex '(would be dealt damage|damage would be dealt to|would deal damage to)[^.]*? while [^.]*?, prevent' selects the same 8.
+  Bearing rulings (all 39 read):
+  G1 [Undergrowth Champion] "If Undergrowth Champion is dealt damage from multiple sources at the same time (for example, if it's blocked by multiple creatures), its prevention effect will apply once to all that damage. You'll remove only one +1/+1 counter." -> T-F1, N-3 (reading once per batch); the "only one counter" half with >= 2 counters is the PR's disclosed known gap (recipient-phrased effect once per batch).
+  G2 [Oathsworn Knight] "If multiple sources would deal damage to Oathsworn Knight simultaneously (for example, multiple creatures blocking it), its last ability applies once. All of that damage is prevented, and only one counter is removed." -> same as G1.
+  G3 [Oathsworn Knight] "Oathsworn Knight's last ability removes only one counter from it each time it would be dealt damage, not one counter per 1 damage prevented." -> no row (existing counter_guards test).
+  G4 [Jared Carthalion, True Heir] "If you're the monarch and damage would be dealt to Jared Carthalion at the same time combat damage is dealt to you, Jared Carthalion's last ability will prevent damage and put counters on it before the triggered ability that makes another player the monarch resolves." -> existing jared_carthalion_reads_the_monarchy_before_combat_damage_moves_it (preservation).
+  G5 [Ugin's Conjurant] / [Polukranos] / [Magma Pummeler] "damage greater than the number of +1/+1 counters ... all of that damage is prevented, and all of those counters are removed" -> no row (not affected by carry).
+  G6 CR 615.12 rulings (Undergrowth Champion, Oathsworn Knight, Polukranos, Bloatfly Swarm, Jared: "damage that can't be prevented") -> out of scope (PR follow-up, strict-failure tags stay).
+
+F2 class: wither_infect_class.json
+  regex '\b(wither|infect)\b'  kw 'Wither' (keyword_missing empty; same query with kw 'Infect' also empty)  add [] drop []
+  count 104, 128 distinct rulings, sha256 38f03c2c78e710e76d2af2cf10af3c574cda6b79c8ac9242472b5efa0e047594
+  Bearing rulings (all 128 read in batches 0:64, 64:128):
+  W-R1 (21 cards) "Damage from a source with infect is damage in all respects. If the source with infect also has lifelink, damage dealt by that source also causes its controller to gain that much life. Damage from a source with infect can be prevented or redirected. Abilities that trigger on damage being dealt will trigger ..." -> W1/W2: one DamageDealt per leg, exactly once across the pause.
+  W-R2 [Raven's Run] "Since damage from a creature with wither is real damage, it follows all the other rules for damage. It can be prevented or redirected. When it's dealt, it will cause "Whenever [this creature] deals damage" and "Whenever [this creature] is dealt damage" abilities to trigger." -> W1/W2 DamageDealt rows.
+  W-R3 (11+7 cards) "If damage from a source with infect that would be dealt to a creature is prevented, that creature doesn't get -1/-1 counters." -> no new row (Phase B prevention precedes Phase C placement).
+  W-R4 [one card] "If the source of the damage is still on the battlefield at the time that damage is dealt, its characteristics are checked to see if it has wither. If the source has left the battlefield by then, its last existence on the battlefield is checked" -> W1 variant B (the Ripper is dealt lethal before its own leg is delivered; its leg still places counters from the snapshot).
+  W-R5 [Phyrexian Crusader] "-1/-1 counters will affect how much damage the other creature assigns (if it's still on the battlefield)" -> no row (first strike, not this seam).

@@ -1,0 +1,720 @@
+{
+  "version": "5.3.0+20261021",
+  "regex": "(If [^.]*(would deal|would be dealt)[^.]*damage[^.]*, (you may )?prevent[^.]*\\.[^.]*(this way|that much|that many)|prevented this way)",
+  "keyword": "",
+  "add": [],
+  "drop": [],
+  "count": 39,
+  "cards": [
+    "Acolyte's Reward",
+    "Awe Strike",
+    "Bone Mask",
+    "Brace for Impact",
+    "Candles' Glow",
+    "Channel Harm",
+    "Chant of Vitu-Ghazi",
+    "Cho-Arrim Alchemist",
+    "Comeuppance",
+    "Deflecting Palm",
+    "Divine Deflection",
+    "Hallow",
+    "Honorable Passage",
+    "Hostility",
+    "Immortal Coil",
+    "Inkshield",
+    "Intervention Pact",
+    "Judgment of Alexander",
+    "New Way Forward",
+    "Outfitted Jouster",
+    "Phyrexian Hydra",
+    "Phyrexian Vindicator",
+    "Purity",
+    "Refraction Trap",
+    "Rem Karolus, Stalwart Slayer",
+    "Reverse Damage",
+    "Ria Ivor, Bane of Bladehold",
+    "Sacred Boon",
+    "Samite Ministration",
+    "Scars of the Veteran",
+    "Shadowbane",
+    "Sokrates, Athenian Teacher",
+    "Stormwild Capridor",
+    "Stuffy Doll Avatar",
+    "Swans of Bryn Argoll",
+    "Temper",
+    "Test of Faith",
+    "Vengeful Archon",
+    "Vigor"
+  ],
+  "masked_only": [],
+  "rejected_add": [],
+  "rejected_drop": [],
+  "keyword_missing": [],
+  "rulings": [
+    {
+      "text": "Although this ability triggers when the Incarnation is put into a graveyard from the battlefield, it doesn’t *specifically* trigger on leaving the battlefield, so it doesn’t behave like other leaves-the-battlefield abilities. The ability will trigger from the graveyard.",
+      "cards": [
+        "Hostility",
+        "Purity"
+      ]
+    },
+    {
+      "text": "If multiple replacement or prevention effects try to modify damage that would be dealt to a creature, the controller of the creature chooses the order in which they apply.",
+      "cards": [
+        "Phyrexian Vindicator",
+        "Stormwild Capridor"
+      ]
+    },
+    {
+      "text": "If the Incarnation had lost this ability while on the battlefield (due to Lignify, for example) and then was destroyed, the ability would still trigger and it would get shuffled into its owner’s library. However, if the Incarnation lost this ability when it was put into the graveyard (due to Yixlid Jailer, for example), the ability wouldn’t trigger and the Incarnation would remain in the graveyard.",
+      "cards": [
+        "Hostility",
+        "Purity"
+      ]
+    },
+    {
+      "text": "If the Incarnation is removed from the graveyard after the ability triggers but before it resolves, it will remain in its new zone when its owner shuffles their library. Similarly, if a replacement effect has the Incarnation move to a different zone instead of being put into the graveyard, the ability won’t trigger at all.",
+      "cards": [
+        "Hostility",
+        "Purity"
+      ]
+    },
+    {
+      "text": "The last ability triggers when the Incarnation is put into its owner’s graveyard from any zone, not just from on the battlefield.",
+      "cards": [
+        "Hostility",
+        "Purity"
+      ]
+    },
+    {
+      "text": "A card with a splice ability can’t be spliced onto itself because the spell is on the stack (and not in your hand) when you reveal the cards you want to splice onto it.",
+      "cards": [
+        "Candles' Glow"
+      ]
+    },
+    {
+      "text": "A player with ten or more poison counters loses the game. This is a state-based action and doesn't use the stack. In other words, it happens immediately and players can't respond to it, just like a player losing the game due to having 0 or less life.",
+      "cards": [
+        "Ria Ivor, Bane of Bladehold"
+      ]
+    },
+    {
+      "text": "Acolyte's Reward has two targets: the creature that would be dealt damage and the permanent or player that Acolyte's Reward will deal damage to. These targets are chosen as you cast Acolyte's Reward.",
+      "cards": [
+        "Acolyte's Reward"
+      ]
+    },
+    {
+      "text": "After Acolyte's Reward resolves, it no longer matters whether either target is still legal. For example, if the second target is a creature controlled by an opponent, and it gains hexproof after Acolyte's Reward resolves but before it prevents damage, Acolyte's Reward will still deal damage to that creature. If Acolyte's Reward can't deal damage to the second target (perhaps because it's a creature that has left the battlefield), Acolyte's Reward will still prevent damage; it just won't deal any damage itself.",
+      "cards": [
+        "Acolyte's Reward"
+      ]
+    },
+    {
+      "text": "Although originally printed with a characteristic-defining ability that defined its color, this card now has a color indicator. This color indicator can’t be affected by text-changing effects (such as the one created by Crystal Spray), although color-changing effects can still overwrite it.",
+      "cards": [
+        "Intervention Pact"
+      ]
+    },
+    {
+      "text": "Although this ability triggers when the Incarnation is put into a graveyard from the battlefield, it doesn't *specifically* trigger on leaving the battlefield, so it doesn't behave like other leaves-the-battlefield abilities. The ability will trigger from the graveyard.",
+      "cards": [
+        "Vigor"
+      ]
+    },
+    {
+      "text": "As Acolyte's Reward tries to resolve, if only the first target is illegal, Acolyte's Reward won't prevent any damage that would be dealt to that creature and, because of this, Acolyte's Reward won't deal damage to the second target. If only the second target is illegal, damage that would be dealt to the first target will be prevented, but Acolyte's Reward won't deal damage. If both targets are illegal, Acolyte's Reward won't resolve.",
+      "cards": [
+        "Acolyte's Reward"
+      ]
+    },
+    {
+      "text": "Because convoke isn't an alternative cost, it can be used in conjunction with alternative costs.",
+      "cards": [
+        "Chant of Vitu-Ghazi"
+      ]
+    },
+    {
+      "text": "Channel Harm’s effect is not a redirection effect. If it prevents damage, you may have Channel Harm (not the original source) deal damage to the creature as part of that prevention effect. Channel Harm is the source of the new damage, so the characteristics of the original source (such as its color, or whether it had lifelink or deathtouch) don’t affect the new damage. The new damage is not combat damage, even if the prevented damage was.",
+      "cards": [
+        "Channel Harm"
+      ]
+    },
+    {
+      "text": "Channel Harm’s only target is the creature it may deal damage to. You choose that target as you cast Channel Harm, not at the time it prevents damage.",
+      "cards": [
+        "Channel Harm"
+      ]
+    },
+    {
+      "text": "Comeuppance's effect is not a redirection effect. If it prevents damage, Comeuppance (not the original source) deals damage to the permanent or player as part of that prevention effect. Comeuppance is the source of the new damage, so the characteristics of the original source (such as its color, or whether it had lifelink or deathtouch) don't affect the new damage. The new damage is not combat damage, even if the prevented damage was.",
+      "cards": [
+        "Comeuppance"
+      ]
+    },
+    {
+      "text": "Conversely, replacement effects that apply to the number of counters put on a player can modify the counters placed this way. For example, Vorinclex, Monstrous Raider's last two abilities can apply to counters placed this way.",
+      "cards": [
+        "Ria Ivor, Bane of Bladehold"
+      ]
+    },
+    {
+      "text": "Damage dealt by a creature with toxic grants the same number of counters regardless of how much damage is dealt. Notably, if a replacement effect modifies the damage in some way (such as that of Gratuitous Violence), the number of counters given remains unchanged.",
+      "cards": [
+        "Ria Ivor, Bane of Bladehold"
+      ]
+    },
+    {
+      "text": "Deflecting Palm doesn't target any permanent or player. You choose a source of damage as Deflecting Palm resolves.",
+      "cards": [
+        "Deflecting Palm"
+      ]
+    },
+    {
+      "text": "Divine Deflection can prevent damage from multiple sources dealing damage simultaneously (such as during combat). If the chosen value for X won’t prevent all the damage, you choose which sources to prevent damage from.",
+      "cards": [
+        "Divine Deflection"
+      ]
+    },
+    {
+      "text": "Divine Deflection can prevent damage that would be dealt to you, one or more creatures you control, and/or one or more planeswalkers you control.",
+      "cards": [
+        "Divine Deflection"
+      ]
+    },
+    {
+      "text": "Divine Deflection’s effect is not a redirection effect. If it prevents damage, Divine Deflection (not the original source) deals damage to the targeted permanent or player as part of that prevention effect. Divine Deflection is the source of the new damage, so the characteristics of the original source (such as its color, or whether it had lifelink or deathtouch) don’t affect this damage. The new damage is not combat damage, even if the prevented damage was.",
+      "cards": [
+        "Divine Deflection"
+      ]
+    },
+    {
+      "text": "Divine Deflection’s only target is the permanent or player it may deal damage to. You choose that target as you cast Divine Deflection, not at the time it prevents damage.",
+      "cards": [
+        "Divine Deflection"
+      ]
+    },
+    {
+      "text": "Hybrid mana symbols, monocolored hybrid mana symbols, and Phyrexian mana symbols do count toward your devotion to their color(s).",
+      "cards": [
+        "Acolyte's Reward"
+      ]
+    },
+    {
+      "text": "If Acolyte's Reward prevents damage, it deals its damage immediately afterward as part of that same prevention effect. This happens before state-based actions are performed, and before any player can cast spells or activate abilities. If the source of the original damage was a spell or ability, this happens before that spell or ability resumes its resolution.",
+      "cards": [
+        "Acolyte's Reward"
+      ]
+    },
+    {
+      "text": "If Divine Deflection can’t deal damage to the targeted permanent or player (because the creature is no longer on the battlefield, or is no longer a creature, or the player is no longer in the game, for example), it will still prevent damage. It just won’t deal any damage itself.",
+      "cards": [
+        "Divine Deflection"
+      ]
+    },
+    {
+      "text": "If Divine Deflection prevents damage, excess damage (if any) dealt by that source is dealt at the same time. Immediately afterward, as part of that same prevention effect, Divine Deflection deals its damage. This happens before state-based actions are checked, and before the spell or ability that caused damage to be dealt resumes its resolution.",
+      "cards": [
+        "Divine Deflection"
+      ]
+    },
+    {
+      "text": "If Refraction Trap doesn’t prevent any damage (perhaps because a different prevention effect is applied to the damage the source would deal, or because the damage is unpreventable), Refraction Trap won’t deal any damage itself.",
+      "cards": [
+        "Refraction Trap"
+      ]
+    },
+    {
+      "text": "If Vengeful Archon’s ability doesn’t prevent any damage (perhaps because a different prevention effect is applied to the damage that would be dealt to you, or because the damage is unpreventable), Vengeful Archon won’t deal any damage itself.",
+      "cards": [
+        "Vengeful Archon"
+      ]
+    },
+    {
+      "text": "If Vengeful Archon’s ability prevents damage, Vengeful Archon deals its damage immediately afterward as part of that same prevention effect. This happens before state-based actions are checked, and before any player can cast spells or activate abilities. If a spell or ability would have caused that damage to be dealt, this happens before that spell or ability resumes its resolution.",
+      "cards": [
+        "Vengeful Archon"
+      ]
+    },
+    {
+      "text": "If a creature with toxic deals combat damage to a creature or planeswalker, or if it deals noncombat damage, toxic has no effect and no player gets poison counters.",
+      "cards": [
+        "Ria Ivor, Bane of Bladehold"
+      ]
+    },
+    {
+      "text": "If a creature with wither would deal damage to Swans of Bryn Argoll, that damage is treated just like any other damage. It’s prevented, and the creature’s controller draws cards. Swans of Bryn Argoll doesn’t get any -1/-1 counters.",
+      "cards": [
+        "Swans of Bryn Argoll"
+      ]
+    },
+    {
+      "text": "If a creature you control has a mana ability with {T} in the cost, activating that ability while casting a spell with convoke will result in the creature being tapped before you pay the spell's costs. You won't be able to tap it again for convoke. Similarly, if you sacrifice a creature to activate a mana ability while casting a spell with convoke, that creature won't be on the battlefield when you pay the spell's costs, so you won't be able to tap it for convoke.",
+      "cards": [
+        "Chant of Vitu-Ghazi"
+      ]
+    },
+    {
+      "text": "If a spell is causing damage to be dealt, that spell will always identify the source of the damage. In most cases, the source is the spell itself. For example, Burn Trail says “Burn Trail deals 3 damage to any target.”",
+      "cards": [
+        "Swans of Bryn Argoll"
+      ]
+    },
+    {
+      "text": "If all of the spell’s targets are illegal when the spell tries to resolve, it won’t resolve and none of its effects will happen.",
+      "cards": [
+        "Candles' Glow"
+      ]
+    },
+    {
+      "text": "If an ability is causing damage to be dealt, that ability will always identify the source of the damage. The ability itself is never the source. However, the source of the ability is often the source of the damage. For example, Knollspine Invocation’s ability says “Knollspine Invocation deals X damage to any target.”",
+      "cards": [
+        "Swans of Bryn Argoll"
+      ]
+    },
+    {
+      "text": "If an activated ability or triggered ability has an effect that depends on your devotion to a color, you count the number of mana symbols of that color among the mana costs of permanents you control as the ability resolves. The permanent with that ability will be counted if it's still on the battlefield at that time.",
+      "cards": [
+        "Acolyte's Reward"
+      ]
+    },
+    {
+      "text": "If another effect (or effects) modifies how much damage the chosen source would deal to you this turn, you choose the order in which any such effects, including the effect of New Way Forward, apply.",
+      "cards": [
+        "New Way Forward"
+      ]
+    },
+    {
+      "text": "If another effect modifies how much damage a spell would deal to an opponent or a permanent they control, including preventing some of it, the player being dealt damage or the controller of the permanent being dealt damage chooses an order in which to apply those effects. If all of the damage is prevented, Rem's effect no longer applies.",
+      "cards": [
+        "Rem Karolus, Stalwart Slayer"
+      ]
+    },
+    {
+      "text": "If damage dealt by a creature with the ability granted by Sokrates's last ability can't be prevented for some reason, the appropriate players will still draw half that many cards, rounded down. (This won't come up often, but the unexamined ability is not worth activating.)",
+      "cards": [
+        "Sokrates, Athenian Teacher"
+      ]
+    },
+    {
+      "text": "If damage dealt by a source you control is being divided or assigned among multiple permanents an opponent controls or among an opponent and one or more permanents they control, divide the original amount before adding 1. For example, if you cast a spell that deals 4 damage divided among any number of targets and you choose to have it deal 2 damage to a creature and 2 damage to that creature's controller, that spell will deal 3 damage to each of them instead.",
+      "cards": [
+        "Rem Karolus, Stalwart Slayer"
+      ]
+    },
+    {
+      "text": "If damage dealt to Phyrexian Hydra can’t be prevented (due to Leyline of Punishment, for example), it will be dealt as normal and won’t cause Phyrexian Hydra to put -1/-1 counters on itself.",
+      "cards": [
+        "Phyrexian Hydra"
+      ]
+    },
+    {
+      "text": "If damage is dealt to multiple permanents you control, or is dealt to you and at least one permanent you control, you choose which of that damage to prevent if the chosen value for X won’t prevent all the damage. For example, if 3 damage would be dealt to you and to each of two creatures you control, and Divine Deflection will prevent the next 3 damage, you might choose to prevent the next 2 damage it would deal to you and the next 1 damage it would deal to one of the creatures, among other choices. You don’t decide until the point at which the damage would be dealt.",
+      "cards": [
+        "Divine Deflection"
+      ]
+    },
+    {
+      "text": "If damage that can be prevented is dealt to Stormwild Capridor at the same time as damage that can’t be prevented, it gets +1/+1 counters for the prevented damage before checking to see if it dies from the damage that couldn’t be prevented.",
+      "cards": [
+        "Stormwild Capridor"
+      ]
+    },
+    {
+      "text": "If damage that can’t be prevented is dealt to Stormwild Capridor, it doesn’t get +1/+1 counters for that damage.",
+      "cards": [
+        "Stormwild Capridor"
+      ]
+    },
+    {
+      "text": "If multiple damage prevention effects would apply to combat damage that would be dealt to you, you get to choose the order the prevention effects are applied in.",
+      "cards": [
+        "Inkshield"
+      ]
+    },
+    {
+      "text": "If multiple damage prevention effects, including Phyrexian Hydra’s, are attempting to prevent damage that would be dealt to Phyrexian Hydra, its controller chooses which to apply.",
+      "cards": [
+        "Phyrexian Hydra"
+      ]
+    },
+    {
+      "text": "If multiple effects modify how damage will be dealt, the player who would be dealt damage chooses the order to apply the effects. For example, say you’ve activated Vengeful Archon’s ability with X = 3 targeting Player A, and you’ve activated Vengeful Archon’s ability with X = 1 targeting Player B. You’re dealt 2 damage. You can apply the first prevention effect (dealing 2 damage to Player A), or you can apply the second prevention effect (dealing 1 damage to Player B) followed by the first prevention effect (dealing 1 damage to Player A). The unused portions of the prevention effects remain.",
+      "cards": [
+        "Vengeful Archon"
+      ]
+    },
+    {
+      "text": "If multiple prevention and/or replacement effects are trying to apply to the same damage, the player who would be dealt damage chooses the order in which to apply them.",
+      "cards": [
+        "Deflecting Palm"
+      ]
+    },
+    {
+      "text": "If multiple replacement or prevention effects try to modify damage that would be dealt to a player, the player being dealt damage chooses the order in which they apply.",
+      "cards": [
+        "Ria Ivor, Bane of Bladehold"
+      ]
+    },
+    {
+      "text": "If the Incarnation had lost this ability while on the battlefield (due to Lignify, for example) and then was destroyed, the ability would still trigger and it would get shuffled into its owner's library. However, if the Incarnation lost this ability when it was put into the graveyard (due to Yixlid Jailer, for example), the ability wouldn't trigger and the Incarnation would remain in the graveyard.",
+      "cards": [
+        "Vigor"
+      ]
+    },
+    {
+      "text": "If the Incarnation is removed from the graveyard after the ability triggers but before it resolves, it will remain in its new zone when its owner shuffles their library. Similarly, if a replacement effect has the Incarnation move to a different zone instead of being put into the graveyard, the ability won't trigger at all.",
+      "cards": [
+        "Vigor"
+      ]
+    },
+    {
+      "text": "If the amount of damage that would be dealt to the first target is in excess of the amount of damage that Acolyte's Reward would prevent, the source deals its excess damage to the first target at the same time that the rest of it is prevented. Then Acolyte's Reward deals its damage.",
+      "cards": [
+        "Acolyte's Reward"
+      ]
+    },
+    {
+      "text": "If the amount of damage that would be dealt to you is in excess of the amount of damage that Vengeful Archon’s ability would prevent, that source deals its excess damage to you at the same time that the rest of it is prevented. Then Vengeful Archon deals its damage.",
+      "cards": [
+        "Vengeful Archon"
+      ]
+    },
+    {
+      "text": "If the chosen source would deal damage, Refraction Trap prevents 3 of that source’s damage and the source deals its excess damage (if any) at the same time. Immediately afterward, as part of that same prevention effect, Refraction Trap deals its damage. This happens before state-based actions are checked, and before the spell or ability that caused damage to be dealt resumes its resolution.",
+      "cards": [
+        "Refraction Trap"
+      ]
+    },
+    {
+      "text": "If the chosen source would simultaneously deal damage to multiple permanents you control, or would simultaneously deal damage to you and at least one permanent you control, you choose which of that damage to prevent. For example, if the chosen source is Earthquake, you might choose to prevent the next 2 damage it would deal to you and the next 1 damage it would deal to a creature you control. You don’t decide until the point at which the source would deal its damage.",
+      "cards": [
+        "Refraction Trap"
+      ]
+    },
+    {
+      "text": "If the first target would be dealt combat damage by multiple creatures, you choose which of that damage to prevent. (For example, if one of those creatures has deathtouch, you could choose to prevent the damage from that creature specifically.) You don't decide until the point at which the creatures would deal their damage.",
+      "cards": [
+        "Acolyte's Reward"
+      ]
+    },
+    {
+      "text": "If the source of the damage is a permanent, Swans of Bryn Argoll checks who that permanent’s controller is at the time that damage is prevented. If the permanent has left the battlefield by then, its last known information is used. If the source of the damage is a spell, its controller is obvious. If the source of the damage is a card from some other zone (such as a cycled Gempalm Incinerator), Swans of Bryn Argoll checks its owner rather than its controller.",
+      "cards": [
+        "Swans of Bryn Argoll"
+      ]
+    },
+    {
+      "text": "If the target creature is an illegal target as Channel Harm tries to resolve, the entire spell doesn’t resolve. No damage will be prevented.",
+      "cards": [
+        "Channel Harm"
+      ]
+    },
+    {
+      "text": "If the targeted permanent or player is an illegal target by the time Divine Deflection resolves, the entire spell doesn’t resolve. No damage will be prevented.",
+      "cards": [
+        "Divine Deflection"
+      ]
+    },
+    {
+      "text": "If the targeted permanent or player is an illegal target by the time Refraction Trap resolves, the entire spell doesn’t resolve. No damage will be prevented.",
+      "cards": [
+        "Refraction Trap"
+      ]
+    },
+    {
+      "text": "If the targeted player is an illegal target by the time the ability resolves, the entire ability doesn’t resolve. No damage will be prevented.",
+      "cards": [
+        "Vengeful Archon"
+      ]
+    },
+    {
+      "text": "If the third ability is countered, but your graveyard is still empty, the ability will immediately trigger again.",
+      "cards": [
+        "Immortal Coil"
+      ]
+    },
+    {
+      "text": "If two players have each cast Channel Harm targeting a creature the other controls, and a source one player controls would deal damage to the second player or a permanent that player controls, one Channel Harm will prevent that damage and try to deal damage to the creature controlled by the first player. That player’s Channel Harm will then prevent that damage and try to deal damage to the creature controlled by the second player. This forms a loop that either player can break by choosing to not have Channel Harm try to deal damage. It doesn’t matter which player breaks the loop, as no damage will be dealt in either case.",
+      "cards": [
+        "Channel Harm"
+      ]
+    },
+    {
+      "text": "If you do not have enough cards in your library, the damage is still prevented and all the cards in your library are exiled.",
+      "cards": [
+        "Bone Mask"
+      ]
+    },
+    {
+      "text": "If you would be dealt combat damage by multiple attacking creatures, you choose which of that damage to prevent. For example, if X is 3 and you’d be dealt combat damage by a 1/3 Scroll Thief and a 3/5 Siege Mastodon, you might choose to prevent 1 damage from the Scroll Thief and 2 damage from the Siege Mastodon. You don’t decide until the point at which the creatures would deal their damage.",
+      "cards": [
+        "Vengeful Archon"
+      ]
+    },
+    {
+      "text": "It only affects damage dealt by the source one time. If the source damages you a second time this turn, the damage will not be reversed.",
+      "cards": [
+        "Reverse Damage"
+      ]
+    },
+    {
+      "text": "Mana symbols in the text boxes of permanents you control don't count toward your devotion to any color.",
+      "cards": [
+        "Acolyte's Reward"
+      ]
+    },
+    {
+      "text": "Multiple instances of toxic are cumulative. For example, if a creature has toxic 2 and gains toxic 1 due to another effect, combat damage that creature deals to a player will cause that player to get 3 poison counters.",
+      "cards": [
+        "Ria Ivor, Bane of Bladehold"
+      ]
+    },
+    {
+      "text": "New Way Forward doesn’t target any permanent or player. You choose a source as New Way Forward resolves.",
+      "cards": [
+        "New Way Forward"
+      ]
+    },
+    {
+      "text": "Numeric mana symbols ({0}, {1}, and so on) in mana costs of permanents you control don't count toward your devotion to any color.",
+      "cards": [
+        "Acolyte's Reward"
+      ]
+    },
+    {
+      "text": "Refraction Trap can prevent damage that would be dealt to you, one or more creatures you control, and/or one or more planeswalkers you control.",
+      "cards": [
+        "Refraction Trap"
+      ]
+    },
+    {
+      "text": "Refraction Trap doesn’t target the source of the damage it prevents. You choose that source as Refraction Trap resolves. If you cast Refraction Trap for {W}, the source you choose doesn’t have to be the red instant or sorcery spell an opponent cast.",
+      "cards": [
+        "Refraction Trap"
+      ]
+    },
+    {
+      "text": "Refraction Trap’s effect is not a redirection effect. If it prevents damage, Refraction Trap (not the chosen source) deals damage to the targeted permanent or player as part of that prevention effect. Refraction Trap is the source of the new damage, so the characteristics of the original source (such as its color, or whether it had lifelink or deathtouch) don’t affect this damage. The new damage is not combat damage, even if the prevented damage was.",
+      "cards": [
+        "Refraction Trap"
+      ]
+    },
+    {
+      "text": "Refraction Trap’s only target is the permanent or player it may deal damage to. You choose that target as you cast Refraction Trap, not at the time it prevents damage.",
+      "cards": [
+        "Refraction Trap"
+      ]
+    },
+    {
+      "text": "Rem Karolus, Stalwart Slayer's last two abilities apply only to damage dealt by spells on the stack. A spell that becomes a permanent and then deals damage won't be affected.",
+      "cards": [
+        "Rem Karolus, Stalwart Slayer"
+      ]
+    },
+    {
+      "text": "Similarly, if the third ability resolves but you don’t lose the game for some reason (because you control Platinum Angel, perhaps), it will immediately trigger again if your graveyard is still empty. Immortal Coil + Platinum Angel + an empty graveyard is an involuntary infinite loop. Unless a player disrupts it, the game will end in a draw.",
+      "cards": [
+        "Immortal Coil"
+      ]
+    },
+    {
+      "text": "Some spells cause other objects to deal damage, such as spells that cause two creatures to fight. Rem Karolus, Stalwart Slayer's last two abilities don't apply to damage from such effects.",
+      "cards": [
+        "Rem Karolus, Stalwart Slayer"
+      ]
+    },
+    {
+      "text": "Tapping a multicolored creature using convoke will pay for {1} or one mana of your choice of any of that creature's colors.",
+      "cards": [
+        "Chant of Vitu-Ghazi"
+      ]
+    },
+    {
+      "text": "Tapping an untapped creature that's attacking or blocking to convoke a spell won't cause that creature to stop attacking or blocking.",
+      "cards": [
+        "Chant of Vitu-Ghazi"
+      ]
+    },
+    {
+      "text": "The +1/+1 counters are put onto the creature at the same time the damage is prevented. If a 1/1 creature would be dealt 6 damage, 3 damage is prevented and three +1/+1 counters are put on the creature. The creature ends up as a 4/4 creature with 3 damage marked on it.",
+      "cards": [
+        "Test of Faith"
+      ]
+    },
+    {
+      "text": "The +1/+1 counters do show up at the same time as any unprevented damage, which means they are there before you check for lethal damage.",
+      "cards": [
+        "Temper"
+      ]
+    },
+    {
+      "text": "The additional 1 damage is dealt by the original source of damage. The additional damage isn't dealt by Rem Karolus.",
+      "cards": [
+        "Rem Karolus, Stalwart Slayer"
+      ]
+    },
+    {
+      "text": "The amount of damage the prevention shield will prevent is based on your devotion to white as Acolyte's Reward resolves. That amount won't change later in the turn, even if your devotion to white does.",
+      "cards": [
+        "Acolyte's Reward"
+      ]
+    },
+    {
+      "text": "The damage prevention shield lasts for the rest of the turn, and you gain life each time that shield prevents 1 or more damage.",
+      "cards": [
+        "Chant of Vitu-Ghazi"
+      ]
+    },
+    {
+      "text": "The damage will be dealt by Acolyte's Reward as it existed on the stack, not as it exists when the damage is dealt. That is, it's an instant spell that's dealing the damage, in case an ability cares about that (such as Satyr Firedancer's, which includes the phrase \"Whenever an instant or sorcery spell you control deals damage to an opponent\").",
+      "cards": [
+        "Acolyte's Reward"
+      ]
+    },
+    {
+      "text": "The delayed triggered ability will trigger regardless of whether any damage is actually prevented.",
+      "cards": [
+        "Intervention Pact"
+      ]
+    },
+    {
+      "text": "The effect of Acolyte's Reward isn't a redirection effect. If it prevents damage, Acolyte's Reward (not the source of that damage) deals damage to the second target as part of that prevention effect. Acolyte's Reward is the source of the new damage, so the characteristics of the original source (such as its color or whether it had lifelink) don't apply. The new damage isn't combat damage, even if the prevented damage was.",
+      "cards": [
+        "Acolyte's Reward"
+      ]
+    },
+    {
+      "text": "The effect of Vengeful Archon’s ability is not a redirection effect. If it prevents damage, Vengeful Archon (not the source of that damage) deals damage to the targeted player as part of that prevention effect. Vengeful Archon is the source of the new damage, so the characteristics of the original source (such as its color, or whether it had lifelink or deathtouch) don’t affect this damage. The new damage is not combat damage, even if the prevented damage was.",
+      "cards": [
+        "Vengeful Archon"
+      ]
+    },
+    {
+      "text": "The first ability exiles two cards in your graveyard as a cost. You can’t activate this ability unless you have at least two cards in your graveyard. Exiling those two cards can’t be responded to.",
+      "cards": [
+        "Immortal Coil"
+      ]
+    },
+    {
+      "text": "The last ability triggers when the Incarnation is put into its owner's graveyard from any zone, not just from on the battlefield.",
+      "cards": [
+        "Vigor"
+      ]
+    },
+    {
+      "text": "The only difference between a colored artifact and a colorless artifact is, obviously, its color. Unlike most artifacts, a colored artifact requires colored mana to cast. Also unlike most artifacts, a colored artifact has a color in all zones. It will interact with cards that care about color. Other than that, a colored artifact behaves just like any other artifact. It will interact as normal with any card that cares about artifacts, such as Shatter or Arcbound Ravager.",
+      "cards": [
+        "Immortal Coil"
+      ]
+    },
+    {
+      "text": "The only target of Vengeful Archon’s ability is the player it may deal damage to. You choose that target as you activate the ability, not at the time it prevents damage.",
+      "cards": [
+        "Vengeful Archon"
+      ]
+    },
+    {
+      "text": "The second ability prevents all damage that would be dealt to you, regardless of how many cards are in your graveyard. For example, if you have three cards in your graveyard and would be dealt 5 damage, Immortal Coil prevents all 5 damage and exiles all the cards in your graveyard.",
+      "cards": [
+        "Immortal Coil"
+      ]
+    },
+    {
+      "text": "The source of combat damage is the creature that deals it.",
+      "cards": [
+        "Swans of Bryn Argoll"
+      ]
+    },
+    {
+      "text": "The third ability checks whether your graveyard is empty only at the time it triggers. Putting a card into your graveyard after that doesn’t help. You’ll lose the game when the ability resolves.",
+      "cards": [
+        "Immortal Coil"
+      ]
+    },
+    {
+      "text": "This only prevents damage the chosen source would deal to you or a creature you control. If the creature would deal damage to another player, a planeswalker, or a creature you don’t control, it does not get prevented.",
+      "cards": [
+        "Shadowbane"
+      ]
+    },
+    {
+      "text": "Toxic doesn't change the amount of combat damage a creature deals. For example, if a 2/2 creature with toxic 1 deals combat damage to a player, that creature will deal 2 damage. The results of that damage are the player loses 2 life and gets a poison counter.",
+      "cards": [
+        "Ria Ivor, Bane of Bladehold"
+      ]
+    },
+    {
+      "text": "Vengeful Archon’s ability doesn’t have you choose a source of damage. It will apply to the next X damage you would be dealt that turn, regardless of where that damage comes from. It doesn’t matter whether the damage would all be dealt at the same time. For example, if X is 4 and you’d be dealt 3 damage by Lightning Bolt, that 3 damage is prevented and Vengeful Archon deals 3 damage to the targeted player. The prevention effect will still apply to the next 1 damage you’d be dealt that turn.",
+      "cards": [
+        "Vengeful Archon"
+      ]
+    },
+    {
+      "text": "When calculating a spell's total cost, include any alternative costs, additional costs, or anything else that increases or reduces the cost to cast the spell. Convoke applies after the total cost is calculated. Convoke doesn't change a spell's mana cost or mana value.",
+      "cards": [
+        "Chant of Vitu-Ghazi"
+      ]
+    },
+    {
+      "text": "Whether the target creature is still a legal target is not checked after Channel Harm resolves. Damage will still be prevented, even if Channel Harm can’t deal damage to that creature.",
+      "cards": [
+        "Channel Harm"
+      ]
+    },
+    {
+      "text": "Whether the targeted permanent or player is still a legal target is no longer checked after Refraction Trap resolves. For example, if a creature targeted by Refraction Trap gains shroud after Refraction Trap resolves but before it prevents damage, Refraction Trap will still prevent damage and still deal damage to that creature. If Refraction Trap can’t deal damage to the targeted permanent or player (because the creature is no longer on the battlefield, or is no longer a creature, or the player is no longer in the game, for example), it will still prevent damage. It just won’t deal any damage itself.",
+      "cards": [
+        "Refraction Trap"
+      ]
+    },
+    {
+      "text": "Whether the targeted permanent or player is still a legal target is not checked after Divine Deflection resolves. For example, if a creature targeted by Divine Deflection gains shroud after Divine Deflection resolves, Divine Deflection can still deal damage to that creature.",
+      "cards": [
+        "Divine Deflection"
+      ]
+    },
+    {
+      "text": "Whether the targeted player is still a legal target is no longer checked after Vengeful Archon’s ability resolves. For example, if a player targeted by Vengeful Archon’s ability puts Leyline of Sanctity (which says “You can’t be the target of spells or abilities your opponents control”) onto the battlefield after the ability resolves but before it prevents damage, the ability will still prevent damage and still deal damage to that player. If Vengeful Archon can’t deal damage to the targeted player (because the player is no longer in the game in a multiplayer game, for example), it will still prevent damage. It just won’t deal any damage itself.",
+      "cards": [
+        "Vengeful Archon"
+      ]
+    },
+    {
+      "text": "You can choose a creature you control as the target. If you do, the damage Channel Harm deals to that creature won’t be prevented.",
+      "cards": [
+        "Channel Harm"
+      ]
+    },
+    {
+      "text": "You can make X be larger than the amount of damage, but you only get one counter for each actual point of damage prevented.",
+      "cards": [
+        "Temper"
+      ]
+    },
+    {
+      "text": "You can tap any untapped creature you control to convoke a spell, even one you haven't controlled continuously since the beginning of your most recent turn.",
+      "cards": [
+        "Chant of Vitu-Ghazi"
+      ]
+    },
+    {
+      "text": "You choose all targets for the spell after revealing cards you want to splice, including any targets required by the text of any of those cards. You may choose a different target for each instance of the word “target” on the resulting spell.",
+      "cards": [
+        "Candles' Glow"
+      ]
+    },
+    {
+      "text": "You don't choose a source of damage. The prevention shield will apply to the next X damage that would be dealt to the first target, no matter where that damage comes from. It also doesn't matter whether the damage is dealt at the same time. For example, if the shield prevents the next 5 damage to the first target, and that creature would be dealt 3 damage by Lightning Strike, that 3 damage is prevented and Acolyte's Reward deals 3 damage to the second target. The prevention effect will still apply to the next 2 damage the first target would be dealt that turn.",
+      "cards": [
+        "Acolyte's Reward"
+      ]
+    },
+    {
+      "text": "You reveal all cards you intend to splice at the same time. Each individual card can be spliced only once onto any one spell.",
+      "cards": [
+        "Candles' Glow"
+      ]
+    }
+  ]
+}

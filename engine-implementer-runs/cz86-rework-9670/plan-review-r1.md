@@ -1,0 +1,8 @@
+# Codex plan review r1 (magi-1e8215ba), returned inline
+
+1. [behavior, HIGH] Coverage regression (fencing Soul-Scar Mage, Szadek, Undead Alchemist; plan-r1.md:602-606, 1016-1023) contradicts the acceptance criterion "no card that #10639 or main supports regresses". Orchestrator must resolve the acceptance conflict before execution: authorize and record the three drops, or include the behavior that preserves support. Do not narrow the fence merely to keep coverage green.
+2. [behavior, MEDIUM] The retained batch's preservation row (plan-r1.md:597, 634-635; V1.1, V1.2, V2.2, V2.3, V4.3) lacks a claim-to-test map and independent card/CR-derived reference readings. Expand into explicit existing test names, seams, exact discriminating assertions, positive reach-guards, and derived readings, including the effect-stated outcome behavior that justifies keeping the carrier. Existing product tests suffice.
+3. [text, LOW] plan-r1.md:810-811 "each opponent of a winner who is not an effect loser → OpponentWon" -> "For each winner who is not an effect loser, insert `OpponentWon` for every living opponent, including opponents already carrying `EffectStatedLoss`; union both reasons in the same set."
+
+Q views: Q1 fence uniformly if the gap remains, but get an explicit acceptance amendment. Q2 keep ResumeDamageBatch provisionally (carrier and DamageTail answer different questions); finding 2 must substantiate. Q3 keep ApplyPostReplacementDamage inside the single dispatch/ownership table. Q4 widening event_amount and keeping the dispatch-bound reader is reasonable; record it as the chosen reconciliation.
+Recommendation: return for the two behavior revisions, apply the text fix, run charter adjudication before execution.

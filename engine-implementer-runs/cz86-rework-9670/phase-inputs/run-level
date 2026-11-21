@@ -1,0 +1,5 @@
+# Run-level verification inputs (moved from the charter, charter review r1 correction 1)
+
+- **Budgets.** `GameState` stays ≤ 16,384 bytes (measured in P1, re-measured in P2 if a pending
+  carrier grows). The Kathril stack test stays within 16 MiB (P1 changes frame return types). Both
+  are run-level verification rows.

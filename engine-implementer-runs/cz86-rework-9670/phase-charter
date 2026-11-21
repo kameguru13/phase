@@ -1,0 +1,368 @@
+# Phase charter: cz86-rework-9670 (reconcile #10639 with main's #9670, one authority per seam)
+
+Charter mode, derived from the draft `plan-r1.md` and the accumulated findings of plan review r1
+(`plan-review-r1.md`: 2 behavior, 1 text). Run base = the PR head named in `task.md`; main = the
+`upstream/main` named there. This charter fixes phases, order, seams, each phase's goal, the
+architecture decisions it carries out, and what is deferred to which phase. It holds no file
+inventory and asserts nothing about today's code: every "the phase plan establishes" below is a
+claim that phase's plan buys by measurement.
+
+Three phases, linear: **P1 merge onto main's authorities → P2 every combat pause asked → P3 one
+substitution predicate and the fence decision.** P1 cannot be split further (§Feasibility, P1).
+
+---
+
+## Carried survival steps (Step 0, 0.5, 1, 2)
+
+**Step 0 (premise).** Re-read from MTGJSON `AtomicCards.json` `5.3.0+20261021`, not from the brief:
+Soul-Scar Mage "If a source you control would deal noncombat damage to a creature an opponent
+controls, put that many -1/-1 counters on that creature instead."; Szadek, Lord of Secrets "If Szadek
+would deal combat damage to a player, instead put that many +1/+1 counters on Szadek and that player
+mills that many cards."; Undead Alchemist "If a Zombie you control would deal combat damage to a
+player, instead that player mills that many cards."; Force Bubble "If damage would be dealt to you,
+put that many depletion counters on this enchantment instead." The remaining premise texts are
+plan-r1 §0's, which match MTGJSON. CR numbers used here were grep-verified in
+`docs/MagicCompRules.txt`: 101.4, 104.1, 104.2b, 104.3e, 104.3f, 104.4a, 120.4b, 120.8, 510.2,
+608.2c, 608.2d, 608.2f, 614.1a, 614.5, 614.6, 614.9, 615.1a, 615.5, 615.7, 615.12, 615.13, 616.1,
+616.1f, 616.1g, 700.1, 701.14a, 702.16e, 800.4a, 810.8a.
+
+**Step 0.5 (class attribution; phase plans cite this, they do not re-run it).** `jq-1.8.1`, MTGJSON
+`5.3.0+20261021`, query `class/query.sh` (the skill's query with reminder text stripped before
+masking), commands verbatim in plan-r1 §1.
+- Class A, damage substitutions: `class/substitution_class.json`, count 12 (Crumbling Sanctuary,
+  Delaying Shield, Dralnu, Lich Lord, Force Bubble, Lichenthrope, Nefarious Lich, Oozeavite,
+  Phytohydra, Soul-Scar Mage, Szadek, Lord of Secrets, Undead Alchemist, Underdark Beholder), 38
+  distinct rulings, hash `3f5d7d097714407289320c69a66af51663beebf175f6eeb177f48921597b256b`.
+  Drives P3 (and the substitution rows P1 keeps green).
+- Class B, prevention with additional effects: `class/prevention_rider_class.json`, count 39, 110
+  distinct rulings, hash `a49c1dc69e5fbbb2fcb63e1ec55e135623b8a17109bac4a63e5a24b24e5de6b5`.
+  Drives P1 (per-leg riders, noncombat batch) and P2 (aggregate riders).
+- Class C, CR-defined combat replacement/prevention choices (CR 510.2 + CR 616.1): A ∪ B
+  (`class/union.txt`, 51) minus the three noncombat-only by printed text (Purity, Soul-Scar Mage,
+  Stormwild Capridor) = 48. Drives P1 (per-leg asks) and P2 (aggregate and in-leg rider asks).
+- Bearing rulings: `class/notes.txt` S1–S12, P1–P9, quoted verbatim in plan-r1 §1. Attribution by
+  phase: S7, S8, S9, P5 → P1; S11, P1, P2, P7, P8 → P1 (per-leg and noncombat) and P2 (in-leg
+  earlier rider, Phase D); P3, P4 → P2; S1–S5, S6, S10, S12 → P3; P6, P9 → unchanged gaps (fence
+  `shared_shield_split_unoffered`; Command Zone #172).
+
+**Step 1 (skills, per phase).** P1: `/add-replacement-effect`, `/add-interactive-effect`
+(combat `ReplacementChoice` round trip), `/casting-stack-conditions` (tail ownership, resolution
+frames), `/card-test`. P2: `/add-interactive-effect`, `/add-replacement-effect`, `/card-test`,
+`/add-card-data-pipeline` (coverage fence removal). P3: `/add-replacement-effect`,
+`/oracle-parser`, `/add-engine-variant` (a variant deletion; the gate's sibling check only),
+`/add-card-data-pipeline` (fence key), `/card-test`.
+
+**Step 2 (analogous traces that choose the seams).** plan-r1 §9: main's #9670 lifelink-gain park
+(the model P2's Phase D park copies); the branch's noncombat two-phase batch through
+`ResumeDamageBatch` (the carrier P1 keeps); main's `DamageTail` from the multi-event arm of
+`resolve_effect_step` to the chain driver's early return (the tail authority P1 adopts).
+
+---
+
+## Decisions taken on plan-r1 §18 Q2–Q4 (reviewer's views adopted)
+
+Each is recorded as the chosen reconciliation and carried out in P1.
+
+- **Q2.** `Effect::ResumeDamageBatch` stays the parked two-phase batch's carrier. `DamageTail` is the
+  single tail authority. The batch runner and its park report `Caller`/`Stashed` like every other
+  damage instruction, and the branch's tail inference is deleted. The carrier and `DamageTail` answer
+  different questions: what the paused batch still owes, and who places the instruction's tail.
+- **Q3.** `Effect::ApplyPostReplacementDamage` stays inside the one multi-event damage dispatch table
+  and its ownership mapping. It is not deleted here, because deleting it is a separate protocol
+  change.
+- **Q4.** `PostReplacementDrain::event_amount` widens to "the amount of the event this drain's
+  replacement replaced or prevented, latched when it applied" (CR 614.6 + CR 615.5). Main's
+  `ReplacedEventContext` is its only installer, filled by one amount authority. The branch's
+  dispatch-bound reader, carried across a prompt on the pending continuation, is its only reader.
+  Main's `post_replacement_event_amount()` tier and the branch's thread-local stamp both go.
+
+These answer pr-question-1 items 2 and 3, which are still open with the maintainer. If the
+maintainer rejects either one, that breaks a P1 decision, and the remaining phases are re-chartered
+(§Open decisions).
+
+---
+
+## Phase 1 — Merge onto main's authorities
+
+**Goal.** Merge `upstream/main` into the branch as the phase's opening move. Resolve every conflict
+hunk onto the authority this charter assigns to its seam, and leave a green tree. P1 adds no
+behavior that neither side has. A seam extension that the green tree does not force waits for P2
+or P3.
+
+**Scope rule.** Anchor subsystems: the combat damage step and its replacement pass, the noncombat
+damage instructions and the fight instruction, the effect dispatcher and chain driver, effect-stated
+win/loss and elimination, the replaced-event amount and its quantity reader, and `GameState` and its
+size budget. Anchor paths: `crates/engine/src/game/combat_damage.rs`,
+`crates/engine/src/game/replacement.rs`, `crates/engine/src/game/effects/deal_damage.rs`,
+`crates/engine/src/game/effects/fight.rs`, `crates/engine/src/game/effects/mod.rs`,
+`crates/engine/src/game/effects/win_lose.rs`, `crates/engine/src/game/elimination.rs`,
+`crates/engine/src/game/engine.rs`, `crates/engine/src/game/quantity.rs`,
+`crates/engine/src/types/game_state.rs`, `crates/engine/src/types/game_state_size.rs`,
+`scripts/post-replacement-continuation-baseline.txt`, and the per-leg combat test files
+`crates/engine/tests/integration/damage_substitution_replacements.rs`,
+`crates/engine/tests/integration/unpreventable_damage_prevention_effects.rs`,
+`crates/engine/tests/integration/ironscale_hydra_combat_prevention.rs`. The auto-merged
+duplicate-field and old-arity sites the compiler names fall under the standing compiler-forced class.
+
+**Architecture decisions carried out.**
+1. *Merge shape.* The merge commit carries every hunk's resolution and the repairs needed to compile.
+   Test-expectation conversions may follow in their own P1 commit. P1's candidate is green.
+2. *Mechanical integration.* One `LazyBoxedVec` type, with both sides' methods and impls. One
+   `PostReplacementDrain::event_amount` field with main's serde attribute. Main's 16,384-byte
+   `GameState` ceiling, keeping the branch's boxed `damage_batch_ledger` note because that field
+   survives. #10810's removal of the loop-ring life-move call is kept. Main's `LossReason` is threaded
+   through `lose_by_effect`, `win_by_effect` and `settle_event_outcomes`: `EffectStatedLoss` for each
+   effect loser and each CR 810.8a shared-life teammate added for it. For each winner who is not an
+   effect loser, insert `OpponentWon` for every living opponent, including opponents already carrying
+   `EffectStatedLoss`; union both reasons in the same set. The result goes through
+   `eliminate_players(.., DepartureTriggers::ScannedByCaller, ..)`. This applies CR 104.2b, CR 104.3e,
+   CR 104.3f, CR 104.4a and CR 810.8a. (The text finding's replacement sentence from r1 is applied
+   verbatim.) The continuation census baseline is regenerated at the phase's end.
+3. *Seam 1, complete.* Q4 as decided above. One amount authority feeds `ReplacedEventContext.amount` at
+   every stash site: damage substitution, damage prevention (amount prevented, none at 0, CR 120.8),
+   and life-gain and life-loss substitution. The appliers keep setting `last_effect_count` directly.
+   P1 adds no third substitution test. Where the amount authority must recognize a substitution, it
+   reads the class through one helper whose body names both current representations, and P3 collapses
+   that helper.
+4. *Seam 3, legs.* Main's resumable `CombatDamageReplacementPass` is the only combat replacement
+   authority. It brings main's CR 616.1 order choice asked at the leg, the leg's own continuation
+   drained and asked (CR 616.1g), APNAP by actual chooser (CR 101.4), and reconciliation of parked
+   legs. The branch's per-batch auto-settle of order parks is retired. The branch's
+   `DamageBatchLedger` replaces main's one-shot application slot: the pass installs it on entry and
+   moves the pass's applications back out on exit. In P1, guards are read once per pass entry. The
+   pass also carries the branch's existing combat claims that its suites pin: the CR 104.1 stop (a
+   game that ended settles every remaining leg without dealing it) and the CR 800.4a departed
+   recipient (an unstarted leg whose player has left settles without being proposed). The P1 plan
+   establishes which of these main's pass already carries. Two paths keep the branch's in-batch
+   settlement under the existing `damage_replacement_choice_unasked_in_combat` fence: the aggregate
+   Phase D riders, and the substitution arm's drain of an earlier rider inside a leg. On per-leg cards
+   that fence is now conservative, which is honest, and P2 removes it.
+5. *Seam 3, test conversions.* Every branch combat test whose choice main's pass now asks at a leg is
+   rewritten to answer the prompt. Where the player has two answers, the test drives both and asserts
+   each exact value, derived clause by clause from the card's Oracle text and CR 616.1. The
+   set-valued "engine picks" readings are not copied (plan-r1 §13 rows for per-leg choices). The P1
+   plan classifies every branch combat test as per-leg (converted in P1), Phase D or in-leg
+   earlier-rider (P2), or APNAP restage (CR 101.4: restage it and keep its intent).
+6. *Seam 4, complete.* Main's `DamageTail` → `TailOwnership` is the single tail authority, and the
+   chain driver places a tail only for `Caller`. The multi-event table lists every instruction that
+   deals damage through the replacement pipeline: main's five, plus `Fight` (CR 701.14a),
+   `ResumeDamageBatch` (Q2) and `ApplyPostReplacementDamage` (Q3). The branch's two-phase
+   `run_damage_batch` stays the runner for the multi-source and fight instructions, and it and its
+   park report `DamageTail`. This keeps the batch semantics: replacement of every portion before any
+   delivery (CR 120.4b); held riders (CR 614.6 + CR 615.5); deferred APNAP choices (CR 616.1 +
+   CR 101.4); capped-redirect split parts (CR 614.9 + CR 614.5); the shared-shield wait (CR 615.7);
+   effect-stated outcomes settled together (CR 104.3f + CR 104.4a + CR 810.8a); and the CR 104.1 and
+   CR 800.4a stops. Per-recipient loops keep the branch's rider placement and report
+   `Caller`/`Stashed`. One tail builder is used: main's name, the branch's body. Main's per-node stash
+   of a paused multi-source batch is not restored. The branch's tail inference and main's
+   per-instruction stash helpers are deleted.
+7. *Seam 2, untouched.* `ShieldKind::Substitution` (the branch's seven cards, the branch's runtime
+   arm) and main's `ShieldKind::None` structural predicate (main's three cards, main's runtime arm)
+   stand side by side. The substitution fence keeps its current key.
+8. *Carried review finding (r1 behavior, MED).* Its obligations are P1 plan inputs (`phase-inputs/phase-1`).
+
+**Deferral list.**
+- Guards read once across a combat park (CR 608.2f + CR 700.1; Undergrowth Champion ruling), and the
+  pass's serialized guard carrier → P2.
+- An earlier rider's prompt inside a combat leg parks the leg (CR 615.5 + CR 608.2c) → P2.
+- Aggregate Phase D rider choices asked, and the record parked (CR 510.2 + CR 615.5 + CR 608.2d) → P2.
+- Deleting the branch's combat rider auto-settle machinery that still serves Phase D, the
+  `damage_replacement_choice_unasked_in_combat` fence and its predicates and unit tests, and the
+  Command Zone #140 module-doc paragraphs in the three branch test files → P2.
+- Folding `ShieldKind::Substitution` into one predicate, re-keying every consumer, the substitution
+  fence's key and the Q1 outcome, removing the branch's unreleased protocol record for the variant,
+  and measuring Oozeavite and Underdark Beholder against the structural predicate → P3.
+- Discriminating rows that cannot exist before their phase: the two-aggregate-shields row, the
+  in-leg earlier-rider row and the cross-park guard row → DEFERRED(phase 2). The substitution parse
+  and predicate rows, the substitution-vs-redirect order row and the Soul-Scar Mage fight-ruling row
+  (S10: held `WithEvent` timing for main's cards) → DEFERRED(phase 3).
+
+**Addenda file.** `addenda/phase-1`.
+
+---
+
+## Phase 2 — Every combat pause asked
+
+**Goal.** Finish seam 3. A prompt raised while the combat batch's riders settle is asked of its owing
+player, never auto-settled. A parked batch resumes reading the guards it read when it opened. The
+combat fence goes away because its gap is closed.
+
+**Scope rule.** Anchor subsystems: the combat replacement pass and its park and resume, Phase D
+aggregate riders, the serialized pending-combat carriers, and coverage's structural fences. Anchor
+paths: `crates/engine/src/game/replacement.rs`, `crates/engine/src/game/combat_damage.rs`,
+`crates/engine/src/game/coverage.rs`, `crates/engine/src/types/game_state.rs`,
+`crates/engine/tests/integration/unpreventable_damage_prevention_effects.rs`,
+`crates/engine/tests/integration/damage_substitution_replacements.rs`,
+`crates/engine/tests/integration/ironscale_hydra_combat_prevention.rs`, `protocol/changes/`
+(registry step only), `scripts/post-replacement-continuation-baseline.txt`.
+
+**Architecture decisions carried out.**
+1. One combat rider drain. It suspends the ledger, runs the resident post-replacement work, restores
+   the ledger and returns the pause it raised (`Option<WaitingFor>`); it settles nothing. The
+   per-leg continuation drain and Phase D both call it. The noncombat rider drain stops branching on
+   combat.
+2. In-leg earlier rider. When the substitution arm's drain of an earlier rider pauses inside a leg,
+   the leg parks on that prompt through main's continuation leg state. The work queued behind it runs
+   on the round trip, and the leg then resumes (CR 615.5 + CR 608.2c).
+3. Phase D parks. Aggregate shields are processed one at a time. A rider that pauses returns its
+   prompt with the unprocessed shields still in the record, and the record parks in the pending
+   combat lifelink slot exactly as main's lifelink-gain pause does. The existing priority resume
+   finishes the remaining shields once. CR 510.2 forbids a priority window, not the rider's choice
+   (CR 615.5, CR 608.2d), and the CR 104.1 stop is kept between shields.
+4. Guards across a park. The pass reads the printed "while" guards once, when it is created. It
+   carries them with the parked batch on the serialized pending combat replacement and installs them
+   into the ledger on every re-entry (CR 608.2f + CR 700.1).
+5. Deleted: the auto-settle machinery (rider pause settlement, its answer and abandon helpers, and
+   the pause record type), the `damage_replacement_choice_unasked_in_combat` fence with its predicates
+   and coverage unit tests, and the strict-failure module-doc paragraphs. Coverage flips this produces
+   are measured at run-level verification and listed.
+6. Test obligations are P2 plan inputs (`phase-inputs/phase-2`).
+
+**Deferral list.** The substitution predicate fold and the fence decision → P3.
+
+**Addenda file.** `addenda/phase-2`.
+
+---
+
+## Phase 3 — One substitution predicate; the fence decision (last)
+
+**Goal.** Finish seam 2. Main's structural predicate (a `DamageDone` replacement with no shield
+kind, no damage modification, and an `execute` that is neither damage nor unimplemented) and its
+rid-level wrapper become the single "is this a damage substitution" authority. `ShieldKind::Substitution`
+is deleted. The coverage fence is settled per the Q1 outcome. This is the only phase the pending
+coverage decision touches.
+
+**Scope rule.** Anchor subsystems: the replacement AST and its builder, the Oracle replacement
+parser's damage-instead patterns, the damage replacement appliers and candidate discovery, coverage's
+substitution fence, and the substitution integration suites. Anchor paths:
+`crates/phase-ast/src/types/ability.rs`, `crates/phase-parser/src/parser/oracle_replacement.rs`,
+`crates/phase-parser/src/parser/oracle_tests.rs`, `crates/engine/src/game/replacement.rs`,
+`crates/engine/src/game/coverage.rs`, `crates/engine/src/game/effects/deal_damage.rs`,
+`crates/engine/tests/integration/damage_substitution_replacements.rs`, `protocol/changes/`.
+
+**Architecture decisions carried out (both outcomes).**
+1. The parser emits the substitution class with the default shield kind. No detection or dispatch
+   step changes, and no Oracle text is newly accepted.
+2. Every consumer of the deleted tag calls the predicate. Matches stay exhaustive, and the P1
+   two-representation helper collapses onto the predicate. The branch's runtime semantics move onto
+   the predicate and so reach main's three cards:
+   - Use one substitution arm in the damage applier. When stashing a substitution’s action, preserve an earlier Ready prevention rider for the same damage event and run it immediately after the substitution (CR 614.6 and CR 615.5). Held work follows Phase D’s `RiderTiming` order. Work queued behind another recipient’s paused rider keeps its queue position (Command Zone #172). Combat’s in-leg drain keeps the earlier-first order under strict failure (Command Zone #267).
+   - a substitution is not a prevention effect (CR 615.12, CR 615.1a; rulings S1–S4);
+   - the zero-damage candidate gate (CR 120.8);
+   - order-material against every damage replacement, using main's unconditional materiality
+     (CR 616.1; rulings S7–S9);
+   - spends no shared prevention capacity (CR 615.7);
+   - held `WithEvent` in a two-phase batch (CR 614.6; ruling S10).
+3. Nothing counts as prevented (CR 615.13; S5). Multiple copies replace once (CR 614.5; S12).
+4. The P3 plan establishes whether Oozeavite and Underdark Beholder now satisfy the structural
+   predicate. One whose `execute` is not faithful reports unsupported; it never becomes a supported
+   substitution silently.
+5. The branch's unreleased protocol record for the deleted variant goes, through the
+   protocol-versions registry.
+
+**The pending decision — both outcomes this phase must handle.**
+- **Outcome A (the three drops accepted).** The fence `damage_substitution_choice_incomplete` keys on
+  the engine predicate and covers the whole class uniformly. Soul-Scar Mage, Szadek, Lord of Secrets
+  and Undead Alchemist report unsupported. They are listed as coverage-honesty drops with the
+  acceptance amendment recorded, together with the two gaps the fence names:
+  - protection's prevention (CR 702.16e) applies ahead of the substitution's CR 616.1 choice;
+  - simultaneous multi-source damage asks one choice per source, where Force Bubble's ruling (S6)
+    gives one.
+
+  The fence is not narrowed. Protection reaches every class member, so no narrower key is rules-clean
+  (review r1 finding 1). Under A, the phase is one unit within the scope rule above.
+- **Outcome B (the three stay supported).** The gap is closed for the whole class, and the fence is
+  deleted, not narrowed. This takes two behaviors before the fold deletes the fence:
+  1. protection's prevention offered as a CR 616.1 candidate against a substitution, so the affected
+     player chooses the order (CR 702.16e + CR 616.1; Soul-Scar Mage's "multiple prevention and/or
+     replacement effects" ruling);
+  2. one substitution choice for damage from several sources dealt at once (CR 510.2 + CR 616.1;
+     Force Bubble ruling S6), noncombat batch and combat batch alike.
+
+  Each is its own unit with its own discriminating tests. Under B the phase holds three units, and its
+  scope reaches the protection and combat-batch subsystems. Its scope-freeze re-adjudication is then
+  expected to fire, and the orchestrator re-charters P3 into "gap behaviors" then "fold and fence
+  deletion". P1 and P2 are unaffected either way.
+
+**Deferral list.** None under A. Under B, as re-chartered.
+
+**Addenda file.** `addenda/phase-3`.
+
+---
+
+## Seam notes
+
+- **Surfaces held green by strict-failure tags.** `damage_replacement_choice_unasked_in_combat` stays
+  through P1, honest for Phase D and in-leg riders and conservative for per-leg ones, and is removed
+  in P2. `damage_substitution_choice_incomplete` keeps its tag-based key through P2 and is re-keyed or
+  deleted in P3. Interim coverage may be conservative, and run-level verification measures the final
+  head against the acceptance line (as amended under outcome A).
+- **Two substitution representations, P1–P2.** Each keeps its own runtime arm. No phase before P3 adds a consumer of either except through P1's single helper.
+- **The merge phase's spans (for the orchestrator).** P1's base is the run base, and its candidate
+  sits after a merge whose second parent brings upstream's history in.
+  - P1's review span is `git show --remerge-diff <merge>` plus `<merge>..<P1 candidate>`.
+  - Its chain-integrity interval is read with `--first-parent`.
+  - Its T2 count covers the files P1 authors (hunk resolutions, compile repairs, conversions), not
+    upstream's own changes.
+  - Its parser-gate range starts at the merge's first parent.
+  - From P2 on, spans are ordinary.
+- **Serialized surfaces.** P1 unions both sides' records. P2 changes a serialized pending-combat type,
+  and P3 deletes a serialized variant. Each takes the protocol-versions registry step (CLAUDE.md
+  "Protocol version changes").
+
+---
+
+## Feasibility and the recursive T1∧T2 check
+
+| Phase | Units (planner's unit rule) | Expected counted paths | T1∧T2 |
+|---|---|---|---|
+| P1 | ≥ 2: mechanical integration; seam 3 legs with conversions; seam 1; seam 4 | ≥ 13 | **fires: irreducible, feasibility exit below** |
+| P2 | 2: combat pauses asked; guards across a park | under 13 (the anchor list above, protocol excluded) | does not fire |
+| P3 (A) | 1: predicate fold with uniform fence | under 13 | does not fire |
+| P3 (B) | 3: fold; protection ordering; one choice per simultaneous batch | at or near 13 | expected to fire → re-charter P3 only |
+
+**P1 cannot be split into green phases that each clear the conjunction.** The evidence is measured at
+the commits named in `task.md` and the conflicted merge tree
+`e8dcf6fa52b25b801a15b947ce9b9b366a6d523e`.
+
+1. *Path floor.* `git merge-tree --write-tree --name-only <PR head> upstream/main` lists the
+   conflicted files. A phase that contains the merge also repairs the auto-merged sites that declare
+   `PostReplacementDrain::event_amount` twice (the merged tree's `types/game_state.rs` and its
+   literals in other files). So any phase holding the merge has 13 or more counted paths, whatever is
+   moved out of it, and it must therefore be a single unit.
+2. *The mechanical unit is compile-forced.* In the merged tree, `elimination.rs` calls
+   `eliminate_players_simultaneously` at the branch's old arity, while main's signature takes a
+   `LossReason`. Main's combat pass also references a `GameState` slot the branch removed. Without
+   these repairs the tree does not compile.
+3. *The combat unit is test-forced.* The combat pass body conflicts as one hunk, so one body stands.
+   - Main's suites assert a combat `WaitingFor::ReplacementChoice`
+     (`szadek_combat_damage_to_counters`, `adamantoise_vigor_combat_order`).
+   - The branch's suites assert `combat.prompts.is_empty()` or an engine-picked set
+     (`ironscale_hydra_combat_prevention`, `damage_substitution_replacements`).
+   - Main's body with no conversions leaves the branch's suites red. The branch's body leaves main's
+     suites red, and the acceptance line forbids weakening them.
+
+   So the merge phase holds the mechanical unit and the combat-legs unit together: two units over
+   13 or more paths.
+4. *Moving seam 1 or seam 4 out does not help.* Deferring seam 1 would mean feeding one field from
+   two producers. Deferring seam 4 would mean resolving the dispatcher and chain-driver hunks to the
+   branch's tail inference, which is unmeasured against main's tail-once suites and rewrites the same
+   hunks twice. Each is green at best by putting a parallel authority into the merge commit, which
+   the maintainer reviews by remerge-diff. Each still leaves the merge phase at two or more units
+   over 13 or more paths (points 1–3), so neither split discharges the conjunction.
+
+P1 is therefore the smallest merge phase. Everything the green tree does not force has been moved
+to P2 and P3. Record this evidence in the phase-fit record as P1's feasibility exit, so that a firing
+at P1's own scope-freeze is answered by this exit rather than by a second-level stop.
+
+---
+
+## Open decisions
+
+1. **Q1, pending with Jakob and the maintainer**: are the three coverage drops (Soul-Scar Mage,
+   Szadek, Undead Alchemist) accepted? This affects only P3, and both outcomes are specified there.
+   P1 and P2 can run while it is open.
+2. **pr-question-1 items 2–3 (Q2, Q4), pending with the maintainer.** This charter adopts the
+   reviewer's views. A contrary answer breaks a P1 decision. Before P1's executor dispatch, that means
+   a re-charter. After it, a later repair phase.
+3. **P1's feasibility exit** (above) is for the orchestrator to record. It is not a design question.

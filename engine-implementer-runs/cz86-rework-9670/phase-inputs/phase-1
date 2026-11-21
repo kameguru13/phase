@@ -1,0 +1,7 @@
+# P1 plan inputs (moved from the charter, charter review r1 correction 1)
+
+8. *Carried review finding (r1 behavior, MED).* The P1 plan substantiates the retained batch (Q2) with
+   an explicit claim-to-test map: the existing test names, the seam each one pins, the exact
+   discriminating assertion, its positive reach-guard, and a reading derived independently from the
+   card and the CR. That includes the effect-stated outcome behavior that justifies keeping the
+   carrier. Existing product tests suffice.

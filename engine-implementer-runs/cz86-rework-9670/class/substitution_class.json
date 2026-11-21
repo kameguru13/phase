@@ -1,0 +1,256 @@
+{
+  "version": "5.3.0+20261021",
+  "regex": "If (damage would be dealt to [^.,]*|[^.]* would (deal|be dealt) [^.,]*damage[^.,]*), (instead (put|remove|exile|sacrifice|that player mills|create)|(put|remove|exile|sacrifice|that player exiles|that player mills)[^.]* instead)",
+  "keyword": "",
+  "add": [],
+  "drop": [],
+  "count": 12,
+  "cards": [
+    "Crumbling Sanctuary",
+    "Delaying Shield",
+    "Dralnu, Lich Lord",
+    "Force Bubble",
+    "Lichenthrope",
+    "Nefarious Lich",
+    "Oozeavite",
+    "Phytohydra",
+    "Soul-Scar Mage",
+    "Szadek, Lord of Secrets",
+    "Undead Alchemist",
+    "Underdark Beholder"
+  ],
+  "masked_only": [],
+  "rejected_add": [],
+  "rejected_drop": [],
+  "keyword_missing": [],
+  "rulings": [
+    {
+      "text": "\"Flashback [cost]\" means \"You may cast this card from your graveyard by paying [cost] rather than paying its mana cost\" and \"If the flashback cost was paid, exile this card instead of putting it anywhere else any time it would leave the stack.\"",
+      "cards": [
+        "Dralnu, Lich Lord"
+      ]
+    },
+    {
+      "text": "A spell cast using flashback will always be exiled afterward, whether it resolves, is countered, or leaves the stack in some other way.",
+      "cards": [
+        "Dralnu, Lich Lord"
+      ]
+    },
+    {
+      "text": "Dralnu may be one of the permanents you sacrifice while applying its replacement effect.",
+      "cards": [
+        "Dralnu, Lich Lord"
+      ]
+    },
+    {
+      "text": "If Dralnu would be dealt more damage than the number of permanents you control, instead you sacrifice all permanents you control.",
+      "cards": [
+        "Dralnu, Lich Lord"
+      ]
+    },
+    {
+      "text": "If Phytohydra blocks or is blocked by a creature with first strike or double strike, Phytohydra will get the counters during the first-strike combat damage step before it deals its own combat damage during the second combat damage step.",
+      "cards": [
+        "Phytohydra"
+      ]
+    },
+    {
+      "text": "If Underdark Beholder leaves the battlefield while its last ability is on the stack, use the number of eyestalk counters it had before it left to determine what converted mana cost to look for.",
+      "cards": [
+        "Underdark Beholder"
+      ]
+    },
+    {
+      "text": "If a card has multiple instances of flashback, you may choose any of its flashback costs to pay.",
+      "cards": [
+        "Dralnu, Lich Lord"
+      ]
+    },
+    {
+      "text": "If a card with flashback is put into your graveyard during your turn, you can cast it if it's legal to do so before any other player can take any actions.",
+      "cards": [
+        "Dralnu, Lich Lord"
+      ]
+    },
+    {
+      "text": "If a card with no mana cost gains flashback, it has no flashback cost. It can't be cast this way.",
+      "cards": [
+        "Dralnu, Lich Lord"
+      ]
+    },
+    {
+      "text": "If a spell has {X} in its mana cost, you must choose 0 as the value of X when casting it without paying its mana cost.",
+      "cards": [
+        "Underdark Beholder"
+      ]
+    },
+    {
+      "text": "If a spell or ability an opponent controls causes a source you control to deal noncombat damage to a creature an opponent controls, that damage will be replaced with -1/-1 counters.",
+      "cards": [
+        "Soul-Scar Mage"
+      ]
+    },
+    {
+      "text": "If a split card gains flashback, you pay only the cost of the half you're casting.",
+      "cards": [
+        "Dralnu, Lich Lord"
+      ]
+    },
+    {
+      "text": "If an effect causes a creature you control to fight a creature an opponent controls, the damage is dealt simultaneously. For instance, if your 2/2 creature fights an opponent’s 4/4 creature, your creature will be dealt 4 damage and your opponent’s creature will have two -1/-1 counters put on it.",
+      "cards": [
+        "Soul-Scar Mage"
+      ]
+    },
+    {
+      "text": "If another effect would prevent Szadek's combat damage from being dealt to the defending player or replace it with something else, that player chooses which effect applies first. For example, the player can choose to first have Mending Hands prevent 4 of the damage and then apply Szadek's ability so that it gets only one counter.",
+      "cards": [
+        "Szadek, Lord of Secrets"
+      ]
+    },
+    {
+      "text": "If another effect would prevent damage from being dealt to Phytohydra or replace it with something else, Phytohydra's controller chooses which effect to apply first.",
+      "cards": [
+        "Phytohydra"
+      ]
+    },
+    {
+      "text": "If any of the sacrificed permanents would deal or be dealt damage at the same time as Dralnu, they deal or are dealt damage at the same time that they're sacrificed. Any abilities of the sacrificed permanents that would trigger on that damage don't trigger, but abilities of other permanents that trigger on that damage do.",
+      "cards": [
+        "Dralnu, Lich Lord"
+      ]
+    },
+    {
+      "text": "If multiple prevention and/or replacement effects are trying to apply to the same damage, the controller of the creature that would be dealt damage chooses the order in which to apply them. As examples, an opponent could choose to apply the effect of Djeru’s Resolve and prevent the damage rather than put -1/-1 counters on it; or an opponent could choose to convert the damage to -1/-1 counters before Insult could double it, and then Insult’s effect won’t apply anymore.",
+      "cards": [
+        "Soul-Scar Mage"
+      ]
+    },
+    {
+      "text": "If you cast a card “without paying its mana cost,” you can’t choose to cast it for any alternative costs. You can, however, pay additional costs. If the card has any mandatory additional costs, such as that of Tormenting Voice, you must pay those to cast the card.",
+      "cards": [
+        "Underdark Beholder"
+      ]
+    },
+    {
+      "text": "If you cast a spell with flashback, you can't pay any alternative costs such as overload costs. You can pay additional costs such as kicker costs. If the spell has any mandatory additional costs, you must pay those to cast the spell with flashback.",
+      "cards": [
+        "Dralnu, Lich Lord"
+      ]
+    },
+    {
+      "text": "If you cast an instant or sorcery with {X} in its mana cost this way, you still choose the value of X as part of casting the spell and pay that cost.",
+      "cards": [
+        "Dralnu, Lich Lord"
+      ]
+    },
+    {
+      "text": "If you control more than one, each time you take damage you can decide which one replaces the damage, and that one replaces all of the damage. You can’t split the damage between them. You decide each time you take damage. Note that damage from multiple sources that happens at one time (such as combat damage) gives one choice, not one per source.",
+      "cards": [
+        "Force Bubble"
+      ]
+    },
+    {
+      "text": "If you control multiple Undead Alchemists, the multiple replacement abilities will have no added effect. Combat damage dealt to a player by a Zombie you control will be replaced only once with cards being put into that player's graveyard.",
+      "cards": [
+        "Undead Alchemist"
+      ]
+    },
+    {
+      "text": "If you have no cards in your library, then damage done to you will have no effect since it will get changed into a removal that can’t happen.",
+      "cards": [
+        "Crumbling Sanctuary"
+      ]
+    },
+    {
+      "text": "If you take 6 damage at once, it will replace all 6 damage and put 6 counters on it. Then the second ability will trigger. Any additional damage you take before this ability resolves also results in counters, but once the ability resolves, this card is sacrificed.",
+      "cards": [
+        "Force Bubble"
+      ]
+    },
+    {
+      "text": "If you were going to gain life and you also have a replacement that can turn card drawing into life gain on the battlefield, you can gain life by using the Lich to turn the original life gain into card drawing, and then using the other replacement to turn a card draw into life gain. Nefarious Lich will not replace the life gain with a card draw again because it has already acted on this event.",
+      "cards": [
+        "Nefarious Lich"
+      ]
+    },
+    {
+      "text": "Note that the damage is replaced and is not “prevented”. This means it can replace damage that “can’t be prevented”.",
+      "cards": [
+        "Delaying Shield"
+      ]
+    },
+    {
+      "text": "Phytohydra's ability doesn't prevent damage. Damage that can't be prevented will still be replaced by +1/+1 counters being put on Phytohydra.",
+      "cards": [
+        "Phytohydra"
+      ]
+    },
+    {
+      "text": "Soul-Scar Mage’s effect isn’t a prevention effect. Damage that can’t be prevented will be replaced with -1/-1 counters.",
+      "cards": [
+        "Soul-Scar Mage"
+      ]
+    },
+    {
+      "text": "The ability affects all players.",
+      "cards": [
+        "Crumbling Sanctuary"
+      ]
+    },
+    {
+      "text": "The effect does not prevent damage, it replaces it so the damage is neither dealt or prevented.",
+      "cards": [
+        "Force Bubble"
+      ]
+    },
+    {
+      "text": "This card will not prevent you from losing the game due to zero or less life.",
+      "cards": [
+        "Nefarious Lich"
+      ]
+    },
+    {
+      "text": "This card’s effect replaces damage with placement of -1/-1 counters, so side-effects of damage to it will not trigger.",
+      "cards": [
+        "Lichenthrope"
+      ]
+    },
+    {
+      "text": "To determine the total cost of a spell, start with the mana cost or alternative cost (such as a flashback cost) you're paying, add any cost increases, then apply any cost reductions. The mana value of the spell is determined only by its mana cost, no matter what the total cost to cast the spell was.",
+      "cards": [
+        "Dralnu, Lich Lord"
+      ]
+    },
+    {
+      "text": "Underdark Beholder’s second ability isn’t a damage prevention effect. It can replace damage that can’t be prevented.",
+      "cards": [
+        "Underdark Beholder"
+      ]
+    },
+    {
+      "text": "Whenever a creature card is put into an opponent's graveyard from their library, the triggered ability of each Undead Alchemist you control will trigger. The first such ability to resolve will exile that creature card and create a Zombie token. Subsequent abilities won't exile the creature card, but each will create another Zombie token.",
+      "cards": [
+        "Undead Alchemist"
+      ]
+    },
+    {
+      "text": "You can cast a spell using flashback even if it was somehow put into your graveyard without having been cast.",
+      "cards": [
+        "Dralnu, Lich Lord"
+      ]
+    },
+    {
+      "text": "You must cast the revealed card while Underdark Beholder’s triggered ability is resolving. You can’t cast it later in the turn.",
+      "cards": [
+        "Underdark Beholder"
+      ]
+    },
+    {
+      "text": "You must still follow any timing restrictions and permissions, including those based on the card's type. For instance, you can cast a sorcery using flashback only when you could normally cast a sorcery.",
+      "cards": [
+        "Dralnu, Lich Lord"
+      ]
+    }
+  ]
+}

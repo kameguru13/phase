@@ -1,0 +1,6 @@
+# Codex P2 plan r4 review (magi-f98de30e), returned inline — summary
+1. MED behavior: the public action boundary's reconcile_terminal_sba (engine.rs:2750, 3076; withholds_priority game_state.rs:33629) can eliminate a player at 0 life (T-3 with P1 at exactly 2 paying 2) while the combat batch is re-parked on P2's offer (CR 104.3b, 704.3). Guard it with the combat ownership invariant.
+2. MED behavior: T-5 can pass with two separate APNAP passes (move-time observers queued by the zone move, combat resolver's own ordering pass, dispatcher drains the queue separately; change_zone.rs:2117, combat_damage.rs:82, triggers.rs:15303). Require one APNAP placement using the collected zone contexts; verify with controllers reversed or a common ordering group; give the drain gate its own discriminator.
+3. MED behavior: MP-2 masked (removing D8.1 alone leaves the queue blocked by D8.2/D8.3); T-4b returns on PausedForReplacement before the action-end queue, so it cannot discriminate MP-3; use a real re-park exercising D8.1 and T-4a for D8.2.
+4. LOW text: T-4b sentence replacement (land first, Colossus second; assert the land's PermanentSacrificed is in deferred_events and absent from the answer's events).
+Keep: the wrapper (D9) and the drain-only gate.

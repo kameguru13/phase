@@ -1,0 +1,6 @@
+# P2 plan inputs (moved from the charter, charter review r1 correction 1)
+
+6. Tests: the Phase D and in-leg rows of plan-r1 §13 are converted, answered both ways with derived
+   values. New rows cover two aggregate shields (the second shield's rider runs once, after the first
+   one's answer), an in-leg earlier rider ahead of a substitution, and a guard read once across a
+   park, restored from serialization at the second prompt.

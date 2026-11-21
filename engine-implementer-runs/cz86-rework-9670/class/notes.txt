@@ -1,0 +1,22 @@
+Bearing rulings (MTGJSON 5.3.0+20261021), read in full: substitution_class.json (38 distinct), prevention_rider_class.json (110 distinct).
+S1 [Soul-Scar Mage] "Soul-Scar Mage's effect isn't a prevention effect. Damage that can't be prevented will be replaced with -1/-1 counters." -> seam 2: substitution survives CR 615.12 gate.
+S2 [Phytohydra] "Phytohydra's ability doesn't prevent damage. Damage that can't be prevented will still be replaced by +1/+1 counters" -> seam 2.
+S3 [Delaying Shield] "the damage is replaced and is not 'prevented'. ... can replace damage that 'can't be prevented'." -> seam 2.
+S4 [Underdark Beholder] "isn't a damage prevention effect. It can replace damage that can't be prevented." -> seam 2 class member.
+S5 [Force Bubble] "The effect does not prevent damage, it replaces it so the damage is neither dealt or prevented." -> CR 615.13 no DamagePrevented.
+S6 [Force Bubble] "... damage from multiple sources that happens at one time (such as combat damage) gives one choice, not one per source." -> substitution fence stays (Q1).
+S7 [Soul-Scar Mage] "If multiple prevention and/or replacement effects are trying to apply to the same damage, the controller of the creature ... chooses the order" -> materiality Unconditional.
+S8 [Szadek] "If another effect would prevent Szadek's combat damage ... that player chooses which effect applies first ... Mending Hands prevent 4" -> combat choice asked.
+S9 [Phytohydra] "If another effect would prevent damage ... or replace it ..., Phytohydra's controller chooses which effect to apply first." -> combat choice asked.
+S10 [Soul-Scar Mage] fight: "the damage is dealt simultaneously ... your creature will be dealt 4 damage and your opponent's creature will have two -1/-1 counters" -> fight two-phase batch with held substitution action.
+S11 [Dralnu] "If Dralnu would be dealt more damage than the number of permanents you control, instead you sacrifice all permanents you control." / "Dralnu may be one of the permanents you sacrifice" -> sacrifice choice asked in combat.
+S12 [Undead Alchemist] multiple Alchemists replace only once -> CR 614.5.
+P1 [Acolyte's Reward] "deals its damage immediately afterward as part of that same prevention effect. ... before state-based actions ... before that spell or ability resumes its resolution." -> held riders run after batch damage, before the spell's next instruction (DamageTail ordering).
+P2 [Vengeful Archon]/[Refraction Trap]/[Divine Deflection] same "immediately afterward ... before the spell or ability ... resumes its resolution" -> same.
+P3 [Channel Harm] "The new damage is not combat damage, even if the prevented damage was." -> Phase D rider damage is independent noncombat damage (CR 700.1).
+P4 [Channel Harm] two Channel Harms loop "either player can break by choosing to not have Channel Harm try to deal damage" -> the "may" is a real choice: ask it in combat.
+P5 [Inkshield]/[Deflecting Palm]/[Phyrexian Hydra]/[New Way Forward]/[Ria Ivor] the player being dealt damage chooses the order -> combat asks.
+P6 [Vengeful Archon]/[Acolyte's Reward]/[Divine Deflection]/[Refraction Trap] "If you would be dealt combat damage by multiple attacking creatures, you choose which of that damage to prevent" -> CR 615.7 shared-shield gap kept (fence, as on main for combat).
+P7 [Test of Faith] "The +1/+1 counters are put onto the creature at the same time the damage is prevented" / [Temper] counters "show up at the same time as any unprevented damage" -> riders settle before SBA.
+P8 [Stormwild Capridor] counters for prevented damage "before checking to see if it dies" -> SBA after the batch.
+P9 [Phyrexian Hydra] unpreventable damage dealt as normal, no counters -> CR 615.12 (unchanged, Command Zone #172 follow-up).
