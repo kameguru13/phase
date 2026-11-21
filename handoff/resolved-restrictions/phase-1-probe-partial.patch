@@ -1,0 +1,282 @@
+diff --git a/crates/engine/tests/integration/rr_probe.rs b/crates/engine/tests/integration/rr_probe.rs
+new file mode 100644
+index 000000000..a23e217d5
+--- /dev/null
++++ b/crates/engine/tests/integration/rr_probe.rs
+@@ -0,0 +1,218 @@
++//! PROBE (phase-1 planner, removal-restrictions run) — not a product test.
++//! Measures the runtime reading of quoted graveyard-permission grants in two
++//! shapes inside one build: the phase-1 shape (`GrantStaticAbility` carrying the
++//! full quoted definition) and the BASE shape, re-created by rewriting the
++//! card's parsed ability tree with the base collapse (affected == SelfRef, no
++//! condition, empty modifications -> `AddStaticMode { mode }`).
++
++use engine::game::casting::{can_cast_object_now, spell_objects_available_to_cast};
++use engine::game::scenario::{GameRunner, GameScenario, P0};
++use engine::types::ability::AbilityDefinition;
++use engine::types::mana::ManaCost;
++use engine::types::phase::Phase;
++use engine::types::identifiers::ObjectId;
++use std::sync::Arc;
++
++const KETHIS: &str = "Legendary spells you cast cost {1} less to cast.\n\
++    Exile two legendary cards from your graveyard: Until end of turn, each legendary card \
++     in your graveyard gains \"You may play this card from your graveyard.\"";
++
++const CASE: &str = "Whenever a creature you control enters, you gain 1 life.\n\
++     To solve — You've gained 5 or more life this turn. (If unsolved, solve at the \
++     beginning of your end step.)\n\
++     Solved — Sacrifice this Case: Creature cards in your graveyard gain \"You may cast \
++     this card from your graveyard\" until end of turn.";
++
++fn collapse(v: &mut serde_json::Value) -> usize {
++    let mut n = 0;
++    match v {
++        serde_json::Value::Object(map) => {
++            let is_target = map.get("type").and_then(|t| t.as_str()) == Some("GrantStaticAbility")
++                && map
++                    .get("definition")
++                    .map(|d| {
++                        d.get("affected") == Some(&serde_json::json!({"type": "SelfRef"}))
++                            && d.get("condition").map_or(true, |c| c.is_null())
++                            && d.get("modifications")
++                                .and_then(|m| m.as_array())
++                                .map_or(true, |m| m.is_empty())
++                    })
++                    .unwrap_or(false);
++            if is_target {
++                let mode = map["definition"]["mode"].clone();
++                map.clear();
++                map.insert("type".into(), "AddStaticMode".into());
++                map.insert("mode".into(), mode);
++                return 1;
++            }
++            for (_, child) in map.iter_mut() {
++                n += collapse(child);
++            }
++        }
++        serde_json::Value::Array(items) => {
++            for child in items {
++                n += collapse(child);
++            }
++        }
++        _ => {}
++    }
++    n
++}
++
++/// Rewrite the object's activated abilities to the base shape. Returns the
++/// number of rewritten modifications (positive marker).
++fn to_base_shape(runner: &mut GameRunner, id: ObjectId) -> usize {
++    let obj = runner.state_mut().objects.get_mut(&id).unwrap();
++    let mut rewritten = 0;
++    let rewrite = |list: &Arc<Vec<AbilityDefinition>>, count: &mut usize| {
++        let mut v = serde_json::to_value(&**list).unwrap();
++        *count += collapse(&mut v);
++        Arc::new(serde_json::from_value::<Vec<AbilityDefinition>>(v).unwrap())
++    };
++    obj.abilities = rewrite(&obj.abilities, &mut rewritten);
++    let mut base_count = 0;
++    obj.base_abilities = rewrite(&obj.base_abilities, &mut base_count);
++    rewritten
++}
++
++fn mod_kinds(runner: &GameRunner) -> Vec<String> {
++    runner
++        .state()
++        .transient_continuous_effects
++        .iter()
++        .flat_map(|t| t.modifications.iter())
++        .map(|m| {
++            let v = serde_json::to_value(m).unwrap();
++            format!("{}", v)
++        })
++        .collect()
++}
++
++fn kethis_probe(base_shape: bool) {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    let kethis = {
++        let mut b = scenario.add_creature(P0, "Kethis, the Hidden Hand", 3, 4);
++        b.as_legendary().from_oracle_text(KETHIS);
++        b.id()
++    };
++    let fodder: Vec<ObjectId> = ["Isamaru, Hound of Konda", "Sakura-Tribe Scout"]
++        .iter()
++        .map(|n| {
++            let mut b = scenario.add_creature_to_graveyard(P0, n, 2, 2);
++            b.as_legendary().from_oracle_text("").with_mana_cost(ManaCost::zero());
++            b.id()
++        })
++        .collect();
++    let target = {
++        let mut b = scenario.add_creature_to_graveyard(P0, "Kiku, Night's Flower", 1, 1);
++        b.as_legendary().from_oracle_text("").with_mana_cost(ManaCost::zero());
++        b.id()
++    };
++    let mut runner = scenario.build();
++    let rewritten = if base_shape { to_base_shape(&mut runner, kethis) } else { 0 };
++    let before_offer = spell_objects_available_to_cast(runner.state(), P0).contains(&target);
++    let tce_before = runner.state().transient_continuous_effects.len();
++    let outcome = runner.activate(kethis, 0).pay_with(&fodder).try_resolve();
++    println!("KETHIS base_shape={base_shape} rewritten={rewritten} outcome_ok={}", outcome.is_ok());
++    if let Err(e) = &outcome {
++        println!("  err={e:?}");
++    }
++    println!("  stack={:?}", runner.stack_names());
++    runner.advance_until_stack_empty();
++    println!("  stack-after-drain={:?} castable_ids={:?}", runner.stack_names(), spell_objects_available_to_cast(runner.state(), P0));
++    println!(
++        "  waiting={:?} tce {} -> {} mods={:?}",
++        runner.waiting_for_kind(),
++        tce_before,
++        runner.state().transient_continuous_effects.len(),
++        mod_kinds(&runner)
++    );
++    for f in &fodder {
++        println!("  fodder zone {:?}", runner.state().objects[f].zone);
++    }
++    let after_offer = spell_objects_available_to_cast(runner.state(), P0).contains(&target);
++    let castable = can_cast_object_now(runner.state(), P0, target);
++    let target_statics: Vec<String> = runner.state().objects[&target]
++        .static_definitions
++        .iter_all()
++        .map(|d| format!("{:?} zones={:?}", d.mode, d.active_zones))
++        .collect();
++    println!(
++        "  target offered before={before_offer} after={after_offer} can_cast_now={castable} target_statics={target_statics:?}"
++    );
++}
++
++fn case_probe(base_shape: bool) {
++    let mut scenario = GameScenario::new();
++    scenario.at_phase(Phase::PreCombatMain);
++    let case = {
++        let mut b = scenario.add_creature(P0, "Case of the Uneaten Feast", 0, 0);
++        b.as_enchantment().with_subtypes(vec!["Case"]).from_oracle_text(CASE);
++        b.id()
++    };
++    let target = {
++        let mut b = scenario.add_creature_to_graveyard(P0, "Grizzly Bears", 2, 2);
++        b.from_oracle_text("").with_mana_cost(ManaCost::zero());
++        b.id()
++    };
++    let mut runner = scenario.build();
++    let rewritten = if base_shape { to_base_shape(&mut runner, case) } else { 0 };
++    let n_abilities = runner.state().objects[&case].abilities.len();
++    if let Some(cs) = runner.state_mut().objects.get_mut(&case).unwrap().case_state.as_mut() {
++        cs.is_solved = true;
++    } else {
++        println!("CASE: no case_state");
++    }
++    let before_offer = spell_objects_available_to_cast(runner.state(), P0).contains(&target);
++    let tce_before = runner.state().transient_continuous_effects.len();
++    let outcome = runner.activate(case, n_abilities - 1).pay_with(&[case]).try_resolve();
++    println!(
++        "CASE base_shape={base_shape} rewritten={rewritten} n_abilities={n_abilities} outcome_ok={}",
++        outcome.is_ok()
++    );
++    if let Err(e) = &outcome {
++        println!("  err={e:?}");
++    }
++    println!("  stack={:?}", runner.stack_names());
++    runner.advance_until_stack_empty();
++    println!("  stack-after-drain={:?}", runner.stack_names());
++    println!(
++        "  waiting={:?} case zone {:?} tce {} -> {} mods={:?}",
++        runner.waiting_for_kind(),
++        runner.state().objects[&case].zone,
++        tce_before,
++        runner.state().transient_continuous_effects.len(),
++        mod_kinds(&runner)
++    );
++    let after_offer = spell_objects_available_to_cast(runner.state(), P0).contains(&target);
++    let castable = can_cast_object_now(runner.state(), P0, target);
++    let target_statics: Vec<String> = runner.state().objects[&target]
++        .static_definitions
++        .iter_all()
++        .map(|d| format!("{:?} zones={:?}", d.mode, d.active_zones))
++        .collect();
++    println!(
++        "  target offered before={before_offer} after={after_offer} can_cast_now={castable} target_statics={target_statics:?}"
++    );
++}
++
++#[test]
++fn rr_probe_kethis_base_shape() {
++    kethis_probe(true);
++}
++
++#[test]
++fn rr_probe_kethis_phase1_shape() {
++    kethis_probe(false);
++}
++
++#[test]
++fn rr_probe_case_base_shape() {
++    case_probe(true);
++}
++
++#[test]
++fn rr_probe_case_phase1_shape() {
++    case_probe(false);
++}
+diff --git a/crates/engine/tests/integration/shard_5.rs b/crates/engine/tests/integration/shard_5.rs
+index 29dbc5312..e7d32055a 100644
+--- a/crates/engine/tests/integration/shard_5.rs
++++ b/crates/engine/tests/integration/shard_5.rs
+@@ -8,6 +8,7 @@
+ pub mod support;
+ 
+ mod reflexive_body_token_referent;
++mod rr_probe;
+ mod reflexive_discard_this_way;
+ mod reflexive_if_rider;
+ mod reflexive_surveil_this_way;
+diff --git a/crates/phase-ast/src/types/ability.rs b/crates/phase-ast/src/types/ability.rs
+index 789406f12..0c04be20f 100644
+--- a/crates/phase-ast/src/types/ability.rs
++++ b/crates/phase-ast/src/types/ability.rs
+@@ -22730,6 +22730,15 @@ impl TryFrom<ContinuousModification> for PerpetualGrantModification {
+         match modification {
+             ContinuousModification::AddKeyword { keyword } => Ok(Self::AddKeyword { keyword }),
+             ContinuousModification::AddStaticMode { mode } => Ok(Self::AddStaticMode { mode }),
++            ContinuousModification::GrantStaticAbility { definition }
++                if definition.affected == Some(TargetFilter::SelfRef)
++                    && definition.condition.is_none()
++                    && definition.modifications.is_empty() =>
++            {
++                Ok(Self::AddStaticMode {
++                    mode: definition.mode,
++                })
++            }
+             // Fail-closed: a `GrantAbility` whose nested tree contains
+             // `Effect::Unimplemented` did not actually parse -- the quoted body
+             // fell through to the parser's honest "couldn't classify this" stub
+diff --git a/crates/phase-parser/src/parser/oracle_static/grammar.rs b/crates/phase-parser/src/parser/oracle_static/grammar.rs
+index 24b298183..52742aacb 100644
+--- a/crates/phase-parser/src/parser/oracle_static/grammar.rs
++++ b/crates/phase-parser/src/parser/oracle_static/grammar.rs
+@@ -1807,19 +1807,8 @@ pub(crate) fn parse_quoted_rule_static_modifications(
+     }
+     let modifications: Vec<_> = defs
+         .into_iter()
+-        .map(|definition| {
+-            if definition.affected == Some(TargetFilter::SelfRef)
+-                && definition.condition.is_none()
+-                && definition.modifications.is_empty()
+-            {
+-                ContinuousModification::AddStaticMode {
+-                    mode: definition.mode,
+-                }
+-            } else {
+-                ContinuousModification::GrantStaticAbility {
+-                    definition: Box::new(definition),
+-                }
+-            }
++        .map(|definition| ContinuousModification::GrantStaticAbility {
++            definition: Box::new(definition),
+         })
+         .collect();
+     Some(modifications)

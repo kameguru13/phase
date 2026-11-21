@@ -1,0 +1,174 @@
+# Phase charter: task 21 (Command Zone #21, Immortal Obligation, phase-rs/phase#9608)
+
+- Run root: `X:/Users/jakob/Documents/dev/phase/.git/engine-implementer-runs/task21/`. Run-level `BASE_SHA` as given in every spawn input. Branch `card/immortal-obligation`.
+- Firing context: the phase-fit gate fired (T1: 4 units; T2: 15 paths) mid-Step-2 on the unreviewed draft `plan-r3.md`. Input shape: **draft plus accumulated findings**, so this charter is *derived*, not partitioned. Inputs read: `plan-r1.md`, `plan-r2.md`, `plan-r3.md`, `plan-review-r1.md` (F1–F5), `plan-review-r2.md` (F6–F8 and notes), `class.json`, `class-notes.md`, `phase-fit.md`, `notes.md`, `scout/` packs. The plan-loop count carries (design rounds r1 and r2).
+- Charter content: architecture and sequencing only. Acceptance rows, verification and figures belong to the phase plans. Wherever a phase depends on how the code behaves today, the phase names a **claim to establish**. The draft's probe measurements are expectations for those claims. They are not facts this charter asserts.
+
+## Step survival record
+
+- **Step 0 (premise): survives, re-checked.** `jq` over `data/mtgjson/AtomicCards.json` (5.3.0+20261016) returns Immortal Obligation's and Burden of Proof's Oracle text verbatim as `plan-r3.md` Step 0 quotes them. Burden of Proof's `confirmed-misparses.toml` row and both cards' backlog bullets exist at BASE.
+- **Step 0.5 (class attribution): survives.** Every phase plan cites this record and does not re-run the query.
+  - Class: `class.json`. Regex and drop list as recorded, count 28, `jq -cS . | sha256sum` = `7cc5e395158310b6fd4df059e255a87657f8b27ff66600e95e665573f738a0f5` (reproduced by plan-review-r1). Rulings are in `class-notes.md` and `plan-r3.md` Step 0.5.
+  - Burden of Proof is outside the regex. It joins the class through U3's "can't block <object>" grammar (plan-review-r2 F7; draft probe R3-P2).
+  - Per-building-block membership is `plan-r3.md`'s Step 0.5 table.
+  - The class attribution for Pattern Coverage is the whole table. Phase 1 covers the "can't block <object>" row (Immortal Obligation and Burden of Proof). Phase 2 covers the remaining rows.
+- **Step 1 (skills): survives.** `/oracle-parser` (both phases), `/add-static-ability` (phase 1: grant propagation; phase 2: the graft anchor), `/card-test` (both phases). `/add-engine-variant` does not apply: no new variant (decision X1).
+- **Step 2 (analogous traces): survives.** `plan-r3.md` traces 1–7. The seam comes from trace 6 (Burden of Proof's static-grant route; whether it needs an engine change is C1.4) and trace 4 (the You Look Upon the Tarrasque source-controller anchor; which printed cards its new `BlockRestriction` member reaches is C2.1).
+- **Step 3 (read every file): survives,** scoped to each phase's scope rule. Each phase plan re-reads at its own `PHASE_BASE_SHA`.
+
+## Run-wide architecture decisions (bind every phase)
+
+- **X1.** No new enum variant, no serialized-type change, and no protocol or `WaitingFor`/`GameAction` surface. Every building block uses existing types: `StaticMode::{BlockRestriction, Goaded, CantAttack}`, `AttackTargetFilter::PlayerOrPermanents`, `ContinuousModification::{AddStaticMode, GrantStaticAbility}`, `TargetFilter::Not`.
+- **X2.** All new parser code is nom on first write (Gate A). Each grammar extension goes into the existing single authority for that grammar. No phase builds a parallel path.
+- **X3. Out of scope for every phase.** Each is reported as an open question and not fixed here:
+  - the singular `Effect::Goad` ignoring a stated duration (Jon Irenicus, Shattered One);
+  - "can't block ~/this creature/it" lowering to a blanket `CantBlock` (Screeching Griffin and kin);
+  - Soul Partition's cost-increase sentence, which stays honest `Unimplemented`.
+
+## Phases (linear order)
+
+### Phase 1: granted "can't block <object>" whitelist in the shared restriction grammar (fixes Burden of Proof)
+
+**Goal.** Every caller of the shared restriction-mode grammar (`parse_restriction_modes`) reads "<subject> can't block <object>" as the CR 509.1b whitelist "can block only attackers that are not <object>". A static grant that carries that mode propagates it to its recipient. As a result, Burden of Proof's dropped "Otherwise, … can't block Detectives." becomes parsed and enforced. Its misparse records are retired in the same change. Immortal Obligation is not yet affected.
+
+**Depends on.** Run `BASE_SHA`.
+
+**Scope rule.** This phase owns:
+- the restriction-mode grammar and grant-propagation predicate in `crates/phase-parser/src/parser/oracle_effect/subject.rs`;
+- the "can't block X" lowering authority and its re-exports in `crates/phase-parser/src/parser/oracle_static/`;
+- the parser tests next to those authorities;
+- a new Burden of Proof runtime test under `crates/engine/tests/integration/`;
+- `crates/phase-ast/data/confirmed-misparses.toml`;
+- `docs/parser-misparse-backlog.md`.
+
+It does **not** touch `crates/engine/src/`, the spell-line classifier, the defended-scope combinator, or the copula-goaded clause. Standing classes (compiler-forced sites, the integration shard `mod` list, comment-only edits) are implied.
+
+**Architecture decisions.**
+- **D1.1 One authority for the inversion.** The "can't block X ⇒ `BlockRestriction{Not(X)}`" construction is extracted from the rule-static lowering into one helper. The rule-static lowering and the new arm both delegate to it. Behavior of the rule-static lowering is unchanged.
+- **D1.2 The arm goes in the shared `parse_restriction_modes` and is not narrowed to the effect path.** Every caller reads the phrase with CR 509.1b's meaning, and narrowing it would leave Burden of Proof's clause dropped with no rules reason (F7). The arm reads the whole phrase or declines:
+  - It declines a self-object; "block ~/this creature/it" stays with the existing list atom (X3).
+  - It declines a trailing rider such as "unless …".
+  - Its object grammar is the existing block-object authority.
+- **D1.3 Grant propagation admits `BlockRestriction`.** The propagation predicate is the single authority that decides whether a granted restriction mode is carried onto its recipient by `AddStaticMode` (CR 509.1b). It serves both the static-grant route (Burden of Proof; C1.3 establishes that this route needs the arm) and the effect-grant route that phase 2's tail composes (Immortal Obligation).
+- **D1.4 No engine change in this phase.** At parser level the arm can represent a controller-relative object ("creatures you control"). Reading "you" at runtime for such an object grafted by a resolving effect is phase 2's anchor (D2.4). Phase 1 ships no printed producer of a controller-relative granted `BlockRestriction` (claim C1.2).
+- **D1.5 Hygiene in the same change.** Delete Burden of Proof's `confirmed-misparses.toml` row. Remove its backlog bullet and recount the backlog's totals at `PHASE_BASE_SHA`.
+
+**Claims the phase plan must establish.**
+- **C1.1** A parse diff over every face phase 1's parser changes can reach (the new arm, and the propagation predicate's new `BlockRestriction` arm, which also reaches faces whose existing grammar already yields a `BlockRestriction` through a propagation-gated caller) changes exactly Burden of Proof, adding one `AddStaticMode{BlockRestriction{Not(Detective)}}` to its Otherwise def and nothing else. The draft measured this as configuration B in R3-P2; it is re-established here on the phase-1 tree. Immortal Obligation and Soul Partition are unchanged.
+- **C1.2** No printed card reaches the new arm with a controller-relative object in this phase. Burden of Proof's object carries no controller slot.
+  - If this fails, phase 1 would ship a carrier-relative "you" reading. That breaks D1.4 and is a **re-charter** (the anchor moves into phase 1). It is not an addendum.
+- **C1.3** Burden of Proof's route is the static-grant consumer gated by the propagation predicate (draft R3-P3), so D1.3 is required.
+- **C1.4** Burden of Proof's runtime rows pass on the phase-1 tree with **unchanged engine source** and fail at `PHASE_BASE_SHA`.
+  - The draft's candidate run (R3-P4) used the engine prototype as well, so this must be measured without it.
+  - The expected reason: phase 1 adds no anchor; the BASE consumers evaluate the grafted filter in the carrier-relative context, and Burden of Proof's object has no controller slot, so that context is never consulted for a player. If this fails, an engine change lands in phase 1, which breaks D1.4: a re-charter, as for C1.2.
+
+**Owned discriminating tests.** The arm's parser unit (with its declines and the propagation predicate), Burden of Proof SHAPE, and Burden of Proof's runtime block rows through the real cast and block pipeline. Each fails without phase 1's change. Their rows, siblings and window mechanics belong to the phase plan (see Accumulated review findings).
+
+**Deferral list.**
+- U1 (spell-line "for as long as" routing): phase 2.
+- U2 (singular defended scope): phase 2.
+- U4 (singular copula-goaded restriction tail): phase 2.
+- U3's engine half (source-controller anchor and both combat consumers): phase 2.
+- Every Immortal Obligation parser and runtime row, and Immortal Obligation's backlog hygiene: phase 2.
+- `DEFERRED(phase 2)`: runtime discrimination of a controller-relative granted `BlockRestriction` read relative to the installing player. Phase 1's verification of that case is structural: a parser unit assertion of the mode, a green tree and the existing suites.
+
+**Addenda file.** `<run-root>/addenda/phase-1`
+
+**Phase-fit (recursive).** One unit (U3's parser half), so T1 does not fire. The draft's estimate is 8 paths. The conjunction cannot fire.
+
+### Phase 2: Immortal Obligation end to end
+
+**Goal.** Immortal Obligation's second sentence reaches the spell's effect chain and lowers to one durationed continuous effect on the returned permanent. The returned creature is goaded by the caster, can't attack the caster or a permanent the caster controls, and can't block the caster's creatures. All of it lasts while the creature has a duty counter (CR 611.2b), and "that creature" is the permanent the card became (CR 400.7 + CR 608.2c). Every "you" is latched to the caster (CR 109.5 + CR 608.2c). This phase also carries U3's engine half, whose only printed consumer is expected to be this card (C2.1).
+
+**Depends on.** Phase 1's accepted candidate. U4 composes the restriction-clause builder, which reaches phase 1's arm (D1.2) and its propagation arm (D1.3) for "can't block creatures you control"; the card's block restriction cannot be read or enforced without them.
+
+**Scope rule.** This phase owns:
+- the spell-line classifier: `crates/phase-parser/src/parser/oracle_classifier.rs`;
+- the defended-scope combinator in `crates/phase-parser/src/parser/oracle_static/` (the `shared` module);
+- the copula-goaded clause and a new restriction-predicate-list combinator in `crates/phase-parser/src/parser/oracle_effect/subject.rs`;
+- the parser tests next to those authorities (`oracle_effect`, `oracle_static`, classifier);
+- the source-controller anchor predicate in `crates/engine/src/game/layers.rs`;
+- every `BlockRestriction` filter consumer in `crates/engine/src/game/combat.rs` (`rg -n 'StaticMode::BlockRestriction \{ filter \} = ' crates/engine/src/game/combat.rs` lists them);
+- a new Immortal Obligation runtime test under `crates/engine/tests/integration/`;
+- `docs/parser-misparse-backlog.md`.
+
+Standing classes are implied.
+
+**Architecture decisions.**
+- **D2.1 (U1).** An instant/sorcery line stating "for as long as" goes to the spell's effect chain (CR 611.2b), through the existing defer-to-effect classifier authority and its phrase-scan idiom. It is not a new routing path.
+- **D2.2 (U2).** "you or a permanent you control" maps to the existing `PlayerOrPermanents` in the single defended-scope authority, nested under the shared " you or " prefix. Every caller of that authority gains the form.
+- **D2.3 (U4).** The singular "it is goaded, <restriction>, and <restriction>" lowers to **one** `GenericEffect`:
+  - Its parts are the goad designation graft (`AddStaticMode{Goaded}`; CR 701.15b: goaded is a designation, carried here by the durationed effect so it lasts for the stated duration, CR 611.2a/611.2b; not `Effect::Goad`, whose duration handling is X3 item 1) followed by each restriction from the existing restriction-clause builder. All parts share the stated duration (CR 611.2a/611.2b).
+  - It declines, to honest `Unimplemented`, when there is no stated duration, when "it" does not bind `ParentTarget`, or when any conjunct is not a whole restriction.
+  - The goad installer is shared with the plural arm.
+  - The predicate list is a new nom combinator, because the existing list grammar distributes one negation over verb atoms, which is a different grammar.
+- **D2.4 (U3 engine half).** The "you" in each restriction is the caster, latched at resolution.
+  - Attack part: the existing caster stamp on `GrantStaticAbility{CantAttack}` (Promise of Loyalty's route), with no engine change (C2.6).
+  - Block part: the graft-time source-controller anchor predicate gains `BlockRestriction` with a controller-relative filter. Every `BlockRestriction` filter consumer (the declaration validator and its legal-action/AI twin) evaluates through the existing installing-player filter context.
+  - A `BlockRestriction` with no anchor keeps today's source-relative reading, so printed statics are unaffected.
+- **D2.5.** The CR 400.7 binding of "that creature" reuses the existing forward-result rewiring of the moved card. The duration reuses the existing `ForAsLongAs`/`RecipientHasCounters` evaluation. Neither is planned to change (C2.6).
+- **D2.6 Hygiene.** Remove Immortal Obligation's backlog bullet and recount the totals on top of phase 1's. Immortal Obligation has no `confirmed-misparses.toml` row; the plan confirms this. Soul Partition stays listed (X3).
+
+**Claims the phase plan must establish.**
+- **C2.1 Anchor census.** After this phase, the only grafted `BlockRestriction` whose filter carries a controller slot is Immortal Obligation's. Burden of Proof (phase 1), Cloudseeder and Craterous Stomp carry none. So D2.4 changes no other card, and printed `BlockRestriction` statics keep their reading. If the census finds another producer, its reading under the anchor must be shown rules-correct (an addendum on D2.4) or the decision revisited (a re-charter).
+- **C2.2** A parse diff against phase 1's accepted candidate changes exactly Immortal Obligation and Soul Partition. Soul Partition's new reading is honest: its cost sentence stays `Unimplemented` and no bogus static remains.
+- **C2.3** Both combat consumers are load-bearing. Reverting either half of the anchor makes the "can't block the caster's creatures" negative pass.
+- **C2.4** The combat windows the runtime rows use reach the real declaration decision (F6; the block-window facts under Accumulated review findings).
+- **C2.5** The tail reaches the copula-goaded clause as one clause, carrying the stated duration, on the phase-2 tree. The draft's Q1/Q2 probes measured this at BASE plus the draft patch.
+- **C2.6** The attack part's caster latch (CR 109.5 + CR 608.2c), the CR 400.7 forward binding of "that creature" and the `ForAsLongAs`/`RecipientHasCounters` duration need no engine change on the phase-2 tree. The draft measured this in R3-P1 (V5–V7) on a patch that touches neither the effect resolver, the forward-result rewiring nor duration evaluation. If it fails, the needed site is outside the scope rule and returns to the phase's plan step.
+
+**Owned discriminating tests.** Immortal Obligation SHAPE; the tail's decline tests (F2, F5); the defended-scope unit; the classifier unit; and Immortal Obligation's runtime rows through the real cast and combat pipeline, covering every acceptance item of the task, including the anchor-revert discriminator for "can't block creatures you control" (the reason the anchor is carried here). Their rows, revert columns and window mechanics belong to the phase plan (plan-r3's V1–V8 are the draft; see Accumulated review findings).
+
+**Deferral list.** None. This is the last phase. X3 items are out of scope, not deferred.
+
+**Addenda file.** `<run-root>/addenda/phase-2`
+
+**Phase-fit (recursive).** Four units (U1, U2, U4, U3's engine half), so T1 fires. The draft's estimate is 10 paths, below 13, so T2 does not fire and the conjunction does not fire. The margin is 3 paths. The materialized `SCOPE_PATHS` re-count at scope-freeze decides.
+
+## Seam notes
+
+- **Seam check, phase 1's arm.** Phase 1's "can't block <object>" arm is discriminating-testable without phase 2 because of D1.2 and D1.3: Burden of Proof's static-grant route is a second, independent consumer whose object has no controller slot. The parser unit, Burden of Proof SHAPE and Burden of Proof runtime rows each fail with the arm removed. C1.3 and C1.4 make the phase-1 plan measure this rather than inherit it.
+- **Seam check, the anchor.** The engine anchor's only consumer is Immortal Obligation (C2.1). In phase 1 its discriminating test could only be `DEFERRED(phase 2)`. In phase 2 the anchor-revert column of the "can't block the caster's creatures" row discriminates it. That is why it travels with its consumer (T3).
+- **Cross-phase interface.** Phase 2 consumes phase 1 through the shared restriction-mode grammar (D1.2), its extracted inversion helper (D1.1), and the propagation predicate's `BlockRestriction` arm (D1.3), which the effect-grant route that phase 2's tail composes also gates on. A phase-2 need to change the arm's grammar or the propagation arm is an addendum on D1.2/D1.3 if the arm stays unnarrowed and the predicate keeps admitting `BlockRestriction`, and a re-charter if either would be narrowed or would change Burden of Proof's reading.
+- **Shared files.** Both phases edit these, in sequence:
+  - `oracle_effect/subject.rs` (different functions: phase 1 the restriction-mode arm and propagation predicate, phase 2 the copula-goaded clause);
+  - the `oracle_static` parser tests;
+  - `docs/parser-misparse-backlog.md` (each phase recounts header totals and percentages at its own `PHASE_BASE_SHA`);
+  - possibly an integration shard `mod` list (a standing class).
+- **Green interim.** After phase 1, Immortal Obligation is expected to parse as at BASE (C1.1) and stays listed in the backlog. No strict-failure tag is needed, and no surface is held red across the seam.
+- **Shipping.** Each phase is its own PR to `phase-rs/phase` main. Phase 2's PR stacks on phase 1's, and its upstream base follows phase 1's merge (run-level PR synchronization). Parse-diff and build-backed verification are deferred to the run-level final boundary per chartered.md. The complete-span measurement checks only the union of C1.1 and C2.2. The final measurement-only executor therefore also measures each phase's span: run base → phase 1's accepted candidate for C1.1, and phase 1's → phase 2's accepted candidate for C2.2. Valid CI parse-diff results on the two PRs may stand in (chartered.md: reuse valid existing/CI results).
+
+## Accumulated review findings: where each binds
+
+These are the phase plans' inherited constraints. The phase plans project from `plan-r3.md`. Its r3 repairs of F6–F8 were never reviewed, so each phase's Step 2 review audits them.
+
+- **Phase 1:**
+  - F7: Burden of Proof's class membership, route, SHAPE, runtime and hygiene.
+  - F4: the arm's siblings must not assert the self-object `CantBlock` reading as correct.
+  - The block-window facts plan-r3 measured (R3-P1, R3-P4): a priority pass to reach `DeclareBlockers`, and a second legal blocker for the defending player, without which the prompt is skipped.
+  - F3: the Sizing path list includes every test file (the arm's parser tests, the SHAPE test file, the runtime test file).
+  - F5: the real-cards statement for every synthetic sibling or decline text (the rider decline uses Heat Wave's verbatim rider, per F5's replacement).
+- **Phase 2:**
+  - F1: restriction-loop error attribution in the goad and control-change rows.
+  - F2: clause-level decline test.
+  - F3: the Sizing path list includes every test file (also binds phase 1).
+  - F5: real-cards statement for the synthetic decline texts.
+  - F6: attack windows through production turn starts; `summoning_sick` never cleared by hand.
+  - F8: paired positives keep the goaded creature in the declaration.
+  - r2 note 1: goader wording.
+- **Accepted deviations (both rounds), still binding:**
+  - The goader is read from the Goaded transient effect's controller (the `pub(crate)` goad query is unreachable from integration tests). Phase 2.
+  - Parser evidence comes from a fresh measurement-only executor at the final verification boundary. This is run-level. It measures each phase's span as well as the complete span (Shipping), so it discharges C1.1 and C2.2 separately.
+
+## Alternatives considered
+
+- **(a) Anchor in phase 1.** The tree would be green, since the anchor stamps nothing on any card in phase 1. Rejected: its only discriminating test would be `DEFERRED(phase 2)`, while co-locating it with its consumer tests it in-phase.
+- **(b) Immortal Obligation first.** Impossible: U4 needs phase 1's arm (edge U3-parser → U4).
+- **(c) Three phases** (U1 or U2 split out of phase 2). Not needed, because phase 2 does not trip T1 ∧ T2. U2 has no runtime discriminator except through Immortal Obligation, and U1 alone would ship Immortal Obligation half-implemented for no gate reason.
+- **(d) Feasibility exit.** Not taken: a green-tree seam exists (above).
+
+## Open questions (orchestrator)
+
+1. X3 items 1 and 2 are pre-existing defects outside this run (`plan-r3.md` Open questions 1 and 2). Proposed: file issues.
+2. If C1.2 fails during phase 1's plan, the route is a re-charter (anchor into phase 1), not an addendum. Flagged now so the orchestrator does not size it as drift.
+3. Phase 2's margin to T2 is 3 paths. A scope extension that brings it to 13 re-runs the conjunction at scope-freeze. With T1 already true it would fire, and the route is a re-charter splitting phase 2 (for example, U1+U2 before U4+anchor).
