@@ -5166,6 +5166,7 @@ export interface GameState {
   city_blessing?: PlayerId[];
   enduring_story?: PlayerId[];
   ring_level?: Record<string, number>;
+  ring_tempt_count?: Record<string, number>;
   ring_bearer?: Record<string, ObjectId | null>;
   commander_damage?: CommanderDamageEntry[];
   exile_links?: Array<{ exiled_id: ObjectId; source_id: ObjectId; kind?: ExileLinkKind }>;

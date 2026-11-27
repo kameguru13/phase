@@ -2584,6 +2584,7 @@ fn object_scope_reads_chain_target(scope: ObjectScope) -> bool {
         | ObjectScope::OtherRevealedCard
         | ObjectScope::OwnedLinkedExileCard
         | ObjectScope::BatchSource
+        | ObjectScope::RingBearer
         | ObjectScope::GrantingObject
         | ObjectScope::SpecificObject { .. } => false,
     }
@@ -12964,8 +12965,7 @@ pub(crate) fn parse_where_x_quantity_expression_with_antecedents(
 /// Every arm of [`parse_where_x_quantity_expression`] except the printed-name
 /// possessive arm. The count entry's equal-to chain
 /// (`oracle_util::parse_equal_to_count`) reads its quantity through this core so
-/// "mills cards equal to your Ring-bearer's power" stays a miss instead of
-/// becoming the source's power.
+/// a foreign possessive stays a miss instead of becoming the source's power.
 pub(crate) fn parse_where_x_quantity_core(where_x: &str) -> Option<QuantityExpr> {
     parse_where_x_quantity_with_owner(
         where_x,
@@ -13006,6 +13006,22 @@ fn parse_where_x_quantity_with_owner(
 ) -> Option<QuantityExpr> {
     let expression = where_x.trim().trim_end_matches('.');
     let expression_lower = expression.to_ascii_lowercase();
+    // CR 701.54a + CR 208.1: the ability controller's current Ring-bearer.
+    if all_consuming((
+        tag::<_, _, OracleError<'_>>("your ring-bearer"),
+        crate::parser::oracle_nom::condition::parse_apostrophe_s,
+        tag(" power"),
+    ))
+    .parse(expression_lower.as_str())
+    .is_ok()
+    {
+        return Some(QuantityExpr::Ref {
+            qty: QuantityRef::Power {
+                scope: ObjectScope::RingBearer,
+            },
+        });
+    }
+
     // CR 702.51c + CR 603.3: Knight-Errant of Eos reads the number of
     // creatures that convoked the spell which became this permanent. The
     // casting pipeline preserves that count through the zone change, so the

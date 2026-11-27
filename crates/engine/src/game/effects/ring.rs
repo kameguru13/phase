@@ -3,6 +3,7 @@ use crate::types::card_type::CoreType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{GameState, WaitingFor};
 use crate::types::identifiers::ObjectId;
+use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
 
 /// CR 701.54: The Ring tempts you.
@@ -11,7 +12,7 @@ use crate::types::zones::Zone;
 /// That creature becomes your Ring-bearer.
 ///
 /// CR 701.54c: Each time the Ring tempts you, your ring level increases by one
-/// (to a maximum of four levels, 0-indexed as 0–3).
+/// (to a maximum tier of four).
 pub fn resolve(
     state: &mut GameState,
     ability: &ResolvedAbility,
@@ -19,7 +20,7 @@ pub fn resolve(
 ) -> Result<(), EffectError> {
     let controller = ability.controller;
 
-    // CR 701.54b: Increment ring level, capping at 4 (the ring has 4 tiers).
+    // CR 701.54c: Increment ring level, capping at 4 (the ring has 4 tiers).
     // Level 0 = never tempted (no abilities). Levels 1–4 unlock progressive tiers.
     let level = state.ring_level.entry(controller).or_insert(0);
     if *level < 4 {
@@ -57,25 +58,12 @@ pub fn resolve(
     });
 
     if candidates.is_empty() {
-        // No creatures — ring tempts but no ring-bearer selection (CR 701.54a).
-        // The temptation is still complete: emit the trigger-visible event with
-        // no chosen bearer.
-        events.push(GameEvent::RingTemptsYou {
-            player_id: controller,
-            chosen_bearer: None,
-        });
+        complete_temptation(state, controller, None, events);
         return Ok(());
     }
 
-    if candidates.len() == 1 {
-        // Only one creature — auto-select as ring-bearer. The temptation's
-        // actions are complete here, so the event carries the choice.
-        state.ring_bearer.insert(controller, Some(candidates[0]));
-        crate::game::layers::mark_layers_full(state);
-        events.push(GameEvent::RingTemptsYou {
-            player_id: controller,
-            chosen_bearer: Some(candidates[0]),
-        });
+    if let [bearer] = candidates.as_slice() {
+        complete_temptation(state, controller, Some(*bearer), events);
         return Ok(());
     }
 
@@ -88,11 +76,31 @@ pub fn resolve(
     Ok(())
 }
 
+/// CR 701.54a + CR 701.54d: Count and emit the temptation once its choice
+/// has been made, or immediately if choosing was impossible.
+pub(crate) fn complete_temptation(
+    state: &mut GameState,
+    player: PlayerId,
+    chosen_bearer: Option<ObjectId>,
+    events: &mut Vec<GameEvent>,
+) {
+    if let Some(bearer) = chosen_bearer {
+        state.ring_bearer.insert(player, Some(bearer));
+        crate::game::layers::mark_layers_full(state);
+    }
+    let count = state.ring_tempt_count.entry(player).or_default();
+    *count = count.saturating_add(1);
+    events.push(GameEvent::RingTemptsYou {
+        player_id: player,
+        chosen_bearer,
+    });
+}
+
 /// CR 701.54e: A player's Ring-bearer designation is valid only while that
 /// creature remains on the battlefield under that player's control.
 pub(crate) fn is_current_ring_bearer(
     state: &GameState,
-    player: crate::types::player::PlayerId,
+    player: PlayerId,
     object_id: ObjectId,
 ) -> bool {
     if state.ring_bearer.get(&player).copied().flatten() != Some(object_id) {
@@ -196,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn ring_level_caps_at_four() {
+    fn ring_level_caps_at_four_but_count_does_not() {
         let mut state = GameState::new_two_player(42);
         let ability = ResolvedAbility::new(Effect::RingTemptsYou, vec![], ObjectId(1), PlayerId(0));
 
@@ -207,6 +215,7 @@ mod tests {
         }
 
         assert_eq!(state.ring_level[&PlayerId(0)], 4);
+        assert_eq!(state.ring_tempt_count[&PlayerId(0)], 5);
     }
 
     #[test]
@@ -240,6 +249,29 @@ mod tests {
             state.waiting_for,
             WaitingFor::ChooseRingBearer { .. }
         ));
+        assert!(state.ring_tempt_count.is_empty());
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, GameEvent::RingTemptsYou { .. })));
+
+        state.ring_level.insert(PlayerId(1), 4);
+        let mut saved = serde_json::to_value(&state).unwrap();
+        saved.as_object_mut().unwrap().remove("ring_tempt_count");
+        let mut restored: GameState = serde_json::from_value(saved).unwrap();
+        assert!(!restored.ring_tempt_count.contains_key(&PlayerId(0)));
+        assert_eq!(restored.ring_tempt_count[&PlayerId(1)], 4);
+        let target = match &restored.waiting_for {
+            WaitingFor::ChooseRingBearer { candidates, .. } => candidates[0],
+            waiting => panic!("expected restored Ring-bearer choice, got {waiting:?}"),
+        };
+        let action = crate::types::actions::GameAction::ChooseRingBearer { target };
+        let result = crate::game::engine::apply(&mut restored, PlayerId(0), action).unwrap();
+        assert_eq!(restored.ring_tempt_count[&PlayerId(0)], 1);
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            GameEvent::RingTemptsYou { player_id: PlayerId(0), chosen_bearer: Some(id) }
+                if *id == target
+        )));
     }
 
     #[test]

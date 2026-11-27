@@ -3827,7 +3827,7 @@ fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes<'_> {
             ));
             acc
         }
-        QuantityRef::CrimesCommittedThisTurn => Axes::NONE,
+        QuantityRef::CrimesCommittedThisTurn | QuantityRef::RingTemptCount => Axes::NONE,
         // CR 107.14 + CR 122.1: controller energy-spent journal; a projected
         // per-turn resource tracker like `LifeLost`.
         QuantityRef::EnergyPaidOrLostThisTurn => Axes {
@@ -5246,6 +5246,7 @@ fn scan_object_scope(x: &ObjectScope) -> Axes<'_> {
         // CR 120.1: per-iteration batch source — a resolution-filtered object
         // with no event/sibling axis (mirrors Source/Target).
         ObjectScope::BatchSource => Axes::NONE,
+        ObjectScope::RingBearer => Axes::NONE,
         // CR 601.2c: the chain-root spell's own declared target, carried on the
         // resolving ability's context — no event/sibling projected axis
         // (mirrors Target/Demonstrative).

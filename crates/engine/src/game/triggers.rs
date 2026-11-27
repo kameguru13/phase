@@ -18824,7 +18824,8 @@ pub(crate) fn gate_binding_diverges(condition: &AbilityCondition, reader: Bindin
                 | ObjectScope::ChainRootTarget
                 | ObjectScope::GrantingObject
                 | ObjectScope::SpecificObject { .. }
-                | ObjectScope::BatchSource => false,
+                | ObjectScope::BatchSource
+                | ObjectScope::RingBearer => false,
             },
         },
         // CR 614.1a: an "instead" gate is a replacement-time reading of the
@@ -19074,7 +19075,8 @@ fn object_scope_unbound(scope: ObjectScope, reader: BindingReader) -> bool {
         // `finalize_cast`, so it is absent when a triggered ability's
         // intervening-if is checked at fire time. Decline the fire-time half.
         | ObjectScope::ChainRootTarget
-        | ObjectScope::BatchSource => true,
+        | ObjectScope::BatchSource
+        | ObjectScope::RingBearer => true,
     }
 }
 
@@ -19422,6 +19424,7 @@ fn quantity_ref_binding_diverges(qty: &QuantityRef, reader: BindingReader) -> bo
         | QuantityRef::DeployedBossCount
         | QuantityRef::BasicLandTypeCount { .. }
         | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::RingTemptCount
         | QuantityRef::EnergyPaidOrLostThisTurn
         | QuantityRef::BendTypesThisTurn
         | QuantityRef::TurnsTaken

@@ -1705,6 +1705,7 @@ fn fmt_name_sticker_letter_count(stickers: &NameStickerSet, letters: &LetterQuer
             ObjectScope::OwnedLinkedExileCard => "in name stickers on owned linked-exiled card",
             ObjectScope::AmassedArmy => "in name stickers on amassed Army",
             ObjectScope::BatchSource => "in name stickers on batch source",
+            ObjectScope::RingBearer => "in name stickers on Ring-bearer",
             ObjectScope::ChainRootTarget => "in name stickers on chain-root target",
             ObjectScope::GrantingObject => "in name stickers on granting object",
             ObjectScope::SpecificObject { .. } => "in name stickers on bound object",
@@ -1791,6 +1792,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                 ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card",
                 ObjectScope::AmassedArmy => "amassed Army",
                 ObjectScope::BatchSource => "batch source",
+                ObjectScope::RingBearer => "Ring-bearer",
                 ObjectScope::ChainRootTarget => "chain-root target",
                 ObjectScope::GrantingObject => "granting object",
                 ObjectScope::SpecificObject { .. } => "bound object",
@@ -1822,6 +1824,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card's power".into(),
             ObjectScope::AmassedArmy => "amassed Army's power".into(),
             ObjectScope::BatchSource => "batch source's power".into(),
+            ObjectScope::RingBearer => "Ring-bearer's power".into(),
             ObjectScope::ChainRootTarget => "chain-root target's power".into(),
             ObjectScope::GrantingObject => "granting object's power".into(),
             ObjectScope::SpecificObject { .. } => "bound object's power".into(),
@@ -1839,6 +1842,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card's base power".into(),
             ObjectScope::AmassedArmy => "amassed Army's base power".into(),
             ObjectScope::BatchSource => "batch source's base power".into(),
+            ObjectScope::RingBearer => "Ring-bearer's base power".into(),
             ObjectScope::ChainRootTarget => "chain-root target's base power".into(),
             ObjectScope::GrantingObject => "granting object's base power".into(),
             ObjectScope::SpecificObject { .. } => "bound object's base power".into(),
@@ -1856,6 +1860,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card's toughness".into(),
             ObjectScope::AmassedArmy => "amassed Army's toughness".into(),
             ObjectScope::BatchSource => "batch source's toughness".into(),
+            ObjectScope::RingBearer => "Ring-bearer's toughness".into(),
             ObjectScope::ChainRootTarget => "chain-root target's toughness".into(),
             ObjectScope::GrantingObject => "granting object's toughness".into(),
             ObjectScope::SpecificObject { .. } => "bound object's toughness".into(),
@@ -1873,6 +1878,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card's mana value".into(),
             ObjectScope::AmassedArmy => "amassed Army's mana value".into(),
             ObjectScope::BatchSource => "batch source's mana value".into(),
+            ObjectScope::RingBearer => "Ring-bearer's mana value".into(),
             ObjectScope::ChainRootTarget => "chain-root target's mana value".into(),
             ObjectScope::GrantingObject => "granting object's mana value".into(),
             ObjectScope::SpecificObject { .. } => "bound object's mana value".into(),
@@ -1891,6 +1897,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card's colors".into(),
             ObjectScope::AmassedArmy => "amassed Army's colors".into(),
             ObjectScope::BatchSource => "batch source's colors".into(),
+            ObjectScope::RingBearer => "Ring-bearer's colors".into(),
             ObjectScope::ChainRootTarget => "chain-root target's colors".into(),
             ObjectScope::GrantingObject => "granting object's colors".into(),
             ObjectScope::SpecificObject { .. } => "bound object's colors".into(),
@@ -1910,6 +1917,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             }
             ObjectScope::AmassedArmy => "typeline components on amassed Army".into(),
             ObjectScope::BatchSource => "typeline components on batch source".into(),
+            ObjectScope::RingBearer => "typeline components on Ring-bearer".into(),
             ObjectScope::ChainRootTarget => "typeline components on chain-root target".into(),
             ObjectScope::GrantingObject => "typeline components on granting object".into(),
             ObjectScope::SpecificObject { .. } => "typeline components on bound object".into(),
@@ -1927,6 +1935,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::OwnedLinkedExileCard => "words in owned linked-exiled card's name".into(),
             ObjectScope::AmassedArmy => "words in amassed Army's name".into(),
             ObjectScope::BatchSource => "words in batch source's name".into(),
+            ObjectScope::RingBearer => "words in Ring-bearer's name".into(),
             ObjectScope::ChainRootTarget => "words in chain-root target's name".into(),
             ObjectScope::GrantingObject => "words in granting object's name".into(),
             ObjectScope::SpecificObject { .. } => "words in bound object's name".into(),
@@ -1946,6 +1955,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                 ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card",
                 ObjectScope::AmassedArmy => "amassed Army",
                 ObjectScope::BatchSource => "batch source",
+                ObjectScope::RingBearer => "Ring-bearer",
                 ObjectScope::ChainRootTarget => "chain-root target",
                 ObjectScope::GrantingObject => "granting object",
                 ObjectScope::SpecificObject { .. } => "bound object",
@@ -2176,6 +2186,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             )
         }
         QuantityRef::CrimesCommittedThisTurn => "crimes committed this turn".into(),
+        QuantityRef::RingTemptCount => "completed Ring temptations".into(),
         QuantityRef::EnergyPaidOrLostThisTurn => "energy paid or lost this turn".into(),
         QuantityRef::BendTypesThisTurn => "distinct bend types this turn".into(),
         QuantityRef::LifeGainedThisTurn { player } => {
@@ -5196,6 +5207,7 @@ fn fmt_ability_condition(cond: &AbilityCondition) -> String {
             | ObjectScope::OtherRevealedCard
             | ObjectScope::OwnedLinkedExileCard
             | ObjectScope::BatchSource
+            | ObjectScope::RingBearer
             | ObjectScope::ChainRootTarget
             | ObjectScope::GrantingObject
             | ObjectScope::SpecificObject { .. } => format!("target is {}", fmt_target(filter)),
@@ -11984,6 +11996,7 @@ fn window_attr_support(attr: &QuantityRef) -> FeatureSupport {
         | QuantityRef::EnteredThisTurn { .. }
         | QuantityRef::SacrificedThisTurn { .. }
         | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::RingTemptCount
         | QuantityRef::EnergyPaidOrLostThisTurn
         | QuantityRef::BendTypesThisTurn
         | QuantityRef::LifeGainedThisTurn { .. }
@@ -12272,6 +12285,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::OwnedLinkedExileCard => ("OwnedLinkedExileCardPower", Unhandled),
             ObjectScope::AmassedArmy => ("AmassedArmyPower", Handled),
             ObjectScope::BatchSource => ("BatchSourcePower", Handled),
+            ObjectScope::RingBearer => ("RingBearerPower", Handled),
             // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
             // chain-root target's characteristics yet (CR 601.2c referent is
             // wired for `CountersOn` only).
@@ -12292,6 +12306,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::OwnedLinkedExileCard => ("OwnedLinkedExileCardBasePower", Unhandled),
             ObjectScope::AmassedArmy => ("AmassedArmyBasePower", Handled),
             ObjectScope::BatchSource => ("BatchSourceBasePower", Handled),
+            ObjectScope::RingBearer => ("RingBearerBasePower", Handled),
             // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
             // chain-root target's characteristics yet (CR 601.2c referent is
             // wired for `CountersOn` only).
@@ -12312,6 +12327,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::OwnedLinkedExileCard => ("OwnedLinkedExileCardToughness", Unhandled),
             ObjectScope::AmassedArmy => ("AmassedArmyToughness", Handled),
             ObjectScope::BatchSource => ("BatchSourceToughness", Handled),
+            ObjectScope::RingBearer => ("RingBearerToughness", Handled),
             // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
             // chain-root target's characteristics yet (CR 601.2c referent is
             // wired for `CountersOn` only).
@@ -12332,6 +12348,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::OwnedLinkedExileCard => ("OwnedLinkedExileCardManaValue", Handled),
             ObjectScope::AmassedArmy => ("AmassedArmyManaValue", Handled),
             ObjectScope::BatchSource => ("BatchSourceManaValue", Handled),
+            ObjectScope::RingBearer => ("RingBearerManaValue", Handled),
             // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
             // chain-root target's characteristics yet (CR 601.2c referent is
             // wired for `CountersOn` only).
@@ -12356,6 +12373,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::OwnedLinkedExileCard => ("OwnedLinkedExileCardColorCount", Handled),
             ObjectScope::AmassedArmy => ("AmassedArmyObjectColorCount", Handled),
             ObjectScope::BatchSource => ("BatchSourceObjectColorCount", Handled),
+            ObjectScope::RingBearer => ("RingBearerObjectColorCount", Handled),
             // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
             // chain-root target's characteristics yet (CR 601.2c referent is
             // wired for `CountersOn` only).
@@ -12376,6 +12394,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::OwnedLinkedExileCard => ("OwnedLinkedExileCardNameWordCount", Handled),
             ObjectScope::AmassedArmy => ("AmassedArmyObjectNameWordCount", Handled),
             ObjectScope::BatchSource => ("BatchSourceObjectNameWordCount", Handled),
+            ObjectScope::RingBearer => ("RingBearerObjectNameWordCount", Handled),
             // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
             // chain-root target's characteristics yet (CR 601.2c referent is
             // wired for `CountersOn` only).
@@ -12400,6 +12419,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::EventSource => ("EventSourceNameStickerLetterCount", Handled),
             ObjectScope::EventTarget => ("EventTargetNameStickerLetterCount", Handled),
             ObjectScope::BatchSource => ("BatchSourceNameStickerLetterCount", Handled),
+            ObjectScope::RingBearer => ("RingBearerNameStickerLetterCount", Handled),
             // `object_for_scope` has no referent for this scope → fail-closed 0.
             ObjectScope::CostPaidObject => ("CostPaidObjectNameStickerLetterCount", Unhandled),
             // `object_for_scope` has no referent for this scope → fail-closed 0.
@@ -12437,6 +12457,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             }
             ObjectScope::AmassedArmy => ("AmassedArmyObjectTypelineComponentCount", Handled),
             ObjectScope::BatchSource => ("BatchSourceObjectTypelineComponentCount", Handled),
+            ObjectScope::RingBearer => ("RingBearerObjectTypelineComponentCount", Handled),
             // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
             // chain-root target's characteristics yet (CR 601.2c referent is
             // wired for `CountersOn` only).
@@ -12465,6 +12486,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             }
             ObjectScope::AmassedArmy => ("AmassedArmyManaSymbolsInManaCost", Handled),
             ObjectScope::BatchSource => ("BatchSourceManaSymbolsInManaCost", Handled),
+            ObjectScope::RingBearer => ("RingBearerManaSymbolsInManaCost", Handled),
             // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
             // chain-root target's characteristics yet (CR 601.2c referent is
             // wired for `CountersOn` only).
@@ -12537,6 +12559,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         QuantityRef::EnteredThisTurn { .. } => ("EnteredThisTurn", Handled),
         QuantityRef::SacrificedThisTurn { .. } => ("SacrificedThisTurn", Handled),
         QuantityRef::CrimesCommittedThisTurn => ("CrimesCommittedThisTurn", Handled),
+        QuantityRef::RingTemptCount => ("RingTemptCount", Handled),
         QuantityRef::EnergyPaidOrLostThisTurn => ("EnergyPaidOrLostThisTurn", Handled),
         QuantityRef::BendTypesThisTurn => ("BendTypesThisTurn", Handled),
         QuantityRef::LifeGainedThisTurn { .. } => ("LifeGainedThisTurn", Handled),

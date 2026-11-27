@@ -61,6 +61,8 @@ pub struct QuantityContext<'a> {
     pub entering: Option<ObjectId>,
     /// The static ability source (always set).
     pub source: ObjectId,
+    /// Controller of the ability whose quantity is being read.
+    pub controller: Option<PlayerId>,
     /// Exact triggered-source authority, when this quantity is evaluated for a
     /// triggered ability or its intervening-if. `source` remains attribution;
     /// source-relative facts must use this context instead of rebinding it.
@@ -106,6 +108,7 @@ impl<'a> QuantityContext<'a> {
         Self {
             entering: None,
             source,
+            controller: None,
             trigger_source: None,
             stack_trigger_context: None,
             recipient: None,
@@ -2217,6 +2220,7 @@ pub(crate) fn quantity_expr_uses_resolution_only_object_scope(expr: &QuantityExp
             // `EachSourceDealsDamage` batch is bound per batch member only at
             // resolution time, never as a static CDA read.
             | ObjectScope::BatchSource => true,
+            ObjectScope::RingBearer => true,
         }
     }
     match expr {
@@ -2349,6 +2353,11 @@ fn resolution_only_scope_referent_present(
         // CR 120.1: the per-iteration batch member is bound only while the
         // per-source resolver runs; absent everywhere else.
         ObjectScope::BatchSource => ctx.damage_source.is_some(),
+        ObjectScope::RingBearer => crate::game::effects::ring::ring_bearer_for(
+            state,
+            ability.original_controller.unwrap_or(ability.controller),
+        )
+        .is_some(),
     }
 }
 
@@ -2531,6 +2540,7 @@ fn quantity_ref_uses_unspent_mana(qty: &QuantityRef) -> bool {
         | QuantityRef::SpellsCastBeforeTriggeringSpell { .. }
         | QuantityRef::SacrificedThisTurn { .. }
         | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::RingTemptCount
         | QuantityRef::EnergyPaidOrLostThisTurn
         | QuantityRef::BendTypesThisTurn
         | QuantityRef::LifeGainedThisTurn { .. }
@@ -2884,6 +2894,7 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
         | QuantityRef::SpellsCastBeforeTriggeringSpell { .. }
         | QuantityRef::SacrificedThisTurn { .. }
         | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::RingTemptCount
         | QuantityRef::EnergyPaidOrLostThisTurn
         | QuantityRef::BendTypesThisTurn
         | QuantityRef::LifeGainedThisTurn { .. }
@@ -3215,6 +3226,7 @@ fn quantity_ref_characteristic_reads(qty: &QuantityRef, depth: u32) -> Character
         // CR 701.16a: sacrifice-time characteristics.
         | QuantityRef::SacrificedThisTurn { .. }
         | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::RingTemptCount
         | QuantityRef::EnergyPaidOrLostThisTurn
         | QuantityRef::BendTypesThisTurn
         | QuantityRef::LifeGainedThisTurn { .. }
@@ -3502,6 +3514,7 @@ fn entered_object_perturbs_quantity_ref(
         | QuantityRef::SpellsCastBeforeTriggeringSpell { .. }
         | QuantityRef::SacrificedThisTurn { .. }
         | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::RingTemptCount
         | QuantityRef::EnergyPaidOrLostThisTurn
         | QuantityRef::BendTypesThisTurn
         | QuantityRef::LifeGainedThisTurn { .. }
@@ -4281,6 +4294,7 @@ fn ability_quantity_context(ability: &ResolvedAbility) -> QuantityContext<'_> {
     QuantityContext {
         entering: None,
         source: ability.source_id,
+        controller: Some(ability.original_controller.unwrap_or(ability.controller)),
         trigger_source: ability.trigger_source.clone(),
         stack_trigger_context: None,
         recipient: None,
@@ -4461,6 +4475,7 @@ pub fn resolve_quantity_with_parked_targets(
             QuantityContext {
                 entering: None,
                 source: source_id,
+                controller: Some(controller),
                 trigger_source: None,
                 stack_trigger_context: None,
                 recipient: None,
@@ -5231,6 +5246,10 @@ fn resolve_ref(
             );
         }
     }
+    let ctx = QuantityContext {
+        controller: Some(controller),
+        ..ctx
+    };
     let source_id = ctx.source;
     // Build a FilterContext that preserves ability scope (for `chosen_x`/targets
     // in nested filter thresholds) when available, falling back to the controller
@@ -5702,6 +5721,18 @@ fn resolve_ref(
                 _ => None,
             })
             .unwrap_or(0),
+        // CR 608.2h + CR 701.54a: A distributed instruction reads its
+        // controller's current bearer once when the instruction starts.
+        QuantityRef::Power {
+            scope: ObjectScope::RingBearer,
+        } if ctx.scoped_player.is_some()
+            && let Some(value) = state
+                .clause_minimum_snapshot
+                .as_ref()
+                .and_then(|s| s.get(qty)) =>
+        {
+            value
+        }
         // CR 208.3 + CR 113.6: A creature's power/toughness from current state,
         // falling back to Last Known Information if the source has left the
         // battlefield. Scoped via ObjectScope (Π-6).
@@ -6889,6 +6920,12 @@ fn resolve_ref(
                 )
             },
         ),
+        // CR 701.54d: The history contains only completed temptations.
+        QuantityRef::RingTemptCount => state
+            .ring_tempt_count
+            .get(&controller)
+            .copied()
+            .map_or(0, u32_to_i32_saturating),
         // CR 700.13: Crimes committed this turn — uses tracked counter on player.
         QuantityRef::CrimesCommittedThisTurn => {
             player.map_or(0, |p| u32_to_i32_saturating(p.crimes_committed_this_turn))
@@ -8207,6 +8244,8 @@ fn object_for_scope<'a>(
         // CR 120.1: the per-iteration damage source of an `EachSourceDealsDamage`
         // batch is bound per batch member by the per-source resolver.
         ObjectScope::BatchSource => ctx.damage_source.and_then(|id| state.objects.get(&id)),
+        ObjectScope::RingBearer => object_id_for_scope(state, scope, ctx, targets)
+            .and_then(|id| state.objects.get(&id)),
     }
 }
 
@@ -8286,6 +8325,9 @@ pub(crate) fn object_id_for_scope(
         // CR 120.1: the per-iteration damage source of an `EachSourceDealsDamage`
         // batch is bound per batch member by the per-source resolver.
         ObjectScope::BatchSource => ctx.damage_source,
+        ObjectScope::RingBearer => ctx.controller.and_then(|controller| {
+            crate::game::effects::ring::ring_bearer_for(state, controller)
+        }),
     }
 }
 
@@ -8324,6 +8366,7 @@ pub(crate) fn distinct_counter_kinds_among(
         let ctx = QuantityContext {
             entering: None,
             source: filter_ctx.source_id,
+            controller: filter_ctx.source_controller,
             trigger_source: filter_ctx.trigger_source.cloned(),
             stack_trigger_context: filter_ctx.stack_trigger_context,
             recipient: None,
@@ -8812,6 +8855,7 @@ fn read_counters_on_scope<T>(
         | ObjectScope::BatchSource => {
             read_counters_on_live_or_lki_scope(state, scope, ctx, targets, read)
         }
+        ObjectScope::RingBearer => object_for_scope(state, scope, ctx, targets).map(|object| read(&object.counters)),
         ObjectScope::CostPaidObject => ability
             .and_then(|ability| ability.cost_paid_object.as_ref())
             .map(|snapshot| read(&snapshot.lki.counters)),
@@ -9635,6 +9679,9 @@ where
         ObjectScope::SpecificObject { object } => {
             read_specific_object(state, object, ability, &obj_extract, &lki_extract).unwrap_or(0)
         }
+        ObjectScope::RingBearer => object_for_scope(state, scope, ctx, targets)
+            .and_then(obj_extract)
+            .unwrap_or(0),
         // CR 120.1 + CR 208.3 + CR 608.2h: the per-iteration damage source of an
         // `EachSourceDealsDamage` batch reads its OWN characteristic ("deals
         // damage equal to ITS power"). Guarded live-then-LKI read (a batch
@@ -10021,6 +10068,8 @@ fn resolve_object_mana_value(
             &|l| Some(u32_to_i32_saturating(l.mana_value)),
         )
         .unwrap_or(0),
+        ObjectScope::RingBearer => object_for_scope(state, scope, ctx, targets)
+            .map_or(0, |obj| u32_to_i32_saturating(obj.effective_mana_value())),
         // CR 120.1 + CR 202.3 + CR 608.2h: the per-iteration damage source of an
         // `EachSourceDealsDamage` batch reads its OWN mana value. Live object
         // first, LKI fallback (mirrors the `EventSource` arm), so a batch member
@@ -26935,7 +26984,7 @@ mod tests {
         }};
     }
 
-    fn all_object_scopes() -> [(&'static str, ObjectScope); 15] {
+    fn all_object_scopes() -> [(&'static str, ObjectScope); 16] {
         every_object_scope!(
             Source,
             Target,
@@ -26949,6 +26998,7 @@ mod tests {
             OtherRevealedCard,
             OwnedLinkedExileCard,
             BatchSource,
+            RingBearer,
             ChainRootTarget,
             GrantingObject,
             SpecificObject {
@@ -26972,6 +27022,7 @@ mod tests {
                 | ObjectScope::OtherRevealedCard
                 | ObjectScope::OwnedLinkedExileCard
                 | ObjectScope::BatchSource
+                | ObjectScope::RingBearer
                 | ObjectScope::ChainRootTarget
                 | ObjectScope::GrantingObject
         )

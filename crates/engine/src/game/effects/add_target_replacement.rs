@@ -472,6 +472,7 @@ fn entry_counter_reference_is_deferred(qty: &QuantityRef) -> bool {
         | QuantityRef::EventContextSourceCostX
         | QuantityRef::EventContextSourceModesChosen
         | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::RingTemptCount
         | QuantityRef::EnergyPaidOrLostThisTurn
         | QuantityRef::BendTypesThisTurn
         | QuantityRef::TurnsTaken

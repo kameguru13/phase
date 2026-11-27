@@ -47,6 +47,7 @@ mod rikku_resourceful_guardian_your_counters;
 mod riku_modal_modes_chosen_cap;
 mod riku_modal_spell_trigger;
 mod ring_entering_blocker;
+mod ring_tempt_count;
 mod riot_control_regression;
 mod ripple_reveal_choice_interaction;
 mod ripple_stolen_spell_controller;

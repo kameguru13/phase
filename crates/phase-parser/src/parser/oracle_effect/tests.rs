@@ -83906,6 +83906,7 @@ fn amount_reads_the_antecedent_accepts_only_anaphoric_subject_scopes() {
         OtherRevealedCard,
         OwnedLinkedExileCard,
         BatchSource,
+        RingBearer,
         ChainRootTarget,
         GrantingObject,
         SpecificObject {
@@ -101446,10 +101447,8 @@ fn draw_that_many_reads_through_the_slot() {
     }
 }
 
-/// The equal-to chain's where-X rung cannot read a foreign possessive as the
-/// card's own name (One Ring to Rule Them All's "your Ring-bearer's power").
 #[test]
-fn equal_to_foreign_possessive_fails_closed() {
+fn ring_saga_mill_reads_the_controller_bearer() {
     let ring = parse_oracle_text(
         "(As this Saga enters and after your draw step, add a lore counter. Sacrifice after III.)\nI — The Ring tempts you, then each player mills cards equal to your Ring-bearer's power.\nII — Destroy all nonlegendary creatures.\nIII — Each opponent loses 1 life for each creature card in that player's graveyard.",
         "One Ring to Rule Them All",
@@ -101458,19 +101457,55 @@ fn equal_to_foreign_possessive_fails_closed() {
         &["Saga".to_string()],
     );
     let ring = to_json(&ring);
-    // Reach guard: the chapters parsed (chapter II's destroy is typed).
     assert!(
-        !serialized_effects(&ring, "DestroyAll").is_empty(),
+        serialized_effects(&ring, "Unimplemented").is_empty(),
         "{ring}"
     );
-    assert!(
-        !serialized_effects(&ring, "Unimplemented").is_empty(),
-        "chapter I's mill stays an honest gap: {ring}"
+    assert_eq!(
+        serialized_effects(&ring, "RingTemptsYou").len(),
+        1,
+        "{ring}"
     );
+    assert_eq!(serialized_effects(&ring, "Mill").len(), 1, "{ring}");
     assert!(
-        serialized_effects(&ring, "Mill").is_empty(),
-        "the Ring-bearer's power must not become the Saga's own power: {ring}"
+        has_effect_field(
+            &ring,
+            "Mill",
+            "count",
+            &QuantityExpr::Ref {
+                qty: QuantityRef::Power {
+                    scope: ObjectScope::RingBearer,
+                },
+            },
+        ),
+        "{ring}"
     );
+}
+
+#[test]
+fn frodo_uses_the_temptation_count_in_its_draw_gate() {
+    let frodo = parse_oracle_text(
+        "Partner with Sam, Loyal Attendant\nVigilance\nWhenever Frodo attacks, if you gained 3 or more life this turn, the Ring tempts you. Then if Frodo is your Ring-bearer and the Ring has tempted you two or more times this game, draw a card.",
+        "Frodo, Adventurous Hobbit",
+        &["Partner".to_string(), "Partner with".to_string(), "Vigilance".to_string()],
+        &["Creature".to_string()],
+        &["Halfling".to_string(), "Scout".to_string()],
+    );
+    let frodo = to_json(&frodo);
+    assert!(
+        serialized_effects(&frodo, "Unimplemented").is_empty(),
+        "{frodo}"
+    );
+    assert_eq!(
+        serialized_effects(&frodo, "RingTemptsYou").len(),
+        1,
+        "{frodo}"
+    );
+    assert_eq!(serialized_effects(&frodo, "Draw").len(), 1, "{frodo}");
+    let ast = frodo.to_string();
+    for leaf in ["IsRingBearer", "RingTemptCount", "LifeGainedThisTurn"] {
+        assert!(ast.contains(leaf), "{frodo}");
+    }
 }
 
 /// The where-X wrapper keeps the printed-name possessive arm (Halana and
@@ -101488,7 +101523,7 @@ fn where_x_core_declines_the_printed_name_possessive() {
         None
     );
     assert_eq!(
-        super::lower::parse_where_x_quantity_core("your ring-bearer's power"),
+        super::lower::parse_where_x_quantity_core("your companion's power"),
         None
     );
     assert_eq!(

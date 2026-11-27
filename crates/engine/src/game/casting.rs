@@ -35697,6 +35697,7 @@ fn quantity_ref_reads_target_object(qty: &QuantityRef, read: TargetRead) -> bool
         | QuantityRef::EventContextSourceCostX
         | QuantityRef::EventContextSourceModesChosen
         | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::RingTemptCount
         | QuantityRef::EnergyPaidOrLostThisTurn
         | QuantityRef::BendTypesThisTurn
         | QuantityRef::TurnsTaken
@@ -35736,6 +35737,7 @@ fn object_scope_reads_chosen_target(scope: &ObjectScope, read: TargetRead) -> bo
         | ObjectScope::OtherRevealedCard
         | ObjectScope::OwnedLinkedExileCard
         | ObjectScope::BatchSource
+        | ObjectScope::RingBearer
         | ObjectScope::GrantingObject
         | ObjectScope::SpecificObject { .. } => false,
     }

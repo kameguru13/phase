@@ -143,6 +143,7 @@ const NUMERIC_MAP_ROUND_TRIP_OWNERS: &[NumericRoundTripOwner] = &[
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::departed_triggered_abilities", map_key_types: &["ObjectId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::linked_exile_lki", map_key_types: &["ObjectId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::ring_level", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
+    NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::ring_tempt_count", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::ring_bearer", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::dungeon_progress", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::planar_die_actions_this_turn", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
@@ -327,6 +328,7 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         "stack_trigger_firings",
         "linked_exile_lki",
         "ring_level",
+        "ring_tempt_count",
         "ring_bearer",
         "dungeon_progress",
         "planar_die_actions_this_turn",
@@ -1403,7 +1405,7 @@ fn serde_hash_owner_census_is_exhaustive_and_every_canonical_owner_names_its_ada
 
     assert_eq!(
         NUMERIC_MAP_ROUND_TRIP_OWNERS.len(),
-        65,
+        66,
         "the reviewed numeric-map owner matrix must remain exact"
     );
     for group in [
@@ -1479,6 +1481,11 @@ fn build_populated_state(reverse: bool) -> GameState {
     state.ring_level = player_order
         .into_iter()
         .map(|player| (player, player.0 + 1))
+        .collect();
+
+    state.ring_tempt_count = player_order
+        .into_iter()
+        .map(|player| (player, u32::from(player.0) + 5))
         .collect();
 
     let inner_order = if reverse {
@@ -1695,6 +1702,7 @@ fn assert_representative_membership(state: &GameState) {
         assert!(state.players_who_created_token_this_turn.contains(&player));
     }
     assert_eq!(state.ring_level.len(), 2);
+    assert_eq!(state.ring_tempt_count.len(), 2);
     assert_eq!(state.enduring_story.len(), 2);
     assert_eq!(state.attacked_defenders_this_turn.len(), 2);
     assert_eq!(state.attacked_players_directly_this_turn.len(), 2);
@@ -2317,6 +2325,7 @@ fn build_all_direct_numeric_maps_state() -> GameState {
         ),
     ]);
     state.ring_level = HashMap::from([(PlayerId(0), 1), (PlayerId(1), 2)]);
+    state.ring_tempt_count = HashMap::from([(PlayerId(0), 5), (PlayerId(1), 6)]);
     state.ring_bearer = HashMap::from([
         (PlayerId(0), Some(ObjectId(1))),
         (PlayerId(1), Some(ObjectId(2))),
@@ -2401,13 +2410,14 @@ fn every_direct_numeric_key_game_state_map_round_trips_populated() {
         "departed_triggered_abilities",
         "linked_exile_lki",
         "ring_level",
+        "ring_tempt_count",
         "ring_bearer",
         "dungeon_progress",
         "planar_die_actions_this_turn",
     ];
     assert_eq!(
         direct_fields.len(),
-        49,
+        50,
         "private stack_trigger_firings and scoped_reveal_sets have their own unit tests"
     );
     for field in direct_fields {

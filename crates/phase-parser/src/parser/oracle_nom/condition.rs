@@ -7952,6 +7952,27 @@ fn parse_youve_player_action_history_condition(input: &str) -> OracleResult<'_, 
     .parse(input)
 }
 
+/// CR 701.54d: Compare completed temptations this game.
+fn parse_ring_tempt_history_condition(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, (threshold, comparator)) = delimited(
+        tag("the ring has tempted you "),
+        parse_numeric_threshold_suffix,
+        tag(" times this game"),
+    )
+    .parse(input)?;
+    let value = i32::try_from(threshold).map_err(|_| oracle_err(input))?;
+    Ok((
+        rest,
+        StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::RingTemptCount,
+            },
+            comparator,
+            rhs: QuantityExpr::Fixed { value },
+        },
+    ))
+}
+
 /// Parse event-state conditions: "a creature died this turn", "you attacked this turn",
 /// "an opponent lost life this turn", "no spells were cast last turn", etc.
 ///
@@ -7963,6 +7984,7 @@ fn parse_event_state_conditions(input: &str) -> OracleResult<'_, StaticCondition
         parse_you_didnt_this_turn,
         parse_zone_history_condition,
         parse_life_history_condition,
+        parse_ring_tempt_history_condition,
         parse_discard_history_condition,
         parse_combat_history_condition,
         parse_no_attacked_this_turn,

@@ -3129,7 +3129,8 @@ fn evaluate_condition_inner(
             | crate::types::ability::ObjectScope::AmassedArmy
             | crate::types::ability::ObjectScope::ChainRootTarget
             | crate::types::ability::ObjectScope::GrantingObject
-            | crate::types::ability::ObjectScope::BatchSource => false,
+            | crate::types::ability::ObjectScope::BatchSource
+            | crate::types::ability::ObjectScope::RingBearer => false,
             // CR 110.5d + CR 400.7: the bound object is tapped only while it is that same
             // incarnation on the battlefield.
             crate::types::ability::ObjectScope::SpecificObject { object } => {
@@ -5049,6 +5050,7 @@ fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
         | QuantityRef::SpellsCastBeforeTriggeringSpell { .. }
         | QuantityRef::SacrificedThisTurn { .. }
         | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::RingTemptCount
         | QuantityRef::EnergyPaidOrLostThisTurn
         | QuantityRef::LifeGainedThisTurn { .. }
         | QuantityRef::CardsDrawnThisTurn { .. }
@@ -5464,6 +5466,7 @@ fn quantity_ref_reads_life(qty: &QuantityRef) -> bool {
         | QuantityRef::EventContextSourceCostX
         | QuantityRef::EventContextSourceModesChosen
         | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::RingTemptCount
         | QuantityRef::EnergyPaidOrLostThisTurn
         | QuantityRef::BendTypesThisTurn
         | QuantityRef::CardsDrawnThisTurn { .. }

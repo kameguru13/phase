@@ -3598,6 +3598,7 @@ fn parse_referent_noun_mana_value_condition_text(
         | ObjectScope::OtherRevealedCard
         | ObjectScope::OwnedLinkedExileCard
         | ObjectScope::BatchSource
+        | ObjectScope::RingBearer
         | ObjectScope::ChainRootTarget
         | ObjectScope::GrantingObject
         | ObjectScope::SpecificObject { .. } => LeadingConditionRoute::General,

@@ -1,0 +1,7 @@
+{
+  "surfaces": [
+    "full",
+    "wire"
+  ],
+  "reason": "Ring temptation counts and Ring-bearer quantity references extend serialized game state and ability ASTs."
+}

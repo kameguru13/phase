@@ -10263,6 +10263,7 @@ pub fn quantity_ref_grammar_any(
         | QuantityRef::EventContextSourceCostX
         | QuantityRef::EventContextSourceModesChosen
         | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::RingTemptCount
         | QuantityRef::EnergyPaidOrLostThisTurn
         | QuantityRef::BendTypesThisTurn
         | QuantityRef::LifeGainedThisTurn { .. }
@@ -11130,6 +11131,7 @@ fn rewrite_quantity_ref_filter_props<C>(
         | QuantityRef::EventContextSourceCostX
         | QuantityRef::EventContextSourceModesChosen
         | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::RingTemptCount
         | QuantityRef::EnergyPaidOrLostThisTurn
         | QuantityRef::BendTypesThisTurn
         | QuantityRef::LifeGainedThisTurn { .. }
@@ -12759,6 +12761,8 @@ pub enum ObjectScope {
     /// the per-iteration id is absent (a condition/layer read) it reads null →
     /// 0, mirroring [`ObjectScope::Target`]'s fail-closed null read.
     BatchSource,
+    /// CR 701.54a + CR 109.5: The current Ring-bearer of the ability controller.
+    RingBearer,
     /// CR 601.2c + CR 608.2c: The **chain-root** spell/ability's declared object
     /// target — the referent of a demonstrative back-reference ("that artifact",
     /// "that creature") made by a LATER instruction in the same resolution, from
@@ -13402,6 +13406,7 @@ fn object_scope_is_selected_dependent(scope: &ObjectScope) -> bool {
         | ObjectScope::EventSource
         | ObjectScope::EventTarget
         | ObjectScope::BatchSource
+        | ObjectScope::RingBearer
         | ObjectScope::SpecificObject { .. } => false,
     }
 }
@@ -13580,6 +13585,7 @@ fn quantity_ref_has_unsupported_selected_ref(qty: &QuantityRef) -> bool {
         | QuantityRef::Devotion { .. }
         | QuantityRef::VoteCount { .. }
         | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::RingTemptCount
         | QuantityRef::EnergyPaidOrLostThisTurn
         | QuantityRef::BendTypesThisTurn
         | QuantityRef::TurnsTaken
@@ -15030,6 +15036,8 @@ pub enum QuantityRef {
     },
     /// CR 700.13: Number of crimes the controller has committed this turn.
     CrimesCommittedThisTurn,
+    /// CR 701.54d + CR 109.5: Completed Ring temptations of the ability controller this game.
+    RingTemptCount,
     /// CR 107.14 + CR 122.1: Number of energy counters the controller has paid
     /// or lost this turn. Reads `Player::energy_paid_or_lost_this_turn`, bumped
     /// on every energy decrement (cost payment or any other removal) and reset
@@ -15544,6 +15552,7 @@ impl QuantityRef {
             | QuantityRef::SpellsCastBeforeTriggeringSpell { .. }
             | QuantityRef::EnteredThisTurn { .. }
             | QuantityRef::CrimesCommittedThisTurn
+            | QuantityRef::RingTemptCount
             | QuantityRef::EnergyPaidOrLostThisTurn
             | QuantityRef::BendTypesThisTurn
             | QuantityRef::TurnsTaken
@@ -15704,6 +15713,7 @@ impl QuantityRef {
             | QuantityRef::EventContextSourceCostX
             | QuantityRef::EventContextSourceModesChosen
             | QuantityRef::CrimesCommittedThisTurn
+            | QuantityRef::RingTemptCount
             | QuantityRef::EnergyPaidOrLostThisTurn
             | QuantityRef::BendTypesThisTurn
             | QuantityRef::LifeGainedThisTurn { .. }
@@ -15818,6 +15828,7 @@ impl QuantityRef {
             | QuantityRef::SpellsCastBeforeTriggeringSpell { .. }
             | QuantityRef::EnteredThisTurn { .. }
             | QuantityRef::CrimesCommittedThisTurn
+            | QuantityRef::RingTemptCount
             | QuantityRef::EnergyPaidOrLostThisTurn
             | QuantityRef::BendTypesThisTurn
             | QuantityRef::TurnsTaken
@@ -16724,6 +16735,7 @@ pub fn quantity_ref_object_scope_read(qty: &QuantityRef) -> ObjectScopeRead {
         | QuantityRef::PreviousEffectCount | QuantityRef::UnspentMana { .. }
         | QuantityRef::EventContextAmount | QuantityRef::EventContextSourceCostX
         | QuantityRef::EventContextSourceModesChosen | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::RingTemptCount
         | QuantityRef::EnergyPaidOrLostThisTurn
         | QuantityRef::BendTypesThisTurn | QuantityRef::TurnsTaken | QuantityRef::NotedNumber
         | QuantityRef::ChosenNumber | QuantityRef::DescendedThisTurn
@@ -29912,6 +29924,7 @@ pub fn quantity_ref_recipient_read(qty: &QuantityRef) -> RecipientRead {
         | QuantityRef::EventContextSourceCostX
         | QuantityRef::EventContextSourceModesChosen
         | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::RingTemptCount
         | QuantityRef::EnergyPaidOrLostThisTurn
         | QuantityRef::BendTypesThisTurn
         | QuantityRef::TurnsTaken
@@ -29946,6 +29959,7 @@ fn object_scope_recipient_read(scope: &ObjectScope) -> RecipientRead {
         | ObjectScope::OtherRevealedCard
         | ObjectScope::OwnedLinkedExileCard
         | ObjectScope::BatchSource
+        | ObjectScope::RingBearer
         | ObjectScope::ChainRootTarget
         | ObjectScope::GrantingObject
         | ObjectScope::SpecificObject { .. } => RecipientRead::Unread,

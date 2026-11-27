@@ -6364,6 +6364,7 @@ fn detect_duration_this_turn(
                 | QuantityRef::EnteredThisTurn { .. }
                 | QuantityRef::SacrificedThisTurn { .. }
                 | QuantityRef::CrimesCommittedThisTurn
+                | QuantityRef::RingTemptCount
                 | QuantityRef::EnergyPaidOrLostThisTurn
                 | QuantityRef::BendTypesThisTurn
                 | QuantityRef::LifeGainedThisTurn { .. }

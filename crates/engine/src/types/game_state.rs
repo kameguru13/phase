@@ -32973,10 +32973,14 @@ declare_game_state! {
     #[serde(skip)]
     pub(crate) announcement_event_scope: AnnouncementEventScope,
 
-    /// CR 701.54: Per-player ring level (0-3, 4 levels total).
+    /// CR 701.54: Per-player Ring emblem tier (0 before the first temptation, capped at 4).
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub ring_level: HashMap<PlayerId, u8>,
+    /// CR 701.54d: Per-player count of completed Ring temptations.
+    #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
+    pub ring_tempt_count: HashMap<PlayerId, u32>,
     /// CR 701.54: Per-player ring-bearer (the creature the Ring is on).
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
@@ -35571,9 +35575,27 @@ impl GameStateDecode {
     }
 
     pub(crate) fn materialize_prepared(value: serde_json::Value) -> Result<GameState, String> {
+        let legacy = value.get("ring_tempt_count").is_none();
         let raw = serde_json::from_value::<RawGameStateFields>(value)
             .map_err(|error| error.to_string())?;
-        Ok(GameState::from(raw))
+        let mut state = GameState::from(raw);
+        if legacy {
+            // Old saves stored only the capped emblem tier. That tier had
+            // already advanced when a bearer choice was pending.
+            let pending_player = match &state.waiting_for {
+                WaitingFor::ChooseRingBearer { player, .. } => Some(*player),
+                _ => None,
+            };
+            state.ring_tempt_count = state
+                .ring_level
+                .iter()
+                .filter_map(|(&player, &level)| {
+                    let completed = level.saturating_sub(u8::from(pending_player == Some(player)));
+                    (completed > 0).then_some((player, u32::from(completed)))
+                })
+                .collect();
+        }
+        Ok(state)
     }
 }
 
@@ -42254,6 +42276,7 @@ impl GameState {
             in_flight_spell_trigger_carrier: None,
             announcement_event_scope: AnnouncementEventScope::Unowned,
             ring_level: HashMap::new(),
+            ring_tempt_count: HashMap::new(),
             ring_bearer: HashMap::new(),
             dungeon_progress: HashMap::new(),
             planar_deck: im::Vector::new(),
@@ -46332,6 +46355,7 @@ impl GameState {
             in_flight_spell_trigger_carrier: _,
             announcement_event_scope: _,
             ring_level: _,
+            ring_tempt_count: _,
             ring_bearer: _,
             dungeon_progress: _,
             planar_deck: _,
@@ -48030,6 +48054,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         in_flight_spell_trigger_carrier: _,
         announcement_event_scope: _,
         ring_level: _,
+        ring_tempt_count: _,
         ring_bearer: _,
         dungeon_progress: _,
         planar_deck: _,
@@ -48577,6 +48602,7 @@ impl PartialEq for GameState {
             && self.spells_cast_this_game == other.spells_cast_this_game
             && self.spells_cast_this_game_by_player == other.spells_cast_this_game_by_player
             && self.cycles_completed_this_game_by_player == other.cycles_completed_this_game_by_player
+            && self.ring_tempt_count == other.ring_tempt_count
             && self.spells_cast_this_turn_by_player == other.spells_cast_this_turn_by_player
             && self.lands_played_this_turn_by_player == other.lands_played_this_turn_by_player
             && self.players_who_searched_library_this_turn

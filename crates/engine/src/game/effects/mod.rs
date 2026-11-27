@@ -6526,6 +6526,8 @@ fn waits_for_resolution_choice(waiting_for: &WaitingFor) -> bool {
             | WaitingFor::PhysicalContest { .. }
             | WaitingFor::TopOrBottomChoice { .. }
             | WaitingFor::ProliferateChoice { .. }
+            // CR 701.54a + CR 608.2c: later instructions read the settled bearer.
+            | WaitingFor::ChooseRingBearer { .. }
             | WaitingFor::TimeTravelChoice { .. }
             | WaitingFor::ChooseObjectsSelection { .. }
             | WaitingFor::ExploreChoice { .. }
@@ -15682,8 +15684,8 @@ fn detach_after_multi_target_player_local_chain(
 
 /// CR 608.2h + CR 608.2e: Collect the quantity references whose answer is
 /// determined only once, when the clause is applied (608.2h), across an APNAP
-/// fan-out that is one action processed simultaneously (608.2e). Three classes
-/// are admitted: `ControlledByEachPlayer` (battlefield extremum),
+/// fan-out that is one action processed simultaneously (608.2e). These classes
+/// are admitted: controller-relative Ring-bearer power, `ControlledByEachPlayer` (battlefield extremum),
 /// `HandSize { AllPlayers }` (hand extremum), and `PreviousEffectAmount`
 /// (a look-back at a COMPLETED instruction's result — see the arm below). The
 /// per-player `left` operand of a `Difference` is intentionally NOT collected:
@@ -15693,7 +15695,8 @@ fn collect_clause_minimum_refs<'a>(expr: &'a QuantityExpr, out: &mut Vec<&'a Qua
         QuantityExpr::Ref { qty } => {
             if matches!(
                 qty,
-                QuantityRef::ControlledByEachPlayer { .. }
+                QuantityRef::Power { scope: ObjectScope::RingBearer }
+                    | QuantityRef::ControlledByEachPlayer { .. }
                     | QuantityRef::HandSize {
                         player: PlayerScope::AllPlayers { .. }
                     }
@@ -35007,6 +35010,7 @@ fn resolve_condition_referent(
         | ObjectScope::OtherRevealedCard
         | ObjectScope::OwnedLinkedExileCard
         | ObjectScope::BatchSource
+        | ObjectScope::RingBearer
         | ObjectScope::ChainRootTarget
         | ObjectScope::GrantingObject
         | ObjectScope::SpecificObject { .. } => None,
@@ -35251,7 +35255,8 @@ pub(crate) fn evaluate_condition(
             | crate::types::ability::ObjectScope::ChainRootTarget
             | crate::types::ability::ObjectScope::GrantingObject
             | crate::types::ability::ObjectScope::SpecificObject { .. }
-            | crate::types::ability::ObjectScope::BatchSource => false,
+            | crate::types::ability::ObjectScope::BatchSource
+            | crate::types::ability::ObjectScope::RingBearer => false,
         },
         AbilityCondition::AlternativeManaCostPaid => ability.context.alternative_mana_cost_paid,
         AbilityCondition::EffectOutcome {
@@ -35544,7 +35549,8 @@ pub(crate) fn evaluate_condition(
                 | crate::types::ability::ObjectScope::ChainRootTarget
                 | crate::types::ability::ObjectScope::GrantingObject
                 | crate::types::ability::ObjectScope::SpecificObject { .. }
-                | crate::types::ability::ObjectScope::BatchSource => None,
+                | crate::types::ability::ObjectScope::BatchSource
+                | crate::types::ability::ObjectScope::RingBearer => None,
             };
             object_id
                 .and_then(|id| state.objects.get(&id))
@@ -35733,12 +35739,16 @@ pub(crate) fn evaluate_condition(
                     &crate::game::filter::FilterContext::from_ability(ability),
                 )
             }),
-        // CR 701.54a: Ring-bearer designation on the ability source.
-        AbilityCondition::IsRingBearer => crate::game::effects::ring::is_current_ring_bearer(
-            state,
-            ability.controller,
-            ability.source_id,
-        ),
+        // CR 201.5 + CR 400.7 + CR 701.54e: A self-name checks the
+        // ability source. Blinking it in response cannot rebind the source.
+        AbilityCondition::IsRingBearer => {
+            ability.source_is_current(state)
+                && ring::is_current_ring_bearer(
+                    state,
+                    ability.original_controller.unwrap_or(ability.controller),
+                    ability.source_id,
+                )
+        }
         // "Instead" override conditions — return pure boolean value.
         // Terminal control flow (early return from resolve_ability_chain) is the caller's
         // responsibility in the sub-ability context.
@@ -36159,6 +36169,7 @@ pub(crate) fn evaluate_condition(
             let ctx = crate::game::quantity::QuantityContext {
                 entering: None,
                 source: ability.source_id,
+                controller: Some(controller),
                 trigger_source: ability.trigger_source.clone(),
                 stack_trigger_context: None,
                 recipient: None,

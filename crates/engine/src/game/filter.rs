@@ -3585,6 +3585,7 @@ fn quantity_ref_contains_input(
         | QuantityRef::EventContextSourceCostX
         | QuantityRef::EventContextSourceModesChosen
         | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::RingTemptCount
         | QuantityRef::EnergyPaidOrLostThisTurn
         | QuantityRef::BendTypesThisTurn
         | QuantityRef::LifeGainedThisTurn { .. }

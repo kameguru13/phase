@@ -1376,16 +1376,8 @@ fn scoped_player_member_filter_follows_the_resolution_scope() {
         ),
     };
     let ctx_with = |scoped_player| QuantityContext {
-        entering: None,
-        source: oak,
-        trigger_source: None,
-        stack_trigger_context: None,
-        recipient: None,
         scoped_player,
-        damage_source: None,
-        spell: None,
-        event_amount: None,
-        granting_object: None,
+        ..QuantityContext::new(oak)
     };
 
     assert_eq!(

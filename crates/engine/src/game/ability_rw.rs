@@ -2374,6 +2374,7 @@ fn legacy_quantity_ref(x: &QuantityRef) -> bool {
         | QuantityRef::PreviousEffectCount
         | QuantityRef::TurnsTaken
         | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::RingTemptCount
         | QuantityRef::EnergyPaidOrLostThisTurn
         | QuantityRef::ChosenNumber
         | QuantityRef::PlayerChosenNumber { .. }
@@ -2446,6 +2447,7 @@ fn legacy_object_scope(s: &ObjectScope) -> bool {
         // CR 120.1: the per-iteration batch source is resolution-local, not one
         // of the retained legacy refs (mirrors EventTarget).
         | ObjectScope::BatchSource
+        | ObjectScope::RingBearer
         // CR 601.2c: the chain-root spell's declared target is resolution-local,
         // not one of the retained legacy refs (mirrors AmassedArmy).
         | ObjectScope::ChainRootTarget
@@ -4107,6 +4109,7 @@ fn current_pt_scope(scope: &ObjectScope) -> CurrentPtReads {
         // CR 120.1 + CR 208.3: a batch-source P/T read is a live board
         // characteristic read, so counter writes to the batch population feed it.
         ObjectScope::BatchSource => CurrentPtReads::BOARD,
+        ObjectScope::RingBearer => CurrentPtReads::BOARD,
         ObjectScope::Recipient
         | ObjectScope::EventSource
         | ObjectScope::CostPaidObject
@@ -4639,6 +4642,7 @@ fn read_object_scope(scope: &ObjectScope, kind: StateKind) -> RwProfile {
         // member's live power — a mutable board characteristic (mirrors
         // `Target`/`Anaphoric`/`Demonstrative`).
         ObjectScope::BatchSource => reads_board_of(kind),
+        ObjectScope::RingBearer => reads_board_of(kind),
         // D5 carrier: `CostPaidObject` is one of the 12 retained refs.
         ObjectScope::CostPaidObject => legacy_ref(),
     }
@@ -7338,6 +7342,7 @@ fn rw_quantity_ref(x: &QuantityRef) -> RwProfile {
         | QuantityRef::PreviousEffectCount
         | QuantityRef::TurnsTaken
         | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::RingTemptCount
         | QuantityRef::EnergyPaidOrLostThisTurn
         | QuantityRef::AttackedThisTurn { .. }
         | QuantityRef::DescendedThisTurn
