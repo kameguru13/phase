@@ -275,6 +275,21 @@ mod tests {
     }
 
     #[test]
+    fn legacy_save_below_cap_migrates_the_level() {
+        let mut state = GameState::new_two_player(42);
+        state.ring_level.insert(PlayerId(0), 2);
+        state.ring_level.insert(PlayerId(1), 0);
+        assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+
+        let mut saved = serde_json::to_value(&state).unwrap();
+        saved.as_object_mut().unwrap().remove("ring_tempt_count");
+        let restored: GameState = serde_json::from_value(saved).unwrap();
+
+        assert_eq!(restored.ring_tempt_count.get(&PlayerId(0)), Some(&2));
+        assert!(!restored.ring_tempt_count.contains_key(&PlayerId(1)));
+    }
+
+    #[test]
     fn ring_tempts_no_creatures_still_increments_level() {
         let mut state = GameState::new_two_player(42);
         let ability = ResolvedAbility::new(Effect::RingTemptsYou, vec![], ObjectId(1), PlayerId(0));

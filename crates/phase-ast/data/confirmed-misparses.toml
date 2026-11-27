@@ -797,7 +797,6 @@ face = [
   { key = "freyalise's winds", class = "wrong_object", clauses = ["If a permanent with a wind counter on it would untap during its controller's untap step, remove all wind counters from it instead."] },
   { key = "frie, displaced in time", class = "dropped_qualifier", clauses = ["Whenever a card is exiled because it was warped, put three time counters on it."] },
   { key = "frilled deathspitter", class = "target_wrong", clauses = ["Enrage — Whenever this creature is dealt damage, it deals 2 damage to target opponent or planeswalker."] },
-  { key = "frodo, adventurous hobbit", class = "condition_wrong", clauses = ["Then if Frodo is your Ring-bearer and the Ring has tempted you two or more times this game, draw a card."] },
   { key = "frodo, determined hero", class = "dropped_qualifier", clauses = ["During your turn, prevent all damage that would be dealt to Frodo."] },
   { key = "frodo, sauron's bane", class = "missing_effect", clauses = ["{B}{B}{B}: If Frodo is a Scout, it becomes a Halfling Rogue with \"Whenever this creature deals combat damage to a player, that player loses the game if the Ring has tempted you four or more times this game. Otherwise, the Ring tempts you.\""] },
   { key = "from father to son", class = "extra_effect", clauses = ["Search your library for a Vehicle card, reveal it, and put it into your hand."] },
