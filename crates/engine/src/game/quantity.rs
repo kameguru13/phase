@@ -1744,6 +1744,7 @@ pub fn trigger_definition_is_cast_stable_for_pre_cast(definition: &TriggerDefini
         gotcha_condition: _,
         expend_threshold: _,
         attack_target_filter: _,
+        attack_declaration_ordinal: _,
         // CR 509.3e: a blocker filter, checked like the other matcher filters.
         blocker_count,
         player_actions: _,
@@ -12187,6 +12188,7 @@ mod tests {
             AttackDeclarationRecord {
                 object_id: p0_attacker,
                 incarnation: None,
+                ordinal_this_turn: None,
                 lki: creature_lki("Goblin", PlayerId(0)),
                 is_token: false,
                 is_commander: false,
@@ -12194,6 +12196,7 @@ mod tests {
             AttackDeclarationRecord {
                 object_id: p1_attacker,
                 incarnation: None,
+                ordinal_this_turn: None,
                 lki: creature_lki("Soldier", PlayerId(1)),
                 is_token: false,
                 is_commander: false,
@@ -24769,6 +24772,7 @@ mod tests {
         let record_with_power = |power| AttackDeclarationRecord {
             object_id: attacker,
             incarnation: None,
+            ordinal_this_turn: None,
             lki: {
                 let mut lki = state.objects[&attacker].snapshot_public_characteristics();
                 lki.power = Some(power);
@@ -24797,6 +24801,7 @@ mod tests {
             declaration_records: vec![AttackDeclarationRecord {
                 object_id: unrelated_attacker,
                 incarnation: None,
+                ordinal_this_turn: None,
                 lki: {
                     let mut lki =
                         state.objects[&unrelated_attacker].snapshot_public_characteristics();
