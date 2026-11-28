@@ -10899,9 +10899,9 @@ pub enum BatchCompletion {
     PutOnTopComplete {
         source_id: ObjectId,
         removed_exile_links: Vec<ObjectId>,
-        /// The selected library cards to subtract from the looked-at pile.
+        /// The looked-at pile and the cards this bottom step took from it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        looked_at_bottom_selection: Option<Vec<ObjectId>>,
+        looked_at_bottom_selection: Option<(TrackedSetId, Vec<ObjectId>)>,
     },
     /// CR 614.1 + CR 616.1: A PutOnTopOrBottom object's Library delivery has settled, so
     /// its chained resolution tail may run exactly once.

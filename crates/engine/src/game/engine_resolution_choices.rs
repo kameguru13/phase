@@ -20,7 +20,7 @@ use crate::types::game_state::{
     PendingContinuation, PendingPlayerScopeSacrificeCompletion, PersistentAxisMaterialization,
     WaitingFor, ZoneOpponentChooserPurpose,
 };
-use crate::types::identifiers::ObjectId;
+use crate::types::identifiers::{ObjectId, TrackedSetId};
 use crate::types::resolved_commands::{
     ResolvedInformationAudience, ResolvedInformationEdit, ResolvedInformationLifetime,
 };
@@ -10870,11 +10870,14 @@ fn replay_effect_zone_library_placement(
     library
 }
 
-/// CR 608.2c: A later instruction reads only the looked-at cards not placed
-/// by this bottom step. Publish the empty remainder as its own scope.
-fn publish_looked_at_bottom_remainder(state: &mut GameState, chosen: &[ObjectId]) {
-    let remainder = state
-        .chain_tracked_set_id
+/// CR 608.2c: A later instruction reads only the looked-at cards of `pile`
+/// that this bottom step did not place. Publish the empty remainder as its own scope.
+fn publish_looked_at_bottom_remainder(
+    state: &mut GameState,
+    pile: Option<TrackedSetId>,
+    chosen: &[ObjectId],
+) {
+    let remainder = pile
         .and_then(|id| state.tracked_object_sets.get(&id))
         .into_iter()
         .flatten()
@@ -10906,7 +10909,7 @@ fn finish_effect_zone_put_at_library_position(
 ) {
     if state.active_ability_continuation().is_some() {
         if matches!(library_position, LibraryPosition::Bottom) {
-            publish_looked_at_bottom_remainder(state, &chosen);
+            publish_looked_at_bottom_remainder(state, state.chain_tracked_set_id, &chosen);
         } else {
             effects::publish_fresh_tracked_set(state, chosen.clone());
         }
@@ -11862,8 +11865,8 @@ pub(crate) fn run_batch_completion(
             removed_exile_links,
             looked_at_bottom_selection,
         } => {
-            if let Some(chosen) = looked_at_bottom_selection {
-                publish_looked_at_bottom_remainder(state, &chosen);
+            if let Some((pile, chosen)) = looked_at_bottom_selection {
+                publish_looked_at_bottom_remainder(state, Some(pile), &chosen);
             }
             state.exile_links.retain(|link| {
                 link.source_id != source_id || !removed_exile_links.contains(&link.exiled_id)

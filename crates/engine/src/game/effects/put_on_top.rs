@@ -632,13 +632,16 @@ pub fn resolve(
     // library shuffle consumer exists (tracked_set_publication_mode).
     publish_finalized_owner_library_subjects(state, ability, &collected_targets);
 
-    let looked_at_bottom_selection = (matches!(position, LibraryPosition::Bottom)
-        && matches!(
-            crate::game::targeting::resolve_tracked_set_sentinel(state, target_filter),
+    let looked_at_bottom_selection =
+        match crate::game::targeting::resolve_tracked_set_sentinel(state, target_filter) {
             TargetFilter::TrackedSet { id } | TargetFilter::TrackedSetFiltered { id, .. }
-                if state.chain_tracked_set_id == Some(id)
-        ))
-    .then(|| to_place.to_vec());
+                if matches!(position, LibraryPosition::Bottom)
+                    && state.chain_tracked_set_id == Some(id) =>
+            {
+                Some((id, to_place.to_vec()))
+            }
+            _ => None,
+        };
     zone_pipeline::move_objects_simultaneously_then(
         state,
         requests,

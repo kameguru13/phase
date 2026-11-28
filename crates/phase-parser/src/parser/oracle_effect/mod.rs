@@ -57175,6 +57175,29 @@ fn parse_effect_chain_ir_body(
             absorbed_choice_prev.or_else(|| non_absorbed.first().map(|c| effective_effect_of(c)));
         // CR 608.2c + CR 608.2d: After placing part of a looked-at pile,
         // select the next cards from the remaining pile before moving them.
+        // The pile is the nearest earlier published batch, and it must be a
+        // look that names no remainder destination, so its unchosen cards stay
+        // in the library. `DigRestRemainder` is only lowered at assembly, so
+        // here the declared fact is the absent `rest_destination`.
+        let looked_at_pile_stays_in_library = || {
+            non_absorbed
+                .iter()
+                .skip(1)
+                .find(|clause| {
+                    matches!(effective_effect_of(clause), Effect::Dig { .. })
+                        || classify_latest_bare_card_publisher_in_clause(&clause.parsed).is_some()
+                        || clause_ir_is_exile_producer(clause)
+                })
+                .is_some_and(|look| {
+                    matches!(
+                        effective_effect_of(look),
+                        Effect::Dig {
+                            rest_destination: None,
+                            ..
+                        }
+                    )
+                })
+        };
         if matches!(
             effective_prev_effect,
             Some(Effect::PutAtLibraryPosition {
@@ -57182,9 +57205,7 @@ fn parse_effect_chain_ir_body(
                 position: crate::types::ability::LibraryPosition::Bottom,
                 ..
             })
-        ) && non_absorbed
-            .get(1)
-            .is_some_and(|look| matches!(effective_effect_of(look), Effect::Dig { .. }))
+        ) && looked_at_pile_stays_in_library()
         {
             if let Some((count, _)) =
                 nom_on_lower(normalized_text, &normalized_text.to_lowercase(), |input| {
