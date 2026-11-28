@@ -77,7 +77,9 @@ pub fn resolve(
 }
 
 /// CR 701.54a + CR 701.54d: Count and emit the temptation once its choice
-/// has been made, or immediately if choosing was impossible.
+/// has been made, or immediately if choosing was impossible. The event carries
+/// the chosen bearer so a bearer-dependent intervening-if (CR 603.4) reads this
+/// record at collection and at resolution, not the mutable designation.
 pub(crate) fn complete_temptation(
     state: &mut GameState,
     player: PlayerId,

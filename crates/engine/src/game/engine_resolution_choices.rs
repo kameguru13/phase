@@ -9718,9 +9718,6 @@ pub(super) fn handle_resolution_choice(
             }
             let event_start = events.len();
             super::effects::ring::complete_temptation(state, player, Some(target), events);
-            // CR 701.54c + CR 608.2h: the new designation can change the
-            // bearer's characteristics before a following instruction reads them.
-            crate::game::layers::flush_layers(state);
             let waiting_for = finish_with_continuation(state, player, events);
             // CR 603.2 + CR 701.54: RingTemptsYou observer triggers are batched
             // while ChooseRingBearer pauses spell resolution (issue #1017).
