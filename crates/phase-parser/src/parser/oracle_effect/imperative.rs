@@ -8053,6 +8053,14 @@ fn try_parse_two_targets(rest: &str, ctx: &mut ParseContext) -> Option<ChooseImp
     })
 }
 
+pub(super) fn parse_counted_group_anaphor(input: &str) -> OracleResult<'_, u32> {
+    terminated(
+        nom_primitives::parse_number,
+        alt((tag(" of them"), tag(" of those"))),
+    )
+    .parse(input)
+}
+
 /// Parse anaphoric "choose N of them/those [cards]" patterns using nom combinators.
 /// Returns (count, chooser) if the pattern matches.
 fn parse_choose_anaphoric(lower: &str) -> Option<(u32, Chooser, CardSelectionMode)> {
@@ -8082,16 +8090,7 @@ fn parse_choose_anaphoric(lower: &str) -> Option<(u32, Chooser, CardSelectionMod
         .map(|(r, _)| r)
         .unwrap_or(rest);
 
-    // Parse count (one/two/three/N).
-    let (rest, count) = nom_primitives::parse_number.parse(rest).ok()?;
-
-    // Must be followed by " of them" or " of those" (optionally with trailing type noun).
-    let (after_anaphor, ()) = alt((
-        value((), tag::<_, _, E>(" of them")),
-        value((), tag(" of those")),
-    ))
-    .parse(rest)
-    .ok()?;
+    let (after_anaphor, count) = parse_counted_group_anaphor(rest).ok()?;
 
     // CR 608.2d (override) + CR 701.9b (analogous): "choose one of them at
     // random" (River Song's Diary) — the game picks, not the chooser. Scan the

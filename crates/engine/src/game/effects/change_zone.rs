@@ -1492,9 +1492,10 @@ pub fn resolve(
     // looks the set up by exact id and would otherwise miss the sentinel.
     let mut effective_target_filter =
         crate::game::targeting::resolve_tracked_set_sentinel(state, parsed_target);
-    // CR 608.2c: After a dig that already routed ParentTarget to hand, a chained
-    // "exile one of them" must pick from the remaining looked-at cards in the
-    // tracked set — not re-exile the card already in hand (Expressive Iteration).
+    // CR 608.2c: Older look-and-split continuations encode their remainder
+    // exile as ParentTarget, which still carries the card put into hand.
+    // Preserve their library redirect. Current RevealHand continuations still
+    // use the hand-origin fallback for an explicitly chosen hand card.
     let mut exile_tracked_set_library_only = false;
     if let Effect::ChangeZone {
         destination: Zone::Exile,

@@ -10870,8 +10870,29 @@ fn replay_effect_zone_library_placement(
     library
 }
 
+/// CR 608.2c: A later instruction reads only the looked-at cards not placed
+/// by this bottom step. Publish the empty remainder as its own scope.
+fn publish_looked_at_bottom_remainder(state: &mut GameState, chosen: &[ObjectId]) {
+    let remainder = state
+        .chain_tracked_set_id
+        .and_then(|id| state.tracked_object_sets.get(&id))
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|id| !chosen.contains(id))
+        .filter(|id| {
+            state
+                .objects
+                .get(id)
+                .is_some_and(|object| object.zone == Zone::Library)
+        })
+        .collect();
+    effects::publish_fresh_tracked_set(state, remainder);
+}
+
 /// CR 401.4 + CR 101.4: the one completion of a (possibly multi-owner)
 /// arrangement: tracked set, count and EffectResolved cover the whole moved set.
+///
 /// Every selected member — one that began in a library included — was delivered
 /// by the replacement-consulting batch that carries this completion, and that
 /// batch settled the arrangement's CR 701.20d reorder before this tail runs.
@@ -10884,28 +10905,11 @@ fn finish_effect_zone_put_at_library_position(
     events: &mut Vec<GameEvent>,
 ) {
     if state.active_ability_continuation().is_some() {
-        let tracked = if matches!(library_position, LibraryPosition::Bottom) {
-            state
-                .chain_tracked_set_id
-                .and_then(|id| state.tracked_object_sets.get(&id).cloned())
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|id| !chosen.contains(id))
-                .filter(|id| {
-                    state
-                        .objects
-                        .get(id)
-                        .is_some_and(|object| object.zone == Zone::Library)
-                })
-                .collect()
+        if matches!(library_position, LibraryPosition::Bottom) {
+            publish_looked_at_bottom_remainder(state, &chosen);
         } else {
-            chosen.clone()
-        };
-        // This seam's placement fixes its producer: it resolves as
-        // `PutAtLibraryPosition`, which names no "<verb>ed this way" set and
-        // carries no destination, so the table records no cause here.
-        let cause = effects::this_way_cause_for_action(EffectKind::PutAtLibraryPosition, None);
-        effects::publish_fresh_tracked_set_with_causes(state, tracked, cause);
+            effects::publish_fresh_tracked_set(state, chosen.clone());
+        }
     }
     state.last_effect_count = Some(chosen.len() as i32);
     events.push(GameEvent::EffectResolved {
@@ -11856,7 +11860,11 @@ pub(crate) fn run_batch_completion(
         BatchCompletion::PutOnTopComplete {
             source_id,
             removed_exile_links,
+            looked_at_bottom_selection,
         } => {
+            if let Some(chosen) = looked_at_bottom_selection {
+                publish_looked_at_bottom_remainder(state, &chosen);
+            }
             state.exile_links.retain(|link| {
                 link.source_id != source_id || !removed_exile_links.contains(&link.exiled_id)
             });

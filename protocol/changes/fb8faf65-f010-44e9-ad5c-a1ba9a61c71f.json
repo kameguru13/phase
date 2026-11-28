@@ -1,0 +1,7 @@
+{
+  "surfaces": [
+    "full",
+    "wire"
+  ],
+  "reason": "BatchCompletion::PutOnTopComplete gains an optional looked_at_bottom_selection so an automatic bottom placement publishes the looked-at remainder; older peers drop the field and would leave the placed card in the remainder"
+}

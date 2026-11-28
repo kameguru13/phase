@@ -71711,6 +71711,21 @@ mod tests {
         )
         .unwrap();
 
+        let WaitingFor::ChooseFromZoneChoice {
+            cards, count: 1, ..
+        } = &state.waiting_for
+        else {
+            panic!("expected the mandatory exile choice");
+        };
+        assert_eq!(cards, &[card_c]);
+        engine::apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![card_c],
+            },
+        )
+        .unwrap();
+
         assert_eq!(state.objects[&card_a].zone, Zone::Hand);
         assert_eq!(state.objects[&card_b].zone, Zone::Library);
         assert_eq!(state.objects[&card_c].zone, Zone::Exile);

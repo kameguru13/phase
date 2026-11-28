@@ -697,7 +697,6 @@ face = [
   { key = "explore the vastlands", class = "missing_effect", clauses = ["Each player looks at the top five cards of their library and may reveal a land card and/or an instant or sorcery card from among them.", "Each player puts the cards they revealed this way into their hand and the rest on the bottom of their library in a random order."] },
   { key = "explosive singularity", class = "wrong_count", clauses = ["As an additional cost to cast this spell, you may tap any number of untapped creatures you control."] },
   { key = "expose the culprit", class = "missing_effect", clauses = ["Exile any number of face-up creatures you control with disguise in a face-down pile, shuffle that pile, then cloak them."] },
-  { key = "expressive iteration", class = "wrong_object", clauses = ["and exile one of them."] },
   { key = "extinction", class = "dropped_qualifier", clauses = ["Destroy all creatures of the creature type of your choice."] },
   { key = "extirpate", class = "target_wrong", clauses = ["Choose target card in a graveyard other than a basic land card.", "Search its owner's graveyard, hand, and library for all cards with the same name as that card and exile them."] },
   { key = "extortion", class = "wrong_count", clauses = ["and choose up to two cards from it.", "That player discards those cards."] },

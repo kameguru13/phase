@@ -3,10 +3,15 @@
 use std::collections::BTreeSet;
 
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::ability::{CastingPermission, Duration, EffectKind, TargetRef};
+use engine::types::ability::{
+    CastingPermission, Duration, Effect, EffectKind, TargetFilter, TargetRef,
+};
 use engine::types::actions::GameAction;
 use engine::types::card_type::{CoreType, Supertype};
-use engine::types::game_state::{CastPaymentMode, ManaChoice, ManaChoicePrompt, WaitingFor};
+use engine::types::game_state::{
+    CastPaymentMode, ManaChoice, ManaChoicePrompt, PersistedGameState, WaitingFor,
+};
+use engine::types::identifiers::TrackedSetId;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
@@ -303,8 +308,13 @@ fn assert_dig(runner: &GameRunner, expected: &[ObjectId]) {
 
 /// CR 608.2c: "Put one of them into your hand, put one of them on the bottom
 /// of your library, and exile one of them. You may play the exiled card this turn."
-#[test]
-fn expressive_iteration_three_cards_go_to_hand_bottom_and_exile() {
+enum IterationPath {
+    Fresh,
+    EarlierExile,
+    LegacyRestore,
+}
+
+fn iteration(library_count: usize, path: IterationPath) {
     let mut board = scenario(2, 42);
     mana(&mut board, [ManaType::Blue, ManaType::Red]);
     let iteration = board
@@ -314,59 +324,136 @@ fn expressive_iteration_three_cards_go_to_hand_bottom_and_exile() {
             shards: vec![ManaCostShard::Blue, ManaCostShard::Red],
         })
         .id();
-    let deeper = land(&mut board, P0, "Unseen land");
-    let remaining_spell = spell(&mut board, P0, "Remaining spell", false, 1);
-    let remaining_land = land(&mut board, P0, "Remaining land");
+    let deeper = (library_count == 4).then(|| land(&mut board, P0, "Unseen land"));
+    let exile = (library_count >= 3).then(|| spell(&mut board, P0, "Remaining spell", false, 1));
+    let bottom = (library_count >= 2).then(|| land(&mut board, P0, "Bottom land"));
     let hand = land(&mut board, P0, "Hand land");
+    let seen: Vec<_> = [Some(hand), bottom, exile].into_iter().flatten().collect();
+
+    let earlier = if matches!(path, IterationPath::EarlierExile) {
+        mana(
+            &mut board,
+            [
+                ManaType::Blue,
+                ManaType::Red,
+                ManaType::Red,
+                ManaType::Colorless,
+            ],
+        );
+        let resolve = board
+            .add_spell_to_hand_from_oracle(
+                P0,
+                "Wrenn's Resolve",
+                false,
+                "Exile the top two cards of your library. Until the end of your next turn, you may play those cards.",
+            )
+            .with_mana_cost(ManaCost::Cost {
+                generic: 1,
+                shards: vec![ManaCostShard::Red],
+            })
+            .id();
+        Some((
+            resolve,
+            [
+                land(&mut board, P0, "Earlier A"),
+                land(&mut board, P0, "Earlier B"),
+            ],
+        ))
+    } else {
+        None
+    };
     let mut runner = board.build();
+    let earlier = earlier.map(|(resolve, cards)| {
+        runner.cast(resolve).resolve();
+        assert_priority(&runner, 0);
+        cards.map(|id| {
+            let object = &runner.state().objects[&id];
+            assert_eq!(object.zone, Zone::Exile);
+            assert!(!object.casting_permissions.is_empty());
+            assert!(runner
+                .state()
+                .tracked_object_sets
+                .values()
+                .any(|set| set.contains(&id)));
+            (id, object.casting_permissions.clone())
+        })
+    });
     runner.cast(iteration).commit();
     pass_until_prompt(&mut runner);
-    assert_dig(&runner, &[hand, remaining_land, remaining_spell]);
-    select(&mut runner, vec![hand]);
-    let WaitingFor::EffectZoneChoice {
+    // A mandatory singleton may resolve without a prompt.
+    if library_count > 1 || !matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
+        assert_dig(&runner, &seen);
+        select(&mut runner, vec![hand]);
+    }
+    if let WaitingFor::EffectZoneChoice {
         player: P0,
         zone: Zone::Library,
         effect_kind: EffectKind::PutAtLibraryPosition,
         cards,
         ..
     } = &runner.state().waiting_for
-    else {
-        panic!(
-            "expected a library bottom choice, got {}",
-            runner.state().waiting_for.variant_name()
+    {
+        same_cards(
+            cards,
+            &seen[1..],
+            "the bottom choice excludes the card in hand",
         );
-    };
-    same_cards(
-        cards,
-        &[remaining_land, remaining_spell],
-        "the bottom choice excludes the card in hand",
-    );
-    let exile = cards[0];
-    let bottom = cards[1];
-    select(&mut runner, vec![bottom]);
+        if matches!(path, IterationPath::LegacyRestore) {
+            runner = restore_legacy_iteration(runner, hand);
+        }
+        select(&mut runner, vec![bottom.expect("a bottom candidate")]);
+        if let Some(exile) = exile.filter(|_| !matches!(path, IterationPath::LegacyRestore)) {
+            let WaitingFor::ChooseFromZoneChoice {
+                player: P0,
+                cards,
+                count: 1,
+                up_to: false,
+                ..
+            } = &runner.state().waiting_for
+            else {
+                panic!("expected the mandatory exile choice");
+            };
+            assert_eq!(cards, &[exile]);
+            select(&mut runner, vec![exile]);
+        }
+    } else {
+        assert!(exile.is_none(), "two candidates require a bottom prompt");
+    }
     assert_priority(&runner, 0);
     assert_eq!(
         runner.state().objects[&hand].zone,
         Zone::Hand,
         "first selection must go to hand"
     );
-    assert_eq!(
-        runner.state().objects[&bottom].zone,
-        Zone::Library,
-        "the bottom card must remain in the library"
-    );
-    assert_eq!(
-        runner.state().players[0].library.back(),
-        Some(&bottom),
-        "second selection belongs at library bottom"
-    );
-    for card in [hand, bottom] {
-        assert!(
-            runner.state().objects[&card].casting_permissions.is_empty(),
-            "hand and bottom cards get no permission"
+    if let Some(bottom) = bottom {
+        let object = &runner.state().objects[&bottom];
+        assert_eq!(
+            (object.zone, object.casting_permissions.is_empty()),
+            (Zone::Library, true),
+            "the bottom card must remain in the library without play permission"
         );
     }
-    assert_bottom(&runner, P0, &[deeper], &[bottom]);
+    assert!(runner.state().objects[&hand].casting_permissions.is_empty());
+    assert_bottom(&runner, P0, deeper.as_slice(), bottom.as_slice());
+    let Some(exile) = exile else {
+        let expected: Vec<_> = earlier
+            .iter()
+            .flatten()
+            .map(|(id, permissions)| {
+                assert_eq!(&runner.state().objects[id].casting_permissions, permissions);
+                *id
+            })
+            .collect();
+        let actual: Vec<_> = runner
+            .state()
+            .objects
+            .values()
+            .filter(|object| object.zone == Zone::Exile)
+            .map(|object| object.id)
+            .collect();
+        same_cards(&actual, &expected, "Iteration must leave exile unchanged");
+        return;
+    };
     assert_eq!(
         runner.state().objects[&exile].zone,
         Zone::Exile,
@@ -386,6 +473,72 @@ fn expressive_iteration_three_cards_go_to_hand_bottom_and_exile() {
             )),
         "the exiled card must receive the play-this-turn permission"
     );
+}
+
+fn restore_legacy_iteration(mut runner: GameRunner, hand: ObjectId) -> GameRunner {
+    let pending = &mut runner
+        .state_mut()
+        .active_ability_continuation_frame_mut()
+        .expect("bottom choice carries a continuation")
+        .pending;
+    let chooser = &mut pending.chain;
+    assert!(matches!(chooser.effect, Effect::ChooseFromZone { .. }));
+    let mut old_exile = chooser.sub_ability.take().expect("exile follows choice");
+    let Effect::ChangeZone {
+        origin,
+        target: TargetFilter::ParentTarget,
+        ..
+    } = &mut old_exile.effect
+    else {
+        panic!("expected the selected card's exile step");
+    };
+    *origin = None;
+    old_exile.set_unpinned_targets(vec![TargetRef::Object(hand)]);
+    let Effect::GrantCastingPermission { target, .. } = &mut old_exile
+        .sub_ability
+        .as_mut()
+        .expect("grant follows exile")
+        .effect
+    else {
+        panic!("expected play permission");
+    };
+    *target = TargetFilter::TrackedSet {
+        id: TrackedSetId(0),
+    };
+    pending.chain = old_exile;
+    let saved = serde_json::to_vec(&PersistedGameState::capture(runner.state().clone())).unwrap();
+    let restored: PersistedGameState = serde_json::from_slice(&saved).unwrap();
+    GameRunner::from_state(restored.into_game_state().expect("restore legacy chain"))
+}
+
+#[test]
+fn expressive_iteration_one_card_goes_to_hand() {
+    iteration(1, IterationPath::Fresh);
+}
+
+#[test]
+fn expressive_iteration_two_cards_go_to_hand_and_bottom() {
+    iteration(2, IterationPath::Fresh);
+}
+
+#[test]
+fn expressive_iteration_three_cards_go_to_hand_bottom_and_exile() {
+    iteration(3, IterationPath::Fresh);
+}
+
+#[test]
+fn expressive_iteration_four_cards_leaves_the_unseen_card_on_top() {
+    iteration(4, IterationPath::Fresh);
+}
+
+#[test]
+fn expressive_iteration_ignores_the_earlier_exile_set() {
+    iteration(2, IterationPath::EarlierExile);
+}
+
+#[test]
+fn expressive_iteration_resumes_a_legacy_bottom_choice() {
+    iteration(3, IterationPath::LegacyRestore);
 }
 
 /// CR 608.2c: "Exile the top three cards of target opponent's library. Choose one of them."

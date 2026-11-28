@@ -57173,6 +57173,86 @@ fn parse_effect_chain_ir_body(
             });
         let effective_prev_effect =
             absorbed_choice_prev.or_else(|| non_absorbed.first().map(|c| effective_effect_of(c)));
+        // CR 608.2c + CR 608.2d: After placing part of a looked-at pile,
+        // select the next cards from the remaining pile before moving them.
+        if matches!(
+            effective_prev_effect,
+            Some(Effect::PutAtLibraryPosition {
+                target: TargetFilter::TrackedSet { .. },
+                position: crate::types::ability::LibraryPosition::Bottom,
+                ..
+            })
+        ) && non_absorbed
+            .get(1)
+            .is_some_and(|look| matches!(effective_effect_of(look), Effect::Dig { .. }))
+        {
+            if let Some((count, _)) =
+                nom_on_lower(normalized_text, &normalized_text.to_lowercase(), |input| {
+                    all_consuming(preceded(
+                        tag("exile "),
+                        terminated(imperative::parse_counted_group_anaphor, opt(tag(" cards"))),
+                    ))
+                    .parse(input)
+                })
+            {
+                if let Effect::ChangeZone {
+                    origin,
+                    destination: Zone::Exile,
+                    target: TargetFilter::ParentTarget,
+                    ..
+                } = &mut clause.effect
+                {
+                    *origin = Some(Zone::Library);
+                    let move_effect = std::mem::replace(
+                        &mut clause.effect,
+                        Effect::ChooseFromZone {
+                            count,
+                            zone: Zone::Library,
+                            additional_zones: Vec::new(),
+                            zone_owner: Default::default(),
+                            filter: Some(TargetFilter::Typed(TypedFilter::default().properties(
+                                vec![FilterProp::InZone {
+                                    zone: Zone::Library,
+                                }],
+                            ))),
+                            chooser: Default::default(),
+                            candidate_source: ZoneChoiceCandidateSource::Tracked,
+                            reciprocal_role: None,
+                            gather_role: None,
+                            up_to: false,
+                            selection: Default::default(),
+                            constraint: None,
+                        },
+                    );
+                    clause.sub_ability = Some(Box::new(AbilityDefinition::new(kind, move_effect)));
+                }
+            }
+        }
+        if let Effect::GrantCastingPermission { target, .. } = &mut clause.effect {
+            if matches!(target, TargetFilter::TrackedSet { .. })
+                && matches!(
+                    effective_prev_effect,
+                    Some(Effect::ChangeZone {
+                        origin: Some(Zone::Library),
+                        destination: Zone::Exile,
+                        target: TargetFilter::ParentTarget,
+                        ..
+                    })
+                )
+                && non_absorbed.first().is_some_and(|previous| {
+                    matches!(
+                        previous.parsed.effect,
+                        Effect::ChooseFromZone {
+                            zone: Zone::Library,
+                            candidate_source: ZoneChoiceCandidateSource::Tracked,
+                            ..
+                        }
+                    )
+                })
+            {
+                *target = exiled_caused_tracked_set();
+            }
+        }
         // CR 701.24c + CR 608.2c: "then shuffle(s) the rest into their library"
         // directly after a `RevealUntil` whose rest pile went into the library
         // shuffles that library — the revealing player's (Transmogrify, Blessed

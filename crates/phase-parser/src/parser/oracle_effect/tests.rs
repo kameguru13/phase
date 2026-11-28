@@ -111003,3 +111003,53 @@ fn source_owner_shuffle_preserves_blink_investigate() {
             .any(|node| matches!(node.effect.as_ref(), Effect::Investigate)));
     }
 }
+
+#[test]
+fn expressive_iteration_selects_from_the_remainder_and_grants_only_exile_arrivals() {
+    let parsed = parse_effect_chain(
+        "Look at the top three cards of your library. Put one of them into your hand, put one of them on the bottom of your library, and exile one of them. You may play the exiled card this turn.",
+        AbilityKind::Spell,
+    );
+    let bottom = parsed.sub_ability.as_deref().expect("bottom follows dig");
+    assert!(matches!(
+        &*bottom.effect,
+        Effect::PutAtLibraryPosition {
+            target: TargetFilter::TrackedSet { .. },
+            position: crate::types::ability::LibraryPosition::Bottom,
+            count: QuantityExpr::Fixed { value: 1 },
+            ..
+        }
+    ));
+    let choice = bottom
+        .sub_ability
+        .as_deref()
+        .expect("choose from remainder");
+    assert!(
+        matches!(
+            &*choice.effect,
+            Effect::ChooseFromZone {
+                count: 1,
+                zone: Zone::Library,
+                candidate_source: ZoneChoiceCandidateSource::Tracked,
+                up_to: false,
+                ..
+            }
+        ),
+        "{choice:?}"
+    );
+    let exile = choice.sub_ability.as_deref().expect("exile follows choice");
+    assert!(matches!(
+        &*exile.effect,
+        Effect::ChangeZone {
+            origin: Some(Zone::Library),
+            destination: Zone::Exile,
+            target: TargetFilter::ParentTarget,
+            ..
+        }
+    ));
+    let grant = exile.sub_ability.as_deref().expect("grant follows exile");
+    let Effect::GrantCastingPermission { target, .. } = &*grant.effect else {
+        panic!("expected play permission, got {:?}", grant.effect);
+    };
+    assert_eq!(*target, exiled_caused_tracked_set());
+}
