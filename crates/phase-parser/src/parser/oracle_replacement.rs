@@ -6227,7 +6227,7 @@ fn parse_enters_where_x_tail_quantity(qty_text: &str) -> Option<QuantityExpr> {
 ///   It binds only when the possessive-free core reading
 ///   (`parse_where_x_quantity_core`) exists and does not depend on X:
 ///   * the core reader is the one validated precisely so the shared reader's
-///     printed-name possessive arm — which would read "your Ring-bearer's
+///     printed-name possessive arm — which would read "your companion's
 ///     power" as the entering permanent's own stat — is never what admits a
 ///     definition; a foreign possessive has no core reading and declines;
 ///   * X := f(X) is circular and defines no value (CR 107.3 separates
@@ -24576,7 +24576,7 @@ mod tests {
         }
     }
 
-    /// CR 107.3 + CR 107.3i: a foreign possessive ("your Ring-bearer's
+    /// CR 107.3 + CR 107.3i: a foreign possessive ("your companion's
     /// power/toughness") is not the entering permanent's own stat. The shared
     /// where-X reader's printed-name possessive arm reads it as the source's
     /// stat (reach guard below), so a composite count around X must not bind it
@@ -24591,13 +24591,13 @@ mod tests {
         const READABLE: &str = "the number of creatures you control.";
         for (definition, source_stat) in [
             (
-                "your Ring-bearer's power.",
+                "your companion's power.",
                 QuantityRef::Power {
                     scope: ObjectScope::Source,
                 },
             ),
             (
-                "your Ring-bearer's toughness.",
+                "your companion's toughness.",
                 QuantityRef::Toughness {
                     scope: ObjectScope::Source,
                 },
@@ -26324,7 +26324,7 @@ mod tests {
             // Unreadable where-X property.
             "If this creature was kicked, it enters with flying and with X +1/+1 counters on it, where X is the discarded card's favorite color.",
             // A foreign possessive is not this object's cost-paid referent.
-            "If this creature was kicked, it enters with flying and with X +1/+1 counters on it, where X is your Ring-bearer's power.",
+            "If this creature was kicked, it enters with flying and with X +1/+1 counters on it, where X is your companion's power.",
             // A leading chain with no counter clause.
             "This creature enters with flying and with haste.",
             // Partner-family leads are never grantable entry riders.
